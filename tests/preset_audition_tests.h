@@ -1,0 +1,728 @@
+#pragma once
+#include <juce_core/juce_core.h>
+#include <memory>
+#include <set>
+#include <vector>
+#include "control_grammar_tests.h"
+#include "../src/ui/screens/PresetScreen.h"
+#include "../src/project/PresetManager.h"
+#include "../src/project/ProjectBridge.h"
+
+// PRESET: the highlighted preset takes over the selected track's sound for listening only; the
+// track's own sound returns on every way out of the screen unless LD kept the preset.
+namespace presetaudition
+{
+    // Everything that makes a track's sound, as the engine / mixer / effects hold it.
+    struct Sound
+    {
+        EngineType engine = EngineType::UnifiedVoice, trackType = EngineType::UnifiedVoice;
+        ParamMap stored;                    // Track::soundParams
+        std::vector<std::pair<int, float>> values;      // every engine id, mixer, effect blocks
+        std::vector<float> routes;
+    };
+
+    inline std::vector<std::pair<int, float>> engineValues(const EngineBase& e)
+    {
+        std::vector<std::pair<int, float>> v;
+        for (int id = 0; id < EngineParamRange::THIRD_END; ++id)
+            if (EngineParamRange::contains(id))
+                v.push_back({ id, e.getParameter(id) });
+        return v;
+    }
+
+    inline Sound soundOf(SequencerCore& seq, AudioEngine& audio, int t)
+    {
+        Sound s;
+        auto& track = seq.getPattern().getTrack(t);
+        s.engine = audio.getEngineTypeOf(t);
+        s.trackType = track.engineType;
+        s.stored = track.soundParams;
+        if (auto* e = audio.getEngine(t))
+            s.values = engineValues(*e);
+        for (int id = MixParam::VOLUME; id < MixParam::SEND_BASE + MixParam::MAX_SENDS; ++id)
+            s.values.push_back({ id, audio.getTrackParameter(t, id) });
+        for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
+            s.values.push_back({ id, audio.getTrackParameter(t, id) });
+        for (int i = 0; i < AftertouchRouter::MAX_ROUTES; ++i)
+        {
+            auto r = audio.getPressureRouter(t).effectiveRoute(i);
+            s.routes.push_back((float) (int) r.dest);
+            s.routes.push_back(r.depth);
+            s.routes.push_back(r.bipolar ? 1.0f : 0.0f);
+        }
+        return s;
+    }
+
+    // Empty when the two are the same sound; otherwise the first difference.
+    inline juce::String difference(const Sound& a, const Sound& b)
+    {
+        if (a.engine != b.engine) return "engine type " + juce::String((int) a.engine) + " / " + juce::String((int) b.engine);
+        if (a.trackType != b.trackType) return "track engine type";
+        if (a.values.size() != b.values.size()) return "value count";
+        for (size_t i = 0; i < a.values.size(); ++i)
+            if (a.values[i].second != b.values[i].second)
+                return "id " + juce::String(a.values[i].first) + ": " + juce::String(a.values[i].second, 6)
+                       + " / " + juce::String(b.values[i].second, 6);
+        if (a.stored != b.stored) return "stored parameters";
+        if (a.routes != b.routes) return "pressure routes";
+        return {};
+    }
+
+    inline juce::String engineDifference(const std::vector<std::pair<int, float>>& a, const std::vector<std::pair<int, float>>& b)
+    {
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+            if (a[i].second != b[i].second)
+                return "id " + juce::String(a[i].first) + ": " + juce::String(a[i].second, 6) + " / " + juce::String(b[i].second, 6);
+        return {};
+    }
+
+    // What a new engine holds after a preset was loaded into it.
+    inline std::vector<std::pair<int, float>> freshValues(const Preset& p)
+    {
+        SequencerCore seq;
+        AudioEngine audio;
+        audio.setSequencer(&seq);
+        audio.addEngine(0, AudioEngine::createEngine(p.engineType));
+        audio.applyAllTrackParameters(0, p.soundParams);
+        return engineValues(*audio.getEngine(0));
+    }
+
+    // The screen alone: track 0 with a sound of its own (not a preset, not the defaults), track 1 FM.
+    struct Rig
+    {
+        SequencerCore seq;
+        AudioEngine audio;
+        PresetManager mgr;
+        std::unique_ptr<PresetScreen> screen;
+        juce::int64 now = 1000;
+
+        explicit Rig(EngineType type = EngineType::UnifiedVoice)
+        {
+            audio.setSequencer(&seq);
+            audio.addEngine(0, AudioEngine::createEngine(type));
+            seq.getPattern().getTrack(0).engineType = type;
+            audio.addEngine(1, AudioEngine::createEngine(EngineType::FM));
+            seq.getPattern().getTrack(1).engineType = EngineType::FM;
+            makeOwnSound(0);
+            screen = std::make_unique<PresetScreen>(seq, &audio, mgr);
+            screen->setClock([this] { return now; });
+        }
+
+        void set(int t, int id, float v)
+        {
+            audio.setTrackParameter(t, id, v);
+            seq.getPattern().getTrack(t).soundParams[id] = v;
+        }
+
+        // The last preset of the track's engine with every page value nudged, a mixer setting, an
+        // effect block, a pressure range and a pressure route: nothing a preset would put there.
+        void makeOwnSound(int t)
+        {
+            const auto type = audio.getEngineTypeOf(t);
+            auto list = mgr.getFilteredIndices(type);
+            if (!list.empty())
+                for (auto& [id, v] : mgr.getPreset(list.back()).soundParams)
+                    set(t, id, v);
+            auto* e = audio.getEngine(t);
+            for (auto& page : e->getParamPages())
+                for (auto& p : page.params)
+                    if (p.isValid() && !e->isRebuildParam(p.id) && p.id != e->getMasterParamId())
+                    {
+                        const float v = e->getParameter(p.id);
+                        const float moved = p.turned(v, 1, TurnStep::Plain);
+                        set(t, p.id, moved != v ? moved : p.turned(v, -1, TurnStep::Plain));
+                    }
+            set(t, MixParam::VOLUME, 0.33f);
+            set(t, MixParam::PAN, -0.25f);
+            set(t, MixParam::SEND_BASE, 0.4f);
+            set(t, TrackFxParam::DIRT_BASE, audio.getTrackParameter(t, TrackFxParam::DIRT_BASE) + 0.25f);
+            seq.getPattern().getTrack(t).soundParams[RangeParam::LO_BASE + 10] = 0.2f;
+            audio.setPressureRoute(t, 1, { AudioEngine::PressureDest::Volume, 0.4f, false });
+        }
+
+        Sound sound(int t = 0) { return soundOf(seq, audio, t); }
+        void turn(int knob, int clicks = 1) { screen->onEncoderChange(knob, clicks < 0 ? 128 + clicks : clicks); }
+        void confirm(int knob) { for (int i = 0; i < 4; ++i) { turn(knob); now += 150; } }
+
+        // The highlighted preset (the screen's readout names it).
+        const Preset* highlighted() const
+        {
+            const auto name = screen->getEncoderReadout(0).fromFirstOccurrenceOf("PRESET ", false, false);
+            for (int i = 0; i < mgr.getPresetCount(); ++i)
+                if (mgr.getPreset(i).name == name)
+                    return &mgr.getPreset(i);
+            return nullptr;
+        }
+    };
+
+    // The screen inside a ScreenManager, driven by controller messages: TRACKS (0), PRESET (1),
+    // SETTINGS (2), ARP (3); Shift + pad 1 opens TRACKS, Shift + pad 5 PRESET.
+    struct Nav
+    {
+        SequencerCore seq;
+        AudioEngine audio;
+        PresetManager presets;
+        DisplayRenderer display;
+        ScreenManager mgr;
+        PresetScreen* screen = nullptr;
+        juce::int64 now = 1000;
+
+        Nav()
+        {
+            audio.setSequencer(&seq);
+            audio.addEngine(0, AudioEngine::createEngine(EngineType::UnifiedVoice));
+            audio.addEngine(1, AudioEngine::createEngine(EngineType::FM));
+            seq.getPattern().getTrack(0).engineType = EngineType::UnifiedVoice;
+            seq.getPattern().getTrack(1).engineType = EngineType::FM;
+            for (int t = 0; t < 2; ++t)
+            {
+                audio.setTrackParameter(t, MixParam::VOLUME, 0.3f + 0.1f * (float) t);
+                seq.getPattern().getTrack(t).soundParams[MixParam::VOLUME] = 0.3f + 0.1f * (float) t;
+            }
+            audio.setTrackParameter(0, UnifiedParam::CUTOFF, 1234.0f);
+            seq.getPattern().getTrack(0).soundParams[UnifiedParam::CUTOFF] = 1234.0f;
+
+            mgr.setSequencer(&seq);
+            mgr.setClock([this] { return now; });
+            mgr.setDisplay(&display);
+            mgr.setTrackCount(2);
+            // As in the app: the picture is drawn straight after a track is selected.
+            mgr.setTrackSelectionCallback([this](int t)
+            {
+                seq.setSelectedTrack(t);
+                mgr.requestRedraw();
+                mgr.redrawIfNeeded();
+            });
+            mgr.addScreen(std::make_unique<cgtest::Rec>("TRACKS"));
+            auto ps = std::make_unique<PresetScreen>(seq, &audio, presets);
+            screen = ps.get();
+            screen->setClock([this] { return now; });
+            mgr.addScreen(std::move(ps));
+            mgr.addScreen(std::make_unique<cgtest::Rec>("SETTINGS"));
+            mgr.addScreen(std::make_unique<cgtest::Rec>("ARP"));
+            mgr.setShiftPadScreen(0, 0);
+            mgr.setShiftPadScreen(4, 1);
+            openPreset();
+        }
+
+        Sound sound(int t) { return soundOf(seq, audio, t); }
+        void press(int cc)   { mgr.controlChangeReceived(1, cc, 127); }
+        void release(int cc) { mgr.controlChangeReceived(1, cc, 0); }
+        void shift(bool on)  { mgr.controlChangeReceived(7, 63, on ? 127 : 0); }
+        void pad(int pad)
+        {
+            mgr.noteOnReceived(1, cgtest::Rig::padNote(pad), 100);
+            mgr.noteOffReceived(1, cgtest::Rig::padNote(pad));
+        }
+        void shiftPad(int p) { shift(true); pad(p); shift(false); }
+        void openPreset() { shiftPad(4); }
+        void turn(int encoder, int clicks = 1) { mgr.controlChangeReceived(16, 0x15 + encoder, clicks < 0 ? 128 + clicks : clicks); }
+        // Scroll until the track sounds different from `from`.
+        bool audition(int t, const Sound& from)
+        {
+            for (int i = 0; i < screen->getListSize(); ++i)
+            {
+                turn(0);
+                if (difference(sound(t), from).isNotEmpty()) return true;
+            }
+            return false;
+        }
+    };
+}
+
+class PresetAuditionTests : public juce::UnitTest
+{
+public:
+    PresetAuditionTests() : UnitTest("Preset Audition") {}
+
+    void runTest() override
+    {
+        using namespace presetaudition;
+
+        beginTest("Entering changes nothing; the highlight moving makes the preset the track's sound, AU untouched");
+        {
+            Rig rig;
+            const auto own = rig.sound();
+            rig.screen->onActivate();
+            expect(rig.screen->isAuditionOn(), "audition is on from the start");
+            expectEquals(rig.screen->getEncoderReadout(3), juce::String("AUDITION ON"));
+            expect(difference(rig.sound(), own).isEmpty(), "entering the screen leaves the sound alone");
+            expect(!rig.screen->isAuditioning());
+            expect(!rig.screen->getSubPage().contains("AUD"));
+
+            // Knob 1.
+            rig.turn(0);
+            expectEquals(rig.screen->getSelectedIndex(), 1);
+            expect(rig.screen->isAuditioning());
+            expect(rig.screen->getSubPage().contains("AUD"), "the name bar says the sound is only being listened to");
+            auto* p = rig.highlighted();
+            expect(p != nullptr);
+            if (p == nullptr) return;
+            expect(engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p)).isEmpty(),
+                   "the track plays the highlighted preset: " + engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p)));
+            for (auto& [id, v] : p->soundParams)
+                expectEquals(rig.seq.getPattern().getTrack(0).soundParams[id], v, "and stores its values");
+            // The mixer, the effect block and the pressure routes are the track's own.
+            expectEquals(rig.audio.getTrackParameter(0, MixParam::VOLUME), 0.33f);
+            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), own.values[own.values.size() - (size_t) (TrackFxParam::END - TrackFxParam::DIRT_BASE)].second);
+            expect(rig.sound().routes == own.routes);
+
+            // Up / Down.
+            rig.screen->onPadPageNext();
+            expectEquals(rig.screen->getSelectedIndex(), 2);
+            auto* next = rig.highlighted();
+            expect(next != nullptr && next != p);
+            if (next != nullptr)
+                expect(engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*next)).isEmpty(), "Down auditions");
+            rig.screen->onPadPagePrev();
+            expect(engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p)).isEmpty(), "Up auditions");
+
+            // Back to the first row: that preset is heard too (the highlight moved onto it).
+            rig.screen->onPadPagePrev();
+            expectEquals(rig.screen->getSelectedIndex(), 0);
+            if (auto* first = rig.highlighted())
+                expect(engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*first)).isEmpty());
+            // Against the end of the list nothing moves and nothing is loaded again.
+            const auto* engine = rig.audio.getEngine(0);
+            rig.screen->onPadPagePrev();
+            expect(rig.audio.getEngine(0) == engine);
+        }
+
+        beginTest("A category or engine-filter change that moves the highlight auditions too");
+        {
+            Rig rig;
+            const auto own = rig.sound();
+            rig.screen->onActivate();
+            auto* before = rig.highlighted();
+            // CT: step through the categories; each time the highlight lands on another preset it is heard.
+            int heard = 0;
+            for (int c = 0; c < PresetManager::getCategories().size(); ++c)
+            {
+                rig.turn(1);
+                auto* p = rig.highlighted();
+                if (rig.screen->getListSize() == 0)
+                {
+                    expect(difference(rig.sound(), own).isEmpty(), "an empty list gives the track's own sound back");
+                    expect(!rig.screen->isAuditioning());
+                    before = nullptr;
+                    continue;
+                }
+                if (p != nullptr && p != before)
+                {
+                    expect(engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p)).isEmpty(),
+                           "category " + juce::String(c + 1) + ": " + p->name);
+                    ++heard;
+                }
+                before = p;
+            }
+            expect(heard >= 2);
+
+            // EN: with ANY the list holds other engines' presets; a category whose first preset is
+            // another engine's brings that engine in.
+            Rig any;
+            const auto anyOwn = any.sound();
+            any.screen->onActivate();
+            any.turn(2);
+            expect(any.screen->getSubPage().contains("ANY"));
+            bool otherEngine = false;
+            for (int i = 0; i < any.screen->getListSize() && !otherEngine; ++i)
+            {
+                any.turn(0);
+                otherEngine = any.audio.getEngineTypeOf(0) != EngineType::UnifiedVoice;
+            }
+            expect(otherEngine, "a preset of another engine type is heard on its own engine");
+            auto* p = any.highlighted();
+            if (p != nullptr)
+            {
+                expect(any.audio.getEngineTypeOf(0) == p->engineType);
+                expect(any.seq.getPattern().getTrack(0).engineType == p->engineType);
+                expect(engineDifference(engineValues(*any.audio.getEngine(0)), freshValues(*p)).isEmpty());
+            }
+            // Back to "this track's engine": that is still the engine of the track's own sound.
+            any.turn(2, -1);
+            for (int i = 0; i < any.screen->getListSize(); ++i)
+            {
+                any.screen->onPadPageNext();
+                expect(any.audio.getEngineTypeOf(0) == EngineType::UnifiedVoice, "THIS lists the own sound's engine");
+            }
+            any.screen->onDeactivate();
+            expect(difference(any.sound(), anyOwn).isEmpty(), difference(any.sound(), anyOwn));
+        }
+
+        beginTest("Every engine: presets of the same engine are applied to the running engine and equal a fresh load");
+        {
+            PresetManager all;
+            std::set<EngineType> types;
+            for (int i = 0; i < all.getPresetCount(); ++i)
+                types.insert(all.getPreset(i).engineType);
+            expect(types.size() >= 5);
+
+            for (auto type : types)
+            {
+                Rig rig(type);
+                const juce::String tag = "engine " + juce::String((int) type) + ": ";
+                const auto own = rig.sound();
+                const auto* engine = rig.audio.getEngine(0);
+                rig.screen->onActivate();
+                const int count = rig.screen->getListSize();
+                expect(count >= 1, tag + "has presets");
+
+                // Down the whole list and back up: whatever was heard before, each preset sounds
+                // as if loaded into a new engine.
+                for (int i = 0; i < 2 * count; ++i)
+                {
+                    if (i < count) rig.screen->onPadPageNext(); else rig.screen->onPadPagePrev();
+                    auto* p = rig.highlighted();
+                    if (p == nullptr || !rig.screen->isAuditioning()) continue;
+                    const auto d = engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p));
+                    expect(d.isEmpty(), tag + p->name + " " + d);
+                }
+                expect(rig.audio.getEngine(0) == engine, tag + "no engine was built while scrolling");
+
+                rig.screen->onDeactivate();
+                expect(rig.audio.getEngine(0) == engine, tag + "nor on leaving");
+                const auto d = difference(rig.sound(), own);
+                expect(d.isEmpty(), tag + "the own sound is back exactly: " + d);
+            }
+        }
+
+        beginTest("Every engine: after presets of every other engine, leaving restores the sound exactly");
+        {
+            for (auto type : { EngineType::UnifiedVoice, EngineType::FM, EngineType::MacroOsc, EngineType::Wavetable,
+                               EngineType::WaveSeq, EngineType::Sampler, EngineType::Drum })
+            {
+                Rig rig(type);
+                const juce::String tag = "engine " + juce::String((int) type) + ": ";
+                const auto own = rig.sound();
+                rig.screen->onActivate();
+                rig.turn(2);                                    // ANY
+                std::set<EngineType> heard;
+                for (int i = 0; i < rig.screen->getListSize(); ++i)
+                {
+                    rig.screen->onPadPageNext();
+                    heard.insert(rig.audio.getEngineTypeOf(0));
+                }
+                expect(heard.size() >= 5, tag + "other engines were heard");
+                expect(rig.audio.getEngineTypeOf(0) != type || rig.screen->isAuditioning());
+                rig.screen->onDeactivate();
+                expect(!rig.screen->isAuditioning());
+                const auto d = difference(rig.sound(), own);
+                expect(d.isEmpty(), tag + d);
+            }
+        }
+
+        beginTest("LD keeps the highlighted preset: LOAD OK, nothing is put back on leaving");
+        {
+            Rig rig;
+            const auto own = rig.sound();
+            rig.screen->onActivate();
+            rig.turn(0, 2);
+            auto* p = rig.highlighted();
+            const auto heard = rig.sound();
+            const auto* engine = rig.audio.getEngine(0);
+
+            for (int i = 0; i < 3; ++i) { rig.turn(4); rig.now += 150; }
+            expect(rig.screen->isAuditioning(), "three clicks are not a load");
+            rig.turn(4);
+            expectEquals(rig.screen->getSubPage(), juce::String("LOAD OK"));
+            expect(!rig.screen->isAuditioning());
+            expect(rig.audio.getEngine(0) == engine, "the preset being heard simply stays");
+            expect(difference(rig.sound(), heard).isEmpty(), "LD changes nothing audible");
+            expect(rig.highlighted() == p, "the kept preset stays highlighted");
+
+            rig.screen->onDeactivate();
+            expect(difference(rig.sound(), heard).isEmpty(), "LD keeps: " + difference(rig.sound(), heard));
+            expect(difference(rig.sound(), own).isNotEmpty());
+
+            // The kept preset is now the sound that auditioning returns to.
+            rig.screen->onActivate();
+            rig.screen->onPadPageNext();
+            expect(difference(rig.sound(), heard).isNotEmpty());
+            rig.screen->onDeactivate();
+            expect(difference(rig.sound(), heard).isEmpty(), difference(rig.sound(), heard));
+
+            // LD without scrolling loads the highlighted preset.
+            Rig direct;
+            direct.screen->onActivate();
+            auto* first = direct.highlighted();
+            direct.confirm(4);
+            expectEquals(direct.screen->getSubPage(), juce::String("LOAD OK"));
+            if (first != nullptr)
+                expect(engineDifference(engineValues(*direct.audio.getEngine(0)), freshValues(*first)).isEmpty());
+            const auto loaded = direct.sound();
+            direct.screen->onDeactivate();
+            expect(difference(direct.sound(), loaded).isEmpty());
+
+            // LD on a preset of another engine type: the track is that engine from then on.
+            Rig other;
+            other.screen->onActivate();
+            other.turn(2);
+            for (int i = 0; i < other.screen->getListSize() && other.audio.getEngineTypeOf(0) == EngineType::UnifiedVoice; ++i)
+                other.turn(0);
+            const auto type = other.audio.getEngineTypeOf(0);
+            expect(type != EngineType::UnifiedVoice);
+            auto* kept = other.highlighted();
+            other.confirm(4);
+            expect(other.highlighted() == kept);
+            const auto otherSound = other.sound();
+            other.screen->onDeactivate();
+            expect(other.audio.getEngineTypeOf(0) == type && other.seq.getPattern().getTrack(0).engineType == type);
+            expect(difference(other.sound(), otherSound).isEmpty());
+
+            // Nothing highlighted: LOAD FAIL, and the sound is untouched.
+            Rig empty;
+            const auto emptyOwn = empty.sound();
+            empty.screen->onActivate();
+            for (int c = 0; c < PresetManager::getCategories().size() && empty.screen->getListSize() > 0; ++c)
+                empty.turn(1);
+            expectEquals(empty.screen->getListSize(), 0);
+            empty.confirm(4);
+            expectEquals(empty.screen->getSubPage(), juce::String("LOAD FAIL"));
+            expect(difference(empty.sound(), emptyOwn).isEmpty());
+        }
+
+        beginTest("AU is the off switch: off gives the own sound back and scrolling is silent; on, the highlight is heard at once");
+        {
+            Rig rig;
+            const auto own = rig.sound();
+            rig.screen->onActivate();
+            rig.turn(0);
+            expect(difference(rig.sound(), own).isNotEmpty());
+            rig.turn(3, -1);
+            expectEquals(rig.screen->getEncoderReadout(3), juce::String("AUDITION OFF"));
+            expect(rig.screen->getSubPage().contains("AU-"), "the name bar shows that audition is off");
+            expect(difference(rig.sound(), own).isEmpty(), difference(rig.sound(), own));
+            rig.turn(0);
+            rig.screen->onPadPageNext();
+            expect(difference(rig.sound(), own).isEmpty(), "AU off: scrolling loads nothing");
+            rig.turn(3);
+            expect(rig.screen->isAuditioning());
+            if (auto* p = rig.highlighted())
+                expect(engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p)).isEmpty());
+            rig.turn(3);                                         // already on: nothing happens
+            expect(rig.screen->isAuditioning());
+            rig.screen->onDeactivate();
+            expect(difference(rig.sound(), own).isEmpty());
+        }
+
+        beginTest("VL set while auditioning stays; a volume a user preset brings does not");
+        {
+            Rig rig;
+            rig.screen->onActivate();
+            // SV stores the track's sound, volume included, as a user preset.
+            rig.confirm(5);
+            rig.set(0, MixParam::VOLUME, 0.6f);
+            rig.screen->onDeactivate();
+            rig.screen->onActivate();
+            const auto own = rig.sound();
+            for (int i = 0; i < 400; ++i) rig.turn(0);          // to the end: the user preset
+            expectWithinAbsoluteError(rig.audio.getTrackParameter(0, MixParam::VOLUME), 0.33f, 0.001f, "the user preset's volume is heard");
+            rig.screen->onPadPagePrev();
+            expectWithinAbsoluteError(rig.audio.getTrackParameter(0, MixParam::VOLUME), 0.6f, 0.001f,
+                                      "the next preset starts from the track's own mixer again");
+            rig.screen->onPadPageNext();
+            rig.screen->onDeactivate();
+            expect(difference(rig.sound(), own).isEmpty(), difference(rig.sound(), own));
+
+            rig.screen->onActivate();
+            rig.turn(0, -1);
+            const float before = rig.audio.getTrackParameter(0, MixParam::VOLUME);
+            rig.turn(7, -5);
+            const float set = rig.audio.getTrackParameter(0, MixParam::VOLUME);
+            expect(set < before);
+            rig.screen->onDeactivate();
+            expectEquals(rig.audio.getTrackParameter(0, MixParam::VOLUME), set, "VL is the track's level, not part of the audition");
+            expectEquals(rig.seq.getPattern().getTrack(0).soundParams[MixParam::VOLUME], set);
+        }
+
+        beginTest("A step lock that is holding a parameter is neither remembered as the sound nor lost");
+        {
+            Rig rig;
+            rig.set(0, UnifiedParam::CUTOFF, 1234.0f);
+            Step locked, plain;
+            locked.paramLocks[UnifiedParam::CUTOFF] = 500.0f;
+            rig.seq.getPattern().getTrack(0).steps[0].paramLocks[UnifiedParam::CUTOFF] = 500.0f;
+            rig.audio.applyStepLocks(0, locked);
+            expectWithinAbsoluteError(rig.audio.getTrackParameter(0, UnifiedParam::CUTOFF), 500.0f, 0.5f);
+
+            rig.screen->onActivate();
+            rig.turn(0);
+            auto* p = rig.highlighted();
+            rig.audio.applyStepLocks(0, plain);                 // the lock ends while the preset is heard
+            if (p != nullptr)
+                expect(engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p)).isEmpty(),
+                       "the parameter goes back to the preset's value, not to the own sound's");
+            rig.audio.applyStepLocks(0, locked);
+            rig.screen->onDeactivate();
+            rig.audio.applyStepLocks(0, plain);
+            expectWithinAbsoluteError(rig.audio.getTrackParameter(0, UnifiedParam::CUTOFF), 1234.0f, 0.5f,
+                                      "after leaving, the lock ends on the own sound's value");
+        }
+
+        beginTest("Every way out restores: Shift + pad, Settings, Arp, another screen set directly");
+        {
+            for (int route = 0; route < 4; ++route)
+            {
+                Nav nav;
+                const juce::String tag = "route " + juce::String(route) + ": ";
+                expect(nav.mgr.getActiveScreen() == nav.screen);
+                const auto own = nav.sound(0);
+                expect(nav.audition(0, own), tag + "scrolling with knob 1 changes the sound");
+                // Up / Down beside the pads scroll as well.
+                const int index = nav.screen->getSelectedIndex();
+                nav.press(cgtest::UP); nav.release(cgtest::UP);
+                expectEquals(nav.screen->getSelectedIndex(), index - 1, tag + "Up scrolls");
+                expect(nav.screen->isAuditioning());
+
+                if (route == 0)      nav.shiftPad(0);
+                else if (route == 1) { nav.press(cgtest::SETTINGS); nav.release(cgtest::SETTINGS); }
+                else if (route == 2) { nav.press(cgtest::ARP); nav.release(cgtest::ARP); }
+                else                 nav.mgr.setActiveScreen(0);
+
+                expect(nav.mgr.getActiveScreen() != nav.screen, tag + "the screen was left");
+                const auto d = difference(nav.sound(0), own);
+                expect(d.isEmpty(), tag + d);
+                expect(!nav.screen->isAuditioning());
+
+                // Coming back starts clean: nothing is heard until the highlight moves.
+                nav.openPreset();
+                expect(difference(nav.sound(0), own).isEmpty(), tag + "re-entering loads nothing");
+            }
+        }
+
+        beginTest("Another track selected while auditioning: the old track gets its sound back, the new one is remembered");
+        {
+            Nav nav;
+            const auto own0 = nav.sound(0), own1 = nav.sound(1);
+            expect(nav.audition(0, own0));
+
+            // Shift + Down: track 2.
+            nav.shift(true); nav.press(cgtest::DOWN); nav.release(cgtest::DOWN); nav.shift(false);
+            expectEquals(nav.seq.getSelectedTrack(), 1);
+            expect(difference(nav.sound(0), own0).isEmpty(), "track 1 is itself again at once: " + difference(nav.sound(0), own0));
+            expect(difference(nav.sound(1), own1).isEmpty(), "track 2 is untouched until the highlight moves");
+            expect(!nav.screen->isAuditioning());
+
+            expect(nav.audition(1, own1), "now track 2 auditions");
+            expect(nav.audio.getEngineTypeOf(1) == EngineType::FM, "from its own engine's presets");
+            expect(difference(nav.sound(0), own0).isEmpty());
+
+            // Hold Up + top pad 1: back to track 1.
+            nav.press(cgtest::UP); nav.pad(0); nav.release(cgtest::UP);
+            expectEquals(nav.seq.getSelectedTrack(), 0);
+            expect(difference(nav.sound(1), own1).isEmpty(), "track 2 restored: " + difference(nav.sound(1), own1));
+
+            // Keep a preset on track 1, audition on track 2, leave: track 1 keeps, track 2 returns.
+            expect(nav.audition(0, own0));
+            for (int i = 0; i < 4; ++i) { nav.turn(4); nav.now += 150; }
+            const auto kept = nav.sound(0);
+            expect(difference(kept, own0).isNotEmpty());
+            nav.shift(true); nav.press(cgtest::DOWN); nav.release(cgtest::DOWN); nav.shift(false);
+            expect(nav.audition(1, own1));
+            nav.shiftPad(0);
+            expect(difference(nav.sound(0), kept).isEmpty(), "LD on track 1 stays");
+            expect(difference(nav.sound(1), own1).isEmpty(), "track 2 returns");
+        }
+
+        beginTest("A project saved while auditioning holds the track's own sound");
+        {
+            for (int otherEngine = 0; otherEngine < 2; ++otherEngine)
+            {
+                Rig rig;
+                rig.screen->onActivate();
+                const auto before = ProjectBridge::capture({ rig.seq, rig.audio }, "P").toJSON();
+
+                if (otherEngine != 0)
+                {
+                    rig.turn(2);
+                    for (int i = 0; i < rig.screen->getListSize() && rig.audio.getEngineTypeOf(0) == EngineType::UnifiedVoice; ++i)
+                        rig.turn(0);
+                    expect(rig.audio.getEngineTypeOf(0) != EngineType::UnifiedVoice);
+                }
+                else
+                    rig.turn(0, 2);
+                expect(rig.screen->isAuditioning());
+
+                auto data = ProjectBridge::capture({ rig.seq, rig.audio }, "P");
+                expect(data.toJSON() != before, "the engine holds the auditioned preset");
+                rig.screen->keepOriginalInSave(data);
+                expect(data.toJSON() == before, "the saved project is the one from before the audition");
+
+                // Loading that file gives the own sound.
+                SequencerCore seq2;
+                AudioEngine audio2;
+                audio2.setSequencer(&seq2);
+                ProjectBridge::apply(ProjectData::fromJSON(data.toJSON()), { seq2, audio2 });
+                expect(audio2.getEngineTypeOf(0) == EngineType::UnifiedVoice);
+                expectEquals(audio2.getTrackParameter(0, MixParam::VOLUME), 0.33f);
+
+                // After LD the preset is the sound and is what gets saved.
+                rig.confirm(4);
+                auto kept = ProjectBridge::capture({ rig.seq, rig.audio }, "P");
+                const auto plain = kept.toJSON();
+                rig.screen->keepOriginalInSave(kept);
+                expect(kept.toJSON() == plain && plain != before, "nothing is swapped once LD kept the preset");
+            }
+        }
+
+        beginTest("A project loaded while auditioning is not overwritten by the remembered sound");
+        {
+            // The project to load: track 1 with a cutoff of 777 Hz.
+            Rig source;
+            source.set(0, UnifiedParam::CUTOFF, 777.0f);
+            const auto project = ProjectData::fromJSON(ProjectBridge::capture({ source.seq, source.audio }, "B").toJSON());
+
+            Rig rig;
+            rig.screen->onActivate();
+            rig.turn(0, 2);
+            expect(rig.screen->isAuditioning());
+            ProjectBridge::apply(project, { rig.seq, rig.audio });
+            const auto loaded = rig.sound();
+            expectWithinAbsoluteError(rig.audio.getTrackParameter(0, UnifiedParam::CUTOFF), 777.0f, 0.5f);
+
+            auto data = ProjectBridge::capture({ rig.seq, rig.audio }, "B");
+            const auto plain = data.toJSON();
+            rig.screen->keepOriginalInSave(data);
+            expect(data.toJSON() == plain, "a save after the load stores the loaded project");
+
+            rig.screen->onDeactivate();
+            expect(difference(rig.sound(), loaded).isEmpty(), "leaving keeps the loaded project's sound: " + difference(rig.sound(), loaded));
+
+            // And the screen carries on from the loaded sound.
+            rig.screen->onActivate();
+            rig.turn(0);
+            rig.screen->onDeactivate();
+            expect(difference(rig.sound(), loaded).isEmpty());
+        }
+
+        beginTest("Notes held across an audition do not hang");
+        {
+            Rig rig;
+            rig.audio.getEngine(0)->noteOn(60, 0.8f);
+            rig.screen->onActivate();
+            const auto* engine = rig.audio.getEngine(0);
+            rig.turn(0);
+            expect(rig.audio.getEngine(0) == engine, "same engine type: the note carries on in the same engine");
+            rig.audio.getEngine(0)->noteOff(60);
+
+            // Another engine type: the old engine and its notes are gone with it; the release of
+            // the key goes to the new one and is harmless.
+            rig.audio.getEngine(0)->noteOn(64, 0.8f);
+            rig.turn(2);
+            for (int i = 0; i < rig.screen->getListSize() && rig.audio.getEngineTypeOf(0) == EngineType::UnifiedVoice; ++i)
+                rig.turn(0);
+            expect(rig.audio.getEngine(0) != engine);
+            rig.audio.getEngine(0)->noteOff(64);
+            rig.audio.getEngine(0)->allNotesOff();
+
+            // Pads held on the screen are released on leaving.
+            std::vector<int> off;
+            rig.screen->setNoteOffCallback([&](int n) { off.push_back(n); });
+            rig.screen->onPadPress(3, 100);
+            rig.screen->onDeactivate();
+            expectEquals((int) off.size(), 1);
+        }
+    }
+};
+
+static PresetAuditionTests presetAuditionTests;
