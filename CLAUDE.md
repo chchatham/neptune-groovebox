@@ -42,7 +42,7 @@ src/
 ├── sequencer/
 │   ├── SequencerCore       — sample-accurate clock, pattern bank, trig conditions, recording, pressure lanes, mute/solo
 │   ├── Pattern.h, Track.h, Step.h — data model (below)
-│   ├── SongMode.h          — ordered list of patterns
+│   ├── SongMode.h, SongPlayer.h — ordered list of patterns; the listener that moves the song on as track 1 wraps
 │   └── PadRatchet.h        — hold-to-ratchet pads
 ├── engine/
 │   ├── EngineBase.h, ParamSpec.h — engine interface; parameter specs, pages and shared id ranges

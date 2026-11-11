@@ -369,6 +369,9 @@ void SequencerCore::advanceStep(int trackIndex)
 
     listeners.call(&Listener::stepAdvanced, trackIndex, stepIdx);
 
+    // A listener may have changed the pattern at once (the song does, on track 1's wrap): this track
+    // arrives at the new pattern's first step here, not a second time at the next sample.
+    atStepStart[trackIndex] = false;
     arriveAtStep(trackIndex);
 }
 

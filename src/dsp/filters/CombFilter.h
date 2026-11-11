@@ -4,6 +4,11 @@
 // series of harmonic peaks (positive feedback) or odd-harmonic peaks an octave lower (negative).
 // Standard structure (see J. O. Smith, "Physical Audio Signal Processing", feedback comb filters)
 // with a one-pole low-pass in the loop for damping.
+//
+// The delay glides to a new cutoff instead of jumping there: a jump moves the read point by the
+// whole difference at once (59 samples for one knob click at 20 Hz), which is heard as a click and
+// a step in pitch. The glide takes about half a period of the comb (never less than a millisecond),
+// so a low sweep bends like a tape delay and a high one still follows an envelope or LFO at once.
 
 #include "../DSPUtils.h"
 #include <vector>
@@ -22,6 +27,20 @@ public:
 
     float process(float input)
     {
+        if (delaySamples != targetDelay)
+        {
+            if (snap)
+                delaySamples = targetDelay;
+            else
+            {
+                const float d = targetDelay - delaySamples;
+                delaySamples += d * glideCoeff;
+                if (std::abs(d) < 1.0e-3f)
+                    delaySamples = targetDelay;
+            }
+        }
+        snap = false;
+
         // Read the delayed sample with linear interpolation.
         float readPos = (float) writePos - delaySamples;
         if (readPos < 0.0f) readPos += (float) SIZE;
@@ -46,6 +65,7 @@ public:
         std::fill(buffer.begin(), buffer.end(), 0.0f);
         loopState = 0.0f;
         writePos = 0;
+        snap = true;        // an empty delay has nothing to bend: the next cutoff applies at once
     }
 
 private:
@@ -55,7 +75,9 @@ private:
     void calc()
     {
         float fc = std::clamp(cutoff, 20.0f, (float) (sampleRate * 0.45));
-        delaySamples = std::clamp((float) (sampleRate / fc), 2.0f, (float) (SIZE - 2));
+        targetDelay = std::clamp((float) (sampleRate / fc), 2.0f, (float) (SIZE - 2));
+        // Time constant: half the comb's period, at least 1 ms.
+        glideCoeff = std::min(2.0f / targetDelay, (float) (1000.0 / sampleRate));
     }
 
     double sampleRate = 44100.0;
@@ -63,7 +85,10 @@ private:
     float feedback = 0.0f;
     float damping = 0.0f;
     bool negative = false;
-    float delaySamples = 44.1f;
+    float targetDelay = 44.1f;
+    float delaySamples = 44.1f;     // what is read now; glides to targetDelay
+    float glideCoeff = 1.0f;
+    bool snap = true;               // nothing has sounded yet
     float loopState = 0.0f;
     int writePos = 0;
     // On the heap: a voice holds several filters and should stay small enough to live anywhere.

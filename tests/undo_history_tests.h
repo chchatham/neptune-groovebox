@@ -635,6 +635,46 @@ public:
             expect(r.track(0).getStep(0).hasPressure(), "undo brings the swell back");
         }
 
+        beginTest("PRES page: >LCK is an undo step; undo takes the locks away and brings the swell back");
+        {
+            URig r;
+            r.mgr.setActiveScreen(STEP);
+            auto* stepScreen = dynamic_cast<StepViewScreen*>(r.mgr.getActiveScreen());
+            expect(stepScreen != nullptr);
+            if (stepScreen == nullptr) return;
+            stepScreen->setAudioEngine(&r.audio);           // as main.cpp does
+            for (int i = 0; i < 3; ++i)
+            {
+                auto& s = r.track(0).getStep(i);
+                s = Step();
+            }
+            auto& st = r.track(0).getStep(0);
+            st.trig = true;
+            st.length = 3.0f;
+            st.notes = { Note { 60, 0.8f, {} } };
+            st.notes[0].lane.points = { 0, 60, 120, 200, 120, 60 };
+            const auto before = r.state();
+            const int undosBefore = r.undos();
+            r.padDown(0);
+            r.wait(1000);
+            r.tap(BANK_UP);                                 // TRIG
+            r.tap(BANK_UP);                                 // round to the last page: PRES
+            expect(stepScreen->isPressurePage());
+            for (int i = 0; i < 4; ++i) { r.turn(1, 1); r.wait(120); }   // >LCK, four clicks
+            r.padUp(0);
+            expect(!r.track(0).getStep(0).hasPressure(), ">LCK used the pressure up");
+            expect(!r.track(0).getStep(0).paramLocks.empty(), "and left locks");
+            expect(!r.track(0).getStep(1).paramLocks.empty(), "also on the steps the note spans");
+            expectEquals(r.undos(), undosBefore + 1);
+            const auto baked = r.state();
+            r.undo();
+            expectEquals(r.state(), before);
+            expect(r.track(0).getStep(0).hasPressure(), "undo brings the swell back");
+            expect(r.track(0).getStep(1).paramLocks.empty() && !r.track(0).getStep(1).trig, "and removes the lock trigs");
+            r.redo();
+            expectEquals(r.state(), baked);
+        }
+
         beginTest("ARP: EVOL turned back and >PAT are undo steps");
         {
             URig r;

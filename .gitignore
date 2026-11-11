@@ -33,3 +33,6 @@ launchkeyofficial/
 .ralph/launchkey_mk4_programmers_reference.pdf
 .ralph/screen-audit/
 .ralph/display-lag/
+
+# Local launcher (lid-closed playing); not published
+tools/neptune-closed-lid.sh

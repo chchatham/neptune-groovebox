@@ -51,7 +51,7 @@ Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 
 8 SCALE, 9 SONG, 10 AT ROUTE, 11 WAVE, 12 TRK FX.
 
 ## ARP, SCALE AND LATCH (app side)
-- Internally the app still identifies the Arp and Scale buttons as (channel 7, CC 0x49) and (channel 7, CC 0x4A); the virtual controller and the tests use that identity. `ScreenManager::controlChangeReceived` translates the hardware messages CC 109 / CC 110 (ch1) to it and opens SETTINGS on CC 108.
+- Internally the app still identifies the Arp and Scale buttons as (channel 7, CC 0x49) and (channel 7, CC 0x4A); the Mac window's keyboard shortcuts and the tests use that identity. `ScreenManager::controlChangeReceived` translates the hardware messages CC 109 / CC 110 (ch1) to it and opens SETTINGS on CC 108.
 - Key latch: `addPhysicalNote()` on note-on, `removePhysicalNote()` on note-off. Latch suppresses note-off for latched notes; the first key after all keys are up starts a new chord; switching latch off sends note-off only for notes not physically held. Max 16 latched notes (`MAX_HELD_NOTES`).
 - The feature is called **"latch"** (not "hold").
 
@@ -89,11 +89,12 @@ Parameter id ranges in use (engine ids 0–149, 158–189 and 400–527, send ty
 
 ## VIRTUAL CONTROLLER
 - `VirtualControllerComponent.h` renders full on-screen Launchkey MK4
-- Known fault: its Func and Settings buttons send CC 76 / 75 on channel 1, not the hardware's CC 105 / 108, so they do nothing
+- Its buttons send the hardware's messages (Func CC 105, Settings 108, Arp 109, Scale 110 on channel 1; Shift CC 63 on channel 7); its keys are tagged `KEYS_PORT_CHANNEL`, so a key is never taken for a pad whatever the octave; encoders send the app's internal step format (CC 0x15–0x1C, channel 16)
+- Strips: drag; the pitch strip returns to centre on release, the mod strip keeps its value (`onPitchBend`, `onModStrip`, wired in `main.cpp` to the selected track like the hardware's)
 - Right-click = hold element (build combos), left-click = press, click-drag on encoders
 - Mouse wheel on encoders sends relative CC
 - Oct+/- buttons shift virtual keyboard octave range (±3 octaves)
-- `setPadColor()` API for LED feedback, callbacks: `onNoteOn`, `onNoteOff`, `onCC`
+- `setPadColor()` API for LED feedback, callbacks: `onNoteOn`, `onNoteOff`, `onCC`, `onPitchBend`, `onModStrip`
 - CTRL_W=880, CTRL_H=400; stacked below OLED mirror in MainContentComponent
 
 ## CONTROL GRAMMAR (approved by the owner 2026-11-10 — this section wins over anything above it)

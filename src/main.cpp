@@ -21,6 +21,7 @@
 #include "ui/screens/AftertouchScreen.h"
 #include "sequencer/SequencerCore.h"
 #include "sequencer/SongMode.h"
+#include "sequencer/SongPlayer.h"
 #include "engine/AftertouchRouter.h"
 #include "engine/AudioEngine.h"
 #include "engine/ModStripFollower.h"
@@ -202,48 +203,6 @@ public:
         if (sequencer)
             sequencer->setRecording(!sequencer->isRecording());
     }
-};
-
-// Runs the song: when it is armed, Play starts at the first row and each time the pattern (track 1)
-// wraps the song moves on, switching pattern and transposition.
-class SongPlayer : public SequencerCore::Listener
-{
-public:
-    SongMode* song = nullptr;
-    SequencerCore* sequencer = nullptr;
-    std::atomic<int> transpose { 0 };
-
-    void transportStarted() override
-    {
-        firstStep = true;
-        if (!song || !sequencer || !song->isArmed() || song->getEntryCount() == 0)
-            return;
-        song->start();
-        sequencer->selectPattern(song->getCurrentPatternIndex(), SequencerCore::ChangeMode::Immediate);
-        transpose = song->getCurrentTranspose();
-    }
-
-    void transportStopped() override
-    {
-        if (song) song->stop();
-        transpose = 0;
-    }
-
-    void stepAdvanced(int trackIndex, int stepIndex) override
-    {
-        if (!song || !sequencer || trackIndex != 0 || stepIndex != 0 || !song->isActive())
-            return;
-        if (firstStep) { firstStep = false; return; }      // the very first step is not a wrap
-
-        if (song->advancePattern())
-        {
-            sequencer->selectPattern(song->getCurrentPatternIndex(), SequencerCore::ChangeMode::Immediate);
-            transpose = song->getCurrentTranspose();
-        }
-    }
-
-private:
-    bool firstStep = true;
 };
 
 // Pitch strip and mod strip go to the selected track's engine.
@@ -494,6 +453,9 @@ public:
             if (screenManager)
                 screenManager->controlChangeReceived(channel, cc, value);
         };
+        // The strips go where the hardware's go: to the selected track's engine.
+        vc.onPitchBend = [this](int value14) { performanceControls.pitchBendReceived(value14); };
+        vc.onModStrip = [this](int value) { performanceControls.controlChangeReceived(1, 1, value); };
 
         logMidiDevices();
         padManager = std::make_unique<PadManager>();
