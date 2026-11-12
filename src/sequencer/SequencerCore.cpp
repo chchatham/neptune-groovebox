@@ -37,19 +37,69 @@ void SequencerCore::prepareToPlay(double sr, int /*samplesPerBlock*/)
     samplesPerStep = (60.0 / tempo.load()) * sampleRate / 4.0;
 }
 
+// The count-in's beats in this block. Returns the sample at which the transport started (the
+// count-in is over), or numSamples.
+int SequencerCore::processCountIn(int numSamples, double samplesPerBeat)
+{
+    if (countInFresh.exchange(false))
+    {
+        countInBeatsTotal = countInBeatsLeft.load();
+        countInAccumulator = 0.0;
+        countInDue = true;          // its first beat is now
+    }
+    for (int s = 0; s < numSamples; ++s)
+    {
+        if (!countInDue && countInAccumulator >= samplesPerBeat)
+        {
+            countInAccumulator -= samplesPerBeat;
+            countInDue = true;
+        }
+        if (countInDue)
+        {
+            countInDue = false;
+            const int left = countInBeatsLeft.load();
+            if (left <= 0)
+            {
+                // (not when stop() called it off a moment ago)
+                if (countingIn.exchange(false))
+                {
+                    beginPlaying();
+                    countInStarted = true;
+                }
+                return s;
+            }
+            addBeatTick(s, (countInBeatsTotal - left) % BEATS_PER_BAR == 0, true);
+            countInBeatsLeft.store(left - 1);
+        }
+        countInAccumulator += 1.0;
+    }
+    return numSamples;
+}
+
 void SequencerCore::processBlock(int numSamples)
 {
+    beatTickCount = 0;
+    double currentSamplesPerStep = (60.0 / tempo.load()) * sampleRate / 4.0;
+    double samplesPerBeat = currentSamplesPerStep * 4.0;
+
+    int firstSample = 0;
+    if (countingIn.load())
+        firstSample = processCountIn(numSamples, samplesPerBeat);
+
     if (!playing)
         return;
 
     auto& pat = patterns[activePattern];
-    double currentSamplesPerStep = (60.0 / tempo.load()) * sampleRate / 4.0;
-    double samplesPerBeat = currentSamplesPerStep * 4.0;
     cachedSamplesPerStep = currentSamplesPerStep;
 
-    for (int s = 0; s < numSamples; ++s)
+    for (int s = firstSample; s < numSamples; ++s)
     {
         blockSample = s;
+        if (firstBeatDue)
+        {
+            firstBeatDue = false;
+            addBeatTick(s, true, false);
+        }
         if (activeNoteOffCount > 0)
         {
             for (auto& noff : pendingNoteOffs)
@@ -75,6 +125,7 @@ void SequencerCore::processBlock(int numSamples)
         {
             beatAccumulator -= samplesPerBeat;
             beatCount++;
+            addBeatTick(s, beatCount % BEATS_PER_BAR == 0, false);
 
             if (pendingPattern >= 0 && pendingChangeMode == ChangeMode::NextBeat)
                 applyPatternChange();
@@ -133,7 +184,28 @@ void SequencerCore::processBlock(int numSamples)
         advancePressureLanes(numSamples, currentSamplesPerStep);
 }
 
+void SequencerCore::requestStart()
+{
+    if (isRunning())
+        return;
+    const int bars = countInBars.load();
+    if (bars <= 0 || !recording.load())
+    {
+        start();
+        return;
+    }
+    countInBeatsLeft = bars * BEATS_PER_BAR;
+    countInFresh = true;
+    countingIn = true;
+}
+
 void SequencerCore::start()
+{
+    countingIn = false;         // what is left of a count-in is skipped
+    beginPlaying();
+}
+
+void SequencerCore::beginPlaying()
 {
     if (playing)
         return;
@@ -149,6 +221,7 @@ void SequencerCore::start()
     resetTrigTiming(true);      // the first step plays as the transport starts
     captureEpoch.fetch_add(1, std::memory_order_relaxed);   // pressure still being recorded belongs to the last run
     blockSample = 0;
+    firstBeatDue = true;
 
     playing = true;
     listeners.call(&Listener::transportStarted);
@@ -156,6 +229,7 @@ void SequencerCore::start()
 
 void SequencerCore::stop()
 {
+    countingIn = false;         // a count-in is called off
     if (!playing)
         return;
 

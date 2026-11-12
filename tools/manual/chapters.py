@@ -212,6 +212,8 @@ loop is now on its own key. Or {{PLAY}} = {{RAND}} with steps on every sixteenth
 <div class="try"><b>A wavetable from anything</b>On a wavetable track set {{TABL}} to {{USER}}, then choose a recording
 with {{SM}} on the {{WAVE}} screen's {{REC}} page. {{POS}} now scans through your recording, and the {{SCAN}} page can play it
 back at any length. Chapter 5.</div>
+<div class="try"><b>Three waves, one table</b>On a wavetable track open {{WAVE}}: give key 1 a sample with {{SM}}, press
+the second top pad and give key 2 another, then a third. Set {{AL}} to {{TRNS}} or {{VOC}} and sweep {{POS}}. Chapter 5.</div>
 <div class="try"><b>Patterns that never repeat</b>Give two tracks different lengths ({{LN}} on {{STEP}}): 16 against
 12, say. Then give some steps a condition ({{COND}}: {{PROB}} or {{A:B}}). Chapter 9.</div>
 <div class="try"><b>An arp that evolves</b>Press [[Arp]] twice and hold a chord. On the {{VARY}} page raise
@@ -394,7 +396,8 @@ mark in the cell's corner means the step has its own value there (a lock), other
 turn is a lock. The knob-page buttons move through all the track's sound pages while the step is held, and one
 press back from {{MAIN}} is {{TRIG}} ({{NOTE VEL LEN MICR}} | {{COND PROB A B LCKS}}), the step itself. The name bar
 shows the step ({{S5 LOCK}}). Let go and {{STEP}} is back. Turning a knob straight after pressing opens the pages at
-once; a quick tap never shows them. With several steps held, the pages belong to the one nearest the top left.</p>
+once; a quick tap never shows them. With several steps held, the pages show the one nearest the top left and every held step is edited
+together: a knob gives all of them the value you see, and a key gives all of them its note.</p>
 <p><b>Recorded pressure:</b> a step whose notes were recorded from pads with pressure has a small dark dot at the
 lower right of its cell, and one more page, {{PRES}}, one press back from {{TRIG}} (the pages go round, so it is
 also the last page). It shows the recorded curves over the note's length and three cells: {{PRES}} sets how much of
@@ -433,10 +436,14 @@ track. {{LD}} keeps the highlighted preset instead (the name bar shows LOAD OK):
 <p><b>Pads:</b> play the track, sixteen semitones up from middle C, so you can audition without reaching for the keys.
 [[▲]] / [[▼]] also scroll the list.</p>
 <p>Your own presets are files in <i>Music / Neptune / Presets</i>.</p>""")
-    screen("SETTINGS", [("SETTINGS", 1, "SETUP"), ("SETTINGS", 2, "MASTR"), ("SETTINGS", 3, "PROJ")], """
-<p>Three pages. {{SETUP}}: tempo, swing, quantize, clock source, master volume, pattern, and {{HELP}} (when the
+    screen("SETTINGS", [("SETTINGS", 1, "SETUP"), ("SETTINGS", 2, "MASTR"), ("SETTINGS", 3, "PROJ"),
+                        ("SETTINGS", 4, "CLICK")], """
+<p>Four pages. {{SETUP}}: tempo, swing, quantize, clock source, master volume, pattern, and {{HELP}} (when the
 help cards appear). {{MASTR}}: master EQ,
-compressor and limiter. {{PROJ}}: project slots (Chapter 12).</p>""")
+compressor and limiter. {{PROJ}}: project slots (Chapter 12). {{CLICK}}: the metronome — {{CLCK}} (when it
+clicks), {{CLVL}} (how loud) and {{CNT}} (the count-in before a recording); see Recording in the sequencer
+chapter. The metronome's settings belong to the instrument, not to a project: loading or starting a project
+leaves them as they are, and they are kept between sessions.</p>""")
     screen("FLTR — the filter picture", [("FLTR", 1, "FLTR")], """
 <p>The filter's actual response, measured from the filter itself, with the engine's filter controls beneath as
 two-letter labels. For the synth's two filters it shows them combined as routed. Further filter pages of the engine
@@ -466,6 +473,10 @@ track chromatically so you can feel the result.</p>""")
 <p>{{WAVE}} page: the track's sample with start and end brackets, loop marks, slice ticks and a moving line for each
 sounding voice (in granular mode, a tick per grain). Knobs: {{ST EN LS LE}} markers, {{ZM}} zoom, {{SC}} scroll,
 {{MD}} play mode, {{SL}} slices. Pad N selects slice N.</p>
+<p>On a wavetable track the page is the key-frame editor of the {{KEYS}} table (Chapter 5): the sample of one key,
+a line where its cycle is taken and a tick for every other key on the same sample. Knobs: {{KY}} key, {{SM}} its
+sample, {{PO}} its position in the sample, {{PL}} its place along the table, {{ZM}} zoom, {{SC}} scroll, {{AL}}
+algorithm, {{TB}} table. The top-row pads choose the key; the lit ones are in use.</p>
 <p>{{REC}} page: resampling (Chapter 11).</p>""")
     ch.append(("The screens", scr))
 
@@ -511,15 +522,18 @@ through the same filter. Tuning, detune, cross-modulation, the stack and the mix
 non-analog slot has two controls of its own on the {{SRC}} page, labelled with the slot's number (slot 1 on knobs
 1–2, slot 2 on 3–4, slot 3 on 5–6; a slot playing an analog wave shows nothing there):</p>""")
     + table(["Kind", "First control", "Second control", "What it is"], [
-        ("<code>WT</code>", "<code>POS</code> position in the table", "<code>TBL</code> table: SAW SQR TRI SIN PWM FORM HARM SPEC DIGI", "A wavetable oscillator reading one of the nine built-in tables; sweep POS for movement."),
+        ("<code>WT</code>", "<code>POS</code> position in the table", "<code>TBL</code> table: SAW SQR TRI SIN PWM FORM HARM SPEC DIGI, then VOWL SYNC FOLD FM1 FM3 BELL ORGN NOIS RESO WLSH PRIM OCTV PDST COMB", "The wavetable engine's oscillator in a slot: any of its 23 built-in tables, read the same way; sweep POS for movement."),
         ("<code>FM</code>", "<code>IDX</code> modulation depth", "<code>RAT</code> modulator ratio, 1–12", "A sine modulated by a second sine at a whole multiple of its pitch: bells, basses, glassy tones."),
         ("<code>FORM</code>", "<code>FRM</code> formant frequency, 1–16 times the pitch", "<code>WID</code> width of the formant", "A resonant, vocal peak that stays put while the note changes character around it."),
         ("<code>HARM</code>", "<code>TLT</code> tilt, bright to dark", "<code>ODD</code> all harmonics to odd only", "Up to twelve harmonics added together; odd-only is hollow like a square."),
     ]) + fmt("""
 <p>Whatever moves {{PW}} (an LFO with {{DEST}} {{PW}}, pad pressure routed to {{PW}}) also moves the first control
 of every non-analog slot, so one LFO can sweep a pulse's width and a wavetable's position together. Choosing a new
-kind for a slot starts it from that kind's own settings. The wavetable kind plays the built-in tables; a table
-made from your own recording ({{USER}}) is in the wavetable engine.</p>""") + page_list(params, "Unified Voice") + fmt("""
+kind for a slot starts it from that kind's own settings. The wavetable kind is the wavetable engine's own
+oscillator on the wavetable engine's built-in tables (described in the Wavetable section below), read smoothly.
+What stays in the wavetable engine: tables made from your own recordings ({{USER}}, {{KEYS}}), the timed
+{{SCAN}}, and the coarse read-outs of {{INTP}}. An LFO sent to a slot's table cell moves it by eight tables at
+full depth.</p>""") + page_list(params, "Unified Voice") + fmt("""
 <p>Three more pages follow for modulation: {{MOD}} and {{MOD2}} (up to four LFOs) and {{MENV}} (up to four extra
 envelopes). See Chapter 7.</p>
 <p>The {{ANALG}} page is the instrument's "age" control: drift, tuning slop, and per-note variation of waveform,
@@ -535,9 +549,24 @@ suit it.</p>""") + table(["Model", "What it is", "Knobs 2–5"],
                           [(f"<code>{m}</code>", d, " ".join(f"<code>{x}</code>" for x in k.split())) for m, d, k in ctx["macro_models"]])
         + page_list(params, "Macro Oscillator")))
     eng.append(("Wavetable", fmt("""
-<p>{{TABL}} picks one of nine built-in tables or {{USER}}, a table built from any sample (64 frames, so {{POS}} scans
-through the recording). {{MSPD}} and {{MDPT}} move the position by themselves; {{ENVP}} and {{VELP}} move it with
-the envelope and velocity. {{INTP}} sets how frames blend, from smooth to deliberately coarse.</p>
+<p>{{TABL}} picks a built-in table, {{USER}}, a table built from any sample (64 frames, so {{POS}} scans
+through the recording), or {{KEYS}}, a table you define with key frames (below). {{MSPD}} and {{MDPT}} move the
+position by themselves; {{ENVP}} and {{VELP}} move it with the envelope and velocity. {{INTP}} sets how the table
+is read, from smooth to deliberately coarse. Its last setting, {{CLSC}}, reads any table the way the first digital
+wavetable synths did: the scan moves in 64 whole steps, the wave is 128 samples of 8 bits with nothing smoothed
+in between, and nothing is band-limited to the note, so high notes get a glassy top of tones that are not
+harmonics. ({{STEP}} is stepped but clean; {{VINT}} softens each step.)</p>
+<p>After the first nine tables come fourteen more: {{VOWL}} the vowels A E I O U, {{SYNC}} an oscillator-sync
+sweep, {{FOLD}} a sine driven into a wavefolder, {{FM1}} and {{FM3}} FM with a rising index (modulator at 1× and
+3× the pitch), {{BELL}} bar-like partials from a soft to a hard strike, {{ORGN}} an organ pulled out drawbar by
+drawbar, {{NOIS}} noise settling into a tone, {{RESO}} a resonant filter sweep, {{WLSH}} square-cornered digital
+waves, {{PRIM}} prime-numbered harmonics, {{OCTV}} octaves only, {{PDST}} phase distortion from sine to saw, and
+{{COMB}} a saw against a sliding copy of itself. All are level-matched and free of aliasing in themselves.</p>
+<p>Each of the fourteen has at least one factory preset on {{PRESET}} (Vowel Lead, Sync Sweep Lead, Fold Bass,
+FM Table Keys, Glass Pluck, Struck Bar, Drawbar Organ, Noise To Tone, Reso Sweep Bass, Walsh Stepper, Prime
+Shimmer, Octave Climb, Phase Bass, Comb Phase Pad and others), and three play a table through {{CLSC}}: Eight
+Bit Vowels, Glassy Bell and Raw Sync Lead. The same 23 built-in tables can be played by the synth's oscillator
+slots (kind {{WT}}).</p>
 <p>The {{SCAN}} page moves the position by itself over a set time, whatever note you play: this is time stretch
 for a wavetable. {{MODE}} runs once and holds ({{RUN}}), loops, goes there and back ({{PING}}), moves in audible
 steps ({{STEP}}) or jumps to random frames ({{RAND}}). The pass lasts {{TIME}} seconds, or with {{SYNC}} on, {{LEN}}
@@ -546,6 +575,40 @@ slows it or speeds it without changing pitch. The scan starts from {{POS}}.</p>
 <p>{{FRMS}} chooses how a recording is cut into the USER table. The {{A64}}, {{A128}} and {{A256}} settings align
 each frame to the sound's pitch period: scanning is far smoother and the table plays in tune with the keys.
 They work on pitched material; noise and silence are cut the plain way.</p>""")
+        + fmt("""
+<h3>Key frames: your own table</h3>
+<p>The {{KEYS}} table is made from up to eight single waves, the key frames, each picked out of a sample. You say
+where each one sits along the table, and Neptune computes the frames in between.</p>
+<ol>
+<li>On the wavetable track open {{WAVE}} ([[Shift]] + bottom pad 5). On this track its first page is the key
+editor. {{KY}}, or a top-row pad, chooses one of the eight keys.</li>
+<li>{{SM}} gives the key a sample: a factory sample, a file, or a recording made on the {{REC}} page (a take made
+while the table is {{KEYS}} goes to the chosen key). The table switches to {{KEYS}} and you hear the key at once.</li>
+<li>{{PO}} moves the line on the waveform: one cycle is cut there. Where the sample has a pitch the cycle is
+exactly one period, so the wave plays in tune with the keys whatever the pitch of the recording; in noise or a
+drum hit a short piece is taken. {{ZM}} and {{SC}} zoom and scroll for a finer aim.</li>
+<li>Do the same for a second and a third key, from the same sample or from others. {{PL}} sets where each sits
+along the table; only their order and spacing count, the earliest key is the start of the table and the latest
+the end.</li>
+<li>{{AL}} chooses how the frames between two keys are made. Sweep {{POS}} (or use the {{SCAN}} page) and listen.</li>
+</ol>
+<p>The same settings are cells on four pages of the track: {{K SMP}}, {{K POS}} and {{K PLC}} hold the sample,
+position and place of the eight keys, one knob per key, and {{KEYS}} holds the rest.</p>""")
+        + table(["<code>ALGO</code>", "Between two keys"], [
+            ("<code>LIN</code>", "A plain crossfade. Harmonics the two keys hold in opposite phase pass through silence."),
+            ("<code>STEP</code>", "Nothing in between: each key holds until the next takes over."),
+            ("<code>CLSC</code>", fmt("A crossfade stored as an early digital instrument stored waves: 128 samples of 8 bits. With {{INTP}} on {{CLSC}} and a low {{KFRM}} this is the whole classic character.")),
+            ("<code>PHAS</code>", "Each harmonic's level and phase move separately, so nothing cancels on the way."),
+            ("<code>TRNS</code>", "Optimal transport: the energy of the wave glides along the harmonics. A formant or a single partial slides from where it is in one key to where it is in the next, instead of fading out in one place and in at another."),
+            ("<code>VOC</code>", "Vocoder style: first the outline of the spectrum (its formants) changes, then the harmonics under it. Half way you hear one key's formants on the other key's harmonics."),
+        ])
+        + fmt("""
+<p>{{KFRM}} sets the number of frames (8 to 256), {{BIAS}} leans the in-between frames towards the earlier or the
+later key, and {{WRAP}} brings the table back to its first key at the end, for a looped scan without a jump.
+{{ALGN}} lines the keys up in phase (leave it on unless you want the raw cuts), {{NORM}} evens out the level of the
+frames, {{TILT}} darkens or brightens every key and {{HARM}} removes the harmonics above a number. Each change
+rebuilds the table, so these cells cannot be locked to steps. Key frames are saved with the project; their
+samples are found again by name.</p>""")
         + page_list(params, "Wavetable")
         + "<p>Tables: " + " · ".join(f"<code>{c}</code>" for c in choices(params, "Wavetable", "WAVE", "TABL")) + ".</p>"))
     eng.append(("Wave sequencer", fmt("""
@@ -595,9 +658,12 @@ lowest C, eight keys (C to G) are the bottom pad row from left to right, so the 
 next eight (G♯ to D♯) are the top row; the last eight (E to B) are the bottom row once more, and the top C is the
 lower left pad again. Harder keys are louder. The layout repeats every two octaves, so after one press of an octave
 button the same rows sit an octave along, and after two the keys are as they were.</p>
-<div class="note"><b>Sequencing drums</b>Record drum patterns by playing the pads or the keys with [[Rec]] on. A
-step tapped in on {{STEP}} plays the pad last selected on {{DRUMS}}; hold the step and press a key to give it that
-key's drum. The steps can be removed, locked and given conditions on {{STEP}} like any others.</div>""")))
+<div class="note"><b>Sequencing drums</b>Record drum patterns by playing the pads or the keys with [[Rec]] on. On
+{{STEP}} you enter one drum at a time: the pads show the hits of the pad last selected on {{DRUMS}}. A tap adds that
+drum to a step or takes it away, and the other drums on the step stay, so any number of the sixteen can hit
+together. A pad glows dimly, and the step number is underlined, where only other drums hit. Hold a step and press a
+key to add that key's drum. On the step's {{TRIG}} page {{NOTE}} and {{VEL}} are the selected drum's own; length,
+timing, condition and locks belong to the step.</div>""")))
     eng.append(("MIDI track", fmt("""
 <p>Sends notes, pitch bend, per-note pressure, program changes and controllers to outside gear. Its pages send
 standard controllers, so the same knobs, locks and pressure ranges work on a hardware synth.</p>""")
@@ -800,9 +866,10 @@ cells.</li>
         ("Parameter locks", fmt("""
 <p>A lock is a knob value that applies to one step only. Hold a step on {{STEP}}, {{PARAM}}, {{TRK FX}} or {{FLTR}}
 and turn a knob. While the step is held the cells show that step's values and the name bar shows its number
-({{S5}}). After the step, the knob returns to its normal value. Engine controls, mixer levels and sends,
+({{S5}}). After the step, the knob returns to its normal value. Hold several steps and the same turn locks all of them to
+the value shown. Engine controls, mixer levels and sends,
 effect blocks and inserts, and the arp's gate, velocity and ratchet can all be locked.</p>
-<p>Remove one lock: hold the step, hold [[&gt;]], turn the knob. Remove all of a step's locks: {{LCKS}} on its
+<p>Remove one lock: hold the step (or several), hold [[&gt;]], turn the knob. Remove all of a step's locks: {{LCKS}} on its
 {{TRIG}} page, anticlockwise (an undo step).</p>
 <p><b>Pressure into locks.</b> On a step with recorded pad pressure, {{>LCK}} on its {{PRES}} page (four clicks)
 writes the swell as locks: on every step the note spans, each cell the track's pressure routes point at is locked
@@ -824,6 +891,19 @@ pressure is then removed: from here on the swell is edited like any other lock.<
 <p><b>Start.</b> Hold [[Rec]] and press [[Play]]: recording goes on and the sequencer starts from the top. If it
 is already playing it keeps playing and recording simply switches on. [[Rec]] alone switches recording on or off
 without touching the transport (it acts when you let the button go), so [[Rec]], then [[Play]] works too.</p>
+<p><b>Metronome.</b> While recording runs a click marks every beat, higher and louder on the first beat of each
+bar. {{CLCK}} on {{SETTINGS}} → {{CLICK}} chooses when it sounds: <code>OFF</code>, <code>REC</code> (only while
+recording runs: the setting it starts with) or <code>PLAY</code> (whenever the sequencer plays). {{CLVL}} sets its
+level; each turn of that knob plays one click, so you can set it before you start. The click follows the tempo,
+stops with the sequencer, and is only for your ears: it does not pass through the master effects or {{MVOL}}, and
+it is never recorded when you resample a track or the master.</p>
+<p><b>Count-in.</b> Set {{CNT}} on the same page to <code>1BAR</code> or <code>2BAR</code> and a recording starts
+with that many bars of clicks: [[Rec]] + [[Play]] (or [[Play]] with recording already on) shows
+<code>COUNT IN 1 BAR</code>, the metronome counts four beats to the bar — also when {{CLCK}} is off — and the
+sequencer and the recording start together on the beat after. During the count-in nothing plays, nothing you play
+is recorded, and a queued pattern waits. [[Play]] during the count-in calls it off. The count-in is only for a
+recording that starts the sequencer: if the sequencer is already playing, recording switches on at once, and
+[[Play]] without recording always starts at once.</p>
 <p><b>While recording</b> the name bar shows <code>REC FREE</code> or <code>REC QUANT</code> on every screen (a
 single <code>R</code> or <code>Q</code> when room is short) and a red light runs across the pads, one pad per step
 of the selected track. Pads that play notes keep playing them under the light; on {{STEP}} the playhead is the
@@ -918,14 +998,34 @@ Rolls are recorded hit by hit.</p>""")),
     # =========================================================================================
     ch.append(("Sampling, slicing and stretch", [
         ("Samples", fmt("""
-<p>The sampler's {{SMPL}} cell chooses from the bank: a built-in drum loop and eight hits, any WAV or AIFF file in
-<i>Music / Neptune / Samples</i> (read at start-up), and your resampled takes. Set start, end and loop on the
+<p>The sampler's {{SMPL}} cell chooses from the bank: a built-in drum loop, eight hits and a tone, any WAV or AIFF
+file in <i>Music / Neptune / Samples</i> (read at start-up), eight drum breaks (below), and your resampled takes.
+Set start, end and loop on the
 {{SAMPL}} page or by eye on {{WAVE}}; [[Func]] + turn is coarse and [[Shift]] + turn fine, and zooming ({{ZM}})
 makes the markers finer still.</p>
 <p>Play modes: {{FWD}}, {{REV}}, {{1SHT}} (plays to the end regardless of the key), {{GATE}} (stops on release),
 {{LOOP}}, {{PING}} (loops back and forth), {{GRAN}}.</p>
 <p>{{ROOT}} is the key at which the sample plays at its recorded pitch; {{NORM}} brings a quiet sample up to full
 level.</p>""") + '<div class="shots">' + S.svg("WAVE", 1, "WAVE") + S.svg("PARAM sampler", 2, "Sampler, SAMPL") + "</div>"),
+        ("Drum breaks", fmt("""
+<p>Eight drum breaks come with the app, after your own files in the {{SMPL}} list. The name is the tempo the break
+was played at: B080, B090, B105, B120, B157 and B160 are recordings of drummers, released by them into the public
+domain (CC0; names and sources are in <i>docs/sample-credits.md</i>), and B100 and B170 are made by the app's own
+drum voices. Each is one, two or four whole bars. Choosing a break sets {{LEN}} on the {{STRCH}} page to its length,
+so turning {{SYNC}} on is all it takes to play it in time with the project.</p>
+<p>Every break has two sampler presets on the {{PRESET}} screen (category PERC):</p>
+<ul>
+<li><b>Break 90 Loop</b>: hold a key and the break goes round in time with the tempo, whatever
+tempo it was played at. It is cut at its drum hits ({{MODE}} = {{TRNS}}) and played with {{ALGO}} = {{SLCE}}, so
+each hit sounds as recorded and only its place in time moves; other keys play it higher or lower without changing
+the timing. One voice: a new key starts the break again.</li>
+<li><b>Break 90 Slices</b>: the sixteen strongest hits, one on each key going up from C4
+({{PLAY}} = {{KEYS}}, play mode {{1SHT}}), at their recorded speed and pitch. The pads of {{PRESET}} play sixteen keys in
+a row from the C of the track's octave: at C4 that is one slice per pad. Record them into steps to build your own beat
+from the break.</li>
+</ul>
+<p>From there everything on the sampler's pages applies: {{ALGO}} = {{TAPE}} for the repitched sound, {{PLAY}} =
+{{RAND}} or {{NEXT}} on the slices, {{SLCS}} for fewer or more of them.</p>""")),
         ("Slicing", fmt("""
 <p>The {{SLICE}} page cuts the sample into pieces you can play separately.</p>
 <ul>
@@ -988,7 +1088,8 @@ runs backwards. With {{SCAN}} at 0, {{STRT}} is the position: turn it, lock it, 
 <li>{{RC}}: two clicks clockwise within a second arms and starts; one click anticlockwise stops. The top pads are
 red while recording.</li>
 <li>The take is saved as <i>R001.wav</i>, <i>R002.wav</i>… in <i>Music / Neptune / Samples</i> and given to the
-selected track: as its sample on a sampler track, as its {{USER}} table on a wavetable track.</li>
+selected track: as its sample on a sampler track, as its {{USER}} table on a wavetable track (or, while that
+track's table is {{KEYS}}, as the sample of the key chosen on the {{WAVE}} page).</li>
 </ol>
 <p>{{NM}} normalises takes, {{SM}} picks a different sample for the track, and {{CR}} (four clicks) crops the sample
 to its markers.</p>""") + '<div class="shots">' + S.svg("WAVE", 2, "WAVE, REC page") + "</div>"),
@@ -1005,8 +1106,12 @@ each need four clicks and answer OK or FAIL. {{AUTO}} keeps saving to the curren
 the last project when it starts.</p>
 <p>Not saved: an arp's mutation state, the temporary pattern copy, the clipboards, and the keyboard split.</p>""")),
         ("Presets", fmt("""
-<p>A preset is one track's sound. Thirty are built in; yours are saved from {{PRESET}} with {{SV}} into
-<i>Music / Neptune / Presets</i>. Categories: BASS, PAD, LEAD, KEYS, FX, PERC, KIT, INIT.</p>""")),
+<p>A preset is one track's sound. The built-in ones are marked * in the list, among them a loop and a sliced preset
+for each of the sampler's drum breaks (chapter "Sampling, slicing and stretch"); yours are saved from {{PRESET}} with
+{{SV}} into <i>Music / Neptune / Presets</i>. Categories: BASS, PAD, LEAD, KEYS, FX, PERC, KIT, INIT.</p>
+<p><b>Naming:</b> {{SV}} saves at once as User 1, User 2 and so on, so nothing waits for the Mac. The Mac then shows
+a box asking for a name: type up to 15 characters on its keyboard and press Return, or press Escape to keep the User
+name. A name already in use is refused and the name bar says so.</p>""")),
         ("Keyboard split", fmt("""
 <p>[[Shift]] + [[Oct−]] drops the lowest twelve keys by one further octave, then two, then three, then back to
 normal; [[Shift]] + [[Oct+]] steps the other way. The name bar shows {{SPLIT -1 OCT}}. Plain [[Oct−]] / [[Oct+]]
@@ -1023,6 +1128,7 @@ track) uses about a quarter of one processor core on an M3 Pro. You are unlikely
             ("A knob does not seem to change the sound", fmt("A step lock or a pressure range may be overriding it. Orange pads on {{PARAM}} have locks; a violet pad has a range.")),
             ("Pads play notes on a screen where they should not", fmt("They are pinned ({{PIN}} in the name bar). On {{DRUMS}} or {{SCALE}}, hold [[Shift]] and hold that screen's bottom pad for half a second.")),
             ("Notes hang or the arp will not stop", fmt("Latch is on ({{LATCH}} in the name bar): [[Shift]] + [[Arp]].")),
+            ("A sound or an effect rings on and will not stop", fmt("[[Shift]] + [[Play]] stops the sequencer, lets every note go and cuts every effect's tail.")),
             ("Low keys are in the wrong octave", fmt("A keyboard split is on: [[Shift]] + [[Oct+]] until the {{SPLIT}} message says off.")),
             ("Copy or paste did nothing", fmt("They act only on {{STEP}}, {{TRACKS}}, {{PARAM}}, {{FLTR}} and {{TRK FX}}, or on a held step. On {{TRACKS}} clear and paste need the button held for half a second.")),
             ("A synced delay is shorter than the division says", "The division was longer than the delay can hold and has been halved to fit."),
@@ -1056,7 +1162,7 @@ per meaning. Values shown as 0–100 are the display's scale.</p>""") + ctx["glo
         ("Undo / redo", fmt("[[Func]] + [[Shift]] + [[Play]] / [[Rec]]")),
         ("Record", fmt("Hold [[Rec]] + [[Play]]; again = free / quantized; [[Play]] stops and shows the steps")),
         ("Fill", fmt("Hold [[Shift]] + [[Rec]]")),
-        ("Stop and rewind", fmt("[[Shift]] + [[Play]]")),
+        ("Stop, rewind and silence everything", fmt("[[Shift]] + [[Play]]")),
         ("Tap tempo", fmt("[[Func]] + [[Settings]], tapped")),
         ("Arp on / off", fmt("[[Arp]] (opens the screen), [[Arp]] again")),
         ("Latch", fmt("[[Shift]] + [[Arp]]")),

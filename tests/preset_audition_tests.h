@@ -535,6 +535,74 @@ public:
             expectEquals(rig.seq.getPattern().getTrack(0).soundParams[MixParam::VOLUME], set);
         }
 
+        beginTest("SV reports the saved name; a typed name renames the user preset without touching the audition");
+        {
+            Rig rig;
+            juce::String saved;
+            int written = 0;
+            rig.screen->onPresetSaved = [&](const juce::String& n) { saved = n; };
+            rig.screen->onUserPresetsChanged = [&] { ++written; };
+            rig.screen->onActivate();
+            rig.confirm(5);
+            expectEquals(saved, juce::String("User 1"));
+            expect(rig.mgr.findUserPreset("User 1") >= 0);
+            expectEquals(written, 1);
+
+            const auto own = rig.sound();
+            const bool auditioning = rig.screen->isAuditioning();
+            expect(! rig.screen->renameUserPreset("User 1", "   "), "an empty name is refused");
+            expect(! rig.screen->renameUserPreset("User 1", "narptune"), "a factory preset's name is refused, whatever the case");
+            expect(! rig.screen->renameUserPreset("No Such", "Mine"), "only an existing user preset is renamed");
+            expectEquals(written, 1);
+            expect(rig.screen->renameUserPreset("User 1", juce::String::fromUTF8("  My b\xc3\xa4ss sound is very long  ")));
+            expectEquals(written, 2, "the renamed preset is written to disk");
+            expect(rig.mgr.findUserPreset("User 1") < 0);
+            const int idx = rig.mgr.findUserPreset("My bss sound is");
+            expect(idx >= 0, "printable ASCII, 15 characters, no outer spaces");
+            if (idx >= 0)
+                expect(! rig.mgr.getPreset(idx).isFactory);
+            expect(rig.screen->isAuditioning() == auditioning);
+            expect(difference(rig.sound(), own).isEmpty(), "a rename changes no sound");
+
+            // Highlighted and heard: the highlight stays on it under the new name.
+            for (int i = 0; i < 400; ++i) rig.turn(0);
+            expect(rig.highlighted() != nullptr && rig.highlighted()->name == "My bss sound is");
+            const auto heard = rig.sound();
+            expect(rig.screen->renameUserPreset("My bss sound is", "Low One"));
+            expect(rig.highlighted() != nullptr && rig.highlighted()->name == "Low One");
+            expect(difference(rig.sound(), heard).isEmpty(), "the audition goes on unchanged");
+            rig.screen->onDeactivate();
+            expect(difference(rig.sound(), own).isEmpty());
+
+            rig.screen->onActivate();
+            rig.confirm(5);
+            expectEquals(saved, juce::String("User 2"), "the next save takes the next free User name");
+            expect(! rig.screen->renameUserPreset("User 2", "LOW ONE"), "a name in use is refused");
+            rig.screen->onDeactivate();
+        }
+
+        beginTest("Narptune is a factory preset of the unified voice");
+        {
+            PresetManager mgr;
+            int found = -1;
+            for (int i = 0; i < mgr.getPresetCount(); ++i)
+                if (mgr.getPreset(i).name == "Narptune")
+                    found = i;
+            expect(found >= 0);
+            if (found >= 0)
+            {
+                const auto& p = mgr.getPreset(found);
+                expect(p.isFactory && p.engineType == EngineType::UnifiedVoice && p.category == "BASS");
+                auto at = [&](int id) { auto it = p.soundParams.find(id); return it != p.soundParams.end() ? it->second : -999.0f; };
+                expectWithinAbsoluteError(at(UnifiedParam::CUTOFF), 32.436f, 0.001f);
+                expectWithinAbsoluteError(at(UnifiedParam::RESONANCE), 0.9f, 0.0001f);
+                expectEquals(at(UnifiedParam::WAVE1), 1.0f);
+                expectEquals(at(UnifiedParam::TUNE3), -12.0f);
+                expectEquals(at(UnifiedParam::AMP_RELEASE), 10.0f);
+                expectEquals(at(UnifiedParam::DETUNE2), 8.0f);
+            }
+        }
+
         beginTest("A step lock that is holding a parameter is neither remembered as the sound nor lost");
         {
             Rig rig;

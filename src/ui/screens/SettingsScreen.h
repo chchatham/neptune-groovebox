@@ -4,11 +4,12 @@
 #include <functional>
 
 // -----------------------------------------------------------------------------
-// SETTINGS: three pages in the standard grid, one page key (Func + top-row pad) each.
+// SETTINGS: four pages in the standard grid, one page key (Func + top-row pad) each.
 //
 //   SETUP   BPM  SWNG QNT  CLK  | MVOL PAT  HELP ---      (HELP: the Shift / Func help cards)
 //   MASTR   LOW  MID  MFRQ HIGH | THR  RATI MAKE CEIL     (master EQ, compressor, limiter)
 //   PROJ    SLOT LOAD SAVE SVAS | NEW  AUTO ---  ---
+//   CLICK   CLCK CLVL CNT  ---  | ---  ---  ---  ---      (the metronome: when, how loud, count-in)
 //
 // Projects live in numbered slots (there is no keyboard to type names): SLOT picks one, and the
 // strip at the bottom says whether it holds a project and which slot the current project came
@@ -44,6 +45,10 @@ public:
         std::function<bool()> saveCurrent;          // false if never saved
         std::function<void()> newProject;
         std::function<bool()> getAutosave;          std::function<void(bool)> setAutosave;
+        // CLICK (kept by the app between sessions, not in the project)
+        std::function<int()> getClickMode;          std::function<void(int)> setClickMode;     // 0 OFF, 1 REC, 2 PLAY
+        std::function<float()> getClickLevel;       std::function<void(float)> setClickLevel;  // 0..1; the app lets it be heard
+        std::function<int()> getCountIn;            std::function<void(int)> setCountIn;       // bars: 0 OFF, 1, 2
     };
 
     explicit SettingsScreen(Hooks h = {}) : hooks(std::move(h))
@@ -85,7 +90,7 @@ public:
     void onArrowLeft() override  { resetActions(); GridScreen::onArrowLeft(); }
     void onArrowRight() override { resetActions(); GridScreen::onArrowRight(); }
 
-    // Page keys: SETUP, MASTR, PROJ.
+    // Page keys: SETUP, MASTR, PROJ, CLICK.
     int getPageKeyCount() const override { return (int) gridPages.size(); }
     void onPageKey(int index) override
     {
@@ -231,6 +236,24 @@ private:
                              [this] { return (hooks.getAutosave && hooks.getAutosave()) ? 1.0f : 0.0f; },
                              [this](float v) { if (hooks.setAutosave) hooks.setAutosave(v > 0.5f); });
         gridPages.push_back(proj);
+
+        // The metronome. CLCK: never, while recording, or whenever the transport runs. CLVL: its
+        // level (every turn plays one click, so it can be set with the transport stopped and with
+        // CLCK off). CNT: bars counted in before a recording starts; the count-in always clicks.
+        Page click;
+        click.name = "CLICK";
+        static const char* const clickModes[] = { "OFF", "REC", "PLAY" };
+        static const char* const countIns[] = { "OFF", "1BAR", "2BAR" };
+        click.cells[0] = cell({ "CLCK", 0, 0, 2, 1, C, "", clickModes, 3 },
+                              [this] { return hooks.getClickMode ? (float) hooks.getClickMode() : 1.0f; },
+                              [this](float v) { if (hooks.setClickMode) hooks.setClickMode((int) std::lround(v)); });
+        click.cells[1] = cell({ "CLVL", 0, 0, 1, 0.5f, L },
+                              [this] { return hooks.getClickLevel ? hooks.getClickLevel() : 0.5f; },
+                              [this](float v) { if (hooks.setClickLevel) hooks.setClickLevel(v); });
+        click.cells[2] = cell({ "CNT", 0, 0, 2, 0, C, "", countIns, 3 },
+                              [this] { return hooks.getCountIn ? (float) hooks.getCountIn() : 0.0f; },
+                              [this](float v) { if (hooks.setCountIn) hooks.setCountIn((int) std::lround(v)); });
+        gridPages.push_back(click);
     }
 
     Hooks hooks;

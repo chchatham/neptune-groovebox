@@ -256,7 +256,8 @@ private:
             case EngineType::MacroOsc:
             case EngineType::Wavetable:
             case EngineType::WaveSeq:      return 115;
-            case EngineType::Sampler:      return 18;  // SliceCount
+            case EngineType::Sampler:      return 55;  // SamplerEngine::NumParams - 1: the break presets use the
+                                                       // SAMPL, SLICE and STRCH cells (22 VOX .. 51 LEN)
             case EngineType::Drum:         return 127; // 15 voices * 8 + 7
             case EngineType::MIDITrack:    return 29;
             default:                       return 29;

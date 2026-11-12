@@ -9,6 +9,7 @@
 #include "../UiClock.h"
 #include "../../sequencer/SequencerCore.h"
 #include "../../engine/AudioEngine.h"
+#include "../../engine/DrumLane.h"
 #include "../../dsp/DSPUtils.h"
 #include <algorithm>
 #include <cmath>
@@ -225,7 +226,7 @@ public:
             const int step = getStepPage() * STEPS_PER_PAD_PAGE + pad;
             if (step >= track.length)       { out[(size_t) pad] = PAD_OFF; continue; }
             const Step& s = track.getStep(step);
-            if (step == held)               out[(size_t) pad] = PAD_HELD;
+            if (step == held || isAlsoHeld(step)) out[(size_t) pad] = PAD_HELD;
             else if (!s.paramLocks.empty()) out[(size_t) pad] = PAD_LOCKED;
             else if (s.trig)                out[(size_t) pad] = PAD_TRIG;
             else                            out[(size_t) pad] = PAD_EMPTY;
@@ -263,8 +264,50 @@ public:
     // ---- The held step -----------------------------------------------------------------------
 
     // Another screen (the step view) can name the step being edited instead of a held pad here.
-    void setExternalHeldStep(int stepIndex) { externalHeldStep = stepIndex; }
+    void setExternalHeldStep(int stepIndex)
+    {
+        externalHeldStep = stepIndex;
+        if (stepIndex < 0) externalAlsoHeldCount = 0;
+    }
     int getExternalHeldStep() const { return externalHeldStep; }
+    // ... and the other steps held with it there.
+    void setExternalAlsoHeld(const int* steps, int count)
+    {
+        externalAlsoHeldCount = juce::jlimit(0, 16, count);
+        for (int i = 0; i < externalAlsoHeldCount; ++i)
+            externalAlsoHeld[(size_t) i] = steps[i];
+    }
+
+    // Several steps held at once: the cells show the first (getHeldStepIndex), and a lock written
+    // to it or removed from it is written to or removed from every other held step as well.
+    template <typename Fn>
+    void forEachAlsoHeldStep(Fn&& fn) const
+    {
+        if (!ready()) return;
+        auto& track = selectedTrack();
+        const int lead = getHeldStepIndex();
+        if (lead < 0) return;
+        int list[16];
+        int count = 0;
+        if (externalHeldStep >= 0)
+            for (int i = 0; i < externalAlsoHeldCount; ++i) list[count++] = externalAlsoHeld[(size_t) i];
+        else
+            for (int i = 0; i < 16; ++i) if (heldPadStep[i] >= 0) list[count++] = heldPadStep[i];
+        for (int i = 0; i < count; ++i)
+        {
+            const int step = list[i];
+            bool repeat = false;
+            for (int k = 0; k < i; ++k) repeat = repeat || list[k] == step;
+            if (step != lead && step >= 0 && step < track.length && !repeat)
+                fn(step);
+        }
+    }
+    bool isAlsoHeld(int stepIndex) const
+    {
+        bool found = false;
+        forEachAlsoHeldStep([&](int step) { found = found || step == stepIndex; });
+        return found;
+    }
 
     int getHeldStepIndex() const
     {
@@ -333,14 +376,18 @@ public:
             if (track.soundParams.find(spec.id) == track.soundParams.end())
                 track.soundParams[spec.id] = spec.clamp(baseValue(spec, trackIdx));
 
-            auto& step = track.getStep(getHeldStepIndex());
-            step.paramLocks[spec.id] = next;
-            if (!step.trig)
+            auto lock = [&](Step& step)
             {
-                step.trig = true;
-                if (step.notes.empty())
-                    step.notes.push_back({60, 1.0f});
-            }
+                step.paramLocks[spec.id] = next;
+                if (!step.trig)
+                {
+                    step.trig = true;
+                    if (step.notes.empty())
+                        step.notes.push_back({60, 1.0f});
+                }
+            };
+            lock(track.getStep(getHeldStepIndex()));
+            forEachAlsoHeldStep([&](int other) { lock(track.getStep(other)); });   // every held step: the value shown
             return;   // heard when the step plays; the track's own value is untouched
         }
 
@@ -460,7 +507,9 @@ public:
         const int curveId = getCurveTurnId(encoderIndex);
         const int id = curveId >= 0 ? curveId : spec.id;
         auto& track = selectedTrack();
-        if (track.getStep(getHeldStepIndex()).paramLocks.erase(id) > 0)
+        size_t erased = track.getStep(getHeldStepIndex()).paramLocks.erase(id);
+        forEachAlsoHeldStep([&](int other) { erased += track.getStep(other).paramLocks.erase(id); });
+        if (erased > 0)
             restoreBase(id);
     }
 
@@ -1227,6 +1276,8 @@ protected:
 
     int heldPadStep[16] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
     int externalHeldStep = -1;
+    std::array<int, 16> externalAlsoHeld {};
+    int externalAlsoHeldCount = 0;
     int stepPage = 0;
 
     int lastTurnedCell = -1;             // on the current page
@@ -1266,6 +1317,14 @@ public:
 
     // The note a step tapped in on STEP starts with: on a drum track the pad selected on DRUMS
     // (the one this screen's DR page shows), on any other track middle C.
+    // A drum track's lane on STEP: the pad selected on DRUMS. -1 on any other track.
+    int drumLaneOf(int trackIdx) const
+    {
+        if (auto* drums = dynamic_cast<DrumEngine*>(engineOf(trackIdx)))
+            return drums->getSelectedVoice();
+        return -1;
+    }
+
     int newStepNote(int trackIdx) const
     {
         if (auto* drums = dynamic_cast<DrumEngine*>(engineOf(trackIdx)))
@@ -1380,7 +1439,10 @@ protected:
         auto& track = sequencer->getPattern().getTrack(sequencer->getSelectedTrack());
         if (held >= 0 && held < track.length)
         {
+            // The selected drum if it hits on that step, else the step's first drum.
             const Step& step = track.getStep(held);
+            if (DrumLane::find(step, drums->getSelectedVoice()) >= 0)
+                return drums->getSelectedVoice();
             const int pad = step.notes.empty() ? -1 : DrumEngine::padForNote(step.notes[0].pitch);
             if (pad >= 0 && pad < DrumEngine::NUM_VOICES)
                 return pad;

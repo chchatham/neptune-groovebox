@@ -755,7 +755,7 @@ public:
             expect(dark(c[0]));
         }
 
-        beginTest("SETTINGS: three page keys, MVOL, project actions confirmed, pads dark");
+        beginTest("SETTINGS: four page keys, MVOL, project actions confirmed, pads dark");
         {
             int loads = 0, saves = 0, news = 0;
             float tempo = 120.0f, level = 0.8f;
@@ -771,9 +771,9 @@ public:
             juce::int64 now = 100;
             screen.setClock([&] { return now; });
 
-            expectEquals(screen.getPageKeyCount(), 3);
-            static const char* const names[] = { "SETUP", "MASTR", "PROJ" };
-            for (int key = 2; key >= 0; --key)
+            expectEquals(screen.getPageKeyCount(), 4);
+            static const char* const names[] = { "SETUP", "MASTR", "PROJ", "CLICK" };
+            for (int key = 3; key >= 0; --key)
             {
                 screen.onPageKey(key);
                 expectEquals(screen.getName(), juce::String(names[key]));

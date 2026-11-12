@@ -14,6 +14,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(JUCE)
 
+# The drum breaks of assets/breaks (FLAC; credits in docs/sample-credits.md) are built into the app
+# and into the tests, so both read the same bytes and nothing has to be found at run time.
+# SampleBank.h includes NeptuneBreakData.h when it exists; without the files the build still works
+# and the bank holds only the breaks it renders itself.
+file(GLOB NEPTUNE_BREAK_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/breaks/*.flac")
+if(NEPTUNE_BREAK_FILES)
+    juce_add_binary_data(NeptuneBreakData
+        HEADER_NAME "NeptuneBreakData.h"
+        NAMESPACE NeptuneBreaks
+        SOURCES ${NEPTUNE_BREAK_FILES})
+endif()
+
 juce_add_gui_app(NeptuneGroovebox
     PRODUCT_NAME "Neptune Groovebox"
     COMPANY_NAME "Neptune"
@@ -174,5 +186,11 @@ target_compile_definitions(NeptuneTests PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
 )
+
+# The drum breaks, when assets/breaks holds any (see the top of this file).
+if(TARGET NeptuneBreakData)
+    target_link_libraries(NeptuneGroovebox PRIVATE NeptuneBreakData)
+    target_link_libraries(NeptuneTests PRIVATE NeptuneBreakData)
+endif()
 
 add_test(NAME NeptuneTests COMMAND NeptuneTests_artefacts/Debug/NeptuneTests)

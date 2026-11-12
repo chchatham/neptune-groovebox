@@ -3,6 +3,8 @@
 #include "Preset.h"
 #include "FactoryPresets.h"
 #include "../sequencer/Track.h"
+#include "../engine/SampleBank.h"
+#include <cmath>
 #include <juce_core/juce_core.h>
 #include <vector>
 #include <algorithm>
@@ -30,6 +32,48 @@ public:
         if (index >= 0 && index < (int) presets.size() && !presets[(size_t) index].isFactory)
             presets.erase(presets.begin() + index);
     }
+
+    // What a typed name becomes: printable ASCII (all the display's font has), 15 characters
+    // (what the PRESET list shows), no outer spaces. Empty when nothing usable was typed.
+    static juce::String cleanName(const juce::String& typed)
+    {
+        juce::String out;
+        for (auto c : typed)
+            if (c >= 32 && c <= 126)
+                out += juce::String::charToString(c);
+        return out.trim().substring(0, MAX_NAME_LENGTH).trim();
+    }
+
+    // Index of the user preset with this name, or -1.
+    int findUserPreset(const juce::String& name) const
+    {
+        for (int i = 0; i < (int) presets.size(); ++i)
+            if (!presets[(size_t) i].isFactory && presets[(size_t) i].name == name)
+                return i;
+        return -1;
+    }
+
+    bool isNameTaken(const juce::String& name) const
+    {
+        for (auto& p : presets)
+            if (p.name.equalsIgnoreCase(name))      // file names on macOS do not tell case apart
+                return true;
+        return false;
+    }
+
+    // Renames a user preset; false for a factory preset, an empty name or a name already in use.
+    bool renamePreset(int index, const juce::String& typed)
+    {
+        const auto name = cleanName(typed);
+        if (index < 0 || index >= (int) presets.size() || presets[(size_t) index].isFactory)
+            return false;
+        if (name.isEmpty() || isNameTaken(name))
+            return false;
+        presets[(size_t) index].name = name;
+        return true;
+    }
+
+    static constexpr int MAX_NAME_LENGTH = 15;
 
     std::vector<int> getFilteredIndices(EngineType type) const
     {
@@ -61,19 +105,53 @@ public:
         p.engineType = track.engineType;
         p.soundParams = track.soundParams;
         p.isFactory = false;
+        p.sampleName = sampleNameOf(track.engineType, track.soundParams);
         return p;
+    }
+
+    // SamplerEngine::SampleSelect and WavetableEngine::UserSample: a place in the SampleBank.
+    static constexpr int SAMPLE_INDEX_PARAM = 24;
+    static bool usesSample(EngineType type) { return type == EngineType::Sampler || type == EngineType::Wavetable; }
+
+    // The name of the sample a stored sound points at ("" when it stores none).
+    static juce::String sampleNameOf(EngineType type, const ParamMap& params)
+    {
+        if (! usesSample(type))
+            return {};
+        auto it = params.find(SAMPLE_INDEX_PARAM);
+        if (it == params.end())
+            return {};
+        const auto* e = SampleBank::get().entry((int) std::lround(it->second));
+        return e != nullptr ? juce::String(e->name) : juce::String();
+    }
+
+    // The preset's parameters with its sample found by name: the stored place may be another
+    // sample's since files were added. A factory preset means the factory break of that name even
+    // if a file of the user's is called the same. No such sample: the stored place is kept.
+    static ParamMap soundOf(const Preset& preset)
+    {
+        ParamMap params = preset.soundParams;
+        if (preset.sampleName.isEmpty() || ! usesSample(preset.engineType))
+            return params;
+        auto& bank = SampleBank::get();
+        int index = preset.isFactory ? bank.indexOfBreak(preset.sampleName) : -1;
+        if (index < 0)
+            index = bank.indexOf(preset.sampleName);
+        if (index >= 0)
+            params[SAMPLE_INDEX_PARAM] = (float) index;
+        return params;
     }
 
     static void applyToTrack(const Preset& preset, Track& track)
     {
         track.engineType = preset.engineType;
-        track.soundParams = preset.soundParams;
+        track.soundParams = soundOf(preset);
     }
 
     void applyToEngine(const Preset& preset, EngineBase* engine) const
     {
         if (!engine) return;
-        for (auto& [id, value] : preset.soundParams)
+        for (auto& [id, value] : soundOf(preset))
             engine->setParameter(id, value);
     }
 

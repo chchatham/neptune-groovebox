@@ -292,14 +292,15 @@ public:
             { { "1IDX", "2IDX", "3IDX" }, { "1RAT", "2RAT", "3RAT" } },
             { { "1FRM", "2FRM", "3FRM" }, { "1WID", "2WID", "3WID" } },
             { { "1TLT", "2TLT", "3TLT" }, { "1ODD", "2ODD", "3ODD" } } };
-        static const char* const tables[] = { "SAW", "SQR", "TRI", "SIN", "PWM", "FORM", "HARM", "SPEC", "DIGI" };
+        // nTBL: the wavetable engine's built-in set, by its names (the first nine, then the newer ones).
+        const int numTables = WavetableFactory::builtInCount();
         const int k = kind - (int) UnifiedVoice::OscWaveform::Wavetable;
         if (k < 0 || k > 3 || osc < 0 || osc > 2)
             return {};
         const int id = second ? UnifiedParam::srcB(osc) : UnifiedParam::srcA(osc);
         const char* label = labels[k][second ? 1 : 0][osc];
         const float d = srcDefault(kind, second);
-        if (second && k == 0) return { label, id, 0, 8, d, ParamKind::Choice, "", tables, 9 };
+        if (second && k == 0) return { label, id, 0, (float) (numTables - 1), d, ParamKind::Choice, "", WavetableFactory::builtInLabels(), numTables };
         if (second && k == 1) return { label, id, 1, 12, d, ParamKind::Int };
         return { label, id, 0, 1, d, ParamKind::Linear };
     }
@@ -707,6 +708,19 @@ private:
         return false;
     }
 
+    // A slot's table cell: full depth moves it as far as it did when the list was nine tables long
+    // (UnifiedVoice::TABLE_ROUTE_SPAN). 0 for every other cell: its whole range.
+    float tableRouteSpan(int id) const
+    {
+        for (int osc = 0; osc < 3; ++osc)
+            if (id == UnifiedParam::srcB(osc))
+            {
+                const int kind = (int) std::lround(flatParams[osc == 0 ? UnifiedParam::WAVE1 : (osc == 1 ? UnifiedParam::WAVE2 : UnifiedParam::WAVE3)]);
+                return kind == (int) UnifiedVoice::OscWaveform::Wavetable ? UnifiedVoice::TABLE_ROUTE_SPAN : 0.0f;
+            }
+        return 0.0f;
+    }
+
     // The range and scale of a cell an LFO can be sent to, from its ParamSpec.
     void destRange(int id, float& lo, float& hi, bool& log) const
     {
@@ -755,7 +769,7 @@ private:
             float lo, hi; bool log;
             destRange(id, lo, hi, log);
             for (auto& v : voices)
-                v.setParamRoute(source, id, flatParams[(size_t) id], lo, hi, log);
+                v.setParamRoute(source, id, flatParams[(size_t) id], lo, hi, log, tableRouteSpan(id));
         }
         else
         {

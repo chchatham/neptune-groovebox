@@ -146,8 +146,8 @@ Getters: 0xF0FA (+0x10), 0xF102 (+0x14), 0xF10A (+0x18), 0xF112 (+0x1C).
 per-control descriptor (0x14 bytes) via 0x161AA(id); 0x2000A134[id] = owning module number.
 
 **Scan and dispatch:** raw read 0x135D4(id) → hardware 0x9414(id). Scan loops (buttons ~0x1301C–0x13168,
-pads 0x12D5E–0x12F6C) call listener lists: 0x13530 release (list 0x2000F024), 0x1354C (0x2000F048),
-0x13574 press (0x2000F06C), 0x13592 value (0x2000F090). Each list = count byte + up to 8 function pointers.
+pads 0x12D5E–0x12F6C) call listener lists: 0x13530 press (list 0x2000F024), 0x1354C (0x2000F048),
+0x13574 release (0x2000F06C), 0x13592 value (0x2000F090). Each list = count byte + up to 8 function pointers.
 
 **Listener polarity:** list 0x2000F024 (via 0x13530, r1 = value) fires on **press**; list 0x2000F06C (via 0x13574) fires on **release**. Stock registers two no-op stubs there (file 0x1A6DC press, 0x1A6E0 release; both `b.w 0x1E858`, a getter) — NP9 uses them as hooks.
 

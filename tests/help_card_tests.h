@@ -692,7 +692,7 @@ public:
             names.clear();
             pads = r.card(Key::Func, 1);
             for (auto& l : pads.padRows[0].labels) names.add(l.text);
-            expectEquals(names.joinIntoString(" ").trim(), juce::String("SETP MSTR PROJ"));
+            expectEquals(names.joinIntoString(" ").trim(), juce::String("SETP MSTR PROJ CLCK"));
             r.mgr.setActiveScreen(TRKFX);
             names.clear();
             pads = r.card(Key::Func, 1);

@@ -212,6 +212,9 @@ struct TrackData
     // The parameter itself is an index into the sample bank, which shifts when files are added; the
     // name is what a project is loaded by. Empty in older projects (the index is then used as it is).
     juce::String sampleName;
+    // The same for the samples of a wavetable track's key frames (SMP1-8): eight names, empty for a
+    // key that is OFF. Not present in older projects (there are no key frames in them).
+    juce::StringArray keySamples;
 
     // Per-track arpeggiator settings
     ArpData arpSettings;
@@ -378,6 +381,13 @@ struct TrackData
         obj->setProperty("soloed", soloed);
         if (sampleName.isNotEmpty())
             obj->setProperty("sample", sampleName);
+        if (! keySamples.isEmpty())
+        {
+            juce::Array<juce::var> names;
+            for (auto& n : keySamples)
+                names.add(n);
+            obj->setProperty("keySamples", names);
+        }
 
         // Sound params
         juce::Array<juce::var> paramsArr;
@@ -414,6 +424,9 @@ struct TrackData
             t.muted = (bool) obj->getProperty("muted");
             t.soloed = (bool) obj->getProperty("soloed");
             t.sampleName = obj->getProperty("sample").toString();
+            if (auto* names = obj->getProperty("keySamples").getArray())
+                for (auto& n : *names)
+                    t.keySamples.add(n.toString());
 
             if (auto* paramsArr = obj->getProperty("params").getArray())
             {

@@ -409,7 +409,21 @@ public:
         params[SliceCount] = (float) slices;
         if (slices > 1)
             sliceByGrid(slices);
+
+        // A drum break knows how many bars it is: LEN shows it, so SYNC alone plays it in time.
+        if (e->bars > 0.0f)
+            params[StretchLength] = (float) stretchLengthIndex(e->bars);
         sampleChanged();
+    }
+
+    // The LEN choice nearest to a length in bars.
+    static int stretchLengthIndex(float bars)
+    {
+        int best = 0;
+        for (int i = 1; i < NUM_STRETCH_LENGTHS; ++i)
+            if (std::abs(stretchLengthBars()[i] - bars) < std::abs(stretchLengthBars()[best] - bars))
+                best = i;
+        return best;
     }
 
     int getBankIndex() const { return bankIndex; }

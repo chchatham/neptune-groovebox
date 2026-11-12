@@ -8,6 +8,7 @@
 #include "../PadLEDFeedback.h"
 #include "../GridScreen.h"
 #include "ParamPageScreen.h"
+#include "../../engine/DrumLane.h"
 #include <functional>
 
 class StepViewScreen : public Screen
@@ -104,6 +105,7 @@ public:
         auto& track = sequencer.getPattern().getTrack(trackIdx);
         int pageOffset = currentPage * 16;
         int playingStep = sequencer.isPlaying() ? sequencer.getCurrentStep(trackIdx) : -1;
+        const int lane = drumLane(trackIdx);
 
         // Two rows of 8 steps, fitting within content zone (y=11..52)
         // Row 0: y=11, Row 1: y=32. Each cell: 14w x 19h (with 1px gap each side)
@@ -129,17 +131,28 @@ public:
                 auto& step = track.getStep(stepIdx);
                 bool isPlayhead = (stepIdx == playingStep);
                 bool isHeld = heldStep[row * 8 + col] == stepIdx;
+                // A drum track shows one drum (the pad selected on DRUMS): a cell is filled where
+                // that drum hits; a step where only other drums hit keeps its number, underlined.
+                const int laneNote = lane >= 0 ? DrumLane::find(step, lane) : -1;
+                const bool filled = lane >= 0 ? (step.trig && laneNote >= 0) : step.trig;
+                const size_t shownNote = laneNote >= 0 ? (size_t) laneNote : 0;
 
                 // Always draw cell outline first
                 display.drawRect(x, y, CELL_W, CELL_H, false);
 
-                if (step.trig)
+                if (filled)
                 {
                     // Triggered: fill the cell body (inside outline)
                     display.drawRect(x + 1, y + 1, CELL_W - 2, CELL_H - 2, true);
 
-                    // Note name (inverted text since cell is filled)
-                    if (!step.notes.empty())
+                    // Note name (inverted text since cell is filled); on a drum track the number
+                    // of drums on the step when there is more than one.
+                    if (lane >= 0)
+                    {
+                        if (step.notes.size() > 1)
+                            display.drawStringInverted(x + 1, y + 2, juce::String((int) step.notes.size()));
+                    }
+                    else if (!step.notes.empty())
                     {
                         juce::String noteName = NoteUtils::noteToString(step.notes[0].pitch);
                         display.drawStringInverted(x + 1, y + 2, noteName.substring(0, 3));
@@ -148,7 +161,7 @@ public:
                     // Velocity bar at bottom of cell (1px tall, inside outline)
                     if (!step.notes.empty())
                     {
-                        int velW = (int)(step.notes[0].velocity * (float)(CELL_W - 4));
+                        int velW = (int)(step.notes[shownNote].velocity * (float)(CELL_W - 4));
                         if (velW > 0)
                         {
                             // Clear a strip for the velocity bar (inverted region)
@@ -183,6 +196,9 @@ public:
                         display.drawChar(x + 1, y + 6, '0' + (char)(stepNum / 10));
                         display.drawChar(x + 7, y + 6, '0' + (char)(stepNum % 10));
                     }
+                    if (lane >= 0 && step.trig)         // other drums hit here
+                        for (int px = x + 2; px < x + CELL_W - 2; ++px)
+                            display.setPixel(px, y + CELL_H - 3, true);
                 }
 
                 // Playhead and held use invertRegion for consistent selection style
@@ -224,6 +240,14 @@ public:
         pressMs[padIndex] = now();
 
         auto& step = track.getStep(stepIdx);
+        // A drum track: the pads are the selected drum's hits. The press puts that drum on the
+        // step beside whatever else hits there.
+        if (const int lane = drumLane(trackIdx); lane >= 0)
+        {
+            addedOnPress[padIndex] = DrumLane::add(step, lane);
+            syncHeldStep();
+            return;
+        }
         addedOnPress[padIndex] = !step.trig;
         if (!step.trig)
         {
@@ -245,7 +269,13 @@ public:
             const bool shown = isDetailActive();
             const bool tap = !shown && now() - pressMs[padIndex] <= TAP_MS;
             if (tap && !addedOnPress[padIndex] && !editedWhileHeld[padIndex] && stepIdx < track.length)
-                track.getStep(stepIdx).trig = false;
+            {
+                // A drum track: only the selected drum leaves the step; the others play on.
+                if (const int lane = drumLane(sequencer.getSelectedTrack()); lane >= 0)
+                    DrumLane::remove(track.getStep(stepIdx), lane);
+                else
+                    track.getStep(stepIdx).trig = false;
+            }
             heldStep[padIndex] = -1;
             editedWhileHeld[padIndex] = false;
         }
@@ -303,10 +333,17 @@ public:
         {
             auto cells = trigCells(track.getStep(held));
             auto& c = cells[(size_t) encoderIndex];
-            if (encoderIndex == 7 && clicks != 0 && track.getStep(held).paramLocks.empty())
+            if (encoderIndex == 7 && clicks != 0 && !anyHeldHasLocks())
                 notice.say("NO LOCKS");         // LCKS counts the step's locks and clears them: there are none
+            else if (encoderIndex == 7 && heldCount() > 1)
+            {
+                if (clicks < 0) clearLocksOfAllHeld();
+            }
             else if (c.used())
+            {
                 c.set(c.spec.turned(c.get(), clicks, turnStep()));
+                copyTrigCellToOthers(track, encoderIndex, c);
+            }
         }
         else
         {
@@ -339,12 +376,18 @@ public:
         {
             auto cells = trigCells(st);
             auto& c = cells[(size_t) encoderIndex];
-            if (encoderIndex == 7)                                      // LCKS: all of them (one undo step)
+            if (encoderIndex == 7 && heldCount() > 1)
+                clearLocksOfAllHeld();
+            else if (encoderIndex == 7)                                 // LCKS: all of them (one undo step)
             {
                 const UndoMark mark(*this, locksUndoPoint(held));
                 st.paramLocks.clear();
             }
-            else if (c.used())          c.set(c.spec.defaultVal);
+            else if (c.used())
+            {
+                c.set(c.spec.defaultVal);
+                copyTrigCellToOthers(track, encoderIndex, c);
+            }
         }
         else
         {
@@ -419,12 +462,22 @@ public:
         if (held >= track.length)
             return;
 
-        auto& st = track.getStep(held);
-        st.notes.clear();
-        st.notes.push_back({note, velocity / 127.0f});
-
-        if (!st.trig)
-            st.trig = true;
+        // A drum track: the key's drum joins the step (taken off again by a tap in its own lane).
+        const bool drums = drumLane(trackIdx) >= 0;
+        auto setNote = [&](Step& st)
+        {
+            if (drums)
+            {
+                DrumLane::add(st, DrumEngine::padForNote(note), velocity / 127.0f);
+                return;
+            }
+            st.notes.clear();
+            st.notes.push_back({note, velocity / 127.0f});
+            if (!st.trig)
+                st.trig = true;
+        };
+        setNote(track.getStep(held));
+        forEachOtherHeld(track, [&](int other) { setNote(track.getStep(other)); });   // every held step takes the key
 
         markEdited();
     }
@@ -523,7 +576,9 @@ public:
     void setCurrentPage(int page) { currentPage = page; }
 
     // The step being held for editing, or -1. With several held it is the one on the lowest pad
-    // (top row left to right, then the bottom row): the pages show and edit that step only.
+    // (top row left to right, then the bottom row): the pages show that step, and what a knob or a
+    // key gives it is given to every other held step too (the same value, not the same change).
+    // PRES and Func + Record / Play / > act on that step alone.
     int getHeldStepIndex() const
     {
         for (int i = 0; i < 16; ++i)
@@ -547,8 +602,77 @@ private:
     // The lock pages always know the held step (a drum track's page list depends on it).
     void syncHeldStep() const
     {
-        if (lockPages != nullptr)
-            lockPages->setExternalHeldStep(getHeldStepIndex());
+        if (lockPages == nullptr) return;
+        const int lead = getHeldStepIndex();
+        lockPages->setExternalHeldStep(lead);
+        int others[16];
+        int count = 0;
+        for (int i = 0; i < 16; ++i)
+            if (heldStep[i] >= 0 && heldStep[i] != lead)
+                others[count++] = heldStep[i];
+        lockPages->setExternalAlsoHeld(others, count);
+    }
+    // The drum shown on a drum track (the pad selected on DRUMS), -1 on any other track.
+    int drumLane(int trackIdx) const { return lockPages != nullptr ? lockPages->drumLaneOf(trackIdx) : -1; }
+    // The note of a step that NOTE and VEL show: on a drum track the selected drum's, else the first.
+    size_t shownNoteOf(const Step& step) const
+    {
+        const int lane = drumLane(sequencer.getSelectedTrack());
+        const int i = lane >= 0 ? DrumLane::find(step, lane) : -1;
+        return i >= 0 ? (size_t) i : 0;
+    }
+    int heldCount() const
+    {
+        int count = 0;
+        for (int i = 0; i < 16; ++i) count += heldStep[i] >= 0 ? 1 : 0;
+        return count;
+    }
+    // The held steps other than the one the pages show.
+    template <typename Fn>
+    void forEachOtherHeld(Track& track, Fn&& fn) const
+    {
+        const int lead = getHeldStepIndex();
+        for (int i = 0; i < 16; ++i)
+            if (heldStep[i] >= 0 && heldStep[i] != lead && heldStep[i] < track.length)
+                fn(heldStep[i]);
+    }
+    bool anyHeldHasLocks() const
+    {
+        auto& track = sequencer.getPattern().getTrack(sequencer.getSelectedTrack());
+        for (int i = 0; i < 16; ++i)
+            if (heldStep[i] >= 0 && heldStep[i] < track.length && !track.getStep(heldStep[i]).paramLocks.empty())
+                return true;
+        return false;
+    }
+    // A TRIG cell just set on the shown step: the other held steps get the same value, where they
+    // have that cell (PROB / A / B exist only under their own COND).
+    void copyTrigCellToOthers(Track& track, int encoderIndex, GridScreen::Cell& shown)
+    {
+        const float value = shown.get();
+        const juce::String label(shown.spec.label);
+        forEachOtherHeld(track, [&](int other)
+        {
+            auto cells = trigCells(track.getStep(other));
+            auto& c = cells[(size_t) encoderIndex];
+            if (c.used() && label == juce::String(c.spec.label))
+                c.set(c.spec.clamp(value));
+        });
+    }
+    // LCKS with several steps held: every held step's locks go, as one undo step.
+    void clearLocksOfAllHeld()
+    {
+        auto& track = sequencer.getPattern().getTrack(sequencer.getSelectedTrack());
+        UndoPoint point;
+        point.scope = UndoPoint::Scope::TrackSteps;
+        point.track = sequencer.getSelectedTrack();
+        point.step = getHeldStepIndex();
+        point.verb = "CLEAR";
+        const juce::String steps = juce::String(heldCount()) + " STEPS";
+        point.names = { steps + " LOCKS", steps + " LCKS", "LOCKS" };
+        const UndoMark mark(*this, point);
+        for (int i = 0; i < 16; ++i)
+            if (heldStep[i] >= 0 && heldStep[i] < track.length)
+                track.getStep(heldStep[i]).paramLocks.clear();
     }
     // The detail pages: TRIG, the track's parameter pages, and PRES when the held step has recorded
     // pressure. PRES is remembered as a wish: a step without pressure shows TRIG in its place.
@@ -694,17 +818,28 @@ private:
         std::array<GridScreen::Cell, 8> c;
 
         c[0] = { { "NOTE", 0, 0, 127, 60, I, "note" },
-                 [&step] { return step.notes.empty() ? 60.0f : (float) step.notes[0].pitch; },
-                 [&step](float v)
+                 [this, &step] { return step.notes.empty() ? 60.0f : (float) step.notes[shownNoteOf(step)].pitch; },
+                 [this, &step](float v)
                  {
                      if (step.notes.empty()) step.notes.push_back({ 60, 1.0f });
+                     if (drumLane(sequencer.getSelectedTrack()) >= 0)   // drums: this drum only becomes another
+                     {
+                         step.notes[shownNoteOf(step)].pitch = juce::jlimit(0, 127, (int) v);
+                         return;
+                     }
                      int shift = (int) v - step.notes[0].pitch;      // a chord moves together
                      for (auto& n : step.notes) n.pitch = juce::jlimit(0, 127, n.pitch + shift);
                  },
                  [](float v) { return NoteUtils::noteToString((int) v); } };
         c[1] = { { "VEL", 0, 0, 1, 1, L },
-                 [&step] { return step.notes.empty() ? 1.0f : step.notes[0].velocity; },
-                 [&step](float v) { for (auto& n : step.notes) n.velocity = v; },
+                 [this, &step] { return step.notes.empty() ? 1.0f : step.notes[shownNoteOf(step)].velocity; },
+                 [this, &step](float v)
+                 {
+                     if (drumLane(sequencer.getSelectedTrack()) >= 0 && !step.notes.empty())
+                         step.notes[shownNoteOf(step)].velocity = v;    // drums: each has its own velocity
+                     else
+                         for (auto& n : step.notes) n.velocity = v;
+                 },
                  [](float v) { return juce::String((int) std::lround(v * 127.0f)); } };
         c[2] = { { "LEN", 0, 0.25f, 16, 1, L, "x", nullptr, 0, 0.25f },
                  [&step] { return step.length; },

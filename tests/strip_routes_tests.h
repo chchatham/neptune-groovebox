@@ -76,7 +76,34 @@ public:
             { "Metallic Stab", 0.140f, 234, 244, 0.0f },    { "FM Pad", 0.117f, 207, 227, 1.1f },
             { "Lo-Fi Tape", 0.298f, 407, 532, 0.3f },       { "Granular Pad", 0.686f, 334, 483, 4.6f },
             { "Vinyl Scratch", 0.307f, 476, 568, 1.2f },    { "Lo-Fi Kit", 0.326f, 116, 268, -0.8f },
+            // The drum-break presets (measured when they were added, 2026-11-11): the sampler's own routes,
+            // drive and sample-rate reduction, on a break that loops in time and on its slices.
+            { "Break 100 Loop", 0.399f, 408, 371, 3.0f }, { "Break 100 Slices", 0.542f, 93, 103, 2.4f },
+            { "Break 170 Loop", 0.348f, 528, 436, 3.3f }, { "Break 170 Slices", 0.608f, 88, 109, 2.6f },
+            { "Break 80 Loop", 0.298f, 683, 432, 5.2f }, { "Break 80 Slices", 0.289f, 604, 303, 4.7f },
+            { "Break 90 Loop", 0.255f, 561, 641, 2.3f }, { "Break 90 Slices", 0.268f, 668, 672, 2.3f },
+            { "Break 105 Loop", 0.247f, 105, 121, 1.9f }, { "Break 105 Slices", 0.261f, 80, 91, 2.8f },
+            { "Break 120 Loop", 0.243f, 187, 178, 3.6f }, { "Break 120 Slices", 0.249f, 112, 90, 3.8f },
+            { "Break 157 Loop", 0.223f, 1265, 968, 4.1f }, { "Break 157 Slices", 0.236f, 1662, 1167, 4.2f },
+            { "Break 160 Loop", 0.264f, 207, 228, 3.2f }, { "Break 160 Slices", 0.265f, 150, 145, 3.1f },
             { "Minimal Techno Kit", 0.310f, 108, 263, -1.0f },
+            // The presets for the wavetable engine's newer tables (measured when they were added,
+            // 2026-11-11): the engine's own route, POS +60 and vibrato. The strip walks the vowels
+            // (Vowel Choir ends on the dark O / U, so its brightness stays), raises the sync, FM and
+            // fold amounts, pulls the organ's remaining stops (the last registration is the bright
+            // one, hence 364 -> 2179 Hz), moves the octaves' weight upwards, takes Noise To Tone
+            // further towards the tone (darker), and holds Reso Sweep Pad's slow sweep at the open
+            // end of its table (its resonance then sits above most of the harmonics: a touch darker).
+            { "Vowel Lead", 0.263f, 611, 741, -0.2f },       { "Vowel Choir", 0.229f, 385, 384, 0.1f },
+            { "Sync Sweep Lead", 0.349f, 822, 1524, 0.1f },  { "Fold Bass", 0.357f, 390, 596, 0.3f },
+            { "FM Table Keys", 0.468f, 471, 1068, -0.2f },   { "Glass Pluck", 0.425f, 1046, 1768, 0.2f },
+            { "Struck Bar", 0.343f, 1296, 2270, -1.4f },     { "Drawbar Organ", 0.681f, 364, 2179, -1.7f },
+            { "Noise To Tone", 0.358f, 279, 199, -0.2f },    { "Reso Sweep Bass", 0.421f, 236, 279, -0.9f },
+            { "Reso Sweep Pad", 0.329f, 667, 625, -1.3f },   { "Walsh Stepper", 0.292f, 630, 908, -0.0f },
+            { "Prime Shimmer", 0.399f, 414, 541, -0.1f },    { "Octave Climb", 0.534f, 432, 2111, -1.8f },
+            { "Phase Bass", 0.345f, 150, 200, 0.2f },        { "Comb Phase Pad", 0.270f, 533, 927, -0.3f },
+            { "Eight Bit Vowels", 0.266f, 1560, 1191, 0.0f }, { "Glassy Bell", 0.362f, 1850, 4603, -1.2f },
+            { "Raw Sync Lead", 0.314f, 904, 1632, -0.0f },
             // the macro oscillator's models and the sampler's play modes
             { "model 0", 0.335f, 536, 305, -0.6f },          { "model 1", 0.654f, 2221, 2850, -0.3f },
             { "model 2", 0.406f, 672, 925, 0.5f },          { "model 3", 0.367f, 601, 1027, -4.7f },
@@ -119,7 +146,12 @@ public:
         const Ref* r = refFor(name);
         expect(r != nullptr, name + ": no reference measurement");
         if (r == nullptr)
+        {
+            // What to put into REFERENCE once the sound has been looked at.
+            logMessage("{ \"" + name + "\", " + juce::String(m.diff, 3) + "f, " + juce::String((int) std::lround(m.centroid0)) + ", "
+                       + juce::String((int) std::lround(m.centroid127)) + ", " + juce::String(m.levelDb, 1) + "f },");
             return;
+        }
         logMessage(name.paddedRight(' ', 20) + " diff " + juce::String(m.diff, 3) + " (was " + juce::String(r->diff, 3) + ")"
                    + "  centroid " + juce::String((int) m.centroid0) + " -> " + juce::String((int) m.centroid127)
                    + " (was " + juce::String((int) r->centroid0) + " -> " + juce::String((int) r->centroid127) + ")"
@@ -295,7 +327,7 @@ public:
                 checkAgainstReference(preset.name, measureStrip(preset.engineType, &preset.soundParams));
                 ++checked;
             }
-            expectEquals(checked, 27, "the factory presets of the six engines");
+            expectEquals(checked, 62, "the factory presets of the six engines (27, two for each of the eight drum breaks, 19 for the newer wavetables)");
         }
 
         beginTest("Defaults: the macro oscillator's models and the sampler's play modes");

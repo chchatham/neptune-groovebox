@@ -186,8 +186,11 @@ private:
             if (readIdx < 0) readIdx += MAX_AP_SIZE;
 
             float delayed = buf[(size_t)readIdx];
-            float out = -in * coeff + delayed;
-            buf[(size_t)writeIdx] = in + delayed * coeff;
+            // Schroeder allpass: v = x + g v[n-D], y = v[n-D] - g v. (The output once used x in place
+            // of v, which is a comb with gain above 1: the plate's tank fed on itself and never died.)
+            const float v = in + delayed * coeff;
+            float out = delayed - v * coeff;
+            buf[(size_t)writeIdx] = v;
             writeIdx = (writeIdx + 1) % MAX_AP_SIZE;
             return out;
         }

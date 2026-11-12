@@ -123,7 +123,7 @@ public:
 
     // What an oscillator slot plays. The first six are the analog waves; the rest are other kinds
     // of oscillator altogether, each with two controls of its own (OscState::a, b):
-    //   Wavetable   a = position in the table 0..1,        b = which factory table (0..8)
+    //   Wavetable   a = position in the table 0..1,        b = which built-in table (slotTables())
     //   FM          a = modulation index 0..1,             b = modulator ratio (whole number 1..12)
     //   Formant     a = formant frequency 0..1 (1x..16x),  b = width of the formant 0..1
     //   Harmonic    a = tilt 0..1 (bright .. dark),        b = odd 0..1 (all harmonics .. odd only)
@@ -133,12 +133,18 @@ public:
     static constexpr int NUM_WAVEFORMS = 10;
     static bool isAnalog(OscWaveform w) { return (int) w <= (int) OscWaveform::Noise; }
 
-    // The nine factory wavetables, shared by every voice. Built on first use: call it once from
-    // the message thread (the engine's constructor does) before audio runs.
-    static const std::vector<Wavetable>& sharedTables()
+    // The tables a WT slot plays: the wavetable engine's built-in set, where it is (nothing is
+    // copied or made here), read with the wavetable engine's read-out (WavetableRead). 0-8 are
+    // the nine the slots have always had, the newer ones follow; the index is stored in projects.
+    // Built on first use: call it once from the message thread (the engine's constructor does)
+    // before audio runs.
+    static const std::vector<const Wavetable*>& sharedTables()
     {
-        return WavetableFactory::sharedFactoryTables();
+        return WavetableFactory::builtInTables();
     }
+    // An LFO or envelope sent to a slot's table cell at full depth has always moved it by the
+    // eight steps of the first nine tables; it still does, however long the list grows.
+    static constexpr float TABLE_ROUTE_SPAN = (float) (WavetableFactory::NUM_FIRST_TABLES - 1);
 
     // Wave stacking configuration
     struct WaveStackConfig
@@ -904,7 +910,8 @@ public:
 
     // Source `source` moves page cell `id` (-1: nothing): `base` is the cell's set value, lo..hi
     // its range, log whether it is a logarithmic cell.
-    void setParamRoute(int source, int id, float base = 0.0f, float lo = 0.0f, float hi = 1.0f, bool log = false)
+    // `span` (when above 0) is how far full depth moves a linear cell, where that is not hi - lo.
+    void setParamRoute(int source, int id, float base = 0.0f, float lo = 0.0f, float hi = 1.0f, bool log = false, float span = 0.0f)
     {
         if (source < 0 || source >= NUM_MOD_SOURCES)
             return;
@@ -914,7 +921,7 @@ public:
         r.lo = lo;
         r.hi = hi;
         r.log = log && lo > 0.0f && hi > lo;
-        r.span = r.log ? 0.5f * std::log2(hi / lo) : hi - lo;
+        r.span = r.log ? 0.5f * std::log2(hi / lo) : (span > 0.0f ? span : hi - lo);
         anyParamRoute = false;
         for (auto& p : paramRoutes)
             anyParamRoute = anyParamRoute || p.id >= 0;
@@ -1176,23 +1183,12 @@ private:
 
             case OscWaveform::Wavetable:
             {
+                // The wavetable engine's read-out on the wavetable engine's tables: a function
+                // of this slot's phase, so the stack, detune and cross-mod act on it as on any kind.
                 const auto& tables = sharedTables();
-                const auto& table = tables[(size_t) std::clamp((int) std::lround(osc.b), 0, (int) tables.size() - 1)];
-                // The mip level whose harmonics all stay under half the sample rate at this pitch.
-                int level = 0;
-                for (double ratio = dt * 2.0 * Wavetable::kFrameSize; ratio > 1.0 && level < table.getMipLevelCount() - 1; ratio *= 0.5)
-                    ++level;
-                const auto& frames = table.frames[(size_t) level];
-                const int count = (int) frames.size();
-                if (count == 0) return 0.0f;
-                const float framePos = std::clamp(osc.a + osc.aMod, 0.0f, 1.0f) * (float) (count - 1);
-                const int frameA = std::min(count - 1, (int) framePos), frameB = std::min(count - 1, frameA + 1);
-                const float samplePos = p * (float) Wavetable::kFrameSize;
-                const int sA = ((int) samplePos) % Wavetable::kFrameSize, sB = (sA + 1) % Wavetable::kFrameSize;
-                const float sFrac = samplePos - std::floor(samplePos);
-                const float vA = dsp::lerp(frames[(size_t) frameA][(size_t) sA], frames[(size_t) frameA][(size_t) sB], sFrac);
-                const float vB = dsp::lerp(frames[(size_t) frameB][(size_t) sA], frames[(size_t) frameB][(size_t) sB], sFrac);
-                return dsp::lerp(vA, vB, framePos - (float) frameA);
+                const Wavetable& table = *tables[(size_t) std::clamp((int) std::lround(osc.b), 0, (int) tables.size() - 1)];
+                return WavetableRead::sample(table, WavetableRead::mipLevel(table, dt),
+                                             std::clamp(osc.a + osc.aMod, 0.0f, 1.0f), osc.phase);
             }
             case OscWaveform::FM:
             {

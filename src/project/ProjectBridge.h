@@ -222,6 +222,22 @@ namespace ProjectBridge
                         if (const auto* e = SampleBank::get().entry((int) std::lround(it->second)))
                             td.sampleName = juce::String(e->name);
                 }
+                // ... and so are the samples of a wavetable track's key frames (0 = OFF, else index + 1).
+                if (p == data.activePattern && track.engineType == EngineType::Wavetable)
+                {
+                    bool any = false;
+                    juce::StringArray names;
+                    for (int k = 0; k < WavetableKeys::MAX_KEYS; ++k)
+                    {
+                        auto it = td.soundParams.find(WavetableEngine::KeySampleBase + k);
+                        const auto* e = it != td.soundParams.end()
+                                            ? SampleBank::get().entry((int) std::lround(it->second) - 1) : nullptr;
+                        names.add(e != nullptr ? juce::String(e->name) : juce::String());
+                        any = any || e != nullptr;
+                    }
+                    if (any)
+                        td.keySamples = names;
+                }
                 td.steps.clear();
                 for (int s = 0; s < track.length && s < (int) track.steps.size(); ++s)
                     td.steps.push_back(captureStep(track.steps[(size_t) s]));
@@ -370,6 +386,17 @@ namespace ProjectBridge
                 const int index = SampleBank::get().indexOf(soundTracks[(size_t) t].sampleName);
                 if (index >= 0)
                     params[SAMPLE_INDEX_PARAM] = (float) index;
+            }
+            // The key frames' samples by name, in the same way.
+            if (t < (int) soundTracks.size() && type == EngineType::Wavetable)
+            {
+                const auto& names = soundTracks[(size_t) t].keySamples;
+                for (int k = 0; k < WavetableKeys::MAX_KEYS && k < names.size(); ++k)
+                {
+                    const int index = names[k].isNotEmpty() ? SampleBank::get().indexOf(names[k]) : -1;
+                    if (index >= 0)
+                        params[WavetableEngine::KeySampleBase + k] = (float) (index + 1);
+                }
             }
 
             // A fresh engine of the stored type (this clears the track's stored engine parameters,

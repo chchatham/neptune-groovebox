@@ -176,19 +176,22 @@ class TransportController : public ScreenManager::TransportListener
 public:
     SequencerCore* sequencer = nullptr;
     MIDIClock* midiClock = nullptr;
+    AudioEngine* audioEngine = nullptr;
 
     void playPressed() override
     {
         if (!sequencer) return;
-        if (sequencer->isPlaying())
+        if (sequencer->isRunning())     // playing, or counting in
         {
             sequencer->stop();
             if (midiClock) midiClock->stopTransport();
         }
         else
         {
-            sequencer->start();
-            if (midiClock) midiClock->startTransport();
+            // With recording armed and a count-in set (SETTINGS -> CLICK -> CNT) the bars are
+            // counted in first; the audio thread then starts the MIDI clock with the transport.
+            sequencer->requestStart();
+            if (midiClock && sequencer->isPlaying()) midiClock->startTransport();
         }
     }
 
@@ -196,6 +199,7 @@ public:
     {
         if (sequencer) sequencer->stop();
         if (midiClock) midiClock->stopTransport();
+        if (audioEngine) audioEngine->requestSilence();     // Shift + Play also cuts notes and effect tails
     }
 
     void recordPressed() override
@@ -628,6 +632,7 @@ public:
 
         transportController.sequencer = sequencer.get();
         transportController.midiClock = midiClock.get();
+        transportController.audioEngine = audioEngine.get();
         screenManager->setTransportListener(&transportController);
 
         // Patterns, tracks, mutes, fill and tempo for the hold layers and buttons; arpeggiators and
@@ -760,6 +765,12 @@ public:
                     f.deleteFile();
                 presetManager->saveUserPresetsToDirectory(userPresetDir());
             };
+            // SV arrives on the MIDI thread; the name is asked for on the Mac, whose keyboard types.
+            presetScreen->onPresetSaved = [this](const juce::String& savedName)
+            {
+                if (auditFolder().isEmpty())        // the screen audit turns SV too: no box for it
+                    juce::MessageManager::callAsync([this, savedName] { askPresetName(savedName); });
+            };
             presetScreen->setPresetLoadCallback([this](int trackIdx, EngineType newType)
             {
                 juce::ignoreUnused(newType);
@@ -800,6 +811,27 @@ public:
                 screenManager->setHelpMode((ScreenManager::HelpMode) juce::jlimit(0, 2, mode));
                 if (screenAudit == nullptr)         // (the audit turns this knob too: not the player's choice)
                     helpModeFile().replaceWithText(juce::String(mode));
+            };
+            // CLICK: the metronome. App-wide, kept between sessions like HELP; never in a project.
+            h.getClickMode = [this] { return (int) audioEngine->getMetronome().getMode(); };
+            h.setClickMode = [this](int mode)
+            {
+                audioEngine->getMetronome().setMode((Metronome::Mode) juce::jlimit(0, Metronome::NUM_MODES - 1, mode));
+                saveMetronomeSettings();
+            };
+            h.getClickLevel = [this] { return audioEngine->getMetronome().getLevel(); };
+            h.setClickLevel = [this](float v)
+            {
+                audioEngine->getMetronome().setLevel(v);
+                if (screenAudit == nullptr)
+                    audioEngine->getMetronome().audition();     // one click at the new level
+                saveMetronomeSettings();
+            };
+            h.getCountIn = [this] { return sequencer->getCountInBars(); };
+            h.setCountIn = [this](int bars)
+            {
+                sequencer->setCountInBars(bars);
+                saveMetronomeSettings();
             };
             h.getMaster = [this](int i) { return audioEngine->getMasterParam(i); };
             h.setMaster = [this](int i, float v) { audioEngine->setMasterParam(i, v); };
@@ -917,6 +949,13 @@ public:
         }
         if (helpModeFile().existsAsFile())
             screenManager->setHelpMode((ScreenManager::HelpMode) juce::jlimit(0, 2, helpModeFile().loadFileAsString().trim().getIntValue()));
+        if (metronomeFile().existsAsFile())
+        {
+            const auto m = Metronome::fromText(metronomeFile().loadFileAsString(), SequencerCore::MAX_COUNT_IN_BARS);
+            audioEngine->getMetronome().setMode((Metronome::Mode) m.mode);
+            audioEngine->getMetronome().setLevel(m.level);
+            sequencer->setCountInBars(m.countInBars);
+        }
         screenManager->projectLoaded();
 
         {
@@ -1104,6 +1143,42 @@ private:
     int splitTick = 0;
     std::unique_ptr<DrumPadScreen> drumPadScreen;
     PresetScreen* presetScreenRef = nullptr;     // owned by screenManager
+
+    // The preset is already saved as `savedName`; this offers to rename it. Return renames,
+    // Escape keeps the name. The controller goes on working while the box is open.
+    void askPresetName(const juce::String& savedName)
+    {
+        if (mainWindow == nullptr)
+            return;
+        auto* box = new juce::AlertWindow("Name the preset",
+                                          "Saved as \"" + savedName + "\". Type a name (up to "
+                                              + juce::String(PresetManager::MAX_NAME_LENGTH) + " characters) and press Return.",
+                                          juce::MessageBoxIconType::NoIcon, mainWindow.get());
+        box->addTextEditor("name", savedName);
+        if (auto* editor = box->getTextEditor("name"))
+        {
+            editor->setInputRestrictions(PresetManager::MAX_NAME_LENGTH);
+            editor->selectAll();
+        }
+        box->addButton("Rename", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        box->addButton("Keep " + savedName, 0, juce::KeyPress(juce::KeyPress::escapeKey));
+        juce::Component::SafePointer<juce::AlertWindow> safeBox(box);
+        box->enterModalState(true, juce::ModalCallbackFunction::create([this, safeBox, savedName](int result)
+        {
+            if (result != 1 || safeBox == nullptr || screenManager == nullptr || presetScreenRef == nullptr)
+                return;
+            const auto typed = safeBox->getTextEditorContents("name");
+            const auto name = PresetManager::cleanName(typed);
+            if (name.isEmpty() || name == savedName)
+                return;
+            const juce::ScopedLock ui(screenManager->getLock());
+            const bool ok = presetScreenRef->renameUserPreset(savedName, typed);
+            screenManager->showStatus(ok ? "NAMED" : "NAME IN USE");
+            juce::Logger::writeToLog("[Preset] " + savedName + (ok ? " renamed to " : " not renamed to ") + typed);
+        }), true);
+        juce::Process::makeForegroundProcess();
+        box->toFront(true);
+    }
     std::unique_ptr<juce::AudioDeviceManager> deviceManager;
     std::vector<std::unique_ptr<Arpeggiator>> arps;
 
@@ -1288,6 +1363,18 @@ private:
     static void rememberProjectSlot(int slot) { lastProjectFile().replaceWithText(juce::String(slot + 1)); }
     // SETTINGS -> SETUP -> HELP (0 off, 1 after 0.35 s, 2 at once): a preference of the player, not of a project.
     static juce::File helpModeFile() { return lastProjectFile().getSiblingFile("help.txt"); }
+    // The metronome's settings (CLICK page): one line, see Metronome::toText.
+    static juce::File metronomeFile() { return lastProjectFile().getSiblingFile("metronome.txt"); }
+    void saveMetronomeSettings()
+    {
+        if (screenAudit != nullptr)         // (the audit turns these knobs too: not the player's choice)
+            return;
+        Metronome::Settings m;
+        m.mode = (int) audioEngine->getMetronome().getMode();
+        m.level = audioEngine->getMetronome().getLevel();
+        m.countInBars = sequencer->getCountInBars();
+        metronomeFile().replaceWithText(Metronome::toText(m));
+    }
 
     int currentProjectSlot() const
     {

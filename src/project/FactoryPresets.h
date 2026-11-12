@@ -4,6 +4,9 @@
 #include "../dsp/filters/FilterSlot.h"
 #include "../engine/DrumVoice.h"
 #include "../engine/ArchitecturePreset.h"
+#include "../engine/SampleBank.h"
+#include "../engine/WavetableEngine.h"
+#include <cmath>
 #include <vector>
 
 // Forward declaration so callers can wire this up
@@ -45,11 +48,12 @@ namespace FactoryPresets
     //    11 = AmpAttack, 12 = AmpDecay, 13 = AmpSustain, 14 = AmpRelease
     //
     //  Wavetable parameter IDs (from WavetableEngine.h):
-    //    0 = Position (0-1), 1 = InterpMode (0=Linear, 2=Stepped, 3=Vintage),
+    //    0 = Position (0-1), 1 = InterpMode (0=Linear, 2=Stepped, 3=Vintage, 4=Classic),
     //    2 = Detune, 3 = UnisonSpread, 4 = SubLevel, 5 = MorphSpeed (Hz),
     //    6 = Level, 7 = Octave, 8 = TableSelect (0=Saw, 1=Square,
     //        2=Triangle, 3=Sine, 4=PWM, 5=Formant, 6=Harmonics,
-    //        7=Spectral, 8=Digital),
+    //        7=Spectral, 8=Digital, 9=USER, 10=KEYS, 11-24 the newer tables:
+    //        see appendWavetableTablePresets, which uses the engine's names),
     //    9 = AmpAttack, 10 = AmpDecay, 11 = AmpSustain, 12 = AmpRelease
     //
     //  WaveSeq parameter IDs (from WaveSeqEngine.h):
@@ -117,6 +121,20 @@ namespace FactoryPresets
         p.category = category;
         p.engineType = type;
         p.soundParams = (type == EngineType::UnifiedVoice) ? convertUnified(params) : std::move(params);
+        p.isFactory = true;
+        return p;
+    }
+
+    // Helper for presets captured from the app in the engine's native parameter
+    // format (bypasses the old-layout conversion that make() applies).
+    inline Preset makeNative(const juce::String& name, const juce::String& category,
+                             EngineType type, ParamMap params)
+    {
+        Preset p;
+        p.name = name;
+        p.category = category;
+        p.engineType = type;
+        p.soundParams = std::move(params);
         p.isFactory = true;
         return p;
     }
@@ -257,6 +275,12 @@ namespace FactoryPresets
             WheelRoute::to(p, 1, D::Resonance, 0.5f);
         }
 
+        else if (n == "Narptune")       // opens the dark filter, gentle vibrato
+        {
+            WheelRoute::to(p, 0, D::Cutoff, 0.5f);
+            WheelRoute::vibrato(p, 1, 5.0f, 0.2f);
+        }
+
         // ---- FM: the strip triples the modulation index. Where a modulator dies away at once
         // (or the preset has none), give the strip something to raise.
         else if (n == "FM Bass 2")      // the modulator keeps a little level while the note is held
@@ -292,12 +316,264 @@ namespace FactoryPresets
         }
     }
 
+    // ===================== DRUM BREAKS (sampler) - begin =====================
+    //  Two presets for every drum break of the SampleBank (B100, B170 rendered from the drum
+    //  voices; the others recordings credited in docs/sample-credits.md):
+    //
+    //    "Break 90 Loop"    a held key plays the break round and round in time with the tempo,
+    //                       whatever tempo it was played at: MODE = LOOP, SYNC on with LEN = the
+    //                       break's bars, ALGO = SLCE on transient slices (every drum hit stays
+    //                       as it was recorded, only its place in time moves). One voice, so a
+    //                       new key starts the break again. Other keys play it higher or lower.
+    //    "Break 90 Slices"  the sixteen strongest hits on sixteen keys (PLAY = KEYS: the root key
+    //                       C4 plays slice 1), each to its end at its own speed and pitch.
+    //
+    //  A preset names its sample (Preset::sampleName); the place stored in parameter 24 is the one
+    //  the break has in this run and is looked up again by name when the preset is applied.
+    //  Sampler ids used: 6 MODE (2 = 1SHT, 4 = LOOP), 18 SLCS, 22 VOX, 24 SMPL, 40 slice MODE
+    //  (1 = TRNS), 43 PLAY (1 = KEYS), 44 FADE, 46 ROOT, 48 ALGO (4 = SLCE), 50 SYNC, 51 LEN
+    //  (index: 4 = one bar, 5 = two, 6 = four). The mod strip keeps the sampler's own routes
+    //  (drive, sample-rate reduction).
+    inline void appendBreakPresets(std::vector<Preset>& presets)
+    {
+        auto& bank = SampleBank::get();
+        for (int n = 0; n < bank.breakCount(); ++n)
+        {
+            const int index = bank.breakIndex(n);
+            const auto* e = bank.entry(index);
+            if (e == nullptr || e->bars <= 0.0f)
+                continue;
+            const juce::String sample(e->name);                                  // "B090"
+            const juce::String title = "Break " + sample.substring(1).trimCharactersAtStart("0");
+            const float length = (float) juce::jlimit(0, 9, 4 + (int) std::lround(std::log2((double) e->bars)));
+
+            auto loop = make(title + " Loop", "PERC", EngineType::Sampler, {
+                {24, (float) index},  // SMPL: the break
+                {6, 4.0f},            // MODE: LOOP
+                {40, 1.0f},           // slice MODE: TRNS - cut at the drum hits
+                {48, 4.0f},           // ALGO: SLCE - the hits are moved, not stretched
+                {50, 1.0f},           // SYNC: on
+                {51, length},         // LEN: the break's own length in bars
+                {22, 1.0f},           // VOX: one - a new key starts the break again
+                {11, 0.8f},           // LEVL
+            });
+            loop.sampleName = sample;
+            presets.push_back(std::move(loop));
+
+            auto slices = make(title + " Slices", "PERC", EngineType::Sampler, {
+                {24, (float) index},  // SMPL: the break
+                {6, 2.0f},            // MODE: 1SHT - a tap plays the whole hit
+                {40, 1.0f},           // slice MODE: TRNS
+                {18, 16.0f},          // SLCS: the sixteen strongest hits (one for every pad)
+                {43, 1.0f},           // PLAY: KEYS
+                {46, 60.0f},          // ROOT: C4 plays the first slice
+                {44, 0.005f},         // FADE: 5 ms at the end of a slice
+                {11, 0.8f},           // LEVL
+            });
+            slices.sampleName = sample;
+            presets.push_back(std::move(slices));
+        }
+    }
+    // ===================== DRUM BREAKS (sampler) - end =====================
+
+    // ===================== WAVETABLE: THE NEWER TABLES - begin =====================
+    //  At least one preset for each of the wavetable engine's newer built-in tables (VOWL ... COMB,
+    //  src/dsp/WaveTables.h), so that they are found from PRESET, and three that play a table
+    //  through INTP = CLSC (the raw 8-bit read-out, not band-limited: it aliases on high notes).
+    //
+    //  Ids are the wavetable engine's own (WavetableEngine::Param and the voice filter from
+    //  FilterBase; nothing above 115, which tests/factory_preset_coverage_tests.h holds a
+    //  wavetable preset to, so movement comes from SCAN, MSPD / MDPT, ENVP and VELP). A table is named by its TABL label and looked
+    //  up in WavetableEngine::tableLabels(), so a preset says which table it plays.
+    //
+    //  The mod strip keeps the engine's own route (POS +60, a little vibrato) and no preset sets
+    //  a STRIP cell: every preset here rests low enough in its table, or is still on its way
+    //  through it, for the strip to have somewhere to go.
+    //
+    //  LEVL is set by measurement, not by ear: the loudest 100 ms of two held notes is brought to
+    //  about -12 dB, between the older wavetable presets (-8.9 to -18.8 dB, -13.4 on average);
+    //  tests/wavetable_embed_tests.h logs every one and holds them within 4 dB of that average.
+    //  (The frames of the newer tables all have an RMS of 0.35; pads with two copies and a full
+    //  sustain come out louder than plucks, hence the different values.)
+    //
+    //  No preset uses the KEYS table: its key frames are cut from samples, and a preset keeps
+    //  key samples by their place in the bank only (see .ralph/progress.md).
+    inline float wavetableByLabel(const char* label)
+    {
+        const char* const* labels = WavetableEngine::tableLabels();
+        for (int i = 0; i < WavetableEngine::NUM_TABLES; ++i)
+            if (juce::String(labels[i]) == label)
+                return (float) i;
+        jassertfalse;
+        return 0.0f;
+    }
+
+    inline void appendWavetableTablePresets(std::vector<Preset>& presets)
+    {
+        using W = WavetableEngine;
+        const int F = W::FilterBase;                        // + VoiceFilterSection::Offset
+        using VF = VoiceFilterSection;
+        const float CLSC = (float) (int) WavetableInterpMode::Classic;
+        const float RUN = (float) (int) WavetableScanMode::Run, PING = (float) (int) WavetableScanMode::Ping,
+                    STEP = (float) (int) WavetableScanMode::Step;
+        auto add = [&presets](const char* name, const char* category, const char* table, ParamMap params)
+        {
+            params[W::TableSelect] = wavetableByLabel(table);
+            presets.push_back(make(name, category, EngineType::Wavetable, std::move(params)));
+        };
+
+        // VOWL - a lead that speaks: the note starts on "ah", harder notes start further along,
+        // and the strip walks it on through "eh" and "ee".
+        add("Vowel Lead", "LEAD", "VOWL", {
+            {W::Position, 0.0f}, {W::VelToPosition, 0.2f}, {W::Glide, 0.05f}, {W::SubLevel, 0.15f},
+            {W::AmpAttack, 0.01f}, {W::AmpDecay, 0.4f}, {W::AmpSustain, 0.85f}, {W::AmpRelease, 0.25f},
+            {W::Level, 0.8f},
+        });
+
+        // VOWL - a slow choir: two detuned copies drifting between the first three vowels.
+        add("Vowel Choir", "PAD", "VOWL", {
+            {W::Position, 0.3f}, {W::MorphSpeed, 0.13f}, {W::MorphDepth, 0.5f}, {W::UnisonSpread, 0.5f},
+            {W::AmpAttack, 0.9f}, {W::AmpDecay, 2.0f}, {W::AmpSustain, 0.8f}, {W::AmpRelease, 2.8f},
+            {W::Level, 0.65f},
+        });
+
+        // SYNC - the classic sync sweep: the envelope pulls the restarted sine up and lets it fall.
+        add("Sync Sweep Lead", "LEAD", "SYNC", {
+            {W::Position, 0.12f}, {W::EnvToPosition, 0.55f}, {W::UnisonSpread, 0.2f},
+            {W::AmpAttack, 0.004f}, {W::AmpDecay, 0.7f}, {W::AmpSustain, 0.45f}, {W::AmpRelease, 0.3f},
+            {W::Level, 1.0f},
+        });
+
+        // FOLD - a bass that folds over at the start of each note and more when played hard.
+        add("Fold Bass", "BASS", "FOLD", {
+            {W::Octave, -1.0f}, {W::Position, 0.06f}, {W::EnvToPosition, 0.4f}, {W::VelToPosition, 0.25f},
+            {W::SubLevel, 0.3f},
+            {W::AmpAttack, 0.003f}, {W::AmpDecay, 0.35f}, {W::AmpSustain, 0.4f}, {W::AmpRelease, 0.15f},
+            {W::Level, 0.76f},
+        });
+
+        // FM1 - an electric-piano kind of key: the FM index follows the envelope and the velocity.
+        add("FM Table Keys", "KEYS", "FM1", {
+            {W::Position, 0.04f}, {W::EnvToPosition, 0.22f}, {W::VelToPosition, 0.2f},
+            {W::AmpAttack, 0.002f}, {W::AmpDecay, 1.4f}, {W::AmpSustain, 0.2f}, {W::AmpRelease, 0.5f},
+            {W::Level, 1.0f},
+        });
+
+        // FM3 - a glassy pluck: a bright strike that falls back to a sine.
+        add("Glass Pluck", "KEYS", "FM3", {
+            {W::Position, 0.05f}, {W::EnvToPosition, 0.5f}, {W::VelToPosition, 0.2f},
+            {W::AmpAttack, 0.001f}, {W::AmpDecay, 0.6f}, {W::AmpSustain, 0.0f}, {W::AmpRelease, 0.6f},
+            {W::Level, 1.0f},
+        });
+
+        // BELL - a struck bar: the harder the strike the more partials, and they die away first.
+        add("Struck Bar", "KEYS", "BELL", {
+            {W::Position, 0.1f}, {W::EnvToPosition, 0.4f}, {W::VelToPosition, 0.35f},
+            {W::AmpAttack, 0.001f}, {W::AmpDecay, 2.5f}, {W::AmpSustain, 0.0f}, {W::AmpRelease, 2.0f},
+            {W::Level, 0.9f},
+        });
+
+        // ORGN - four drawbars out, no dynamics, a key click's worth of attack; the strip pulls the
+        // rest of the stops.
+        add("Drawbar Organ", "KEYS", "ORGN", {
+            {W::Position, 0.4f}, {W::VelSens, 0.0f}, {W::Vibrato, 0.08f},
+            {W::AmpAttack, 0.003f}, {W::AmpDecay, 0.1f}, {W::AmpSustain, 1.0f}, {W::AmpRelease, 0.06f},
+            {W::Level, 0.64f},
+        });
+
+        // NOIS - every note is a breath of noise that settles into a tone in a second and a half
+        // (SCAN RUN); through a low-pass that closes with it.
+        add("Noise To Tone", "FX", "NOIS", {
+            {W::Position, 0.0f}, {W::ScanMode, RUN}, {W::ScanTime, 1.5f},
+            {W::AmpAttack, 0.005f}, {W::AmpDecay, 1.0f}, {W::AmpSustain, 0.8f}, {W::AmpRelease, 0.8f},
+            {F + VF::Cutoff, 2500.0f}, {F + VF::EnvAmount, 0.35f}, {F + VF::Decay, 1.2f},
+            {W::Level, 0.8f},
+        });
+
+        // RESO - the resonant sweep as a bass line: the "filter" in the table snaps shut after
+        // each note's start.
+        add("Reso Sweep Bass", "BASS", "RESO", {
+            {W::Octave, -1.0f}, {W::Position, 0.12f}, {W::EnvToPosition, 0.5f}, {W::VelToPosition, 0.15f},
+            {W::SubLevel, 0.2f},
+            {W::AmpAttack, 0.003f}, {W::AmpDecay, 0.3f}, {W::AmpSustain, 0.35f}, {W::AmpRelease, 0.12f},
+            {W::Level, 0.9f},
+        });
+
+        // RESO - the same sweep slowly (MSPD: nine seconds there and back), on two detuned copies.
+        add("Reso Sweep Pad", "PAD", "RESO", {
+            {W::Position, 0.3f}, {W::UnisonSpread, 0.6f}, {W::MorphSpeed, 0.11f}, {W::MorphDepth, 0.5f},
+            {W::AmpAttack, 1.2f}, {W::AmpDecay, 2.0f}, {W::AmpSustain, 0.8f}, {W::AmpRelease, 3.0f},
+            {W::Level, 0.75f},
+        });
+
+        // WLSH - a bar-long staircase through the Walsh functions, sixteen steps in time with the
+        // tempo (SCAN STEP, SYNC on): square-cornered and rhythmic.
+        add("Walsh Stepper", "LEAD", "WLSH", {
+            {W::Position, 0.0f}, {W::ScanMode, STEP}, {W::ScanSync, 1.0f}, {W::ScanLength, 4.0f}, {W::ScanSteps, 2.0f},
+            {W::AmpAttack, 0.003f}, {W::AmpDecay, 0.3f}, {W::AmpSustain, 0.8f}, {W::AmpRelease, 0.2f},
+            {W::Level, 0.85f},
+        });
+
+        // PRIM - the prime harmonics come and go over eight seconds (SCAN PING).
+        add("Prime Shimmer", "PAD", "PRIM", {
+            {W::Position, 0.05f}, {W::ScanMode, PING}, {W::ScanTime, 8.0f}, {W::UnisonSpread, 0.45f},
+            {W::AmpAttack, 0.7f}, {W::AmpDecay, 2.0f}, {W::AmpSustain, 0.85f}, {W::AmpRelease, 3.0f},
+            {W::Level, 0.6f},
+        });
+
+        // OCTV - only octaves: the weight climbs to the top ones and back down in six seconds.
+        add("Octave Climb", "PAD", "OCTV", {
+            {W::Position, 0.0f}, {W::ScanMode, PING}, {W::ScanTime, 6.0f}, {W::UnisonSpread, 0.3f},
+            {W::AmpAttack, 0.4f}, {W::AmpDecay, 1.5f}, {W::AmpSustain, 0.9f}, {W::AmpRelease, 2.5f},
+            {W::Level, 0.6f},
+        });
+
+        // PDST - phase distortion's best-known use: a round bass with a bright, velocity-shaped start.
+        add("Phase Bass", "BASS", "PDST", {
+            {W::Octave, -1.0f}, {W::Position, 0.1f}, {W::EnvToPosition, 0.5f}, {W::VelToPosition, 0.3f},
+            {W::AmpAttack, 0.002f}, {W::AmpDecay, 0.28f}, {W::AmpSustain, 0.4f}, {W::AmpRelease, 0.15f},
+            {W::Level, 0.8f},
+        });
+
+        // COMB - a phasing pad: the comb's notches wander down and up through two detuned saws.
+        add("Comb Phase Pad", "PAD", "COMB", {
+            {W::Position, 0.3f}, {W::MorphSpeed, 0.1f}, {W::MorphDepth, 0.5f}, {W::UnisonSpread, 0.4f},
+            {W::AmpAttack, 0.5f}, {W::AmpDecay, 1.5f}, {W::AmpSustain, 0.8f}, {W::AmpRelease, 2.2f},
+            {W::Level, 0.68f},
+        });
+
+        // ---- INTP = CLSC: 64 positions, 128 held samples of 8 bits, nothing band-limited ---------
+
+        // The vowels an octave up, stepping from one to the next: the top folds back and rings.
+        add("Eight Bit Vowels", "LEAD", "VOWL", {
+            {W::InterpMode, CLSC}, {W::Octave, 1.0f}, {W::Position, 0.15f},
+            {W::MorphSpeed, 0.5f}, {W::MorphDepth, 0.3f},
+            {W::AmpAttack, 0.005f}, {W::AmpDecay, 0.4f}, {W::AmpSustain, 0.8f}, {W::AmpRelease, 0.3f},
+            {W::Level, 0.9f},
+        });
+
+        // The struck bar an octave up: the aliasing gives it the glassy top of an early digital bell.
+        add("Glassy Bell", "KEYS", "BELL", {
+            {W::InterpMode, CLSC}, {W::Octave, 1.0f}, {W::Position, 0.3f}, {W::EnvToPosition, 0.35f},
+            {W::AmpAttack, 0.001f}, {W::AmpDecay, 1.8f}, {W::AmpSustain, 0.0f}, {W::AmpRelease, 1.5f},
+            {W::Level, 0.9f},
+        });
+
+        // The sync sweep read raw: gritty steps where the smooth one glides.
+        add("Raw Sync Lead", "LEAD", "SYNC", {
+            {W::InterpMode, CLSC}, {W::Position, 0.2f}, {W::EnvToPosition, 0.45f},
+            {W::AmpAttack, 0.003f}, {W::AmpDecay, 0.9f}, {W::AmpSustain, 0.5f}, {W::AmpRelease, 0.25f},
+            {W::Level, 0.9f},
+        });
+    }
+    // ===================== WAVETABLE: THE NEWER TABLES - end =====================
+
     // Returns all factory presets. Called by PresetManager::loadFactoryPresets()
     // and usable independently in tests.
     inline std::vector<Preset> getAll()
     {
         std::vector<Preset> presets;
-        presets.reserve(45);
+        presets.reserve(46);
 
         // ===================== BASS (6) =====================
 
@@ -1081,6 +1357,9 @@ namespace FactoryPresets
             {17, 0.7f},           // FilterCutoff: slightly opened
         }));
 
+        // ===================== DRUM BREAKS (sampler): a loop and a sliced preset each =====================
+        appendBreakPresets(presets);
+
         // ===================== ADDITIONAL DRUMS (2) =====================
 
         // Lo-Fi Kit - driven sounds, short decays, gritty character
@@ -1126,6 +1405,32 @@ namespace FactoryPresets
                          (int)DrumSynthType::OpenHat);
             presets.push_back(make("Minimal Techno Kit", "KIT", EngineType::Drum, std::move(p)));
         }
+
+        // ===================== WAVETABLE: THE NEWER TABLES (16) AND THE CLSC READ-OUT (3) =====================
+        appendWavetableTablePresets(presets);
+
+        // ===================== SAVED FROM THE APP (1) =====================
+
+        // Narptune - the owner's sound, exactly as PRESET's SV stored it (2026-11-11): two saws
+        // 8 cents apart with the third oscillator's pitch an octave down, ladder filter A at 32 Hz
+        // with resonance 0.9 and full drive, filter envelope 0.64, 10 s release, poly 8.
+        // Ids are UnifiedParam's. Left out, as for every factory preset: the track's mixer values
+        // it was saved with (volume 0.86, sends 0.20 / 0.53, send bus 1 effect type 7).
+        presets.push_back(makeNative("Narptune", "BASS", EngineType::UnifiedVoice, {
+            {0, 1.0f}, {1, 1.0f}, {2, 0.5f}, {3, 0.0f}, {4, 0.0f},
+            {5, 0.0f}, {6, 0.0f}, {7, 0.0f}, {8, 8.0f}, {9, 0.5f},
+            {10, 32.4360695f}, {11, 0.9000001f}, {12, 0.0f}, {13, 0.05f}, {14, 0.6399994f},
+            {15, 0.0f}, {16, 1.0f}, {17, 1.0f}, {18, 2.0f}, {19, 0.0f},
+            {20, 0.01f}, {21, 0.3f}, {22, 1.0f}, {23, 10.0f}, {24, 0.8f},
+            {26, 0.7f}, {27, 0.0f}, {90, 0.01f}, {91, 0.5f}, {92, 0.0f},
+            {93, 0.3f}, {94, 0.0f}, {95, 0.0f}, {96, 0.0f}, {97, 0.0f},
+            {98, -12.0f}, {99, 0.0f}, {100, 0.0f}, {101, 2.0f}, {102, 0.0f},
+            {103, 0.0f}, {104, 0.2f}, {105, 0.5f}, {106, 0.0f}, {107, 0.8599995f},
+            {108, 0.0f}, {109, 1.0f}, {110, 0.0f}, {111, 2.0f}, {112, 8.0f},
+            {113, 0.0f}, {114, 0.0f}, {115, 0.1f}, {116, 0.03f}, {117, 0.0f},
+            {118, 0.9059854f}, {119, 2.4999998f}, {120, 1.0f}, {121, 0.0f}, {122, 30.5f},
+            {123, 0.5000001f}, {124, 0.7299998f}, {125, 0.0f},
+        }));
 
         for (auto& preset : presets)
             addWheelRoute(preset);

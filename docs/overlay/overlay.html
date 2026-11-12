@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Neptune Groovebox - panel overlay</title>
+<!--
+  PRINTABLE OVERLAY ("SKIN") FOR THE LAUNCHKEY MINI 25 MK4 RUNNING NEPTUNE.
+  Print at 100 % ("Actual size", never "Fit"), LANDSCAPE. Check a ruler on the sheet before cutting.
+    overlay.html                      Letter, dark skin         overlay.html?paper=a4            A4, dark skin
+    overlay.html?skin=light           Letter, ink-saving        overlay.html?paper=a4&skin=light A4, ink-saving
+  Everything is drawn by the script below from the DIMENSION TABLE that follows. To correct the fit,
+  change a number in the table and reload. All values are millimetres from the top-left corner of the
+  unit's body (x to the right, y toward the keys).
+
+  ============================== DIMENSION TABLE ==============================
+  Confidence:  P = published by the maker (product page: 338.5 x 176.8 x 49 mm)
+               D = derived: measured in pixels on the maker's public straight-from-above product picture
+                   and scaled by the published width (0.1662 mm per pixel). Edges of dark buttons on a
+                   dark panel are soft: expect +/- 0.7 mm.
+               E = estimated (no clear edge in the picture)
+  The owner's ruler wins over all of it. Measurements that settle the fit are marked  << MEASURE (n);
+  the numbers are those of README.md and of the drawing on sheet 3.
+-->
+<script>
+const DIM = {
+  bodyW:      338.5,  // P   width of the body
+  bodyD:      176.8,  // P   depth of the body (only the top 95 mm is drawn)
+  keysY:       95.0,  // D   y where the keys begin (the overlay must stay above this)
+
+  // --- touch strips (recess outlines) ---
+  stripY0:      3.9,  // D
+  stripY1:     76.6,  // D
+  pitchX0:     20.4,  // D
+  pitchX1:     34.9,  // D
+  modX0:       39.4,  // D
+  modX1:       54.1,  // D                                                     << MEASURE (9: from here to the Shift cap)
+
+  // --- display window (glossy bezel, not the lit pixels) ---
+  dispX0:      67.3,  // D
+  dispX1:     108.8,  // D
+  dispY0:       3.9,  // D
+  dispY1:      29.5,  // D                                                     << MEASURE (10: from here down to the Shift cap)
+
+  // --- the six buttons under the display: Shift Settings / Play Rec / Oct- Oct+ ---
+  clX0:        67.3,  // D   left edge of the left column                      << MEASURE (1)
+  clColPitch:  22.1,  // D   left edge to left edge, column to column
+  clBtnW:      19.2,  // D   width of one cap                                  << MEASURE (2)
+  clY0:        35.3,  // D   top edge of the Shift / Settings row              << MEASURE (3)
+  clRowPitch:  14.75, // D   top edge to top edge, row to row
+  clBtnH:      12.0,  // D   height of one cap                                 << MEASURE (2)
+
+  // --- the narrow buttons: Arp, Scale, pad Up / Down (left), bank up / down, > and Func (right) ---
+  leftBtnX0:  114.8,  // D   left edge of Arp / Scale / Up / Down              << MEASURE (11: display bezel to Arp cap)
+  rightBtnX0: 306.5,  // D   left edge of bank up / bank down / > / Func       << MEASURE (4)
+  narrowW:     11.7,  // D   width of those caps                               << MEASURE (12: Func cap to the body's right edge)
+  smallY0:      3.9,  // D   top edge of Arp and of bank up
+  smallY1:     18.2,  // D   top edge of Scale and of bank down
+  smallH:      11.4,  // D   height of Arp, Scale, bank up, bank down
+  tallY0:      35.5,  // D   top edge of Up and of >
+  tallY1:      57.6,  // D   top edge of Down and of Func
+  tallH:       19.1,  // D   height of Up, Down, >, Func
+
+  // --- pads ---
+  padX0:      129.9,  // D   left edge of pad 1 (lit area)                     << MEASURE (5)
+  padPitch:    22.10, // D   left edge to left edge                            << MEASURE (6: pad 1 left edge to pad 8 right edge = 173.3)
+  padW:        18.6,  // D
+  padTopY0:    35.6,  // D   top edge of the top row                           << MEASURE (7: gap between knob skirts and pads)
+  padBotY0:    57.7,  // D   top edge of the bottom row
+  padH:        18.7,  // D                                                     << MEASURE (8: bottom of pads to the keys)
+
+  // --- encoders (centred over the pad columns in the picture) ---
+  encCy:       16.5,  // D   centre line of the knobs
+  encR:         5.6,  // D   radius of the knob cap seen from above
+  encClear:     6.7,  // E   radius of the hole cut for a knob                 << MEASURE (13: widest diameter of a knob, skirt included)
+
+  // ---------------- the overlay pieces (edges leave about 0.7 mm to the nearest control) ----------------
+  // K  knob plate: wraps the knobs (eight holes) and fills the gap down to the top pads.
+  //    Cut along kCutY instead of kY0 and it is a plain strip with no holes.
+  kX0: 127.2, kX1: 305.8, kY0: 6.6, kY1: 34.7, kCutY: 23.6,
+  // F1, F2  foot strips between the bottom pads / buttons and the keys; they butt at fSplitX.
+  fX0: 3.0, fSplitX: 128.3, fX1: 337.6, fY0: 77.6, fY1: 93.4,
+  // R  right margin strip beside bank up / down, > and Func
+  rX0: 319.4, rX1: 337.6, rY0: 3.0, rY1: 76.9,
+  // T  L-shaped piece: a bar between the display and the Shift row (on under Scale), and a spine
+  //    between the display and Arp / Scale.
+  tBarX0: 67.3, tBarX1: 126.5, tBarY0: 30.3, tBarY1: 34.7, tSpineX0: 109.5, tSpineX1: 114.1, tSpineY0: 3.5,
+  // M  column between the mod strip and the six buttons
+  mX0: 55.0, mX1: 66.6, mY0: 35.3, mY1: 76.8,
+
+  bleed: 1.5          // colour runs this far past every cut line (dark skin only)
+};
+</script>
+<style id="pagecss">@page { size: 279.4mm 215.9mm; margin: 0; }</style>
+<style>
+  :root { --panel: #131416; --ink: #F4F1EA; --shift: #FFB000; --func: #55C6F5; --dim: #8b8e92; --cut: #8a8a8a;
+          --pw: 279.4mm; --ph: 215.9mm; }
+  body.light { --panel: #ffffff; --ink: #111111; --shift: #B85400; --func: #005FB8; --dim: #777777; --cut: #9a9a9a; }
+  body.a4 { --pw: 297mm; --ph: 210mm; }
+  html, body { margin: 0; padding: 0; background: #fff; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .bar { position: sticky; top: 0; background: #eee; border-bottom: 1px solid #999; padding: 6px 12px; z-index: 5;
+         font: 13px "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  .bar a { margin-right: 14px; }
+  .sheet { width: var(--pw); height: calc(var(--ph) - 0.6mm); display: flex; align-items: center; justify-content: center;
+           overflow: hidden; break-after: page; page-break-after: always; }
+  .sheet:last-child { break-after: auto; page-break-after: auto; }
+  svg { display: block; }
+  svg text { font-family: "DIN Condensed", "Avenir Next Condensed", "Arial Narrow", sans-serif; font-weight: 700; }
+  svg text.num { font-family: "DIN Alternate", "Helvetica Neue", Arial, sans-serif; font-weight: 700; }
+  svg text.note { font-family: "Avenir Next", "Helvetica Neue", Arial, sans-serif; font-weight: 500; }
+  @media print { .bar { display: none; } }
+  @media screen { .sheet { border-bottom: 1px dashed #bbb; } }
+</style>
+</head>
+<body>
+<div class="bar">
+  <a href="?">Letter, dark</a><a href="?skin=light">Letter, light</a><a href="?paper=a4">A4, dark</a><a href="?paper=a4&skin=light">A4, light</a>
+  Print landscape at 100 % ("Actual size"), then check a ruler on the sheet.
+</div>
+<script>
+'use strict';
+const Q = new URLSearchParams(location.search);
+const LIGHT = Q.get('skin') === 'light', A4 = Q.get('paper') === 'a4';
+if (LIGHT) document.body.classList.add('light');
+if (A4) { document.body.classList.add('a4'); document.getElementById('pagecss').textContent = '@page { size: 297mm 210mm; margin: 0; }'; }
+
+/* ============================== WORDS ==============================
+   Screens reached by Shift + pad (src/main.cpp, the setShiftPadScreen table). The key is the display's own short
+   name; the value is what the skin prints: whole words, or a musician's everyday short form (FX, AT, ARP, PARAMS). */
+const WORD = { PARAM: 'PARAMS', TRACKS: 'TRACKS', 'TRK FX': 'TRACK FX', STEP: 'STEP', PRESET: 'PRESET', SONG: 'SONG',
+               SETTINGS: 'SETTINGS', 'AT ROUTE': 'AT ROUTE', DRUMS: 'DRUMS', ARP: 'ARP', SCALE: 'SCALE',
+               WAVE: 'WAVEFORM', FLTR: 'FILTER' };
+const SHIFT_TOP = ['PARAM', 'TRACKS', 'TRK FX', 'STEP', 'PRESET', 'SONG', 'SETTINGS', 'AT ROUTE'];
+const SHIFT_BOT = ['STEP', 'DRUMS', 'ARP', 'SCALE', 'WAVE', 'FLTR', null, null];
+let WORDS_ON_SKIN = [];            // filled while the pieces are drawn (see the count on sheet 3)
+let COUNTING = false;
+
+/* ============================== SVG HELPERS ============================== */
+const NS = 'http://www.w3.org/2000/svg';
+const C = { ink: 'var(--ink)', sh: 'var(--shift)', fn: 'var(--func)', dim: 'var(--dim)', panel: 'var(--panel)', cut: 'var(--cut)' };
+const f2 = n => (Math.round(n * 1000) / 1000);
+function E(p, tag, a = {}, style = '') { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (style) e.setAttribute('style', style); p.appendChild(e); return e; }
+function G(p, tr) { return E(p, 'g', tr ? { transform: tr } : {}); }
+function L(g, x1, y1, x2, y2, c = C.ink, w = 0.3, cap = 'round') { return E(g, 'line', { x1: f2(x1), y1: f2(y1), x2: f2(x2), y2: f2(y2) }, `stroke:${c};stroke-width:${w};stroke-linecap:${cap}`); }
+function P(g, d, c = C.ink, w = 0.3, fill = 'none') { return E(g, 'path', { d }, `stroke:${c};stroke-width:${w};fill:${fill};stroke-linecap:round;stroke-linejoin:round`); }
+function F(g, d, c = C.ink) { return E(g, 'path', { d }, `fill:${c}`); }
+function R(g, x, y, w, h, r = 0, c = C.ink, sw = 0.3, fill = 'none') { return E(g, 'rect', { x: f2(x), y: f2(y), width: f2(w), height: f2(h), rx: r }, `stroke:${c};stroke-width:${sw};fill:${fill}`); }
+function FR(g, x, y, w, h, c = C.ink, r = 0) { return E(g, 'rect', { x: f2(x), y: f2(y), width: f2(w), height: f2(h), rx: r }, `fill:${c}`); }
+function CI(g, x, y, r, c = C.ink, sw = 0.3, fill = 'none') { return E(g, 'circle', { cx: f2(x), cy: f2(y), r: f2(r) }, `stroke:${sw ? c : 'none'};stroke-width:${sw};fill:${fill}`); }
+function DOT(g, x, y, r, c = C.ink) { return E(g, 'circle', { cx: f2(x), cy: f2(y), r: f2(r) }, `fill:${c}`); }
+function TX(g, x, y, s, c = C.ink, size = 2.4, anchor = 'middle', cls = '', sp = 0.14) {
+  const t = E(g, 'text', { x: f2(x), y: f2(y), 'text-anchor': anchor, 'font-size': size, class: cls }, `fill:${c};letter-spacing:${sp}px`);
+  t.textContent = s; return t;
+}
+// a word on the skin: counted
+function WD(g, x, y, s, c = C.ink, size = 2.4, anchor = 'middle', sp = 0.14) { if (COUNTING) WORDS_ON_SKIN.push(...s.split(/\s+/)); return TX(g, x, y, s, c, size, anchor, '', sp); }
+const pol = (x, y, r, deg) => [x + r * Math.cos(deg * Math.PI / 180), y + r * Math.sin(deg * Math.PI / 180)];
+
+/* ============================== ICON VOCABULARY ==============================
+   Kept small on purpose: an icon only where it is simpler than its word and known to everyone (play, record,
+   undo, redo, back / on) or where it shows a place (which row of pads). Everything else is a word.
+   One stroke weight for every drawn line. */
+const SW1 = 0.35;
+const I = {
+  // ---- modifiers: a shape as well as a colour ----
+  shift(g, x, y, r = 1.0) { F(g, `M${f2(x)},${f2(y - r)}L${f2(x + r)},${f2(y)}L${f2(x)},${f2(y + r)}L${f2(x - r)},${f2(y)}Z`, C.sh); },
+  func(g, x, y, r = 1.0) { CI(g, x, y, r * 0.78, C.fn, r * 0.44); },
+  play(g, x, y, s, c) { F(g, `M${f2(x - s * 0.36)},${f2(y - s * 0.44)}L${f2(x + s * 0.46)},${f2(y)}L${f2(x - s * 0.36)},${f2(y + s * 0.44)}Z`, c); },
+  rec(g, x, y, s, c) { DOT(g, x, y, s * 0.42, c); },
+  undo(g, x, y, s, c, dir = -1) {
+    const r = s * 0.34, a = pol(x, y, r, 55), b = [x + dir * r, y]; a[0] = x - dir * (a[0] - x);
+    P(g, `M${f2(a[0])},${f2(a[1])}A${f2(r)},${f2(r)} 0 1 ${dir < 0 ? 0 : 1} ${f2(b[0])},${f2(b[1])}`, c, SW1);
+    F(g, `M${f2(b[0] - s * 0.2)},${f2(b[1] - s * 0.02)}h${f2(s * 0.4)}l${f2(-s * 0.2)},${f2(s * 0.3)}Z`, c);
+  },
+  redo(g, x, y, s, c) { I.undo(g, x, y, s, c, 1); },
+  chev(g, x, y, s, dir, c) { P(g, `M${f2(x - dir * s * 0.2)},${f2(y - s * 0.4)}L${f2(x + dir * s * 0.2)},${f2(y)}L${f2(x - dir * s * 0.2)},${f2(y + s * 0.4)}`, c, SW1); },
+  // the two pad rows as two bars: the one meant is solid
+  rows(g, x, y, w, mode, c) { const h = 1.25, gap = 0.7;
+    [['top', y - gap / 2 - h], ['bot', y + gap / 2]].forEach(([m, py]) => { if (m === mode) FR(g, x - w / 2, py, w, h, c, 0.2); else R(g, x - w / 2 + SW1 / 2, py + SW1 / 2, w - SW1, h - SW1, 0.1, C.dim, SW1); }); }
+};
+
+/* ============================== GEOMETRY ============================== */
+const D = DIM;
+const padCx = i => D.padX0 + i * D.padPitch + D.padW / 2;
+const encCx = padCx;                                    // the knobs sit over the pad columns
+const sixBtn = (c, r) => ({ x: D.clX0 + c * D.clColPitch, y: D.clY0 + r * D.clRowPitch, w: D.clBtnW, h: D.clBtnH });
+const BTN = {
+  shift: sixBtn(0, 0), settings: sixBtn(1, 0), play: sixBtn(0, 1), rec: sixBtn(1, 1), octDn: sixBtn(0, 2), octUp: sixBtn(1, 2),
+  arp: { x: D.leftBtnX0, y: D.smallY0, w: D.narrowW, h: D.smallH }, scale: { x: D.leftBtnX0, y: D.smallY1, w: D.narrowW, h: D.smallH },
+  up: { x: D.leftBtnX0, y: D.tallY0, w: D.narrowW, h: D.tallH }, down: { x: D.leftBtnX0, y: D.tallY1, w: D.narrowW, h: D.tallH },
+  bankUp: { x: D.rightBtnX0, y: D.smallY0, w: D.narrowW, h: D.smallH }, bankDn: { x: D.rightBtnX0, y: D.smallY1, w: D.narrowW, h: D.smallH },
+  pat: { x: D.rightBtnX0, y: D.tallY0, w: D.narrowW, h: D.tallH }, func: { x: D.rightBtnX0, y: D.tallY1, w: D.narrowW, h: D.tallH }
+};
+const mid = b => [b.x + b.w / 2, b.y + b.h / 2];
+
+const PIECES = {
+  K:  { pts: [[D.kX0, D.kY0], [D.kX1, D.kY0], [D.kX1, D.kY1], [D.kX0, D.kY1]], holes: true },
+  F1: { pts: [[D.fX0, D.fY0], [D.fSplitX, D.fY0], [D.fSplitX, D.fY1], [D.fX0, D.fY1]] },
+  F2: { pts: [[D.fSplitX, D.fY0], [D.fX1, D.fY0], [D.fX1, D.fY1], [D.fSplitX, D.fY1]] },
+  R:  { pts: [[D.rX0, D.rY0], [D.rX1, D.rY0], [D.rX1, D.rY1], [D.rX0, D.rY1]] },
+  T:  { pts: [[D.tSpineX0, D.tSpineY0], [D.tSpineX1, D.tSpineY0], [D.tSpineX1, D.tBarY0], [D.tBarX1, D.tBarY0], [D.tBarX1, D.tBarY1],
+              [D.tBarX0, D.tBarY1], [D.tBarX0, D.tBarY0], [D.tSpineX0, D.tBarY0]] },
+  M:  { pts: [[D.mX0, D.mY0], [D.mX1, D.mY0], [D.mX1, D.mY1], [D.mX0, D.mY1]] }
+};
+for (const k in PIECES) { const p = PIECES[k], xs = p.pts.map(q => q[0]), ys = p.pts.map(q => q[1]);
+  p.x0 = Math.min(...xs); p.x1 = Math.max(...xs); p.y0 = Math.min(...ys); p.y1 = Math.max(...ys);
+  p.d = 'M' + p.pts.map(q => q.join(',')).join('L') + 'Z'; }
+
+/* ============================== THE HARDWARE (plain outlines, for lining up) ============================== */
+function hardware(g, col = '#b9b9b9', w = 0.15, withBody = false) {
+  const st = `stroke:${col};stroke-width:${w};fill:none`;
+  if (withBody) {
+    E(g, 'rect', { x: 0, y: 0, width: D.bodyW, height: D.keysY + 16, rx: 5 }, st);
+    L(g, 0, D.keysY, D.bodyW, D.keysY, col, w, 'butt');
+    const kw = D.bodyW / 15; for (let i = 1; i < 15; i++) L(g, i * kw, D.keysY, i * kw, D.keysY + 16, col, w, 'butt');
+  }
+  [[D.pitchX0, D.pitchX1], [D.modX0, D.modX1]].forEach(s => E(g, 'rect', { x: s[0], y: D.stripY0, width: s[1] - s[0], height: D.stripY1 - D.stripY0, rx: 2 }, st));
+  E(g, 'rect', { x: D.dispX0, y: D.dispY0, width: D.dispX1 - D.dispX0, height: D.dispY1 - D.dispY0, rx: 1.5 }, st);
+  for (const k in BTN) { const b = BTN[k]; E(g, 'rect', { x: b.x, y: b.y, width: b.w, height: b.h, rx: 1.5 }, st); }
+  for (let i = 0; i < 8; i++) { E(g, 'circle', { cx: encCx(i), cy: D.encCy, r: D.encR }, st);
+    [D.padTopY0, D.padBotY0].forEach(y => E(g, 'rect', { x: D.padX0 + i * D.padPitch, y, width: D.padW, height: D.padH, rx: 1.5 }, st)); }
+}
+
+/* ============================== THE ARTWORK, piece by piece (panel coordinates) ============================== */
+const ART = {};
+const BIG = 3.3, LAB = 2.9, SUB = 2.6;        // label sizes in mm (9.4, 8.2 and 7.4 pt)
+function VT(g, x, y, str, c, size) { const t = WD(g, x, y, str, c, size); t.setAttribute('transform', `rotate(-90 ${f2(x)} ${f2(y)})`); return t; }
+// a screen name over or under its pad, on one line or two
+function padName(g, x, yMid, name) { WD(g, x, yMid + 1.17, WORD[name], C.sh, BIG, 'middle', 0.2); }
+
+// ---- K: knobs 1-4 = the top row of cells, 5-8 = the bottom row; Shift + top pad = a screen ----
+ART.K = g => {
+  const r = 8.0, yT = D.encCy - r, yB = D.encCy + r, gx = (encCx(3) + encCx(4)) / 2;
+  const cw = 1.7, ch = 1.9, gap = 0.4, gw = 4 * cw + 3 * gap, gx0 = gx - gw / 2, gyT = 26.3, gyB = gyT + ch + 0.6;
+  P(g, `M${f2(gx0)},${f2(gyT + ch / 2)}H${f2(gx0 - 0.85)}V${f2(yB)}H${f2(encCx(0))}A${r},${r} 0 0 1 ${f2(encCx(0))},${f2(yT)}H${f2(encCx(3))}A${r},${r} 0 0 1 ${f2(encCx(3))},${f2(yB)}`, C.ink, SW1);
+  P(g, `M${f2(gx0 + gw)},${f2(gyB + ch / 2)}H${f2(gx0 + gw + 0.85)}V${f2(yB)}H${f2(encCx(7))}A${r},${r} 0 0 0 ${f2(encCx(7))},${f2(yT)}H${f2(encCx(4))}A${r},${r} 0 0 0 ${f2(encCx(4))},${f2(yB)}`, C.ink, SW1);
+  for (let i = 0; i < 4; i++) { FR(g, gx0 + i * (cw + gap), gyT, cw, ch, C.ink, 0.25); FR(g, gx0 + i * (cw + gap), gyB, cw, ch, C.ink, 0.25); }
+  I.shift(g, D.kX0 + 2.6, 29.2, 1.3);
+  SHIFT_TOP.forEach((n, i) => padName(g, padCx(i), 29.2, n));
+  beatRuler(g, 34.05, -1, 1);
+};
+// the pad rows as a ruler of sixteen steps: a long mark on every beat
+function beatRuler(g, y, dir, first) {
+  const xe = D.padX0 + 7 * D.padPitch + D.padW;
+  L(g, D.padX0, y, xe, y, C.ink, SW1, 'butt');
+  for (let i = 0; i < 8; i += 4) { const x = D.padX0 + i * D.padPitch + 0.3;
+    L(g, x, y, x, y + dir * 1.5, C.ink, 0.6, 'butt');
+    TX(g, x + 0.9, dir < 0 ? y - 0.45 : y + 2.15, String(first + i), C.ink, 2.4, 'start', 'num', 0); }
+}
+
+// ---- F2: Shift + bottom pad = a screen ----
+ART.F2 = g => {
+  beatRuler(g, 78.25, 1, 9);
+  I.shift(g, D.kX0 + 2.6, 86.2, 1.3);
+  SHIFT_BOT.forEach((n, i) => { if (n) padName(g, padCx(i), 86.2, n); });
+};
+
+// ---- R: knob pages, the pattern key, Func ----
+ART.R = g => {
+  const [, yu] = mid(BTN.bankUp), [, yd] = mid(BTN.bankDn), x0 = D.rX0, xm = (D.rX0 + D.rX1) / 2, xl = x0 + 2.2;
+  const ym = (yu + yd) / 2;
+  I.chev(g, xl + 1.0, yu, 3.4, -1, C.ink); I.chev(g, xl + 1.0, yd, 3.4, 1, C.ink);
+  WD(g, xl + 3.4, ym - 1.0, 'KNOB PAGE', C.ink, LAB, 'start');
+  I.func(g, xl + 4.3, ym + 2.1, 1.0); WD(g, xl + 6.4, ym + 3.15, 'JUMP', C.fn, LAB, 'start');
+  const [, yp] = mid(BTN.pat);
+  WD(g, xl, yp - 1.6, 'PATTERN', C.ink, LAB, 'start');
+  I.func(g, xl + 0.9, yp + 3.4, 1.0); WD(g, xl + 3.0, yp + 4.45, 'PASTE', C.fn, LAB, 'start');
+  const [, yf] = mid(BTN.func);
+  I.func(g, xl + 1.6, yf - 4.6, 2.0);
+  WD(g, xl, yf + 1.6, 'COARSE', C.fn, LAB, 'start');
+  I.rows(g, xl + 2.4, yf + 5.6, 4.8, 'top', C.fn); WD(g, xl + 6.2, yf + 6.65, 'PAGE', C.fn, LAB, 'start');
+};
+
+// ---- T: Shift, Settings, Up (bar); Arp and Scale (upright) ----
+ART.T = g => {
+  const y = (D.tBarY0 + D.tBarY1) / 2, [xs] = mid(BTN.shift), [xt] = mid(BTN.settings), [xu] = mid(BTN.up), sx = (D.tSpineX0 + D.tSpineX1) / 2;
+  I.shift(g, xs - 4.4, y, 1.6); WD(g, xs - 1.8, y + 1.05, 'FINE', C.sh, LAB, 'start');
+  I.func(g, xt - 7.6, y, 1.0); WD(g, xt - 5.6, y + 1.05, 'TAP TEMPO', C.fn, LAB, 'start');
+  I.shift(g, xu - 4.6, y, 1.0); WD(g, xu - 3.0, y + 1.05, 'TRACK', C.sh, LAB, 'start');
+  const [, ya] = mid(BTN.arp), [, yc] = mid(BTN.scale);
+  I.shift(g, sx, D.tSpineY0 + 1.9, 1.0);
+  VT(g, sx + 1.05, ya + 1.3, 'LATCH', C.sh, LAB); VT(g, sx + 1.05, yc + 0.6, 'SCREEN', C.sh, LAB);
+};
+
+// ---- M: Play and Record with Shift, with Func, with both ----
+ART.M = g => {
+  const xm = D.mX0 + 1.3, xw = D.mX0 + 3.2; let y = D.mY0 + 3.4;
+  const line = (mark, str, c) => { y += 3.75; if (mark) mark(g, xm + 0.3, y - 0.95, 0.8); WD(g, xw, y, str, c, SUB, 'start', 0.1); };
+  I.play(g, xm + 1.0, y, 3.2, C.ink);
+  line(I.shift, 'REWIND', C.sh); line(null, 'SILENCE', C.sh); line(I.func, 'CLEAR', C.fn);
+  y += 3.9; I.shift(g, xm + 0.3, y - 0.9, 0.85); I.func(g, xm + 2.5, y - 0.9, 0.85); I.undo(g, xm + 6.3, y - 0.9, 4.0, C.fn);
+  y += 5.2; I.rec(g, xm + 1.0, y, 3.2, C.ink);
+  line(I.shift, 'FILL', C.sh); line(I.func, 'COPY', C.fn);
+  y += 3.9; I.shift(g, xm + 0.3, y - 0.9, 0.85); I.func(g, xm + 2.5, y - 0.9, 0.85); I.redo(g, xm + 6.3, y - 0.9, 4.0, C.fn);
+};
+
+// ---- F1: the key split, Up / Down ----
+ART.F1 = g => {
+  const yc = (D.fY0 + D.fY1) / 2;
+  WD(g, D.fX0 + 3.0, yc + 1.0, 'NEPTUNE', C.dim, SUB, 'start', 0.6);
+  const xo = (BTN.octDn.x + BTN.octUp.x + BTN.octUp.w) / 2;
+  I.shift(g, xo - 7.2, yc, 1.3); WD(g, xo - 5.0, yc + 1.05, 'KEY SPLIT', C.sh, LAB, 'start');
+  // Up / Down tapped: the page of whatever the pads show.  Held: top row = pick a track, bottom row = mute
+  const xd = BTN.down.x;
+  WD(g, xd + 0.3, 82.3, 'PAD PAGE', C.ink, LAB, 'start');
+  WD(g, xd - 1.0, 89.2, 'HOLD', C.dim, SUB, 'end', 0.1);
+  I.rows(g, xd + 2.7, 86.5, 4.8, 'top', C.ink); WD(g, xd + 6.0, 87.5, 'TRACK', C.ink, SUB, 'start', 0.1);
+  I.rows(g, xd + 2.7, 90.4, 4.8, 'bot', C.ink); WD(g, xd + 6.0, 91.4, 'MUTE', C.ink, SUB, 'start', 0.1);
+};
+
+/* ============================== A PIECE ON A SHEET ============================== */
+let uid = 0;
+function drawPiece(svg, key, sx, sy, opt = {}) {
+  const p = PIECES[key], g = G(svg, `translate(${f2(sx - p.x0)},${f2(sy - p.y0)})`), B = D.bleed;
+  if (!opt.inPlace) {
+    // the hardware round the piece, faint, so that it is plain what the piece sits against
+    const id = 'c' + (++uid), m = 4.2, cp = E(g, 'clipPath', { id });
+    E(cp, 'rect', { x: p.x0 - m, y: p.y0 - m, width: p.x1 - p.x0 + 2 * m, height: p.y1 - p.y0 + 2 * m });
+    hardware(E(g, 'g', { 'clip-path': `url(#${id})` }));
+  }
+  // the skin, with its bleed
+  E(g, 'path', { d: p.d }, LIGHT || opt.inPlace ? `fill:${C.panel}` : `fill:${C.panel};stroke:${C.panel};stroke-width:${2 * B};stroke-linejoin:miter`);
+  if (p.holes) for (let i = 0; i < 8; i++) E(g, 'circle', { cx: encCx(i), cy: D.encCy, r: D.encClear }, 'fill:#fff');
+  COUNTING = !opt.inPlace && !opt.noCount; ART[key](g); COUNTING = false;
+  if (opt.inPlace) { E(g, 'path', { d: p.d }, 'fill:none;stroke:#fff;stroke-width:0.5'); return g; }
+  // cut lines: dashed, grey; and crop marks outside the bleed
+  const cut = `fill:none;stroke:${C.cut};stroke-width:0.2;stroke-dasharray:1.3 0.9`;
+  E(g, 'path', { d: p.d }, cut);
+  if (p.holes) {
+    for (let i = 0; i < 8; i++) { E(g, 'circle', { cx: encCx(i), cy: D.encCy, r: D.encClear }, cut); E(g, 'circle', { cx: encCx(i), cy: D.encCy, r: 0.25 }, 'fill:#999'); }
+    L(g, p.x0 - B, D.kCutY, p.x1 + B, D.kCutY, LIGHT ? '#c22' : '#ff5a4a', 0.2, 'butt').setAttribute('stroke-dasharray', '0.4 1.1');
+    scissors(g, p.x0 - B - 4.2, D.kCutY); TX(g, p.x0 - B - 7.4, D.kCutY + 1.0, "K'", '#c22', 2.8, 'end', 'note', 0);
+  }
+  const mk = (x, y, dx, dy) => { L(g, x + dx * (B + 0.8), y, x + dx * (B + 4), y, '#000', 0.15, 'butt'); L(g, x, y + dy * (B + 0.8), x, y + dy * (B + 4), '#000', 0.15, 'butt'); };
+  const has = (x, y) => p.pts.some(q => q[0] === x && q[1] === y);
+  if (has(p.x0, p.y0)) mk(p.x0, p.y0, -1, -1); if (has(p.x1, p.y0)) mk(p.x1, p.y0, 1, -1);
+  if (has(p.x0, p.y1)) mk(p.x0, p.y1, -1, 1); if (has(p.x1, p.y1)) mk(p.x1, p.y1, 1, 1);
+  // its letter, in the margin (the letter is the one on the little panel drawing)
+  tag(g, (opt.tagX !== undefined ? opt.tagX : p.x0 - B - 4.6), (opt.tagY !== undefined ? opt.tagY : p.y0 + 3.2), key);
+  return g;
+}
+function tag(g, x, y, s) { CI(g, x, y, 2.5, '#000', 0.25, '#fff'); TX(g, x, y + 1.05, s, '#000', 3.0, 'middle', 'note', 0); }
+function scissors(g, x, y) { CI(g, x - 1.1, y - 0.9, 0.7, '#c22', 0.22); CI(g, x - 1.1, y + 0.9, 0.7, '#c22', 0.22); L(g, x - 0.5, y - 0.55, x + 2.4, y + 0.75, '#c22', 0.22); L(g, x - 0.5, y + 0.55, x + 2.4, y - 0.75, '#c22', 0.22); }
+
+/* ============================== RULERS ============================== */
+function rulerMM(g, x, y, len, vertical = false) {
+  const q = vertical ? G(g, `translate(${x},${y}) rotate(90)`) : G(g, `translate(${x},${y})`);
+  L(q, 0, 0, len, 0, '#000', 0.12, 'butt');
+  for (let i = 0; i <= len; i++) L(q, i, 0, i, i % 10 === 0 ? 3.2 : i % 5 === 0 ? 2.3 : 1.5, '#000', 0.12, 'butt');
+  for (let i = 0; i <= len; i += 10) { const t = TX(q, i, 6.0, String(i), '#000', 2.5, 'middle', 'note', 0); if (vertical) t.setAttribute('transform', `rotate(-90 ${i} 5.2)`); }
+  // the 100 mm check: two red marks exactly 100 mm apart
+  FR(q, -0.1, -2.2, 0.2, 1.6, '#f00'); FR(q, 99.9, -2.2, 0.2, 1.6, '#f00'); L(q, 0.8, -1.4, 99.2, -1.4, '#f00', 0.12, 'butt');
+  TX(q, 50, -2.2, '100 mm', '#d00', 2.5, 'middle', 'note', 0);
+  if (!vertical) TX(q, len + 2, 3.0, 'mm', '#000', 2.5, 'start', 'note', 0);
+}
+function rulerIN(g, x, y, inches) {
+  const q = G(g, `translate(${x},${y})`), n = inches * 16;
+  L(q, 0, 0, inches * 25.4, 0, '#000', 0.12, 'butt');
+  for (let i = 0; i <= n; i++) L(q, i * 25.4 / 16, 0, i * 25.4 / 16, i % 16 === 0 ? 3.2 : i % 8 === 0 ? 2.5 : i % 4 === 0 ? 1.9 : i % 2 === 0 ? 1.4 : 0.9, '#000', 0.12, 'butt');
+  for (let i = 0; i <= inches; i++) TX(q, i * 25.4, 6.0, String(i), '#000', 2.5, 'middle', 'note', 0);
+  TX(q, inches * 25.4 + 2, 3.0, 'in', '#000', 2.5, 'start', 'note', 0);
+}
+// "print at 100 %": a picture, not a sentence
+function sheetMark(g, x, y, n) {
+  TX(g, x, y, `${n} / 3`, '#000', 3.4, 'start', 'note', 0);
+  TX(g, x + 12, y, '100 %', '#d00', 3.4, 'start', 'note', 0);
+  TX(g, x + 27, y, LIGHT ? 'light' : 'dark', '#777', 2.6, 'start', 'note', 0);
+}
+
+/* ============================== SHEETS ============================== */
+const SW = 259, SH = 190;       // the area both Letter and A4 landscape can print, centred on the page
+function sheet() { const d = document.createElement('div'); d.className = 'sheet'; document.body.appendChild(d);
+  return E(d, 'svg', { xmlns: NS, width: SW + 'mm', height: SH + 'mm', viewBox: `0 0 ${SW} ${SH}` }); }
+
+// the whole panel with every piece in place
+function assembly(svg, x, y, k, withTags = true) {
+  const g = G(svg, `translate(${x},${y}) scale(${k})`);
+  E(g, 'rect', { x: 0, y: 0, width: D.bodyW, height: D.keysY + 16, rx: 5 }, 'fill:#ececec');
+  hardware(g, '#8d8d8d', 0.3, true);
+  for (const key in PIECES) drawPiece(g, key, PIECES[key].x0, PIECES[key].y0, { inPlace: true });
+  for (let i = 0; i < 8; i++) E(g, 'circle', { cx: encCx(i), cy: D.encCy, r: D.encR }, 'fill:#ececec;stroke:#8d8d8d;stroke-width:0.3');
+  if (!withTags) return;
+  const t = G(svg, `translate(${x},${y})`), lead = (px, py, tx, ty, s) => { L(t, px * k, py * k, tx, ty, '#000', 0.2); DOT(t, px * k, py * k, 0.5, '#000'); tag(t, tx, ty, s); };
+  lead(200, D.kY0, 200 * k, -6, 'K'); lead(D.rX1 - 5, D.rY0, D.rX1 * k - 2, -6, 'R'); lead(111.8, D.tSpineY0, 111.8 * k, -6, 'T');
+  lead(D.mX0, 60, -7, 60 * k, 'M'); lead(60, D.fY1, 60 * k, (D.keysY + 16) * k + 6, 'F1'); lead(230, D.fY1, 230 * k, (D.keysY + 16) * k + 6, 'F2');
+}
+
+function build() {
+  // ---------- sheet 1: knob plate, right foot strip, right margin strip, the panel drawing ----------
+  let s = sheet();
+  sheetMark(s, 8, 7, 1);
+  drawPiece(s, 'K', 16, 16);
+  drawPiece(s, 'F2', 16, 62);
+  drawPiece(s, 'R', 236, 9, { tagX: PIECES.R.x0 - 6.5 });
+  assembly(s, 30, 100, 0.5);
+  rulerMM(s, 14, 172, 200); rulerIN(s, 14, 181, 8); rulerMM(s, 229, 88, 100, true);
+
+  // ---------- sheet 2: left foot strip, T, M ----------
+  s = sheet();
+  sheetMark(s, 8, 7, 2);
+  drawPiece(s, 'F1', 16, 22);
+  drawPiece(s, 'T', 160, 14, { tagX: PIECES.T.x0 - 6, tagY: PIECES.T.y1 - 10 });
+  drawPiece(s, 'M', 236, 14);
+  assembly(s, 30, 92, 0.5);
+  rulerMM(s, 14, 172, 200); rulerIN(s, 14, 181, 8); rulerMM(s, 229, 88, 100, true);
+
+  // ---------- sheet 3: what to measure, and the icon legend (plain paper) ----------
+  s = sheet();
+  sheetMark(s, 8, 7, 3);
+  measure(s, 14, 12, 0.66);
+  legend(s, 14, 102);
+  rulerMM(s, 14, 172, 200); rulerIN(s, 14, 181, 8);
+}
+
+/* ---------- sheet 3: where to put the ruler ---------- */
+function measure(svg, x, y, k) {
+  const g = G(svg, `translate(${x},${y}) scale(${k})`);
+  hardware(g, '#555', 0.3, true);
+  const red = '#d00', dim = (x1, y1, x2, y2, n, lx, ly) => {
+    L(g, x1, y1, x2, y2, red, 0.4, 'butt'); const h = Math.abs(y2 - y1) < 0.01;
+    [[x1, y1], [x2, y2]].forEach(p => h ? L(g, p[0], p[1] - 2, p[0], p[1] + 2, red, 0.4, 'butt') : L(g, p[0] - 2, p[1], p[0] + 2, p[1], red, 0.4, 'butt'));
+    const tx = lx !== undefined ? lx : (x1 + x2) / 2, ty = ly !== undefined ? ly : (y1 + y2) / 2 - 4.6;
+    CI(g, tx, ty, 3.7, red, 0.4, '#fff'); TX(g, tx, ty + 1.6, String(n), red, 4.6, 'middle', 'note', 0);
+  };
+  const b = BTN;
+  dim(0, 41.3, b.shift.x, 41.3, 1, 10, 41.3);
+  dim(b.shift.x, 44, b.shift.x + b.shift.w, 44, 2, 76.9, 41.3);
+  dim(62, 0, 62, b.shift.y, 3, 62, 22);
+  dim(0, 86, b.func.x, 86, 4, 150, 86);
+  dim(0, 66, D.padX0, 66, 5, 30, 66);
+  dim(D.padX0, 45, D.padX0 + 7 * D.padPitch + D.padW, 45, 6, 216.5, 45);
+  dim(padCx(1) + 11, D.encCy + D.encClear, padCx(1) + 11, D.padTopY0, 7, padCx(1) + 16, 29);
+  dim(padCx(5) + 11, D.padBotY0 + D.padH, padCx(5) + 11, D.keysY, 8, padCx(5) + 17, 85.7);
+  dim(D.modX1, 50, b.play.x, 50, 9, 60.7, 56);
+  dim(98, D.dispY1, 98, b.settings.y, 10, 104, 32.4);
+  dim(D.dispX1, 9.6, b.arp.x, 9.6, 11, 111.8, 0.5);
+  dim(b.func.x + b.func.w, 67, D.bodyW, 67, 12, 328.4, 60);
+  dim(encCx(6) - D.encClear, D.encCy, encCx(6) + D.encClear, D.encCy, 13, encCx(6), 4.5);
+}
+
+/* ---------- sheet 3: the few marks that are not words ---------- */
+function legend(svg, x, y) {
+  const g = G(svg, `translate(${x},${y})`), k = C.ink, cw = 62, rh = 10.5;
+  const items = [
+    [(g, x, y) => I.shift(g, x, y, 1.8), 'amber, diamond: with Shift held'], [(g, x, y) => I.func(g, x, y, 1.8), 'blue, ring: with Func held'], [(g, x, y) => { I.shift(g, x - 2, y, 1.4); I.func(g, x + 2, y, 1.4); }, 'with Shift and Func held'],
+    [(g, x, y) => I.play(g, x, y, 4, k), 'Play'], [(g, x, y) => I.rec(g, x, y, 4, k), 'Record'], [(g, x, y) => { I.undo(g, x - 2.2, y, 4, C.fn); I.redo(g, x + 2.2, y, 4, C.fn); }, 'undo, redo'],
+    [(g, x, y) => { I.chev(g, x - 1.4, y, 3.4, -1, k); I.chev(g, x + 1.4, y, 3.4, 1, k); }, 'back, on'], [(g, x, y) => I.rows(g, x, y, 6, 'top', k), 'the solid bar: that row of pads'],
+    [(g, x, y) => { for (let i = 0; i < 4; i++) { FR(g, x - 4.2 + i * 2.2, y - 2.1, 1.8, 1.8, k, 0.2); FR(g, x - 4.2 + i * 2.2, y + 0.3, 1.8, 1.8, k, 0.2); } }, 'the eight cells of a grid screen']
+  ];
+  items.forEach((it, i) => {
+    const cx = (i % 3) * cw + 2.5, cy = Math.floor(i / 3) * rh;
+    FR(g, cx, cy, 12, 9, C.panel, 1.2); if (LIGHT) R(g, cx, cy, 12, 9, 1.2, '#999', 0.15);
+    it[0](g, cx + 6, cy + 4.5);
+    TX(g, cx + 14, cy + 5.6, it[1], '#000', 3.0, 'start', 'note', 0);
+  });
+  TX(g, 2.5, 40.5, `Words on the six pieces: ${WORDS_ON_SKIN.length}`, '#555', 2.6, 'start', 'note', 0);
+  const half = Math.ceil(WORDS_ON_SKIN.length / 2);
+  TX(g, 2.5, 44.2, WORDS_ON_SKIN.slice(0, half).join(' · '), '#555', 2.1, 'start', 'note', 0);
+  TX(g, 2.5, 47.4, WORDS_ON_SKIN.slice(half).join(' · '), '#555', 2.1, 'start', 'note', 0);
+}
+
+build();
+</script>
+</body>
+</html>

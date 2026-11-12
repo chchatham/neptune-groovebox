@@ -438,7 +438,7 @@ public:
     // right now (-1 = no light: not recording, or stopped). The light is the selected track's step
     // within its 16-step page.
     bool isRecordArmed() const { return sequencer != nullptr ? sequencer->isRecording() : recordLocal; }
-    bool isTransportRunning() const { return sequencer != nullptr ? sequencer->isPlaying() : playLocal; }
+    bool isTransportRunning() const { return sequencer != nullptr ? sequencer->isRunning() : playLocal; }     // (a count-in is running too)
     int getRecordLightPad() const;
     bool isFuncHeld() const { return funcHeld; }
     bool isPatternKeyHeld() const { return patternKeyHeld; }
@@ -546,6 +546,7 @@ private:
     void recordPlayPressed();
     void leaveRecording();
     juce::String recordModeText() const;
+    bool showCountIn();
     void scaleLockChanged();
 
     // Copy / clear / paste, undo / redo.

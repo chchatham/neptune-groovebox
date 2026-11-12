@@ -635,6 +635,8 @@ void ScreenManager::handlePlay()
     toggleTransport();
     if (wasRunning)
         leaveRecording();
+    else
+        showCountIn();
 }
 
 void ScreenManager::toggleTransport()
@@ -644,8 +646,9 @@ void ScreenManager::toggleTransport()
         transportListener->playPressed();
     else if (sequencer)
     {
-        if (sequencer->isPlaying()) sequencer->stop();
-        else                        sequencer->start();
+        // (requestStart: with recording armed and a count-in set, the bars are counted in first)
+        if (sequencer->isRunning()) sequencer->stop();
+        else                        sequencer->requestStart();
     }
 }
 
@@ -658,6 +661,16 @@ void ScreenManager::setRecordArmed(bool armed)
         transportListener->recordPressed();
     else if (sequencer)
         sequencer->setRecording(armed);
+}
+
+// A count-in has begun (Play with recording armed and CNT set): the name bar says so.
+bool ScreenManager::showCountIn()
+{
+    if (sequencer == nullptr || !sequencer->isCountingIn())
+        return false;
+    const int bars = sequencer->getCountInBars();
+    showMessage(bars == 1 ? juce::String("COUNT IN 1 BAR") : "COUNT IN " + juce::String(bars) + " BARS", LONG_MESSAGE_MS);
+    return true;
 }
 
 juce::String ScreenManager::recordModeText() const
@@ -682,7 +695,8 @@ void ScreenManager::recordPlayPressed()
         if (!isTransportRunning())
             toggleTransport();
     }
-    showMessage(recordModeText(), LONG_MESSAGE_MS);
+    if (!showCountIn())
+        showMessage(recordModeText(), LONG_MESSAGE_MS);
 }
 
 // Recording goes off. If anything was recorded, the track recorded last is selected and laid out
@@ -2677,7 +2691,8 @@ void ScreenManager::buildRecord(HelpCard& card) const
     if (!armed)
         card.lines[1].text = running ? " RECORDS FROM NOW" : " THEN PLAY RECORDS";
     card.lines[2].text = running ? "+ PLAY   RECORD ON" : "+ PLAY   RECORD NOW";
-    card.lines[3].text = running ? " PLAYING GOES ON" : " FROM THE TOP";
+    const bool counts = sequencer != nullptr && sequencer->getCountInBars() > 0;
+    card.lines[3].text = running ? " PLAYING GOES ON" : counts ? " AFTER THE COUNT-IN" : " FROM THE TOP";
     card.lines[4].text = "AGAIN    FREE / QUANT";
     card.lines[5].text = " NOW: " + recordModeText();
 }

@@ -133,3 +133,6 @@ documents in `docs/` are covered by the same licence.
 
 JUCE, fetched at build time, is used under its AGPLv3 option. Novation's firmware and documentation are not
 part of this repository and are not covered by this licence.
+
+The drum-break recordings in `assets/breaks/` were released by their players under CC0 1.0 (public domain);
+authors, sources and what was changed are listed in [docs/sample-credits.md](docs/sample-credits.md).

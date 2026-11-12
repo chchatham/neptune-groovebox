@@ -341,6 +341,21 @@ public:
             }
             case EngineType::Wavetable:
                 if (label == "MDPT") set(WavetableEngine::MorphSpeed, 4.0f);
+                if (page == "KEYS" || page.startsWith("K "))
+                {
+                    // The key-frame pages: the KEYS table with all eight keys taken from the factory
+                    // beat (every place in it is another sound). A key's position in its sample
+                    // (POSn) is heard where that key sits; everything else in the middle of the
+                    // table, half way between two keys - which is also where a key arrives when its
+                    // place (PLCn) is at half (measured where the key sat, PLC3 and PLC6 read 0: at 0,
+                    // 50 and 100 the key is away from there three times, and nothing else moves).
+                    const int beat = SampleBank::get().indexOf("BEAT");
+                    for (int k = 0; k < WavetableKeys::MAX_KEYS; ++k)
+                        set(WavetableEngine::KeySampleBase + k, (float) (beat + 1));
+                    set(WavetableEngine::TableSelect, (float) WavetableEngine::KEY_TABLE);
+                    const int key = label.getLastCharacters(1).getIntValue() - 1;
+                    set(WavetableEngine::Position, page == "K POS" ? WavetableEngine::defaultKeyPlace(key) : 0.5f);
+                }
                 break;
             case EngineType::Sampler:
                 if (page == "SLICE" && (label == "SENS" || label == "GAP"))

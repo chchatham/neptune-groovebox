@@ -15,13 +15,21 @@
 //         slice ticks and live playheads (one dashed line per sounding voice; in granular mode the
 //         scan position as a line and each grain as a short tick).
 //         Knobs: ST EN LS LE | ZM SC MD SL  (start, end, loop start, loop end | zoom, scroll, play
-//         mode, slice). On a wavetable track it shows the sample its USER table is built from.
+//         mode, slice).
+//         On a wavetable track the page is the KEY FRAME editor: the sample of one of the eight
+//         keys of the KEYS table, a full-height line where that key's cycle is taken and a short
+//         tick for every other key taken from the same sample.
+//         Knobs: KY SM PO PL | ZM SC AL TB  (which key, its sample, its position in the sample,
+//         its place along the table | zoom, scroll, the algorithm between keys, the table).
+//         The top-row pads choose the key too. Giving a key a sample selects the KEYS table.
+//         The same cells are on the wavetable's KEYS, K SMP, K POS and K PLC pages.
 //   REC   resampling: record one track (after its effects) or the master into a new sample.
 //         Knobs: SR TH LN QN | RC NM SM CR  (source, threshold, length, start now / on the bar |
 //         record, normalise, sample, crop). RC: two clicks clockwise within a second arm (a stray
 //         click does nothing), one click anticlockwise stops. A finished take
 //         is saved as R001, R002 ... and given to the selected track: a sampler plays it, a
-//         wavetable track uses it as its USER table. CR (four clicks clockwise) keeps only the
+//         wavetable track uses it as its USER table - or, while its table is KEYS, as the sample
+//         of the key chosen on the WAVE page. CR (four clicks clockwise) keeps only the
 //         start..end region of a sampler track's sample, as a new sample.
 class WaveformScreen : public Screen
 {
@@ -37,6 +45,11 @@ public:
         if (flash.isNotEmpty() && now() - flashMs < FLASH_MS)
             return flash;
         juce::String sub;
+        if (page == 0 && getWavetableEngine() != nullptr)
+        {
+            const auto* e = SampleBank::get().entry(keySampleIndex(focusKey));
+            return "K" + juce::String(focusKey + 1) + " " + (e != nullptr ? juce::String(e->name) : juce::String("OFF"));
+        }
         if (const auto* e = currentEntry())
             sub += juce::String(e->name);
         if (page == 0)
@@ -82,9 +95,10 @@ public:
     juce::String getEncoderName(int i) const override
     {
         static const char* const wave[] = { "ST", "EN", "LS", "LE", "ZM", "SC", "MD", "SL" };
+        static const char* const keys[] = { "KY", "SM", "PO", "PL", "ZM", "SC", "AL", "TB" };
         static const char* const rec[]  = { "SR", "TH", "LN", "QN", "RC", "NM", "SM", "CR" };
         if (i < 0 || i >= 8) return {};
-        return page == 0 ? wave[i] : rec[i];
+        return page == 0 ? (getWavetableEngine() != nullptr ? keys[i] : wave[i]) : rec[i];
     }
 
     void onEncoderChange(int encoderIndex, int value) override
@@ -101,6 +115,24 @@ public:
     {
         auto pct = [](float v) { return juce::String(v * 100.0f, 1) + "%"; };
         auto* samp = getSamplerEngine();
+        if (page == 0 && getWavetableEngine() != nullptr)
+        {
+            using W = WavetableEngine;
+            const bool on = SampleBank::get().entry(keySampleIndex(focusKey)) != nullptr;
+            const juce::String key = "KEY " + juce::String(focusKey + 1);
+            switch (i)
+            {
+                case 0: return key + (on ? "" : " OFF");
+                case 1: return key + " SAMPLE " + keyCellText(W::KeySampleBase + focusKey);
+                case 2: return on ? key + " AT " + pct(keyValue(W::KeyPositionBase + focusKey)) : key + " OFF";
+                case 3: return on ? key + " PLACE " + pct(keyValue(W::KeyPlaceBase + focusKey)) : key + " OFF";
+                case 4: return "ZOOM " + juce::String(juce::roundToInt((zoomEnd - zoomStart) * 100.0f)) + "%";
+                case 5: return "SCROLL " + juce::String(juce::roundToInt(zoomStart * 100.0f)) + "%";
+                case 6: return "ALGORITHM " + keyCellText(W::KeyAlgo);
+                case 7: return "TABLE " + keyCellText(W::TableSelect);
+                default: return {};
+            }
+        }
         if (page == 0)
         {
             auto marker = [&](const char* name, int id, float whenZero)
@@ -159,7 +191,17 @@ public:
     bool getPadColours(std::array<PadColour, 16>& out) const override
     {
         out.fill({});
-        if (page == 0)
+        if (page == 0 && getWavetableEngine() != nullptr)
+        {
+            // The eight keys: the chosen one bright, keys in use amber, unused ones dim.
+            for (int k = 0; k < WavetableKeys::MAX_KEYS; ++k)
+            {
+                const bool on = SampleBank::get().entry(keySampleIndex(k)) != nullptr;
+                out[(size_t) k] = k == focusKey ? PadColour { 127, 127, 127 }
+                                : on ? PadColour { 127, 110, 40 } : PadColour { 12, 8, 0 };
+            }
+        }
+        else if (page == 0)
         {
             auto* samp = getSamplerEngine();
             const int slices = samp != nullptr ? samp->getSliceCount() : 0;
@@ -180,6 +222,12 @@ public:
     void onPadPress(int padIndex, int /*velocity*/) override
     {
         cancelGestures();
+        if (page == 0 && getWavetableEngine() != nullptr)
+        {
+            if (padIndex >= 0 && padIndex < WavetableKeys::MAX_KEYS)
+                focusKey = padIndex;
+            return;
+        }
         auto* samp = getSamplerEngine();
         if (page != 0 || samp == nullptr) return;
         if (padIndex >= 0 && padIndex < samp->getSliceCount())
@@ -190,6 +238,7 @@ public:
     float getZoomStart() const { return zoomStart; }
     float getZoomEnd() const { return zoomEnd; }
     int getLengthChoice() const { return lengthChoice; }
+    int getFocusKey() const { return focusKey; }
     bool isNormalise() const { return normalise; }
 
 private:
@@ -205,12 +254,28 @@ private:
         const float* data = nullptr;
         int length = 0;
         auto* samp = getSamplerEngine();
+        auto* wt = getWavetableEngine();
         if (samp != nullptr)
         {
             data = samp->getSampleData();
             length = samp->getSampleLength();
         }
-        else if (const auto* e = currentEntry())       // a wavetable track's USER source
+        else if (wt != nullptr)                         // a wavetable track: the chosen key's sample
+        {
+            if (const auto* e = SampleBank::get().entry(keySampleIndex(focusKey)))
+            {
+                data = e->left.data();
+                length = (int) e->left.size();
+            }
+            else
+            {
+                display.drawString(8, 22, "KEY " + juce::String(focusKey + 1) + " IS OFF.");
+                display.drawString(8, 32, "TURN SM TO GIVE");
+                display.drawString(8, 42, "IT A SAMPLE.");
+                return;
+            }
+        }
+        else if (const auto* e = currentEntry())       // any other track: the sample last browsed
         {
             data = e->left.data();
             length = (int) e->left.size();
@@ -312,6 +377,29 @@ private:
             }
         }
 
+        if (wt != nullptr)
+        {
+            // Where the keys are taken: the chosen key a full-height line with a flag, every other
+            // key on this sample a short tick at the top.
+            const int sample = keySampleIndex(focusKey);
+            for (int k = 0; k < WavetableKeys::MAX_KEYS; ++k)
+            {
+                if (keySampleIndex(k) != sample)
+                    continue;
+                const int px = toPx(keyValue(WavetableEngine::KeyPositionBase + k));
+                if (px < 0)
+                    continue;
+                if (k == focusKey)
+                {
+                    display.invertRegion(px, y0, 1, h);
+                    display.drawHLine(px, y0, 3);
+                    display.drawHLine(px, y0 + 1, 2);
+                }
+                else
+                    display.drawVLine(px, y0, 4);
+            }
+        }
+
         // What part of the sample is in view, when zoomed in.
         if (span < 0.999f)
             display.invertRegion(x0 + (int) (zoomStart * (float) w), y0 + h, juce::jmax(2, (int) (span * (float) w)), 1);
@@ -336,6 +424,11 @@ private:
                 next = cur + (float) delta * span / (mode == TurnStep::Fine ? 2500.0f : 250.0f);
             setTrackParam(id, juce::jlimit(0.0f, 1.0f, next));
         };
+        if (auto* wt = getWavetableEngine(); wt != nullptr && (index <= 3 || index >= 6))
+        {
+            keyEncoder(*wt, index, delta, mode, span);
+            return;
+        }
         // The markers, play mode and slices belong to a sampler track; on any other track say so
         // instead of doing nothing.
         if (samp == nullptr && (index <= 3 || index >= 6))
@@ -389,6 +482,78 @@ private:
                     setFlash("ONE SLICE");      // nothing to choose between
                 }
                 break;
+            default: break;
+        }
+    }
+
+    // ---- The key frames of a wavetable track -----------------------------------------------------
+    // Bank index of key k's sample, -1 when the key is OFF.
+    int keySampleIndex(int key) const
+    {
+        auto* wt = getWavetableEngine();
+        return wt != nullptr ? (int) std::lround(wt->getParameter(WavetableEngine::KeySampleBase + key)) - 1 : -1;
+    }
+    float keyValue(int id) const
+    {
+        auto* wt = getWavetableEngine();
+        return wt != nullptr ? wt->getParameter(id) : 0.0f;
+    }
+    // The cell of the wavetable's pages with this id (its range, its choices).
+    static bool keySpec(const WavetableEngine& wt, int id, ParamSpec& out)
+    {
+        for (auto& p : wt.getParamPages())
+            if (const auto* spec = p.find(id))
+            {
+                out = *spec;
+                return true;
+            }
+        return false;
+    }
+    juce::String keyCellText(int id) const
+    {
+        ParamSpec spec;
+        auto* wt = getWavetableEngine();
+        return wt != nullptr && keySpec(*wt, id, spec) ? spec.format(wt->getParameter(id)) : juce::String("--");
+    }
+
+    void keyEncoder(WavetableEngine& wt, int index, int delta, TurnStep mode, float span)
+    {
+        using W = WavetableEngine;
+        const bool on = SampleBank::get().entry(keySampleIndex(focusKey)) != nullptr;
+        auto turnCell = [&](int id)
+        {
+            ParamSpec spec;
+            if (keySpec(wt, id, spec))
+                setTrackParam(id, spec.turned(wt.getParameter(id), delta, mode));
+        };
+        switch (index)
+        {
+            case 0:     // KY: which key
+            {
+                const ParamSpec spec { "KEY", 0, 0, (float) (WavetableKeys::MAX_KEYS - 1), 0, ParamKind::Int };
+                focusKey = (int) spec.turned((float) focusKey, delta, mode == TurnStep::Coarse ? TurnStep::Plain : mode);
+                break;
+            }
+            case 1:     // SM: its sample (OFF first). A key with a sample is heard: the table becomes KEYS.
+                turnCell(W::KeySampleBase + focusKey);
+                if (keySampleIndex(focusKey) >= 0 && (int) std::lround(wt.getParameter(W::TableSelect)) != W::KEY_TABLE)
+                    setTrackParam(W::TableSelect, (float) W::KEY_TABLE);
+                break;
+            case 2:     // PO: where in the sample (as the sampler's markers: 1/250 of the view per click)
+                if (! on) { setFlash("KEY IS OFF"); break; }
+                if (mode == TurnStep::Coarse)
+                    turnCell(W::KeyPositionBase + focusKey);
+                else
+                    setTrackParam(W::KeyPositionBase + focusKey,
+                                  juce::jlimit(0.0f, 1.0f, wt.getParameter(W::KeyPositionBase + focusKey)
+                                                               + (float) delta * span / (mode == TurnStep::Fine ? 2500.0f : 250.0f)));
+                break;
+            case 3:     // PL: where along the table
+                if (! on) { setFlash("KEY IS OFF"); break; }
+                turnCell(W::KeyPlaceBase + focusKey);
+                break;
+            case 6: turnCell(W::KeyAlgo); break;        // AL
+            case 7: turnCell(W::TableSelect); break;    // TB
             default: break;
         }
     }
@@ -565,16 +730,23 @@ private:
     int currentSampleIndex() const
     {
         if (auto* samp = getSamplerEngine()) return (int) std::lround(samp->getParameter(SamplerEngine::SampleSelect));
-        if (auto* wt = getWavetableEngine()) return (int) std::lround(wt->getParameter(WavetableEngine::UserSample));
+        if (auto* wt = getWavetableEngine())
+            return keysInUse(*wt) ? keySampleIndex(focusKey) : (int) std::lround(wt->getParameter(WavetableEngine::UserSample));
         return browsed;
     }
     const SampleBank::Entry* currentEntry() const { return SampleBank::get().entry(currentSampleIndex()); }
+    static bool keysInUse(const WavetableEngine& wt)
+    {
+        return (int) std::lround(wt.getParameter(WavetableEngine::TableSelect)) == WavetableEngine::KEY_TABLE;
+    }
 
     void assignSample(int index)
     {
         browsed = index;
         if (getSamplerEngine() != nullptr)
             setTrackParam(SamplerEngine::SampleSelect, (float) index);
+        else if (auto* wt = getWavetableEngine(); wt != nullptr && keysInUse(*wt))
+            setTrackParam(WavetableEngine::KeySampleBase + focusKey, (float) (index + 1));     // the chosen key's sample
         else if (getWavetableEngine() != nullptr)
         {
             setTrackParam(WavetableEngine::UserSample, (float) index);
@@ -601,6 +773,7 @@ private:
     AudioEngine* audioEngine;
     int page = 0;
     int selectedSlice = 0;
+    int focusKey = 0;           // the key frame the WAVE page shows on a wavetable track
     float zoomStart = 0.0f;
     float zoomEnd = 1.0f;
     int lengthChoice = 0;

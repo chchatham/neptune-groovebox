@@ -203,6 +203,7 @@ DESC = {
     "ALGO": [
         ('Sampler/', 'Stretch algorithm', 'OFF, TAPE (pitch follows speed), CYCL (vintage cyclic stretch, metallic), GRAN (smooth granular), SLCE (slices keep their sound, only their timing moves), SMER (extreme smear), WSOL (clean stretch).'),
         ("Insert DRV/", "Drive algorithm", "SOFT, HARD, FOLD or CRSH (bit-crush)."),
+        ("Wavetable/", "Key-frame algorithm", "How the frames between two keys of the KEYS table are made. LIN: a crossfade. STEP: none, the nearer key. CLSC: a crossfade kept as 128 samples of 8 bits. PHAS: level and phase of each harmonic separately, so nothing cancels on the way. TRNS: the energy glides along the harmonics (optimal transport), so a formant slides instead of fading. VOC: first the outline of the spectrum changes, then its harmonics; half way it is one key's formants on the other's harmonics."),
         (None, "Algorithm", "How the six operators are wired (8 algorithms, from one chain of six to six parallel carriers)."),
     ],
     "RAT#": [(None, "Operator ratio", "RATIO page: frequency ratio of operators 1 to 6, one knob each.")],
@@ -225,8 +226,12 @@ DESC = {
     # ---- Macro oscillator ----------------------------------------------------------------------
     "MODL": [(None, "Model", "Synthesis model: VA, FM, FOLD, FORM, HARM, PLCK, DUST, BOW. Knobs 2 to 5 are renamed to suit the model.")],
     "SAWS": [(None, "Saws (virtual analog model)", "First macro of the VA model: number and blend of stacked saws.")],
-    "HARM": [(None, "Harmonics (virtual analog model)", "Third macro of the VA model. 50 is the saws as they are; below, each fades into a sine; above, a saw an octave up is mixed in.")],
-    "BIAS": [(None, "Bias (wavefolder model)", "Third macro of the FOLD model: pushes the wave off-centre into the folder, either way of 50, which brings in the even harmonics.")],
+    "HARM": [("Wavetable/", "Highest harmonic", "The highest harmonic kept of every key of the KEYS table, 1 to 127."),
+             (None, "Harmonics (virtual analog model)", "Third macro of the VA model. 50 is the saws as they are; below, each fades into a sine; above, a saw an octave up is mixed in."),
+    ],
+    "BIAS": [("Wavetable/", "Key bias", "Leans the frames between two keys towards the earlier key (down) or the later one (up)."),
+             (None, "Bias (wavefolder model)", "Third macro of the FOLD model: pushes the wave off-centre into the folder, either way of 50, which brings in the even harmonics."),
+    ],
     "STRC": [(None, "Stretch (harmonic model)", "Fourth macro of the HARM model: spreads the harmonics apart, as on a stiff string or a bar; the tone turns into a bell.")],
     "RING": [(None, "Ring (particle noise model)", "Third macro of the DUST model, neutral at 50. Above: the particles ring at the pitch of the key. Below: a high-pass thins them into a hiss that follows the key.")],
     "INDX": [(None, "Index (FM model)", "First macro of the FM model: modulation depth.")],
@@ -246,7 +251,10 @@ DESC = {
         (None, "Formant shift", "Moves all formants down or up: larger or smaller mouth."),
     ],
     "Q": [(None, "Q (formant model)", "Third macro of the FORM model: formant sharpness.")],
-    "TILT": [(None, "Tilt (harmonic model)", "First macro of the HARM model: spectral tilt.")],
+    "TILT": [
+        ("Wavetable/", "Key tilt", "Makes every key of the KEYS table darker (down) or brighter (up), by up to 6 dB per octave."),
+        (None, "Tilt (harmonic model)", "First macro of the HARM model: spectral tilt."),
+    ],
     "EVOD": [(None, "Even / odd (harmonic model)", "Second macro of the HARM model: balance of even and odd harmonics.")],
     "NUM": [(None, "Number (harmonic model)", "Third macro of the HARM model: number of harmonics.")],
     "DAMP": [
@@ -279,12 +287,18 @@ DESC = {
     ],
 
     # ---- Wavetable -----------------------------------------------------------------------------
-    "TABL": [(None, "Table", "Which wavetable: nine built-in tables, or USER, built from a sample.")],
+    "TABL": [(None, "Table", "Which wavetable: 23 built-in tables, USER (a sample cut into frames) or KEYS (a few waves picked out of samples, the frames between them computed).")],
     "MSPD": [(None, "Motion speed", "Speed of the built-in sweep of the table position.")],
     "MDPT": [(None, "Motion depth", "Depth of the built-in position sweep.")],
     "ENVP": [(None, "Envelope to position", "The amp envelope moves the table position.")],
     "VELP": [(None, "Velocity to position", "Harder notes start further into the table.")],
-    "INTP": [(None, "Interpolation", "How frames are blended: LIN smooth, SPEC spectral, STEP stepped, VINT vintage (gritty).")],
+    "INTP": [(None, "Interpolation", "How the table is read: LIN smooth, SPEC spectral, STEP stepped, VINT vintage (gritty), CLSC classic: as an early digital wavetable synth read its tables (64 positions, waves of 128 samples and 8 bits, nothing smoothed or band-limited), which gives high notes a glassy, aliased top.")],
+    "KFRM": [(None, "Key table frames", "How many frames the KEYS table has: 8 to 256. Few frames and INTP on STEP or CLSC make the steps of a scan audible.")],
+    "WRAP": [(None, "Wrap", "On: after the last key the KEYS table returns to the first, so a looped scan has no jump.")],
+    "ALGN": [(None, "Align", "On: every key is turned in time until its fundamental starts like a sine, so waves cut from different places do not cancel each other. Off: as they were cut.")],
+    "SMP#": [(None, "Key sample", "K SMP page: the sample key frame 1 to 8 is taken from. OFF: the key is not used.")],
+    "POS#": [(None, "Key position", "K POS page: where in its sample key frame 1 to 8 is taken. One cycle is cut there (one period where the sample has a pitch) and plays at the pitch of the keys.")],
+    "PLC#": [(None, "Key place", "K PLC page: where along the table key frame 1 to 8 sits. Only order and spacing count: the earliest key in use is the first frame, the latest the last.")],
     "OCT": [
         ("ARP/", "Octave range", "Number of octaves the arp spans."),
         (None, "Octave", "Octave shift of the oscillator."),
@@ -337,7 +351,7 @@ DESC = {
     "T#": [(None, "Step time", "TIM A / TIM B pages: duration of steps 1 to 16.")],
 
     # ---- Sampler -------------------------------------------------------------------------------
-    "SMPL": [(None, "Sample", "Which sample the track plays: factory hits and loop, your files, and resampled takes.")],
+    "SMPL": [(None, "Sample", "Which sample the track plays: factory hits and loop, your files, the drum breaks (B080 … B170, named by tempo), and resampled takes. Choosing a break sets LEN to its length in bars.")],
     "STRT": [(None, "Start", "Where playback starts in the sample.")],
     "END": [(None, "End", "Where playback ends.")],
     "LPST": [(None, "Loop start", "Start of the looped region.")],
@@ -376,6 +390,7 @@ DESC = {
         (None, 'Root note', 'The key at which the sample plays at its original pitch; in KEYS slice play, the key that plays slice 1.'),
     ],
     "NORM": [
+        ("Wavetable/", "Frame level", "Level of the frames of the KEYS table. OFF: as computed. PEAK: every frame at full scale. RMS: every frame equally loud."),
         (None, 'Normalise', "On: the sample's loudest point is brought to full level."),
     ],
     "GAP": [
@@ -524,7 +539,7 @@ DESC = {
 EXTRA = [
     # PARAM, synth: the SRC page (cells of oscillator slots that are not analog waves; n = 1, 2 or 3)
     ("nPOS", "Wavetable position", "PARAM", "SRC", "0–100", "Synth, slot n set to WT: where in the table the oscillator reads."),
-    ("nTBL", "Wavetable table", "PARAM", "SRC", "SAW … DIGI", "Synth, slot n set to WT: which of the nine built-in tables."),
+    ("nTBL", "Wavetable table", "PARAM", "SRC", "SAW … DIGI, VOWL … COMB", "Synth, slot n set to WT: which of the wavetable engine's 23 built-in tables (the first nine, then the fourteen newer ones)."),
     ("nIDX", "FM index", "PARAM", "SRC", "0–100", "Synth, slot n set to FM: how hard the modulator pushes the carrier."),
     ("nRAT", "FM ratio", "PARAM", "SRC", "1–12", "Synth, slot n set to FM: the modulator's pitch as a whole multiple of the note."),
     ("nFRM", "Formant frequency", "PARAM", "SRC", "0–100", "Synth, slot n set to FORM: the resonant peak, from 1 to 16 times the note's pitch."),
@@ -580,7 +595,7 @@ EXTRA = [
     ("EN", "Engine filter", "PRESET", "bar", "THIS / ANY", "Show presets for this track's engine only, or all."),
     ("AU", "Audition", "PRESET", "bar", "OFF / ON", "On (the default): the highlighted preset takes over the track's sound for listening only; the previous sound returns on leaving unless LD is used. Off: the list scrolls without changing the sound."),
     ("LD", "Load", "PRESET", "bar", "four clicks", "Keeps the highlighted preset as the track's sound for good."),
-    ("SV", "Save", "PRESET", "bar", "four clicks", "Saves the track's sound as a user preset."),
+    ("SV", "Save", "PRESET", "bar", "four clicks", "Saves the track's sound as a user preset (User 1, User 2, ...); the Mac then asks for a name."),
     ("DL", "Delete", "PRESET, SONG", "bar", "four clicks", "Deletes the user preset (PRESET) or the selected row (SONG)."),
     ("VL", "Volume", "PRESET", "bar", "0–100", "Track volume, to level-match while browsing."),
     # SETTINGS
@@ -605,6 +620,9 @@ EXTRA = [
     ("SVAS", "Save as", "SETTINGS", "PROJ", "four clicks", "Saves to the slot chosen with SLOT."),
     ("NEW", "New project", "SETTINGS", "PROJ", "four clicks", "Starts an empty project."),
     ("AUTO", "Autosave", "SETTINGS", "PROJ", "OFF / ON", "Keeps saving the full state to the current slot."),
+    ("CLCK", "Metronome click", "SETTINGS", "CLICK", "OFF REC PLAY", "When the metronome clicks: never, while recording runs (the default), or whenever the sequencer plays. One click a beat, the first beat of each bar higher and louder. Kept between sessions, not in the project."),
+    ("CLVL", "Click level", "SETTINGS", "CLICK", "0–100", "Loudness of the click. Every turn plays one click, so it can be set with the sequencer stopped. The click is added after the master effects and MVOL: they do not change it, and it is never recorded into a resample."),
+    ("CNT", "Count-in", "SETTINGS", "CLICK", "OFF 1BAR 2BAR", "Bars the metronome counts in before a recording starts. The count-in always clicks, also with CLCK off. Nothing plays or is recorded until it ends."),
     # ARP
     ("MODE", "Arp mode", "ARP", "ARP", "12 modes", "Order the held notes play in (Appendix C)."),
     ("RATE", "Arp rate", "ARP", "ARP", "1/1–1/64T", "Note value of the arp's steps."),
@@ -677,6 +695,12 @@ EXTRA = [
     ("SC", "Scroll", "WAVE", "WAVE", "position", "Scrolls the zoomed view (zoom in with ZM first)."),
     ("MD", "Play mode", "WAVE", "WAVE", "FWD … GRAN", "The sampler's MODE."),
     ("SL", "Slices", "WAVE", "WAVE", "1–64", "Number of slices (SLCS)."),
+    ("KY", "Key frame", "WAVE", "WAVE (wavetable track)", "1–8", "Which key frame of the KEYS table the page shows and edits. The top-row pads choose it too."),
+    ("SM", "Key sample", "WAVE", "WAVE (wavetable track)", "OFF, list", "The sample this key is taken from (SMPn). Giving a key a sample selects the KEYS table."),
+    ("PO", "Key position", "WAVE", "WAVE (wavetable track)", "position", "Where in the sample the key's cycle is taken (POSn): the line on the waveform."),
+    ("PL", "Key place", "WAVE", "WAVE (wavetable track)", "0–100", "Where along the table the key sits (PLCn)."),
+    ("AL", "Algorithm", "WAVE", "WAVE (wavetable track)", "LIN … VOC", "How the frames between two keys are made (ALGO)."),
+    ("TB", "Table", "WAVE", "WAVE (wavetable track)", "list", "The track's table (TABL)."),
     ("SR", "Source", "WAVE", "REC", "MSTR, T1 …", "What is recorded: the master output or one track after its effects."),
     ("TH", "Threshold", "WAVE", "REC", "level", "Recording starts when the source passes this level."),
     ("LN", "Length", "WAVE", "REC", "free, 1 beat … 8 bars", "Length of the take."),

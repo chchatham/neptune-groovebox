@@ -11,6 +11,7 @@
 #include "../sequencer/SequencerCore.h"
 #include "../arpeggiator/Arpeggiator.h"
 #include "../sequencer/PadRatchet.h"
+#include "Metronome.h"
 #include "../sync/MIDIClock.h"
 #include "Resampler.h"
 #include "SampleBank.h"
@@ -982,6 +983,7 @@ public:
 
         scratchL.resize((size_t) currentBlockSize, 0.0f);
         resampler.prepare(currentSampleRate);
+        metronome.prepare(currentSampleRate);
         trackTapL.assign((size_t) MAX_TRACKS, std::vector<float>((size_t) currentBlockSize, 0.0f));
         trackTapR.assign((size_t) MAX_TRACKS, std::vector<float>((size_t) currentBlockSize, 0.0f));
         scratchR.resize((size_t) currentBlockSize, 0.0f);
@@ -1008,6 +1010,8 @@ public:
 
     // ---- Resampling ---------------------------------------------------------------------------
     Resampler& getResampler() { return resampler; }
+    // The click (SETTINGS -> CLICK). It is added to the output last of all: see Metronome.h.
+    Metronome& getMetronome() { return metronome; }
 
     // A finished take becomes a new sample in the bank (message thread). Mono when both channels
     // are the same. Returns the bank index, or -1 when there is nothing to keep.
@@ -1068,6 +1072,16 @@ public:
         }
         syncLegacyRouter();
 
+        // Shift + Play asked for silence: every note is let go and every effect's memory is emptied
+        // (send buses, inserts), here on the audio thread, between two blocks.
+        if (silenceRequested.exchange(false, std::memory_order_relaxed))
+        {
+            silenceNow();
+            // What a voice still gives while it stops would start the effects ringing again: the
+            // output stays shut for a quarter of a second and the effects are emptied once more.
+            silenceSamplesLeft = (int) (0.25 * currentSampleRate);
+        }
+
         float* mainL = outputChannelData[0];
         float* mainR = outputChannelData[1];
 
@@ -1095,7 +1109,21 @@ public:
                     if (e) e->setTempo(tempo);
             }
             sequencer->processBlock(numSamples);
+
+            // The beats of this block, for the click; a count-in that has just ended starts the
+            // MIDI clock as Play would have.
+            metronome.beginBlock(sequencer->isRunning());
+            const bool recording = sequencer->isRecording();
+            for (int i = 0; i < sequencer->getBeatTickCount(); ++i)
+            {
+                const auto& tick = sequencer->getBeatTick(i);
+                metronome.beat(tick.sample, tick.accent, tick.countIn, recording);
+            }
+            if (sequencer->consumeCountInStart() && midiClock)
+                midiClock->startTransport();
         }
+        else
+            metronome.beginBlock(false);
 
         for (auto& bus : sendBuses)
             bus.clearBuffer();
@@ -1203,8 +1231,27 @@ public:
             mainR[i] *= masterLevel;
         }
 
+        if (silenceSamplesLeft > 0)
+        {
+            juce::FloatVectorOperations::clear(mainL, numSamples);
+            juce::FloatVectorOperations::clear(mainR, numSamples);
+            silenceSamplesLeft -= numSamples;
+            if (silenceSamplesLeft <= 0)
+                silenceNow();
+        }
+
         if (resampler.getSource() == Resampler::MASTER)
             resampler.process(mainL, mainR, numSamples, beatAtStart, beatsPerSample, seqPlaying);
+
+        // The click goes in last: past the master effects, the limiter and the master volume (it
+        // cannot pump the mix), past the silence above and past the resampler (never in a sample).
+        // Only while it sounds, the sum is kept within full scale.
+        if (metronome.isSounding())
+        {
+            metronome.render(mainL, mainR, numSamples);
+            juce::FloatVectorOperations::clip(mainL, mainL, -1.0f, 1.0f, numSamples);
+            juce::FloatVectorOperations::clip(mainR, mainR, -1.0f, 1.0f, numSamples);
+        }
 
         if (midiClock && midiOutput)
         {
@@ -1451,9 +1498,26 @@ private:
     int currentBlockSize = 0;
 
     Resampler resampler;
+    Metronome metronome;
     juce::CriticalSection structureMutex;
     std::atomic<int> skippedBlocks { 0 };
+    std::atomic<bool> silenceRequested { false };
+    int silenceSamplesLeft = 0;         // audio thread only
+
+    // Audio thread: every note off, every insert chain and send bus emptied.
+    void silenceNow()
+    {
+        for (auto& e : engines)
+            if (e) e->allNotesOff();
+        for (auto& chain : trackInsertChains)
+            chain.reset();
+        for (auto& bus : sendBuses)
+            bus.getChain().reset();
+    }
 public:
+    // Stop everything that sounds: notes are released and effect tails cut at the next block.
+    // The way out of any effect that rings on (Shift + Play).
+    void requestSilence() { silenceRequested.store(true, std::memory_order_relaxed); }
     int getSkippedBlocks() const { return skippedBlocks.load(); }     // blocks silenced by a rebuild
 private:
     std::vector<float> scratchL;

@@ -55,7 +55,8 @@ src/
 │   ├── WaveSeqEngine.h     — wave sequencing
 │   ├── SamplerEngine.h, SampleBank.h — sampler (with granular mode) and its samples
 │   ├── Resampler.h         — records a track or the master into a new sample
-│   ├── DrumEngine.h, DrumVoice.h — drum kit
+│   ├── Metronome.h         — the recording click and count-in tick (mixed after the master chain)
+│   ├── DrumEngine.h, DrumVoice.h, DrumLane.h — drum kit; one drum's hits among a step's notes (STEP's drum lanes)
 │   ├── MIDITrack.h         — external MIDI output track
 │   ├── VoiceFilterSection.h, EngineLfoSection.h — per-voice filter; two LFOs, their destination lists and the
 │   │                         STRIP page, shared by the non-unified engines
@@ -66,6 +67,7 @@ src/
 │   ├── filters/            — SVF, SEM, ladder, diode, comb; FilterSlot.h offers them by type and mode
 │   ├── effects/            — EffectBase.h, EffectChain.h, TrackFx.h (DIRT / TALK / MODFX blocks), FxBlocks.h (shared
 │   │                         building blocks), one header per effect
+│   ├── WaveTables.h, WaveMorph.h — the wavetable engine's built-in tables; key-frame morph algorithms and their FFT
 │   └── Envelope.h, EnvelopeChain.h, LFO.h, ModMatrix.h, DSPUtils.h
 ├── arpeggiator/            — Arpeggiator.h (one per track), VariationMacros.h, MutateSystem.h, RhythmCapture.h
 ├── ui/

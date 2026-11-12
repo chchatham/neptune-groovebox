@@ -13,6 +13,10 @@ struct Preset
     ParamMap soundParams;
     std::vector<ModSlot> modSlots;
     bool isFactory = false;
+    // Sampler / wavetable: the name of the sample the sound uses. soundParams holds its place in the
+    // SampleBank as well, but places move when sample files are added: the name decides
+    // (PresetManager::soundOf). Empty = the place alone (presets saved before this existed).
+    juce::String sampleName;
 
     juce::var toVar() const
     {
@@ -21,6 +25,8 @@ struct Preset
         obj->setProperty("category", category);
         obj->setProperty("engineType", static_cast<int>(engineType));
         obj->setProperty("isFactory", isFactory);
+        if (sampleName.isNotEmpty())
+            obj->setProperty("sample", sampleName);
 
         juce::Array<juce::var> paramsArray;
         for (auto& [id, value] : soundParams)
@@ -56,6 +62,7 @@ struct Preset
             p.category = obj->getProperty("category").toString();
             p.engineType = static_cast<EngineType>((int) obj->getProperty("engineType"));
             p.isFactory = (bool) obj->getProperty("isFactory");
+            p.sampleName = obj->getProperty("sample").toString();
 
             if (auto* params = obj->getProperty("params").getArray())
             {

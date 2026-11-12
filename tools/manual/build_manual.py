@@ -79,6 +79,9 @@ def norm_label(label, device, page):
     if device == "Wave seq":
         m = re.fullmatch(r"([PSLT])\d+", label)
         if m: return m.group(1) + "#", f"{m.group(1)}1–{m.group(1)}16"
+    if device == "Wavetable":
+        m = re.fullmatch(r"(SMP|POS|PLC)\d", label)
+        if m: return m.group(1) + "#", f"{m.group(1)}1–{m.group(1)}8"
     if re.fullmatch(r"CC\d+", label): return "CC#", "CC16–CC23"
     return label, label
 

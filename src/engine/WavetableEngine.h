@@ -8,6 +8,8 @@
 #include "../dsp/Envelope.h"
 #include "../dsp/EnvelopeChain.h"
 #include "../dsp/DSPUtils.h"
+#include "../dsp/WaveMorph.h"
+#include "../dsp/WaveTables.h"
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <array>
 #include <atomic>
@@ -149,6 +151,33 @@ struct Wavetable
                 }
                 frames[(size_t) level][(size_t) f] = acc;
             }
+        }
+    }
+
+    // The same mip chain once more, by Fourier transform: one analysis per frame and one
+    // synthesis per level. Level 0 is left exactly as it is. For the tables built while playing
+    // (the key-frame table is rebuilt at every turn of one of its knobs) and the newer built-in ones.
+    void buildMipMapsFFT()
+    {
+        if (frames.empty() || frames[0].empty())
+            return;
+
+        numFrames = (int) frames[0].size();
+        int levels = 1;
+        int harmonics = kFrameSize / 2;
+        while (harmonics > 1 && levels < kMaxMipLevels)
+        {
+            harmonics /= 2;
+            ++levels;
+        }
+        frames.resize((size_t) levels);
+        for (int level = 1; level < levels; ++level)
+            frames[(size_t) level].resize((size_t) numFrames);
+        for (int f = 0; f < numFrames; ++f)
+        {
+            const wavemorph::Spectrum spectrum = wavemorph::analyse(frames[0][(size_t) f]);
+            for (int level = 1; level < levels; ++level)
+                frames[(size_t) level][(size_t) f] = wavemorph::synthesise(spectrum, (kFrameSize / 2) >> level);
         }
     }
 
@@ -700,7 +729,63 @@ struct WavetableFactory
         return tables;
     }
 
-    // Returns all built-in factory tables
+    // The newer built-in tables (src/dsp/WaveTables.h), built once and shared like the first nine.
+    // They are a list of their own, so the first nine keep their numbers; builtInTables() is the
+    // two lists one after the other.
+    static const std::vector<Wavetable>& sharedMoreTables()
+    {
+        static const std::vector<Wavetable> tables = []
+        {
+            std::vector<Wavetable> list;
+            for (auto& def : wavetables::definitions())
+            {
+                Wavetable wt;
+                wt.name = def.label;
+                wt.frames.resize(1);
+                wt.frames[0] = def.make();
+                wt.buildMipMapsFFT();
+                list.push_back(std::move(wt));
+            }
+            return list;
+        }();
+        return tables;
+    }
+
+    // ---- The built-in set: the one list of tables every oscillator in the program reads ----------
+    // The first nine, then the newer ones in the order of wavetables::definitions(); read only,
+    // built on first use (call it from the message thread before audio runs: both engines'
+    // constructors do). The wavetable engine's TABL puts its own USER and KEYS tables after the
+    // first nine; the unified voice's oscillator slots offer exactly this list (nTBL is an index
+    // into it). Both orders are stored in projects: new tables go at the end.
+    static constexpr int NUM_FIRST_TABLES = 9;
+    static const std::vector<const Wavetable*>& builtInTables()
+    {
+        static const std::vector<const Wavetable*> list = []
+        {
+            std::vector<const Wavetable*> l;
+            for (auto& t : sharedFactoryTables())
+                l.push_back(&t);
+            for (auto& t : sharedMoreTables())
+                l.push_back(&t);
+            return l;
+        }();
+        return list;
+    }
+    static int builtInCount() { return NUM_FIRST_TABLES + (int) wavetables::definitions().size(); }
+    // What a table cell shows for each of them, in the same order.
+    static const char* const* builtInLabels()
+    {
+        static const std::vector<const char*> labels = []
+        {
+            std::vector<const char*> l { "SAW", "SQR", "TRI", "SIN", "PWM", "FORM", "HARM", "SPEC", "DIGI" };
+            for (auto& def : wavetables::definitions())
+                l.push_back(def.label);
+            return l;
+        }();
+        return labels.data();
+    }
+
+    // Returns the first nine built-in tables
     static std::vector<Wavetable> createAllFactoryTables()
     {
         std::vector<Wavetable> tables;
@@ -718,6 +803,244 @@ struct WavetableFactory
 };
 
 // ============================================================================
+// Key frames: a table made from a few single cycles taken out of samples.
+//
+// The player picks up to eight waves (KEY 1 .. 8: a sample and a place in it), puts them along
+// the table, and the frames between two neighbouring keys are computed by one of the algorithms
+// of wavemorph::morph(). The frames AT the keys are the key waves themselves.
+//
+// extract()  one cycle out of a sample, as its harmonics. Where the sample has a clear pitch at
+//            that place (WavetableFactory::PeriodFinder, as for the aligned USER table) the cycle
+//            is exactly one period, so the wave plays at the pitch of the key whatever the pitch
+//            of the recording; where it has none (noise, a drum, a chord) it is a piece of about
+//            12 ms. The period is read with cubic interpolation at 256 points or more (the next
+//            power of two above its length), the step where its end meets its start is spread over
+//            the cycle, and only harmonics 1 .. 127 are kept: a long period is band-limited on its
+//            way into a frame instead of aliasing.
+// build()    the table. Each key is limited to HARM harmonics, tilted by TILT, turned to a common
+//            phase (ALGN) and brought to a peak of 1; the keys are put in the order of their
+//            places, the first at the first frame and the last at the last (WRAP adds the first
+//            key once more at the end), each on the frame nearest to its place.
+//
+// Message thread only (both allocate).
+// ============================================================================
+
+struct WavetableKeys
+{
+    static constexpr int MAX_KEYS = 8;
+    static constexpr int NUM_FRAME_OPTIONS = 6;
+    static int frameCount(int option)
+    {
+        static const int counts[NUM_FRAME_OPTIONS] = { 8, 16, 32, 64, 128, 256 };
+        return counts[(size_t) juce::jlimit(0, NUM_FRAME_OPTIONS - 1, option)];
+    }
+
+    enum Norm { NormOff, NormPeak, NormRms, NumNorms };
+
+    struct Settings
+    {
+        wavemorph::Algo algo = wavemorph::Algo::Linear;
+        int frames = 64;
+        float bias = 0.0f;          // -1 .. 1: the in-between frames lean towards the earlier / the later key
+        bool wrap = false;          // after the last key the table goes back to the first
+        bool align = true;          // keys turned to a common phase
+        int norm = NormRms;         // level of the frames: as computed, each to a peak of 1, all equally loud
+        float tilt = 0.0f;          // dB per octave on every key
+        int harmonics = wavemorph::H;   // highest harmonic of a key
+    };
+
+    struct Key
+    {
+        wavemorph::Spectrum spectrum;
+        float place = 0.0f;         // 0 .. 1 along the table (only the order and the spacing count)
+    };
+
+    // One cycle of the sample around `position` (0 .. 1 of its length). right may be null (mono).
+    // False when there is nothing to take.
+    static bool extract(const float* left, const float* right, int numSamples, double sampleRate, float position,
+                        wavemorph::Spectrum& out, bool* pitched = nullptr)
+    {
+        if (pitched != nullptr)
+            *pitched = false;
+        if (left == nullptr || numSamples < 64)
+            return false;
+        if (sampleRate <= 0.0)
+            sampleRate = 44100.0;
+
+        // A window of about 0.19 s around the place is all the pitch search needs.
+        const int window = juce::jmin(numSamples, juce::jmax(256, (int) (sampleRate * 0.1858)));
+        const double centre = (double) juce::jlimit(0.0f, 1.0f, position) * (double) (numSamples - 1);
+        const int windowStart = juce::jlimit(0, numSamples - window, (int) centre - window / 2);
+        std::vector<float> x((size_t) window);
+        for (int i = 0; i < window; ++i)
+            x[(size_t) i] = right != nullptr ? 0.5f * (left[windowStart + i] + right[windowStart + i]) : left[windowStart + i];
+        const double local = centre - (double) windowStart;
+
+        WavetableFactory::PeriodFinder finder(x.data(), window, sampleRate);
+        float period = finder.periodAt(local);
+        const bool isPitched = period >= 2.0f && period + 4.0f < (float) window;
+        if (! isPitched)
+            period = juce::jmin((float) window - 4.0f, (float) (sampleRate * 512.0 / 44100.0));
+        if (pitched != nullptr)
+            *pitched = isPitched;
+
+        auto at = [&x, window](double pos)         // cubic (Catmull-Rom) interpolation
+        {
+            const int i = (int) std::floor(pos);
+            const float f = (float) (pos - (double) i);
+            auto s = [&x, window](int k) { return x[(size_t) juce::jlimit(0, window - 1, k)]; };
+            const float a = s(i - 1), b = s(i), c = s(i + 1), d = s(i + 2);
+            return b + 0.5f * f * (c - a + f * (2.0f * a - 5.0f * b + 4.0f * c - d + f * (3.0f * (b - c) + d - a)));
+        };
+
+        int points = wavemorph::N;
+        while ((float) points < period && points < 4096)
+            points *= 2;
+        const double start = juce::jlimit(0.0, (double) window - 1.0 - (double) period, local - 0.5 * (double) period);
+        std::vector<float> cycle((size_t) points);
+        for (int n = 0; n < points; ++n)
+            cycle[(size_t) n] = at(start + (double) n / (double) points * (double) period);
+        // A real period does not end exactly where it began: spread that step over the cycle.
+        const float seam = at(start + (double) period) - cycle[0];
+        for (int n = 0; n < points; ++n)
+            cycle[(size_t) n] -= seam * ((float) n / (float) points - 0.5f);
+
+        out = wavemorph::analyse(cycle.data(), points);
+        return out.energy() > 1.0e-12;
+    }
+
+    // The frame each key sits on, for keys at `place` (ascending) in a table of `frames` frames:
+    // the nearest frame, and never two keys on one.
+    static std::vector<int> keyFrames(const std::vector<float>& place, int frames)
+    {
+        const int count = (int) place.size();
+        std::vector<int> index((size_t) count, 0);
+        if (count < 2)
+            return index;
+        const float span = place.back() - place.front();
+        for (int k = 0; k < count; ++k)
+        {
+            const float u = span > 1.0e-6f ? (place[(size_t) k] - place.front()) / span : (float) k / (float) (count - 1);
+            index[(size_t) k] = juce::roundToInt(u * (float) (frames - 1));
+        }
+        for (int k = 1; k < count; ++k)
+            index[(size_t) k] = juce::jmax(index[(size_t) k], index[(size_t) k - 1] + 1);
+        for (int k = count - 1; k >= 0; --k)
+            index[(size_t) k] = juce::jmin(index[(size_t) k], frames - 1 - (count - 1 - k));
+        return index;
+    }
+
+    // keyFrameIndices, if given, receives the frame of each key in the order of their places (with
+    // WRAP one more: the first key again, on the last frame).
+    static Wavetable build(std::vector<Key> keys, const Settings& s, std::vector<int>* keyFrameIndices = nullptr)
+    {
+        Wavetable wt;
+        wt.name = "KEYS";
+        wt.frames.resize(1);
+        if (keyFrameIndices != nullptr)
+            keyFrameIndices->clear();
+
+        if (keys.empty())           // nothing chosen yet: a sine
+        {
+            wt.frames[0].resize(1);
+            for (int n = 0; n < wavemorph::N; ++n)
+                wt.frames[0][0][(size_t) n] = std::sin(dsp::TWO_PI_F * (float) n / (float) wavemorph::N);
+            wt.buildMipMapsFFT();
+            return wt;
+        }
+
+        const bool classic = s.algo == wavemorph::Algo::Classic;
+        auto frameOf = [classic](const wavemorph::Spectrum& sp)
+        {
+            return classic ? wavemorph::classicFrame(sp) : wavemorph::synthesise(sp);
+        };
+
+        // The keys as they go into the table.
+        std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.place < b.place; });
+        for (auto& key : keys)
+        {
+            wavemorph::tiltAndLimit(key.spectrum, (double) s.tilt, juce::jlimit(1, wavemorph::H, s.harmonics));
+            if (s.align)
+                wavemorph::alignToFundamental(key.spectrum);
+            const float peak = wavemorph::peakOf(wavemorph::synthesise(key.spectrum));
+            if (peak > 1.0e-9f)
+                wavemorph::scale(key.spectrum, 1.0 / (double) peak);
+        }
+
+        std::vector<float> place;
+        for (auto& key : keys)
+            place.push_back(key.place);
+        if (s.wrap && keys.size() > 1)
+        {
+            // The way back to the first key is as long as the average step between two keys.
+            keys.push_back(keys.front());
+            const float span = place.back() - place.front();
+            place.push_back(place.back() + (span > 1.0e-6f ? span / (float) (place.size() - 1) : 1.0f));
+        }
+
+        const int count = (int) keys.size();
+        const int frames = count == 1 ? 1 : juce::jlimit(count, Wavetable::kMaxFrames, s.frames);
+        const std::vector<int> index = keyFrames(place, frames);
+        if (keyFrameIndices != nullptr)
+            *keyFrameIndices = index;
+
+        wt.frames[0].resize((size_t) frames);
+        const double exponent = std::pow(4.0, -(double) juce::jlimit(-1.0f, 1.0f, s.bias));
+        int segment = 0;
+        for (int f = 0; f < frames; ++f)
+        {
+            while (segment < count - 2 && f >= index[(size_t) segment + 1])
+                ++segment;
+            const int a = index[(size_t) segment];
+            const int b = count > 1 ? index[(size_t) segment + 1] : a;
+            if (f <= a || count == 1)
+                wt.frames[0][(size_t) f] = frameOf(keys[(size_t) segment].spectrum);
+            else if (f >= b)
+                wt.frames[0][(size_t) f] = frameOf(keys[(size_t) segment + 1].spectrum);
+            else
+            {
+                const double t = std::pow((double) (f - a) / (double) (b - a), exponent);
+                wt.frames[0][(size_t) f] = frameOf(wavemorph::morph(s.algo, keys[(size_t) segment].spectrum,
+                                                                    keys[(size_t) segment + 1].spectrum, t));
+            }
+        }
+
+        // The level of the frames.
+        if (s.norm == NormPeak)
+        {
+            for (auto& frame : wt.frames[0])
+                WavetableFactory::normalizeFrame(frame);
+        }
+        else if (s.norm == NormRms)
+        {
+            // Every frame as loud as the others: as loud as the peakiest of them can be with its
+            // peak at 1 (but not below 0.25: a frame peakier than that is held at a peak of 1).
+            float target = 1.0f;
+            for (auto& frame : wt.frames[0])
+            {
+                const float peak = wavemorph::peakOf(frame);
+                if (peak > 1.0e-9f)
+                    target = juce::jmin(target, wavemorph::rmsOf(frame) / peak);
+            }
+            target = juce::jmax(0.25f, target);
+            for (auto& frame : wt.frames[0])
+            {
+                const float rms = wavemorph::rmsOf(frame);
+                if (rms <= 1.0e-9f)
+                    continue;
+                wavemorph::scale(frame, target / rms);
+                const float peak = wavemorph::peakOf(frame);
+                if (peak > 1.0f)
+                    wavemorph::scale(frame, 1.0f / peak);
+            }
+        }
+
+        wt.buildMipMapsFFT();
+        return wt;
+    }
+};
+
+// ============================================================================
 // Interpolation modes for scanning between wavetable frames.
 // ============================================================================
 
@@ -726,7 +1049,20 @@ enum class WavetableInterpMode
     Linear,     // Crossfade between adjacent frames (default)
     Spectral,   // FFT-based interpolation (expensive, highest quality)
     Stepped,    // No interpolation — snaps to nearest frame (lo-fi)
-    Vintage     // Stepped with short crossfade (8-sample xfade, retro character)
+    Vintage,    // Stepped with short crossfade (8-sample xfade, retro character)
+    // The whole read-out of an early digital wavetable instrument, from what is publicly known of
+    // how those worked: a table was 64 waves of 128 samples of 8 bits; the wave was read by a
+    // phase counter with no interpolation between samples, the scan went from one wave to the
+    // next in whole steps, and nothing was band-limited to the pitch being played. So here: the
+    // position is taken to the nearest of 64 places, the frame is read at 128 samples per cycle
+    // with each held, rounded to 8 bits, and ALWAYS from the full-bandwidth copy (never a mip
+    // level). On high notes the harmonics above half the sample rate fold back as tones that are
+    // not harmonics of the note: the glassy top such instruments are known for.
+    // Next to the two older lo-fi modes: STEP also holds samples and frames but reads the band-
+    // limited copy (grainy, no aliasing); VINT interpolates samples and softens each frame step
+    // (smooth, no aliasing); this one leaves everything raw.
+    Classic,
+    Count
 };
 
 // ============================================================================
@@ -744,6 +1080,123 @@ enum class WavetableScanMode
     Step,   // once through in STEP plateaus, then hold
     Rand,   // a random frame, a new one STEP times per pass
     Count
+};
+
+// ============================================================================
+// WavetableRead — how a table is read: the one read-out in the program.
+//
+// One sample of a table is a function of the table, the position along it, the
+// phase within the cycle, the pitch (as phase advance per sample, which picks the
+// band-limited copy) and the INTP mode, and of nothing else: there is no memory
+// between samples. The wavetable engine's voices call it with their own phase,
+// and so do the unified voice's oscillator slots set to WT (UnifiedVoice::
+// generateOsc, where every oscillator kind has to be a function of the slot's
+// phase). What needs memory - the timed scan, glide, the position motion - is in
+// WavetableVoice and decides only WHICH position and phase are asked for.
+// ============================================================================
+
+struct WavetableRead
+{
+    // The copy whose harmonics all stay under half the sample rate when the phase advances by
+    // phaseInc (cycles per sample): each level halves the harmonics.
+    static int mipLevel(const Wavetable& table, double phaseInc)
+    {
+        const int last = table.getMipLevelCount() - 1;
+        int level = 0;
+        for (double ratio = phaseInc * 2.0 * Wavetable::kFrameSize; ratio > 1.0 && level < last; ratio *= 0.5)
+            ++level;
+        return level;
+    }
+
+    // position 0 .. 1 along the table, phase 0 .. 1 within the cycle.
+    static float sample(const Wavetable& table, int mipLevel, float position, double phase,
+                        WavetableInterpMode interpMode = WavetableInterpMode::Linear)
+    {
+        if (mipLevel < 0 || mipLevel >= table.getMipLevelCount())
+            return 0.0f;
+
+        const auto& levelFrames = table.frames[(size_t) mipLevel];
+        int nFrames = (int) levelFrames.size();
+        if (nFrames == 0) return 0.0f;
+
+        // Frame position from the position parameter
+        float framePos = position * (float) (nFrames - 1);
+        int frameA = juce::jlimit(0, nFrames - 1, (int) framePos);
+        int frameB = juce::jlimit(0, nFrames - 1, frameA + 1);
+        float frameFrac = framePos - (float) frameA;
+
+        // Sample position within frame
+        float samplePos = (float) phase * Wavetable::kFrameSize;
+        int sampleA = ((int) samplePos) % Wavetable::kFrameSize;
+        int sampleB = (sampleA + 1) % Wavetable::kFrameSize;
+        float sampleFrac = samplePos - std::floor(samplePos);
+
+        switch (interpMode)
+        {
+            case WavetableInterpMode::Count:
+            case WavetableInterpMode::Spectral:
+                // Falls through to Linear (true FFT interpolation not yet implemented;
+                // mip-mapped tables already provide spectral quality).
+                [[fallthrough]];
+            case WavetableInterpMode::Linear:
+            {
+                float valA = dsp::lerp(levelFrames[(size_t) frameA][(size_t) sampleA],
+                                       levelFrames[(size_t) frameA][(size_t) sampleB],
+                                       sampleFrac);
+                float valB = dsp::lerp(levelFrames[(size_t) frameB][(size_t) sampleA],
+                                       levelFrames[(size_t) frameB][(size_t) sampleB],
+                                       sampleFrac);
+                return dsp::lerp(valA, valB, frameFrac);
+            }
+
+            case WavetableInterpMode::Stepped:
+            {
+                // Nearest frame, nearest sample — lo-fi digital character
+                int nearestFrame = juce::jlimit(0, nFrames - 1, (int) std::round(framePos));
+                int nearestSample = ((int) std::round(samplePos)) % Wavetable::kFrameSize;
+                return levelFrames[(size_t) nearestFrame][(size_t) nearestSample];
+            }
+
+            case WavetableInterpMode::Classic:
+            {
+                const auto& raw = table.frames[0];
+                const int place = (int) std::lround(position * 63.0f);
+                const int frame = juce::jlimit(0, nFrames - 1, (int) std::lround((float) place * (float) (nFrames - 1) / 63.0f));
+                const float v = raw[(size_t) frame][(size_t) (sampleA & ~1)];
+                return std::round(v * 127.0f) * (1.0f / 127.0f);
+            }
+
+            case WavetableInterpMode::Vintage:
+            {
+                // Stepped frames with short crossfade (retro digital character)
+                int nearestFrame = juce::jlimit(0, nFrames - 1, (int) std::round(framePos));
+
+                // Within-frame: linear interpolation on samples
+                float val = dsp::lerp(levelFrames[(size_t) nearestFrame][(size_t) sampleA],
+                                      levelFrames[(size_t) nearestFrame][(size_t) sampleB],
+                                      sampleFrac);
+
+                // Short crossfade near frame boundaries (8 samples worth)
+                float crossfadeZone = 8.0f / Wavetable::kFrameSize;
+                float distToEdge = frameFrac < 0.5f ? frameFrac : (1.0f - frameFrac);
+                if (distToEdge < crossfadeZone && frameA != frameB)
+                {
+                    int otherFrame = frameFrac < 0.5f
+                        ? juce::jlimit(0, nFrames - 1, nearestFrame - 1)
+                        : juce::jlimit(0, nFrames - 1, nearestFrame + 1);
+                    float otherVal = dsp::lerp(levelFrames[(size_t) otherFrame][(size_t) sampleA],
+                                               levelFrames[(size_t) otherFrame][(size_t) sampleB],
+                                               sampleFrac);
+                    float xfade = distToEdge / crossfadeZone;
+                    val = dsp::lerp(otherVal, val, xfade);
+                }
+
+                return val;
+            }
+        }
+
+        return 0.0f;
+    }
 };
 
 // ============================================================================
@@ -935,19 +1388,8 @@ public:
         double freq = baseFrequency * std::exp2((double) octaveShift + detuneCents / 1200.0 + (pitchOffset + lfoSemis) / 12.0);
         double phaseInc = freq / sampleRate;
 
-        // Select mip level based on frequency to avoid aliasing
-        int mipLevel = 0;
-        if (wavetable->getMipLevelCount() > 1)
-        {
-            // Each mip level halves the maximum safe playback frequency
-            double maxFreqForLevel0 = sampleRate / (2.0 * Wavetable::kFrameSize);
-            double ratio = freq / maxFreqForLevel0;
-            while (ratio > 1.0 && mipLevel < wavetable->getMipLevelCount() - 1)
-            {
-                ratio *= 0.5;
-                ++mipLevel;
-            }
-        }
+        // The band-limited copy for this pitch
+        const int mipLevel = WavetableRead::mipLevel(*wavetable, phaseInc);
 
         // Read from wavetable with position-based frame interpolation
         float sample = readWavetable(mipLevel, phase);
@@ -1077,82 +1519,10 @@ private:
         return pos;
     }
 
+    // The shared read-out (WavetableRead), at this voice's position and INTP.
     float readWavetable(int mipLevel, double phase) const
     {
-        if (wavetable == nullptr || mipLevel >= wavetable->getMipLevelCount())
-            return 0.0f;
-
-        const auto& levelFrames = wavetable->frames[(size_t) mipLevel];
-        int nFrames = (int) levelFrames.size();
-        if (nFrames == 0) return 0.0f;
-
-        // Frame position from the position parameter
-        float framePos = effectivePosition * (float) (nFrames - 1);
-        int frameA = juce::jlimit(0, nFrames - 1, (int) framePos);
-        int frameB = juce::jlimit(0, nFrames - 1, frameA + 1);
-        float frameFrac = framePos - (float) frameA;
-
-        // Sample position within frame
-        float samplePos = (float) phase * Wavetable::kFrameSize;
-        int sampleA = ((int) samplePos) % Wavetable::kFrameSize;
-        int sampleB = (sampleA + 1) % Wavetable::kFrameSize;
-        float sampleFrac = samplePos - std::floor(samplePos);
-
-        switch (interpMode)
-        {
-            case WavetableInterpMode::Spectral:
-                // Falls through to Linear (true FFT interpolation not yet implemented;
-                // mip-mapped tables already provide spectral quality).
-                [[fallthrough]];
-            case WavetableInterpMode::Linear:
-            {
-                float valA = dsp::lerp(levelFrames[(size_t) frameA][(size_t) sampleA],
-                                       levelFrames[(size_t) frameA][(size_t) sampleB],
-                                       sampleFrac);
-                float valB = dsp::lerp(levelFrames[(size_t) frameB][(size_t) sampleA],
-                                       levelFrames[(size_t) frameB][(size_t) sampleB],
-                                       sampleFrac);
-                return dsp::lerp(valA, valB, frameFrac);
-            }
-
-            case WavetableInterpMode::Stepped:
-            {
-                // Nearest frame, nearest sample — lo-fi digital character
-                int nearestFrame = juce::jlimit(0, nFrames - 1, (int) std::round(framePos));
-                int nearestSample = ((int) std::round(samplePos)) % Wavetable::kFrameSize;
-                return levelFrames[(size_t) nearestFrame][(size_t) nearestSample];
-            }
-
-            case WavetableInterpMode::Vintage:
-            {
-                // Stepped frames with short crossfade (retro digital character)
-                int nearestFrame = juce::jlimit(0, nFrames - 1, (int) std::round(framePos));
-
-                // Within-frame: linear interpolation on samples
-                float val = dsp::lerp(levelFrames[(size_t) nearestFrame][(size_t) sampleA],
-                                      levelFrames[(size_t) nearestFrame][(size_t) sampleB],
-                                      sampleFrac);
-
-                // Short crossfade near frame boundaries (8 samples worth)
-                float crossfadeZone = 8.0f / Wavetable::kFrameSize;
-                float distToEdge = frameFrac < 0.5f ? frameFrac : (1.0f - frameFrac);
-                if (distToEdge < crossfadeZone && frameA != frameB)
-                {
-                    int otherFrame = frameFrac < 0.5f
-                        ? juce::jlimit(0, nFrames - 1, nearestFrame - 1)
-                        : juce::jlimit(0, nFrames - 1, nearestFrame + 1);
-                    float otherVal = dsp::lerp(levelFrames[(size_t) otherFrame][(size_t) sampleA],
-                                               levelFrames[(size_t) otherFrame][(size_t) sampleB],
-                                               sampleFrac);
-                    float xfade = distToEdge / crossfadeZone;
-                    val = dsp::lerp(otherVal, val, xfade);
-                }
-
-                return val;
-            }
-        }
-
-        return 0.0f;
+        return wavetable != nullptr ? WavetableRead::sample(*wavetable, mipLevel, effectivePosition, phase, interpMode) : 0.0f;
     }
 
     double sampleRate = 44100.0;
@@ -1259,6 +1629,18 @@ public:
         ScanDirection = 30,    // 0 = forward, 1 = reverse
         ScanSpeed = 31,        // 0.25 .. 4: the pass is this many times faster (1 = 100 %)
         UserFrames = 32,       // how the USER table is cut: index into userFrameCounts, +3 = period-aligned
+        // The KEYS table (WavetableKeys): pages KEYS, K SMP, K POS and K PLC. Rebuild parameters all.
+        KeyAlgo = 33,          // wavemorph::Algo index: how the frames between two keys are computed
+        KeyFrames = 34,        // index into WavetableKeys::frameCount
+        KeyBias = 35,          // -1 .. 1
+        KeyWrap = 36,          // 0 / 1
+        KeyAlign = 37,         // 0 / 1
+        KeyNorm = 38,          // WavetableKeys::Norm
+        KeyTilt = 39,          // dB per octave
+        KeyHarmonics = 40,     // highest harmonic of a key, 1 .. 127
+        KeySampleBase = 41,    // 41-48: key n's sample, 0 = OFF, else SampleBank index + 1
+        KeyPositionBase = 49,  // 49-56: where in its sample key n is taken, 0 .. 1
+        KeyPlaceBase = 57,     // 57-64: where along the table key n sits, 0 .. 1
         FilterBase = 100       // 100-115: the per-voice filter (VoiceFilterSection offsets)
     };
 
@@ -1267,18 +1649,25 @@ public:
     {
         voices.resize((size_t) maxVoices);
 
-        // Build factory tables (done once at construction, not on audio thread)
-        tables = WavetableFactory::sharedFactoryTables();
-
-        // One more: USER, built from a sample (a recording made in the app, or a file). Until one
-        // is chosen it is a copy of the sine table.
-        tables.reserve(tables.size() + 1);
-        tables.push_back(tables[3]);
-        tables.back().name = "USER";
+        // The built-in tables are shared by every engine (built once, read only); the engine owns
+        // the two made from samples. USER (a recording made in the app, or a file, cut into frames)
+        // and KEYS (key frames) are copies of the sine table until something is chosen.
+        const auto& builtIn = WavetableFactory::builtInTables();
+        for (int i = 0; i < WavetableFactory::NUM_FIRST_TABLES; ++i)
+            tables.push_back(builtIn[(size_t) i]);
+        userTable = *builtIn[3];
+        userTable.name = "USER";
+        keyTable = *builtIn[3];
+        keyTable.name = "KEYS";
+        tables.push_back(&userTable);
+        tables.push_back(&keyTable);
+        for (size_t i = (size_t) WavetableFactory::NUM_FIRST_TABLES; i < builtIn.size(); ++i)
+            tables.push_back(builtIn[i]);
+        jassert((int) tables.size() == NUM_TABLES);
 
         // Point all voices at the first table
         for (auto& v : voices)
-            v.setWavetable(tables.empty() ? nullptr : &tables[0]);
+            v.setWavetable(tables[0]);
         setScanSeed(0x4E455054u);
 
         allocator.setNoteOnCallback([this](int voiceIdx, const Voice& v)
@@ -1340,6 +1729,60 @@ public:
     // The run sets the base and the others add to it; the sum stops at the two ends of the table.
     // (With MODE = OFF the MSPD motion wraps around the table as it always has; under a run it is
     // clamped like the rest, so a held last frame does not jump to the first.)
+    // ---- The table list ---------------------------------------------------------------------
+    // TABL is an index and is stored in projects: 0-8 the first built-in tables, 9 USER, 10 KEYS,
+    // 11 on the newer built-in tables in the order of wavetables::definitions(). New ones go at
+    // the end.
+    static constexpr int USER_TABLE = 9;
+    static constexpr int KEY_TABLE = 10;
+    static constexpr int FIRST_MORE_TABLE = 11;
+    static constexpr int NUM_MORE_TABLES = 14;
+    static constexpr int NUM_TABLES = FIRST_MORE_TABLE + NUM_MORE_TABLES;
+    static const char* const* tableLabels()
+    {
+        static const std::array<const char*, NUM_TABLES> names = []
+        {
+            std::array<const char*, NUM_TABLES> n {};
+            const char* const* builtIn = WavetableFactory::builtInLabels();
+            jassert(WavetableFactory::builtInCount() == NUM_TABLES - 2);
+            for (int i = 0; i < USER_TABLE; ++i)
+                n[(size_t) i] = builtIn[i];
+            n[(size_t) USER_TABLE] = "USER";
+            n[(size_t) KEY_TABLE] = "KEYS";
+            for (int i = USER_TABLE; i < WavetableFactory::builtInCount() && i + 2 < NUM_TABLES; ++i)
+                n[(size_t) (i + 2)] = builtIn[i];
+            return n;
+        }();
+        return names.data();
+    }
+
+    // ---- The key-frame pages ------------------------------------------------------------------
+    // KEYS   ALGO  how the frames between two keys are made: LIN crossfade, STEP none (the nearer
+    //              key), CLSC crossfade stored as 128 samples of 8 bits, PHAS level and phase of
+    //              each harmonic separately, TRNS the energy glides along the harmonics (optimal
+    //              transport), VOC envelope first, fine structure after (vocoder cross-synthesis
+    //              half way). See wavemorph::morph().
+    //        KFRM  frames in the table: 8 .. 256.
+    //        BIAS  the frames between lean towards the earlier (-) or the later (+) key.
+    //        WRAP  ON: after the last key the table returns to the first (for LOOP scans).
+    //        ALGN  ON: every key is turned so that its fundamental starts like a sine.
+    //        NORM  OFF as computed / PEAK every frame to full scale / RMS every frame equally loud.
+    //        TILT  dB per octave on every key.  HARM  the highest harmonic of a key.
+    // K SMP  SMP1-8  the sample key n is taken from; OFF = the key is not used.
+    // K POS  POS1-8  where in that sample.
+    // K PLC  PLC1-8  where along the table. Only the order and the spacing count: the earliest key
+    //                in use is the first frame, the latest the last.
+    static const char* const* keySampleNames()
+    {
+        static std::array<const char*, SampleBank::MAX_ENTRIES + 1> names {};
+        auto& bank = SampleBank::get();
+        names[0] = "OFF";
+        for (int i = 0; i < bank.size() && i < SampleBank::MAX_ENTRIES; ++i)
+            names[(size_t) i + 1] = bank.names()[i];
+        return names.data();
+    }
+    static bool isKeyParam(ParamId id) { return id >= KeyAlgo && id < KeyPlaceBase + WavetableKeys::MAX_KEYS; }
+
     static constexpr int NUM_SCAN_LENGTHS = 9;
     static constexpr int NUM_SCAN_STEPS = 5;
     static constexpr int NUM_USER_FRAME_OPTIONS = 6;
@@ -1370,8 +1813,14 @@ public:
         static const char* const scanSteps[] = { "4", "8", "16", "32", "64" };
         static const char* const scanDirs[] = { "FWD", "REV" };
         static const char* const userFrames[] = { "64", "128", "256", "A64", "A128", "A256" };
-        static const char* const tableNames[] = { "SAW", "SQR", "TRI", "SIN", "PWM", "FORM", "HARM", "SPEC", "DIGI", "USER" };
-        static const char* const interp[] = { "LIN", "SPEC", "STEP", "VINT" };
+        static const char* const interp[] = { "LIN", "SPEC", "STEP", "VINT", "CLSC" };
+        static const char* const keyAlgos[] = { "LIN", "STEP", "CLSC", "PHAS", "TRNS", "VOC" };
+        static const char* const keyFrames[] = { "8", "16", "32", "64", "128", "256" };
+        static const char* const offOn[] = { "OFF", "ON" };
+        static const char* const keyNorms[] = { "OFF", "PEAK", "RMS" };
+        static const char* const smpLabels[] = { "SMP1", "SMP2", "SMP3", "SMP4", "SMP5", "SMP6", "SMP7", "SMP8" };
+        static const char* const posLabels[] = { "POS1", "POS2", "POS3", "POS4", "POS5", "POS6", "POS7", "POS8" };
+        static const char* const plcLabels[] = { "PLC1", "PLC2", "PLC3", "PLC4", "PLC5", "PLC6", "PLC7", "PLC8" };
         static const char* const chain[] = { "OFF", "SER", "PAR" };
         static const char* const combine[] = { "SUM", "MAX" };
         auto L = ParamKind::Linear; auto G = ParamKind::Log; auto I = ParamKind::Int; auto C = ParamKind::Choice;
@@ -1379,13 +1828,13 @@ public:
         {
           ParamPages l = {
             { "WAVE", "SRC", {{
-                { "TABL", TableSelect, 0, USER_TABLE, 0, C, "", tableNames, USER_TABLE + 1 },
+                { "TABL", TableSelect, 0, NUM_TABLES - 1, 0, C, "", tableLabels(), NUM_TABLES },
                 { "POS",  Position, 0, 1, 0, L },
                 { "MSPD", MorphSpeed, 0, 10, 0, L, "Hz" },
                 { "MDPT", MorphDepth, 0, 1, 1, L },
                 { "ENVP", EnvToPosition, -1, 1, 0, L },
                 { "VELP", VelToPosition, 0, 1, 0, L },
-                { "INTP", InterpMode, 0, 3, 0, C, "", interp, 4 },
+                { "INTP", InterpMode, 0, (float) ((int) WavetableInterpMode::Count - 1), 0, C, "", interp, (int) WavetableInterpMode::Count },
                 { "LEVL", Level, 0, 1, 0.8f, L } }} },
             { "SCAN", "SRC", {{
                 { "MODE", ScanMode, 0, (float) ((int) WavetableScanMode::Count - 1), 0, C, "", scanModes, (int) WavetableScanMode::Count },
@@ -1414,7 +1863,29 @@ public:
                 { "CHAN", EnvChainMode, 0, 2, 0, C, "", chain, 3 },
                 { "STGS", EnvChainStages, 1, 8, 2, I },
                 { "COMB", EnvChainCombine, 0, 1, 0, C, "", combine, 2 } }} },
+            { "KEYS", "KEYS", {{
+                { "ALGO", KeyAlgo, 0, (float) ((int) wavemorph::Algo::Count - 1), 0, C, "", keyAlgos, (int) wavemorph::Algo::Count },
+                { "KFRM", KeyFrames, 0, WavetableKeys::NUM_FRAME_OPTIONS - 1, 3, C, "", keyFrames, WavetableKeys::NUM_FRAME_OPTIONS },
+                { "BIAS", KeyBias, -1, 1, 0, L },
+                { "WRAP", KeyWrap, 0, 1, 0, C, "", offOn, 2 },
+                { "ALGN", KeyAlign, 0, 1, 1, C, "", offOn, 2 },
+                { "NORM", KeyNorm, 0, WavetableKeys::NumNorms - 1, WavetableKeys::NormRms, C, "", keyNorms, WavetableKeys::NumNorms },
+                { "TILT", KeyTilt, -6, 6, 0, L },
+                { "HARM", KeyHarmonics, 1, wavemorph::H, wavemorph::H, I } }} },
           };
+          {
+              ParamPage smp { "K SMP", "KEYS", {} }, pos { "K POS", "KEYS", {} }, plc { "K PLC", "KEYS", {} };
+              const int bank = SampleBank::get().size();
+              for (int k = 0; k < WavetableKeys::MAX_KEYS; ++k)
+              {
+                  smp.params[(size_t) k] = { smpLabels[k], KeySampleBase + k, 0, (float) bank, 0, C, "", keySampleNames(), bank + 1 };
+                  pos.params[(size_t) k] = { posLabels[k], KeyPositionBase + k, 0, 1, defaultKeyPosition(k), L };
+                  plc.params[(size_t) k] = { plcLabels[k], KeyPlaceBase + k, 0, 1, defaultKeyPlace(k), L };
+              }
+              l.push_back(smp);
+              l.push_back(pos);
+              l.push_back(plc);
+          }
           VoiceFilterSection::appendPages(l, FilterBase);
           EngineLfoSection(lfoDests(&l)).appendPages(l);
           return l;
@@ -1461,12 +1932,27 @@ public:
         return l;
     }
 
-    bool isRebuildParam(ParamId id) const override { return id == UserSample || id == UserFrames; }
+    // A key's first place in its sample and along the table: eight keys spread over both, so
+    // that choosing one sample for several keys already gives a table that moves.
+    static float defaultKeyPosition(int key) { return ((float) key + 0.5f) / (float) WavetableKeys::MAX_KEYS; }
+    static float defaultKeyPlace(int key) { return (float) key / (float) (WavetableKeys::MAX_KEYS - 1); }
+
+    bool isRebuildParam(ParamId id) const override { return id == UserSample || id == UserFrames || isKeyParam(id); }
 
     ParamPages getParamPages() const override
     {
         ParamPages out = pages();
         filterSection.updateModeCell(out);
+        // The sample bank grows while the app runs (recordings).
+        const int bank = SampleBank::get().size();
+        for (auto& page : out)
+            for (auto& p : page.params)
+                if (p.id >= KeySampleBase && p.id < KeySampleBase + WavetableKeys::MAX_KEYS)
+                {
+                    p.choices = keySampleNames();
+                    p.numChoices = bank + 1;
+                    p.maxVal = (float) bank;
+                }
         return out;
     }
 
@@ -1496,14 +1982,22 @@ public:
         auto* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer(1) : nullptr;
         int numSamples = buffer.getNumSamples();
 
-        if (userReady.load(std::memory_order_relaxed))
+        if (userReady.load(std::memory_order_relaxed) || keyReady.load(std::memory_order_relaxed))
         {
             const juce::SpinLock::ScopedTryLockType lock(userLock);
             if (lock.isLocked())
             {
-                std::swap(tables[(size_t) USER_TABLE], userPending);     // the voices' pointers stay valid
-                userSeconds = userPendingSeconds;
-                userReady.store(false, std::memory_order_relaxed);
+                if (userReady.load(std::memory_order_relaxed))
+                {
+                    std::swap(userTable, userPending);      // the voices' pointers stay valid
+                    userSeconds = userPendingSeconds;
+                    userReady.store(false, std::memory_order_relaxed);
+                }
+                if (keyReady.load(std::memory_order_relaxed))
+                {
+                    std::swap(keyTable, keyPending);
+                    keyReady.store(false, std::memory_order_relaxed);
+                }
             }
         }
 
@@ -1702,8 +2196,23 @@ public:
             case ScanDirection:  return "Scan Direction";
             case ScanSpeed:      return "Scan Speed";
             case UserFrames:     return "User Frames";
-            default:             return "Param " + juce::String(id);
+            case KeyAlgo:        return "Key Algorithm";
+            case KeyFrames:      return "Key Table Frames";
+            case KeyBias:        return "Key Bias";
+            case KeyWrap:        return "Key Wrap";
+            case KeyAlign:       return "Key Align";
+            case KeyNorm:        return "Key Level";
+            case KeyTilt:        return "Key Tilt";
+            case KeyHarmonics:   return "Key Harmonics";
+            default:             break;
         }
+        if (id >= KeySampleBase && id < KeySampleBase + WavetableKeys::MAX_KEYS)
+            return "Key " + juce::String(id - KeySampleBase + 1) + " Sample";
+        if (id >= KeyPositionBase && id < KeyPositionBase + WavetableKeys::MAX_KEYS)
+            return "Key " + juce::String(id - KeyPositionBase + 1) + " Position";
+        if (id >= KeyPlaceBase && id < KeyPlaceBase + WavetableKeys::MAX_KEYS)
+            return "Key " + juce::String(id - KeyPlaceBase + 1) + " Place";
+        return "Param " + juce::String(id);
     }
 
     int getParameterCount() const override { return 24; }
@@ -1712,13 +2221,12 @@ public:
     VoiceAllocator& getAllocator() { return allocator; }
     WavetableVoice& getVoice(int index) { return voices[(size_t) index]; }
     int getTableCount() const { return (int) tables.size(); }
-    const Wavetable& getTable(int index) const { return tables[(size_t) index]; }
+    const Wavetable& getTable(int index) const { return *tables[(size_t) index]; }
 
     // The USER table: the sample is cut into frames (FRMS: 64 equal pieces unless set otherwise),
     // so POS scans through the recording. Built on the calling (message) thread; the audio thread
     // swaps it in, with the sample's duration (the natural scan length), at the start of its next
     // block and does nothing else: no allocation, and only a try-lock.
-    static constexpr int USER_TABLE = 9;
     void buildUserTable(int bankIndex)
     {
         const auto* e = SampleBank::get().entry(bankIndex);
@@ -1750,6 +2258,59 @@ public:
     }
     bool userTablePending() const { return userReady.load(); }
 
+    // ---- The KEYS table ---------------------------------------------------------------------
+    // Built from the key cells whenever one of them changes while the table is in use, or when
+    // the table is chosen after they changed; on the calling (message) thread, and handed to the
+    // audio thread exactly as the USER table is. A key's cycle is taken from its sample once and
+    // kept until its sample or its position changes, so turning any other cell only recomputes
+    // the frames.
+    bool keyTablePending() const { return keyReady.load(); }
+    int getKeyCount() const
+    {
+        int n = 0;
+        for (int k = 0; k < WavetableKeys::MAX_KEYS; ++k)
+            if (SampleBank::get().entry(keySample[(size_t) k] - 1) != nullptr)
+                ++n;
+        return n;
+    }
+    // Whether key n's cycle was taken as one period of a pitched sound (as of the last build).
+    bool isKeyPitched(int key) const { return key >= 0 && key < WavetableKeys::MAX_KEYS && keyCache[(size_t) key].pitched; }
+    const WavetableKeys::Settings& getKeySettings() const { return keySettings; }
+
+    void buildKeyTable()
+    {
+        std::vector<WavetableKeys::Key> keys;
+        for (int k = 0; k < WavetableKeys::MAX_KEYS; ++k)
+        {
+            auto& cache = keyCache[(size_t) k];
+            const int bankIndex = keySample[(size_t) k] - 1;
+            const auto* e = SampleBank::get().entry(bankIndex);
+            if (e == nullptr)
+            {
+                cache.sample = -1;
+                cache.pitched = false;
+                continue;
+            }
+            if (cache.sample != bankIndex || cache.position != keyPosition[(size_t) k])
+            {
+                cache.sample = bankIndex;
+                cache.position = keyPosition[(size_t) k];
+                cache.valid = WavetableKeys::extract(e->left.data(), e->right.size() == e->left.size() ? e->right.data() : nullptr,
+                                                     (int) e->left.size(), e->sampleRate, cache.position,
+                                                     cache.spectrum, &cache.pitched);
+            }
+            if (cache.valid)
+                keys.push_back({ cache.spectrum, keyPlace[(size_t) k] });
+        }
+        setKeyTable(WavetableKeys::build(std::move(keys), keySettings));
+    }
+
+    // The same from waves given directly (tests; the bank is not involved).
+    void buildKeyTableFrom(std::vector<WavetableKeys::Key> keys)
+    {
+        setKeyTable(WavetableKeys::build(std::move(keys), keySettings));
+    }
+
     // Duration of the sample behind the USER table that is playing (0 until one has been built).
     double getUserSampleSeconds() const { return userSeconds; }
 
@@ -1778,11 +2339,62 @@ public:
         {
             currentTableIndex = index;
             for (auto& v : voices)
-                v.setWavetable(&tables[(size_t) index]);
+                v.setWavetable(tables[(size_t) index]);
+            if (index == KEY_TABLE && keyDirty)
+                buildKeyTable();
         }
     }
 
 private:
+    void setKeyTable(Wavetable wt)
+    {
+        keyDirty = false;
+        const juce::SpinLock::ScopedLockType lock(userLock);
+        keyPending = std::move(wt);
+        keyReady.store(true);
+    }
+
+    // A key cell changed: the table is rebuilt now if it is the one playing, otherwise when it
+    // is next chosen (a project that sets thirty key cells on a track playing SAW builds nothing).
+    void keysChanged()
+    {
+        keyDirty = true;
+        if (currentTableIndex == KEY_TABLE)
+            buildKeyTable();
+    }
+
+    template <typename T>
+    void setKeyValue(T& member, T value)
+    {
+        if (member == value)
+            return;
+        member = value;
+        keysChanged();
+    }
+
+    void applyKeyParameter(ParamId id, float value)
+    {
+        const int whole = (int) std::lround(value);
+        if (id >= KeySampleBase && id < KeySampleBase + WavetableKeys::MAX_KEYS)
+            setKeyValue(keySample[(size_t) (id - KeySampleBase)], juce::jlimit(0, SampleBank::MAX_ENTRIES, whole));
+        else if (id >= KeyPositionBase && id < KeyPositionBase + WavetableKeys::MAX_KEYS)
+            setKeyValue(keyPosition[(size_t) (id - KeyPositionBase)], juce::jlimit(0.0f, 1.0f, value));
+        else if (id >= KeyPlaceBase && id < KeyPlaceBase + WavetableKeys::MAX_KEYS)
+            setKeyValue(keyPlace[(size_t) (id - KeyPlaceBase)], juce::jlimit(0.0f, 1.0f, value));
+        else switch (id)
+        {
+            case KeyAlgo:      setKeyValue(keySettings.algo, static_cast<wavemorph::Algo>(juce::jlimit(0, (int) wavemorph::Algo::Count - 1, whole))); break;
+            case KeyFrames:    setKeyValue(keySettings.frames, WavetableKeys::frameCount(whole)); break;
+            case KeyBias:      setKeyValue(keySettings.bias, juce::jlimit(-1.0f, 1.0f, value)); break;
+            case KeyWrap:      setKeyValue(keySettings.wrap, value > 0.5f); break;
+            case KeyAlign:     setKeyValue(keySettings.align, value > 0.5f); break;
+            case KeyNorm:      setKeyValue(keySettings.norm, juce::jlimit(0, WavetableKeys::NumNorms - 1, whole)); break;
+            case KeyTilt:      setKeyValue(keySettings.tilt, juce::jlimit(-6.0f, 6.0f, value)); break;
+            case KeyHarmonics: setKeyValue(keySettings.harmonics, juce::jlimit(1, wavemorph::H, whole)); break;
+            default: break;
+        }
+    }
+
     // One voice's own value of a page cell: what an LFO routed to that cell sets, sample by
     // sample (TIME, SPD and VIBR are read per block instead, where the engine works them out).
     // Envelope times act on the stage that is running (the chain's stages are copies).
@@ -1819,6 +2431,11 @@ private:
 
     void applyParameter(ParamId id, float value)
     {
+        if (isKeyParam(id))
+        {
+            applyKeyParameter(id, value);
+            return;
+        }
         switch (id)
         {
             case Position:
@@ -1859,7 +2476,7 @@ private:
 
             case InterpMode:
             {
-                int mode = juce::jlimit(0, 3, (int) value);
+                int mode = juce::jlimit(0, (int) WavetableInterpMode::Count - 1, (int) value);
                 for (auto& v : voices)
                     v.setInterpMode(static_cast<WavetableInterpMode>(mode));
                 break;
@@ -2012,9 +2629,24 @@ private:
 
     VoiceAllocator allocator;
     std::vector<WavetableVoice> voices;
-    std::vector<Wavetable> tables;
+    std::vector<const Wavetable*> tables;       // TABL order; the built-in ones are shared
+    Wavetable userTable, keyTable;              // the two this engine owns (their addresses never change)
     ParamMap params;
-    Wavetable userPending;
+    Wavetable userPending, keyPending;
     juce::SpinLock userLock;
-    std::atomic<bool> userReady { false };
+    std::atomic<bool> userReady { false }, keyReady { false };
+
+    // Key frames
+    struct KeyCache
+    {
+        int sample = -1;
+        float position = -1.0f;
+        bool valid = false, pitched = false;
+        wavemorph::Spectrum spectrum;
+    };
+    std::array<int, WavetableKeys::MAX_KEYS> keySample {};
+    std::array<float, WavetableKeys::MAX_KEYS> keyPosition {}, keyPlace {};
+    std::array<KeyCache, WavetableKeys::MAX_KEYS> keyCache;
+    WavetableKeys::Settings keySettings;
+    bool keyDirty = true;
 };

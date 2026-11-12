@@ -48,10 +48,10 @@ public:
 
     void runTest() override
     {
-        beginTest("Three pages; PROJ cells are SLOT LOAD SAVE SVAS / NEW AUTO");
+        beginTest("Four pages; PROJ cells are SLOT LOAD SAVE SVAS / NEW AUTO");
         {
             SettingsScreen screen;
-            expectEquals(screen.getPageCount(), 3);
+            expectEquals(screen.getPageCount(), 4);
             expectEquals(screen.getName(), juce::String("SETUP"));
             toProjectPage(screen);
             const char* expected[8] = { "SLOT", "LOAD", "SAVE", "SVAS", "NEW", "AUTO", "---", "---" };

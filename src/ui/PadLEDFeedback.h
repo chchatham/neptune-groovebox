@@ -3,6 +3,7 @@
 #include "../controller/PadManager.h"
 #include "../sequencer/SequencerCore.h"
 #include "../engine/DrumEngine.h"
+#include "../engine/DrumLane.h"
 
 namespace PadColors
 {
@@ -64,17 +65,24 @@ public:
         bool isPlayhead = sequencer->isPlaying()
                           && sequencer->getCurrentStep(trackIdx) == stepIdx;
 
+        // A drum track shows the drum selected on DRUMS: lit where that drum hits, dim yellow
+        // where only other drums of the kit do.
+        const bool drums = track.engineType == EngineType::Drum && drumEngine != nullptr;
+        const bool hit = drums ? DrumLane::plays(step, drumEngine->getSelectedVoice()) : step.trig;
+
         if (isPlayhead)
-            return step.trig ? PadColors::STEP_PLAYHEAD_ACTIVE : PadColors::STEP_PLAYHEAD;
+            return hit ? PadColors::STEP_PLAYHEAD_ACTIVE : PadColors::STEP_PLAYHEAD;
 
         bool hasLocks = !step.paramLocks.empty();
 
-        if (step.trig && hasLocks)
+        if (hit && hasLocks)
             return PadColors::STEP_ACTIVE_LOCKED;
-        if (step.trig)
+        if (hit)
             return PadColors::STEP_ACTIVE;
         if (hasLocks)
             return PadColors::STEP_LOCKED;
+        if (step.trig)
+            return PadColors::DIM_YELLOW;
 
         return PadColors::STEP_EMPTY;
     }

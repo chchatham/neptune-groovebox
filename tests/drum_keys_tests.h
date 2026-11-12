@@ -347,14 +347,16 @@ public:
             expect(on.size() == 1 && *on.begin() == 12);
             expect(rig.render(6) > 0.01f, "the tapped step is heard");
 
-            // A key while the step is held gives the step that key's voice.
+            // A key while the step is held adds that key's voice beside the selected one.
             rig.silence();
             stepView.onPadPress(1, 100);
             expect(stepView.wantsKeyboardEvents());
             stepView.onKeyboardNoteOn(48, 100);
             stepView.onPadRelease(1);
-            const int keyNote = rig.seq.getPattern().getTrack(1).getStep(1).notes[0].pitch;
-            expectEquals(DrumEngine::padForNote(keyNote), 8);
+            const auto& held = rig.seq.getPattern().getTrack(1).getStep(1);
+            expectEquals((int) held.notes.size(), 2);
+            expectEquals(DrumEngine::padForNote(held.notes[0].pitch), 12);
+            expectEquals(DrumEngine::padForNote(held.notes[1].pitch), 8);
 
             // Any other track still starts on middle C.
             rig.seq.setSelectedTrack(0);

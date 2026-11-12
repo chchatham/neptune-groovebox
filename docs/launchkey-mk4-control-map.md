@@ -133,7 +133,8 @@ when it is off; LATCH tag in the name bar on every screen. Scale: scale lock (ke
 nearest note of the active scale page, arps stay in it); the name bar says "SCALE LOCK ON C MAJOR" / "SCALE LOCK
 OFF" for 2 s (shortened to fit: "SCALE ON C MAJOR", "SCALE ON") and a SCALE tag stays while it is on; Shift + Scale:
 SCALE screen. Play: start / stop; Shift + Play: stop and return to the start (when already stopped: reset the
-position). Shift + Record held: FILL while held. Func + Settings: tap tempo.
+position), and silence: every note is let go and every effect's tail (inserts, send buses) is cut - the way out
+of anything that rings on. Shift + Record held: FILL while held. Func + Settings: tap tempo.
 
 **Copy, clear, paste.** Func + Record = copy, Func + Play = clear, Func + > = paste. What they act on
 (`ScreenManager::getEditPlan`, which the action, the Func help card and the confirmation all go by):
@@ -272,6 +273,23 @@ light on the pads follows the selected track's step (step modulo 16), drawn over
 without changing what the pads do (white on a pad that is already red); hold layers are not drawn over; STEP
 shows its playhead.
 
+**Metronome** (SETTINGS → CLICK, the fourth page; no gesture of its own). CLCK: OFF, REC (a click on every beat
+while recording is on and the transport runs: the default) or PLAY (whenever the transport runs). The first beat
+of each four-beat bar is higher and louder (1760 Hz against 880 Hz; a 40 ms sine burst made in code,
+`src/engine/Metronome.h`). CLVL: its level, 0–100, default 50; every turn plays one click (also when stopped and
+with CLCK off, so the knob always answers). CNT: count-in, OFF (default), 1BAR or 2BAR. With CNT set, a start of
+the transport with recording on (Record + Play, or Record then Play) counts that many bars first: the name bar
+says "COUNT IN 1 BAR" / "COUNT IN 2 BARS", the count-in clicks whatever CLCK says, and the transport and the
+recording start on the sample the count-in ends (`SequencerCore::requestStart`). During the count-in
+`isPlaying()` is false: no step, pattern or song row moves, nothing is recorded, the MIDI clock has not started;
+Play (or Shift + Play) calls it off and switches recording off. Recording switched on while the transport already
+runs, and Play without recording, never count in. The beats come from the sequencer's clock, sample-exact, and
+follow tempo changes; a click still sounding when the transport stops is faded in 3 ms. The click is added to the
+output after the master EQ, compressor, limiter and MVOL and after the resampler's tap: the master chain never
+reacts to it, MVOL does not change it, and it is never in a resample of a track or the master (while it sounds the
+output sum is kept within full scale). The three settings are app-wide (`Projects/metronome.txt`, like HELP):
+no project stores or changes them.
+
 **Destructive actions** need four clicks clockwise on their knob, spread over at least 300 ms, progress shown as
 ">>>"; another knob or an anticlockwise click cancels. Nothing destructive is on a pad, a paging button or a
 modified turn. The edit chords are the other family: instant and undoable, a whole pattern held for 0.5 s (above).
@@ -281,10 +299,18 @@ The one-click destructive cells that have no confirmation (FX TYPE, LCKS, EVOL b
 bright, other assigned pads dim, unassigned off. A trig is added on press; an existing trig is removed only by a
 release within 350 ms with nothing edited — a held step is never removed.
 
+**Drum tracks on STEP.** The pads show one drum of the kit, the pad selected on DRUMS, and a step can hold any
+number of the sixteen drums. A press puts the selected drum on the step beside the ones already there; a tap on a
+step where it hits takes that drum away and leaves the others (the step goes off with its last drum). Pad lights:
+lit where the selected drum hits, dim yellow where only other drums do; the display fills the cell where it hits
+(with the number of drums on the step when more than one) and underlines the step number where only others do.
+Hold a step + a key adds that key's drum. On TRIG, NOTE and VEL belong to the selected drum; LEN, MICR, COND and the
+locks belong to the step. Recording was always polyphonic. Other tracks: a step is one trig, tapped on and off whole.
+
 **Held step.** On STEP a press that lasts longer than those 350 ms is a hold, and the hold alone (no knob, no
 movement) changes the display to that step's pages: the track's PARAM pages as locks, opening on MAIN (the engine's
-first page where there is no MAIN: a MIDI track; a drum track shows the DR page of the pad that step plays, whatever
-pad is selected on DRUMS), with TRIG (NOTE VEL LEN MICR | COND PROB / A B LCKS) one bank button back. Every cell
+first page where there is no MAIN: a MIDI track; a drum track shows the DR page of the pad selected on DRUMS, which the hold has put
+on that step; on PARAM, where a hold adds nothing, the selected pad if it hits there, else the step's first drum), with TRIG (NOTE VEL LEN MICR | COND PROB / A B LCKS) one bank button back. Every cell
 shows the value that step will play: its lock, with the lock mark, or else the track's own value. The name bar reads
 "MAIN T1 S5 LOCK" ("TRIG T1 S5" on TRIG). A step whose notes carry recorded pad pressure (a dark dot at the lower
 right of its cell on STEP) has one more page after the lock pages, PRES (PRES >LCK CLR, the recorded curves below):
@@ -292,8 +318,12 @@ one bank button back from TRIG. PRES = amount played, 0–200 % (hold > + turn: 
 clicks clockwise and the page then gives way to TRIG. A tap never shows the pages; a turn or a bank button before the 350 ms
 opens them at once. The pages close when the last held step is let go, and only then. The page last shown is where
 the next hold opens, until the track changes or STEP is opened again (then MAIN). Several steps held: the pages show
-and edit one step, the one on the lowest pad (top row left to right, then the bottom row); letting that one go moves
-them to the next. On PARAM, TRK FX and FLTR a held step switches the cells to that step's values at once, the pad
+one step, the one on the lowest pad (top row left to right, then the bottom row), and every held step is edited
+with it: what a knob gives the shown step (a lock on the sound pages; NOTE, VEL, LEN, MICR, COND, PROB, A, B on TRIG)
+is written to all of them as the same value, a key sets every held step's note, > + turn removes that lock (or
+restores that TRIG cell) on all, and LCKS clears the locks of all as one undo step. PRES and Func + Record / Play / >
+still act on the shown step alone. Letting the shown step go moves the pages to the next. The same holds for
+several pads held on PARAM, TRK FX and FLTR (lock and unlock all; all go white). On PARAM, TRK FX and FLTR a held step switches the cells to that step's values at once, the pad
 goes white and the name bar puts the step first ("S12 FILTR"; when room is short the step is what stays).
 
 Pad pin: Shift + **hold for half a

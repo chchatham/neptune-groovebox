@@ -78,6 +78,9 @@
 #include "virtual_controller_tests.h"
 #include "song_player_tests.h"
 #include "comb_glide_tests.h"
+#include "multi_step_edit_tests.h"
+#include "drum_lane_tests.h"
+#include "send_reverb_tests.h"
 #include "project_roundtrip_tests.h"
 #include "factory_preset_coverage_tests.h"
 #include "settings_project_tests.h"
@@ -91,6 +94,7 @@
 #include "sampler_grain_tests.h"
 #include "control_grammar_tests.h"
 #include "live_record_tests.h"
+#include "metronome_tests.h"
 #include "held_step_pages_tests.h"
 #include "lfo_destinations_tests.h"
 #include "help_card_tests.h"
@@ -104,10 +108,13 @@
 #include "screen_grammar_tests.h"
 #include "sampler_stretch_tests.h"
 #include "wavetable_scan_tests.h"
+#include "wavetable_keyframe_tests.h"
+#include "wavetable_embed_tests.h"
 #include "drum_keys_tests.h"
 #include "preset_audition_tests.h"
 #include "sampler_release_tests.h"
 #include "mod_wheel_tests.h"
+#include "breakbeat_tests.h"
 #include "bench.h"
 #include "bitmap_benchmark_tests.h"
 #include "display_latency_tests.h"
@@ -9765,6 +9772,8 @@ int main(int argc, char** argv)
             || name == "Sampler Stretch"
             || name == "Sampler Release"
             || name == "Wavetable Scan"
+            || name == "Wavetable Keyframes"
+            || name == "Wavetable Embed"
             || name == "Drum Keys"
             || name == "Preset Audition"
             || name == "Control Grammar"
@@ -9847,7 +9856,7 @@ int main(int argc, char** argv)
             || name == "Filter View Screen"
             || name == "OLED Mirror"
             || name == "MIDI Track Output"
-            || name == "OLED Mirror Input" || name == "Virtual Controller" || name == "Song Player" || name == "Comb Glide"
+            || name == "OLED Mirror Input" || name == "Virtual Controller" || name == "Song Player" || name == "Comb Glide" || name == "Multi Step Edit" || name == "Drum Lanes" || name == "Send Reverb" || name == "Metronome"
             || name == "Project Roundtrip"
             || name == "Factory Preset Coverage"
             || name == "Mod Wheel"
@@ -9856,9 +9865,16 @@ int main(int argc, char** argv)
             || name == "Bitmap Benchmark"
             || name == "Sync Wiring"
             || name == "Onset Clicks"
-            || name == "Display Latency")
+            || name == "Display Latency"
+            || name == "Breakbeats")
             ours.add(t);
     }
+
+    // NEPTUNE_TEST_ONLY=<text>: only the suites whose name contains it (the whole suite takes minutes).
+    if (const auto only = juce::SystemStats::getEnvironmentVariable("NEPTUNE_TEST_ONLY", {}); only.isNotEmpty())
+        for (int i = ours.size(); --i >= 0;)
+            if (! ours[i]->getName().containsIgnoreCase(only))
+                ours.remove(i);
 
     runner.runTests(ours);
 

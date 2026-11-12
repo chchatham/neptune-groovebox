@@ -29,6 +29,36 @@ public:
     void start();
     void stop();
     bool isPlaying() const { return playing; }
+
+    // ---- Count-in and beat ticks (the metronome's clock) ----------------------------------------
+    //
+    // requestStart() is what Play does: start(), or - when recording is armed and a count-in is
+    // set - count the bars in first. During a count-in nothing plays, nothing is recorded and no
+    // step or pattern moves on: isPlaying() stays false, and the transport starts (from the top,
+    // exactly as start() does, listeners told) on the sample the count-in ends, inside
+    // processBlock. stop() during a count-in calls it off; start() skips what is left of it.
+    // The count follows tempo changes.
+    //
+    // Every processBlock leaves the beats that fell in it in getBeatTick(): the count-in's, then
+    // the running transport's (the first beat on the sample the transport starts; every fourth
+    // beat is a bar's first). They say when, not whether anything should sound.
+    static constexpr int MAX_COUNT_IN_BARS = 2;
+    static constexpr int BEATS_PER_BAR = 4;
+    void setCountInBars(int bars) { countInBars = juce::jlimit(0, MAX_COUNT_IN_BARS, bars); }
+    int getCountInBars() const { return countInBars.load(); }
+    void requestStart();
+    bool isCountingIn() const { return countingIn.load(); }
+    // Playing or counting in: what a press of Play would stop.
+    bool isRunning() const { return playing.load() || countingIn.load(); }
+    // Beats of the count-in still to come (0 when none is running).
+    int getCountInBeatsLeft() const { return countingIn.load() ? countInBeatsLeft.load() : 0; }
+    // True once after a count-in has started the transport (the audio thread starts the MIDI clock on it).
+    bool consumeCountInStart() { return countInStarted.exchange(false); }
+
+    struct BeatTick { int sample = 0; bool accent = false; bool countIn = false; };
+    static constexpr int MAX_BEAT_TICKS = 8;
+    int getBeatTickCount() const { return beatTickCount; }
+    const BeatTick& getBeatTick(int i) const { return beatTicks[(size_t) juce::jlimit(0, MAX_BEAT_TICKS - 1, i)]; }
     // Back to the first step of every track (Shift + Play). Only while stopped; start() does the
     // same on its own.
     void resetPosition()
@@ -193,6 +223,26 @@ public:
     int getReadyLaneBuffers() const;
 
 private:
+    void beginPlaying();
+    int processCountIn(int numSamples, double samplesPerBeat);
+    void addBeatTick(int sample, bool accent, bool countIn)
+    {
+        if (beatTickCount < MAX_BEAT_TICKS)
+            beatTicks[(size_t) beatTickCount++] = { sample, accent, countIn };
+    }
+
+    std::atomic<int> countInBars { 0 };
+    std::atomic<bool> countingIn { false };
+    std::atomic<bool> countInFresh { false };      // a count-in was asked for; the audio thread begins it
+    std::atomic<int> countInBeatsLeft { 0 };
+    std::atomic<bool> countInStarted { false };
+    int countInBeatsTotal = 0;                     // audio thread from here
+    double countInAccumulator = 0.0;
+    bool countInDue = false;
+    bool firstBeatDue = false;                     // the transport has started and its first beat is to be ticked
+    std::array<BeatTick, MAX_BEAT_TICKS> beatTicks {};
+    int beatTickCount = 0;
+
     void advanceStep(int trackIndex);
     void arriveAtStep(int trackIndex);
     void fireStep(int trackIndex, int stepIndex);

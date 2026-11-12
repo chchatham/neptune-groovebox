@@ -169,7 +169,8 @@ public:
                 r.padUp(0);
             }
 
-            // Drums: the DR page of the pad that step plays, whatever pad is selected on DRUMS.
+            // Drums: STEP shows the pad selected on DRUMS; a held step gets that drum beside the
+            // ones it has, and the page and the locks are that drum's (drum_lane_tests.h).
             {
                 Rig r(EngineType::Drum);
                 auto* drums = dynamic_cast<DrumEngine*>(r.audio.getEngine(0));
@@ -179,10 +180,11 @@ public:
                 r.step(2).notes.push_back({ 3, 1.0f });        // pad 4
                 r.padDown(2);
                 r.wait();
-                expectEquals(r.mgr.composeNameBar().left, juce::String("DR 4 T1"));
+                expectEquals(r.mgr.composeNameBar().left, juce::String("DR 2 T1"));
                 expectEquals(r.names(), juce::String("TUNE DEC TONE DRIV SNAP LEVL PAN TYPE"));
+                expectEquals((int) r.step(2).notes.size(), 2, "pad 4 still hits there");
                 r.turn(2, 5);
-                expect(r.step(2).paramLocks.count(3 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TONE) > 0, "TONE of pad 4 locked");
+                expect(r.step(2).paramLocks.count(1 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TONE) > 0, "TONE of pad 2 locked");
                 r.padUp(2);
                 expectEquals(drums->getSelectedVoice(), 1, "the pad selected on DRUMS is untouched");
 
@@ -300,7 +302,7 @@ public:
             r.padUp(5);
         }
 
-        beginTest("STEP: several steps held - the pages show and edit the one on the lowest pad, and stay until the last is let go");
+        beginTest("STEP: several steps held - the pages show the one on the lowest pad, and stay until the last is let go");
         {
             Rig r;
             r.padDown(5);
@@ -314,7 +316,7 @@ public:
             expectEquals(r.mgr.composeNameBar().text, juce::String("S3 LOCK"));
             r.turn(1, 10);
             expect(r.step(2).paramLocks.count(UnifiedParam::RESONANCE) > 0);
-            expect(r.step(5).paramLocks.empty(), "only the step shown is edited");
+            expect(r.step(5).paramLocks.count(UnifiedParam::RESONANCE) > 0, "every held step is edited (multi_step_edit_tests.h)");
 
             r.padUp(2);
             r.tick();

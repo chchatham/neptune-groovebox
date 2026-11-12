@@ -307,6 +307,33 @@ public:
     // Called after a user preset is saved or deleted (the app writes them to disk).
     std::function<void()> onUserPresetsChanged;
 
+    // Called after SV with the name the preset was saved under ("User N"). The app asks for a
+    // name on the Mac's keyboard and answers with renameUserPreset; the save never waits for it.
+    std::function<void(const juce::String& savedName)> onPresetSaved;
+
+    // Gives the user preset `from` the typed name. False (nothing changed) when there is no such
+    // user preset, or the name is empty or in use. Call holding ScreenManager::getLock().
+    bool renameUserPreset(const juce::String& from, const juce::String& typed)
+    {
+        const int index = presetManager.findUserPreset(from);
+        if (index < 0)
+            return false;
+        const auto oldKey = keyOf(presetManager.getPreset(index));
+        const auto highlighted = highlightedKey();
+        if (!presetManager.renamePreset(index, typed))
+            return false;
+
+        // The highlight and the audition follow the preset under its new name: a rename is not
+        // a move of the highlight and must not start or end an audition.
+        const auto newKey = keyOf(presetManager.getPreset(index));
+        rebuildFilteredList();
+        selectByKey(highlighted == oldKey ? newKey : highlighted);
+        if (shownKey == oldKey) shownKey = newKey;
+        if (heardKey == oldKey) heardKey = newKey;
+        if (onUserPresetsChanged) onUserPresetsChanged();
+        return true;
+    }
+
     void onPadPress(int padIndex, int velocity) override
     {
         if (padIndex < 0 || padIndex >= 16) return;
@@ -612,7 +639,9 @@ private:
             it = (engineParam || engineRange) ? stored.erase(it) : std::next(it);
         }
         ParamMap trackLevel = snapshotSaved;
-        for (auto& [id, value] : preset.soundParams)
+        // The preset's values, its sample found by name (its place in the bank may have moved).
+        const ParamMap sound = PresetManager::soundOf(preset);
+        for (auto& [id, value] : sound)
         {
             stored[id] = value;
             trackLevel[id] = value;
@@ -621,9 +650,9 @@ private:
         // What a fresh engine holds after the preset: worked out on an engine that is not playing.
         auto reference = AudioEngine::createEngine(preset.engineType);
         const int master = reference->getMasterParamId();
-        if (auto it = preset.soundParams.find(master); master >= 0 && it != preset.soundParams.end())
+        if (auto it = sound.find(master); master >= 0 && it != sound.end())
             reference->setParameter(master, it->second);
-        for (auto& [id, value] : preset.soundParams)
+        for (auto& [id, value] : sound)
             if (id != master && EngineParamRange::contains(id))
                 reference->setParameter(id, value);
 
@@ -687,6 +716,7 @@ private:
         presetManager.addPreset(preset);
         rebuildFilteredList();
         if (onUserPresetsChanged) onUserPresetsChanged();
+        if (onPresetSaved) onPresetSaved(name);
     }
 
     bool deleteSelectedPreset()
