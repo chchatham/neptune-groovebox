@@ -446,7 +446,7 @@ private:
         for (int op = 0; op < 6; ++op)
         {
             mix.params[(size_t) op] = { lvl[op], op * 10 + 1, 0, 1, defLevel[op], L };
-            ratio.params[(size_t) op] = { rat[op], op * 10 + 0, 0.5f, 16, 1, L, "x", nullptr, 0, 0.5f };
+            ratio.params[(size_t) op] = { rat[op], op * 10 + 0, 0.5f, 16, 1, L, "ratio" };
         }
         mix.params[6] = { "ALGO", AlgorithmParam, 0, 7, 0, C, "", algos, 8 };
         mix.params[7] = { "LEVL", MasterLevel, 0, 1, 0.8f, L };
@@ -460,7 +460,7 @@ private:
             ParamPage p; p.name = opNames[op]; p.section = "OPS";
             int b = op * 10;
             p.params = {{
-                { "RATI", b + 0, 0.5f, 16, 1, L, "x", nullptr, 0, 0.5f },
+                { "RATI", b + 0, 0.5f, 16, 1, L, "ratio" },
                 { "LEVL", b + 1, 0, 1, defLevel[op], L },
                 { "DETN", b + 2, -50, 50, 0, L, "ct" },
                 { "FDBK", b + 3, 0, 1, 0, L },

@@ -4,6 +4,7 @@
 #include "../sequencer/SequencerCore.h"
 #include "../engine/AudioEngine.h"
 #include "../arpeggiator/Arpeggiator.h"
+#include "../controller/ChordPads.h"
 
 // -----------------------------------------------------------------------------
 // Moves the whole live state of the instrument into a ProjectData (for saving)
@@ -33,6 +34,7 @@ namespace ProjectBridge
         CustomScaleManager* scales = nullptr;
         AftertouchRouter* pressure = nullptr;     // legacy single router (optional); the routes are per track in `audio`
         std::function<Arpeggiator*(int track)> arpForTrack;     // one arpeggiator per track
+        ChordPads* chords = nullptr;              // the CHORD screen's pads
     };
 
     // Arpeggiator settings as a flat list; the order is the file format (append only).
@@ -264,6 +266,9 @@ namespace ProjectBridge
             data.song.loop = live.song->getLoopMode();
         }
 
+        if (live.chords != nullptr && live.chords->anyStored())
+            data.chordPads = live.chords->toFlat();
+
         if (live.scales != nullptr)
         {
             for (int i = 0; i < live.scales->getPageCount(); ++i)
@@ -451,6 +456,9 @@ namespace ProjectBridge
             }
             live.song->setLoopMode(data.song.loop);
         }
+
+        if (live.chords != nullptr)
+            live.chords->fromFlat(data.chordPads);      // (a project without chords: every pad empty)
 
         if (live.scales != nullptr)
         {

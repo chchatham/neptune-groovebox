@@ -68,7 +68,10 @@ public:
         bool withHeldStep = false;  // repeat once more with a step pad held (parameter locks)
     };
 
-    ScreenAudit(ScreenManager& sm, DisplayRenderer& d) : screens(sm), display(d) {}
+    // (The audit holds every help key right after turning knobs: the "in the middle of something"
+    // wait is switched off while it runs.)
+    ScreenAudit(ScreenManager& sm, DisplayRenderer& d) : screens(sm), display(d) { screens.setHelpBusyWindow(0); }
+    ~ScreenAudit() { screens.setHelpBusyWindow(ScreenManager::HELP_BUSY_WINDOW_MS); }
 
     std::vector<Target> targets;
     juce::StringArray engineNames;                       // one per engine type, in enum order

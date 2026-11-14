@@ -52,7 +52,10 @@ public:
 
     // ---- the measurement before the page existed (commit 767f21d, Debug build, 48 kHz) ---------
     // The macro oscillator and drum rows were measured again after the dead controls were fixed (the
-    // fourth macro now acts in every model; drums ring out and DRIV works on every type).
+    // fourth macro now acts in every model; drums ring out and DRIV works on every type), and the
+    // drum rows and the two breaks rendered from the drum voices (100, 170) once more on 2026-11-14,
+    // when the hats became six band-passed squares: 7-25 % less bright at rest than the old hats,
+    // which were squares at 8 kHz and above folding back from the top of the band.
     struct Ref { const char* name; float diff, centroid0, centroid127, levelDb; };
 
     static const std::vector<Ref>& reference()
@@ -61,32 +64,32 @@ public:
             // engine defaults
             { "FM", 0.172f, 208, 252, -0.4f },              { "Macro oscillator", 0.335f, 536, 305, -0.6f },
             { "Wavetable", 0.825f, 196, 604, -4.2f },       { "Wave sequencer", 0.363f, 633, 635, -0.0f },
-            { "Sampler", 0.653f, 347, 495, 4.0f },          { "Drums", 0.325f, 112, 240, -0.0f },
+            { "Sampler", 0.653f, 347, 495, 4.0f },          { "Drums", 0.302f, 105, 235, -0.0f },
             // factory presets of these engines
             { "FM Bass 2", 0.116f, 199, 212, 0.5f },        { "FM Bell Pad", 0.128f, 421, 408, 0.3f },
             { "FM Pluck", 0.171f, 216, 289, 0.6f },         { "Electric Piano", 0.119f, 202, 248, -0.0f },
             { "Rhodes", 0.089f, 200, 211, 0.2f },           { "FM Metallic", 0.125f, 288, 292, -0.1f },
-            { "808 Kit 2", 0.334f, 121, 268, -0.5f },        { "FM Kit", 0.323f, 156, 359, -0.6f },
-            { "Electro Kit", 0.318f, 123, 287, -0.5f },      { "Minimal Kit", 0.319f, 104, 248, -1.0f },
-            { "Industrial Kit", 0.327f, 139, 348, -0.7f },   { "Percussion Kit", 0.354f, 116, 274, -1.0f },
+            { "808 Kit 2", 0.313f, 103, 252, -0.5f },        { "FM Kit", 0.323f, 156, 359, -0.6f },
+            { "Electro Kit", 0.300f, 108, 274, -0.5f },      { "Minimal Kit", 0.311f, 94, 237, -1.0f },
+            { "Industrial Kit", 0.307f, 126, 335, -0.7f },   { "Percussion Kit", 0.334f, 104, 263, -1.0f },
             { "Grain Cloud", 0.130f, 4972, 2938, 0.0f },    { "Resonator Pluck", 0.505f, 1631, 5380, -5.2f },
             { "Digital Choir", 0.553f, 2486, 4057, -2.1f }, { "Frozen Sweep", 0.490f, 2613, 1152, -2.2f },
             { "Glitch Table", 0.239f, 197, 201, 0.0f },     { "Sequenced Bells", 0.609f, 5114, 5513, -0.2f },
             { "Morphing Texture", 0.590f, 613, 2007, 2.0f }, { "Glass Marimba", 0.175f, 207, 280, 0.0f },
             { "Metallic Stab", 0.140f, 234, 244, 0.0f },    { "FM Pad", 0.117f, 207, 227, 1.1f },
             { "Lo-Fi Tape", 0.298f, 407, 532, 0.3f },       { "Granular Pad", 0.686f, 334, 483, 4.6f },
-            { "Vinyl Scratch", 0.307f, 476, 568, 1.2f },    { "Lo-Fi Kit", 0.326f, 116, 268, -0.8f },
+            { "Vinyl Scratch", 0.307f, 476, 568, 1.2f },    { "Lo-Fi Kit", 0.285f, 104, 253, -0.8f },
             // The drum-break presets (measured when they were added, 2026-11-11): the sampler's own routes,
             // drive and sample-rate reduction, on a break that loops in time and on its slices.
-            { "Break 100 Loop", 0.399f, 408, 371, 3.0f }, { "Break 100 Slices", 0.542f, 93, 103, 2.4f },
-            { "Break 170 Loop", 0.348f, 528, 436, 3.3f }, { "Break 170 Slices", 0.608f, 88, 109, 2.6f },
+            { "Break 100 Loop", 0.395f, 317, 290, 2.5f }, { "Break 100 Slices", 0.531f, 90, 104, 2.0f },
+            { "Break 170 Loop", 0.338f, 403, 368, 2.4f }, { "Break 170 Slices", 0.568f, 91, 112, 1.8f },
             { "Break 80 Loop", 0.298f, 683, 432, 5.2f }, { "Break 80 Slices", 0.289f, 604, 303, 4.7f },
             { "Break 90 Loop", 0.255f, 561, 641, 2.3f }, { "Break 90 Slices", 0.268f, 668, 672, 2.3f },
             { "Break 105 Loop", 0.247f, 105, 121, 1.9f }, { "Break 105 Slices", 0.261f, 80, 91, 2.8f },
             { "Break 120 Loop", 0.243f, 187, 178, 3.6f }, { "Break 120 Slices", 0.249f, 112, 90, 3.8f },
             { "Break 157 Loop", 0.223f, 1265, 968, 4.1f }, { "Break 157 Slices", 0.236f, 1662, 1167, 4.2f },
             { "Break 160 Loop", 0.264f, 207, 228, 3.2f }, { "Break 160 Slices", 0.265f, 150, 145, 3.1f },
-            { "Minimal Techno Kit", 0.310f, 108, 263, -1.0f },
+            { "Minimal Techno Kit", 0.324f, 95, 238, -1.1f },
             // The presets for the wavetable engine's newer tables (measured when they were added,
             // 2026-11-11): the engine's own route, POS +60 and vibrato. The strip walks the vowels
             // (Vowel Choir ends on the dark O / U, so its brightness stays), raises the sync, FM and

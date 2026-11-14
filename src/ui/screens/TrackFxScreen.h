@@ -261,6 +261,28 @@ private:
         return 0;
     }
 
+    // The cells of the effect page depend on what is in the slot and on its SYNC (RATE / TIME
+    // show tempo divisions while it is on). Those can change without a knob of this screen being
+    // turned (a project or preset with SYNC already on, undo, a step lock): the pages are built
+    // again whenever this differs from when they were built.
+    int pageStateKey() const override
+    {
+        if (sequencer == nullptr || audioEngine == nullptr)
+            return 0;
+        const int trackIdx = sequencer->getSelectedTrack();
+        auto* fx = effectOf(trackIdx);
+        int key = fxSelectedSlot + 16 * insertCount(trackIdx);
+        if (fx != nullptr)
+        {
+            EffectType type {};
+            if (audioEngine->getInsertEffectType(trackIdx, fxSelectedSlot, type))
+                key += 256 * (1 + (int) type);
+            if (fx->isSynced())
+                key += 1 << 20;
+        }
+        return key;
+    }
+
     int insertCount(int trackIdx) const
     {
         auto* chain = audioEngine ? audioEngine->getInsertChain(trackIdx) : nullptr;

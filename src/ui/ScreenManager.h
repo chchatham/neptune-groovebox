@@ -357,8 +357,16 @@ public:
     // act after a hold that showed its card, unless its table row says so (Record).
     enum class HelpMode { Off, Delayed, Instant };
     static constexpr juce::int64 HELP_DELAY_MS = 350;
+    // A hold key pressed within HELP_BUSY_WINDOW_MS of a knob, pad or button shows its card only
+    // after HELP_BUSY_DELAY_MS.
+    static constexpr juce::int64 HELP_BUSY_WINDOW_MS = 2000;
+    static constexpr juce::int64 HELP_BUSY_DELAY_MS = 2000;
     void setHelpMode(HelpMode mode) { helpMode = mode; needsRedraw = true; }
     HelpMode getHelpMode() const { return helpMode; }
+    // How long after a knob, pad or button a hold key counts as "pressed in the middle of
+    // something" (its card then waits HELP_BUSY_DELAY_MS). 0 switches the rule off: the screen
+    // audit and tests that send controls with no time between them.
+    void setHelpBusyWindow(juce::int64 ms) { helpBusyWindowMs = ms; }
 
     // Pattern = ">", Track = Up or Down (either button, one layer).
     enum class HelpKey { None = -1, Shift = 0, Func, Pattern, Track, Record, NumKeys };
@@ -444,6 +452,9 @@ public:
     bool isPatternKeyHeld() const { return patternKeyHeld; }
     bool isTrackLayerHeld() const { return trackKeysHeld != 0; }
     bool isKeyLatchOn() const { return holdActive; }
+    // The keys that count as held now: physically down, or kept by the key latch. Each as the note
+    // it sounds (scale lock) with the velocity it was played at. For the chord pads.
+    std::vector<std::pair<int, int>> getHeldKeys() const;
     bool isLatchOn() const;         // key latch, or the selected track's arp latch while that arp is on
     bool isFillHeld() const { return fillHeld; }
 
@@ -635,6 +646,7 @@ private:
     std::function<juce::String()> scaleName;
     std::function<int(int)> keySnap;
     std::array<juce::int8, 128> keySounding {};     // what each held key plays (scale lock), -1 = itself
+    std::array<juce::uint8, 128> keyVelocity {};    // the velocity each key was last played at
 
     std::vector<std::unique_ptr<Screen>> screens;
     struct ScreenTraits { CopyContext context = CopyContext::None; bool pinnable = false; juce::String mapName; };
@@ -670,6 +682,10 @@ private:
     juce::int64 helpPressMs = 0;
     bool helpDismissed = false;
     bool helpShown = false;
+    bool helpBusy = false;              // this hold began in the middle of other control use
+    juce::int64 helpDelayMs = HELP_DELAY_MS;
+    juce::int64 lastControlMs = 0;      // the last knob turn, pad press or button press
+    juce::int64 helpBusyWindowMs = HELP_BUSY_WINDOW_MS;
     std::array<int, (size_t) HelpKey::NumKeys> helpPage {};
 
     // Pads: where each held pad's press went (its release and pressure follow), null = swallowed
@@ -742,4 +758,5 @@ private:
     bool isLatchedNote(int note) const;
     void sendKeyOff(int note);
     void releaseHeldNotes();
+    void releaseLatches();
 };

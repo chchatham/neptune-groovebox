@@ -112,6 +112,7 @@
 #include "wavetable_embed_tests.h"
 #include "drum_keys_tests.h"
 #include "preset_audition_tests.h"
+#include "chord_pad_tests.h"
 #include "sampler_release_tests.h"
 #include "mod_wheel_tests.h"
 #include "breakbeat_tests.h"
@@ -9728,10 +9729,69 @@ public:
 
 static SyncWiringTests syncWiringTests;
 
+static int snapshotController(const juce::File& file)
+{
+    const juce::ScopedJuceInitialiser_GUI gui;
+    auto write = [](VirtualControllerComponent& vc, const juce::File& to)
+    {
+        const auto image = vc.createComponentSnapshot(vc.getLocalBounds(), true, 2.0f);
+        to.deleteFile();
+        juce::FileOutputStream out(to);
+        if (! out.openedOk() || ! juce::PNGImageFormat().writeImageToStream(image, out))
+        {
+            std::cout << "could not write " << to.getFullPathName() << std::endl;
+            return false;
+        }
+        std::cout << "wrote " << to.getFullPathName() << " (" << image.getWidth() << " x " << image.getHeight() << ")" << std::endl;
+        return true;
+    };
+
+    VirtualControllerComponent vc;
+    if (! write(vc, file))
+        return 1;
+
+    // the same panel in use: the Shift screen map, a step row, one pad pressed, a knob turned, the mod strip up
+    DisplayRenderer display;
+    for (int x = 0; x < DisplayRenderer::WIDTH; ++x)
+    {
+        display.setPixel(x, 9, true);
+        display.setPixel(x, 40 + (int) std::lround(14.0 * std::sin(x * 0.12)), true);
+    }
+    for (int y = 0; y < 8; ++y)
+        for (int x = 2; x < 40; ++x)
+            display.setPixel(x, y, ((x / 2 + y / 2) % 2) == 0);
+    vc.setDisplay(&display);
+    const int top[8][3] = { { 255, 255, 255 }, { 60, 60, 60 }, { 60, 60, 60 }, { 255, 110, 0 }, { 60, 60, 60 }, { 150, 40, 255 }, { 0, 230, 255 }, { 20, 255, 40 } };
+    const int bottom[8][3] = { { 255, 220, 0 }, { 80, 68, 0 }, { 255, 24, 12 }, { 80, 68, 0 }, { 255, 220, 0 }, { 20, 70, 255 }, { 0, 0, 0 }, { 255, 40, 160 } };
+    for (int i = 0; i < 8; ++i)
+    {
+        vc.setPadColor(i, top[i][0], top[i][1], top[i][2]);
+        vc.setPadColor(8 + i, bottom[i][0], bottom[i][1], bottom[i][2]);
+    }
+    vc.setHeld(vc.elementNamed("Shift"), true);
+    vc.press(vc.elementNamed("Pad 11"));
+    vc.press(vc.elementNamed("Pad 6"));
+    vc.press(vc.elementNamed("Play"));
+    vc.moveStrip(vc.modStripElement(), 0.7f);
+    juce::MouseWheelDetails wheel;
+    wheel.deltaX = 0.0f; wheel.deltaY = 1.0f; wheel.isReversed = false; wheel.isSmooth = false; wheel.isInertial = false;
+    const auto knob = vc.elementBounds(vc.elementNamed("E3")).getCentre();
+    vc.mouseWheelMove(juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(), knob, juce::ModifierKeys(),
+                                       0.0f, 0.0f, 0.0f, 0.0f, 0.0f, &vc, &vc, juce::Time(), knob, juce::Time(), 1, false), wheel);
+    const bool ok = write(vc, file.getSiblingFile(file.getFileNameWithoutExtension() + "-lit.png"));
+    std::cout << "whole repaint at 2x, static layer cached: " << juce::String(vc.measurePaintMs(50), 2) << " ms" << std::endl;
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && juce::String(argv[1]) == "--bench")
         return bench::main();
+
+    // NEPTUNE_SNAPSHOT_CONTROLLER=<file.png>: draw the panel of the Mac window into that file at 2x (and
+    // <file>-lit.png with pads lit, one pressed, Shift held and a display picture), print the paint time, quit.
+    if (const auto shot = juce::SystemStats::getEnvironmentVariable("NEPTUNE_SNAPSHOT_CONTROLLER", {}); shot.isNotEmpty())
+        return snapshotController(juce::File::getCurrentWorkingDirectory().getChildFile(shot));
 
     juce::UnitTestRunner runner;
 
@@ -9776,6 +9836,7 @@ int main(int argc, char** argv)
             || name == "Wavetable Embed"
             || name == "Drum Keys"
             || name == "Preset Audition"
+            || name == "Chord Pads"
             || name == "Control Grammar"
             || name == "Live Record"
             || name == "Held Step Pages"
@@ -9856,7 +9917,7 @@ int main(int argc, char** argv)
             || name == "Filter View Screen"
             || name == "OLED Mirror"
             || name == "MIDI Track Output"
-            || name == "OLED Mirror Input" || name == "Virtual Controller" || name == "Song Player" || name == "Comb Glide" || name == "Multi Step Edit" || name == "Drum Lanes" || name == "Send Reverb" || name == "Metronome"
+            || name == "OLED Mirror Input" || name == "Virtual Controller" || name == "Panel Dimensions" || name == "Song Player" || name == "Comb Glide" || name == "Multi Step Edit" || name == "Drum Lanes" || name == "Send Reverb" || name == "Metronome"
             || name == "Project Roundtrip"
             || name == "Factory Preset Coverage"
             || name == "Mod Wheel"

@@ -18,6 +18,7 @@
 #include "../src/ui/screens/AftertouchScreen.h"
 #include "../src/ui/screens/WaveformScreen.h"
 #include "../src/ui/screens/TrackFxScreen.h"
+#include "../src/ui/screens/ChordPadScreen.h"
 #include "../src/controller/DisplayRenderer.h"
 #include "../src/controller/LaunchkeyController.h"
 #include "../src/controller/PadManager.h"
@@ -37,11 +38,11 @@ namespace helptest
     using Edit = ScreenManager::Edit;
     using Card = ScreenManager::HelpCard;
 
-    enum { TRACKS = 0, STEP, PARAM, DRUMS, PRESET, SETTINGS, FLTR, ARP, SCALE, SONG, ATROUTE, WAVE, TRKFX, NUM_SCREENS };
+    enum { TRACKS = 0, STEP, PARAM, DRUMS, PRESET, SETTINGS, FLTR, ARP, SCALE, SONG, ATROUTE, WAVE, TRKFX, CHORD, NUM_SCREENS };
     static const char* const screenNames[NUM_SCREENS] = { "TRACKS", "STEP", "PARAM", "DRUMS", "PRESET", "SETTINGS", "FLTR", "ARP",
-                                                          "SCALE", "SONG", "AT ROUTE", "WAVE", "TRK FX" };
+                                                          "SCALE", "SONG", "AT ROUTE", "WAVE", "TRK FX", "CHORD" };
     static const char* const mapNames[NUM_SCREENS] = { "TRKS", "STEP", "PARM", "DRUM", "PRST", "SETT", "FLTR", "ARP",
-                                                       "SCAL", "SONG", "ATRT", "WAVE", "TKFX" };
+                                                       "SCAL", "SONG", "ATRT", "WAVE", "TKFX", "CHRD" };
     enum : int { BANK_UP = 51, BANK_DOWN = 52, PATTERN_KEY = 104, UP = 106, DOWN = 107, SETTINGS_BUTTON = 108,
                  PLAY = 115, RECORD = 117 };
 
@@ -55,6 +56,7 @@ namespace helptest
         DisplayRenderer display;
         PresetManager presets;
         CustomScaleManager scales;
+        ChordPads chordPads;
         SongMode song;
         Arpeggiator arp;
         ScreenManager mgr;
@@ -66,6 +68,8 @@ namespace helptest
 
         Rig()
         {
+            mgr.setHelpBusyWindow(0);       // (controls arrive here with no time between them;
+                                            //  the rule has its own test)
             seq.prepareToPlay(44100.0, 512);
             audio.setSequencer(&seq);
             for (int t = 0; t < seq.getPattern().getTrackCount(); ++t)
@@ -97,15 +101,17 @@ namespace helptest
             add(new AftertouchScreen(audio, [this] { return seq.getSelectedTrack(); }));
             add(new WaveformScreen(seq, &audio));
             add(new TrackFxScreen(seq, &audio));
+            add(new ChordPadScreen(chordPads));
 
             static constexpr int map[16] = { PARAM, TRACKS, TRKFX, STEP, PRESET, SONG, SETTINGS, ATROUTE,
-                                             STEP, DRUMS, ARP, SCALE, WAVE, FLTR, -1, -1 };
+                                             STEP, DRUMS, CHORD, SCALE, WAVE, FLTR, -1, -1 };
             for (int pad = 0; pad < 16; ++pad)
                 mgr.setShiftPadScreen(pad, map[pad]);
             mgr.setButtonScreens(SETTINGS, ARP, SCALE);
             mgr.setStepScreen(STEP);
             mgr.setPinnable(DRUMS, true);
             mgr.setPinnable(SCALE, true);
+            mgr.setPinnable(CHORD, true);
             mgr.setScreenContext(STEP, ScreenManager::CopyContext::Steps);
             mgr.setScreenContext(TRACKS, ScreenManager::CopyContext::Pattern);
             mgr.setScreenContext(PARAM, ScreenManager::CopyContext::Sound);
@@ -281,6 +287,49 @@ public:
             expect(r.picture() == screen, "letting go gives the screen back exactly");
             expectEquals(r.mgr.getActiveIndex(), (int) TRACKS);
             expectEquals(r.home->getPageIndex(), 0);
+        }
+
+        beginTest("In the middle of something: a hold key pressed just after a knob, pad or button gets no card for 2 s");
+        {
+            using SM = ScreenManager;
+            for (Key key : { Key::Shift, Key::Func })
+                for (int mode = 0; mode < 2; ++mode)
+                    for (int kind = 0; kind < 3; ++kind)
+                    {
+                        Rig r;
+                        r.mgr.setHelpBusyWindow(SM::HELP_BUSY_WINDOW_MS);
+                        r.mgr.setHelpMode(mode == 0 ? SM::HelpMode::Delayed : SM::HelpMode::Instant);
+                        r.wait(10000);
+                        const juce::String tag = juce::String(SM::getHelpKeyName(key)) + (mode ? " INST" : "") + " after " + juce::String(kind) + ": ";
+                        if (kind == 0) r.turn(0, 1);
+                        if (kind == 1) r.pad(3);
+                        if (kind == 2) r.tap(BANK_DOWN);
+                        r.wait(300);                    // the hand moves to the key
+                        r.hold(key, true);
+                        r.tick();
+                        expect(!r.showing(key), tag + "nothing at the press");
+                        r.wait(SM::HELP_DELAY_MS + 100);
+                        expect(!r.showing(key), tag + "nothing after the usual delay: the screen stays readable");
+                        r.turn(0, 1);                   // the chord the key was pressed for
+                        r.wait(5000);
+                        expect(!r.showing(key), tag + "and nothing for the rest of the hold once a knob moved");
+                        r.hold(key, false);
+
+                        // Held on and on with nothing else touched, the card still comes.
+                        r.turn(0, 1);
+                        r.wait(300);
+                        r.hold(key, true);
+                        r.wait(SM::HELP_BUSY_DELAY_MS + 10);
+                        expect(r.showing(key), tag + "a long lone hold still shows the card");
+                        r.hold(key, false);
+
+                        // At rest the card comes as always.
+                        r.wait(SM::HELP_BUSY_WINDOW_MS + 100);
+                        r.hold(key, true);
+                        r.wait();
+                        expect(r.showing(key), tag + "at rest: the card after the usual delay");
+                        r.hold(key, false);
+                    }
         }
 
         beginTest("HELP on SETTINGS -> SETUP: OFF never shows a card, INST shows it at once");
@@ -539,7 +588,7 @@ public:
             for (auto& l : card.padRows[0].labels) top.add(l.text);
             for (auto& l : card.padRows[1].labels) bottom.add(l.text);
             expectEquals(top.joinIntoString(" "), juce::String("PARM TRKS TKFX STEP PRST SONG SETT ATRT"));
-            expectEquals(bottom.joinIntoString(" ").trim(), juce::String("STEP DRUM ARP SCAL WAVE FLTR"));
+            expectEquals(bottom.joinIntoString(" ").trim(), juce::String("STEP DRUM CHRD SCAL WAVE FLTR"));
             expectEquals(card.lines[5].text, juce::String("COPY CLEAR PASTE:FUNC"));
             expect(card.lines[4].text.isEmpty(), "TRACKS cannot be pinned");
 

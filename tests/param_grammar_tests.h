@@ -1257,6 +1257,312 @@ public:
                     expect(labels.contains(word), juce::String(word) + " on engine " + juce::String((int) type));
             }
         }
+
+        beginTest("FM operator ratio: plain = the next harmonic, Shift = 0.01, Func = an octave");
+        {
+            FMEngine fm;
+            ParamSpec rat, rati;
+            for (auto& page : fm.getParamPages())
+                for (auto& cell : page.params)
+                {
+                    if (juce::String(cell.label) == "RAT2") rat = cell;
+                    if (juce::String(page.name) == "OP2" && juce::String(cell.label) == "RATI") rati = cell;
+                }
+            expect(rat.isValid() && rati.isValid());
+            for (auto* spec : { &rat, &rati })
+            {
+                auto plain = [&](float v, int n) { return spec->turned(v, n, TurnStep::Plain); };
+                auto fine = [&](float v, int n) { return spec->turned(v, n, TurnStep::Fine); };
+                auto coarse = [&](float v, int n) { return spec->turned(v, n, TurnStep::Coarse); };
+                expectEquals(plain(1.0f, 1), 2.0f);
+                expectEquals(plain(2.0f, 1), 3.0f, "whole ratios, not halves");
+                expectEquals(plain(1.0f, 5), 6.0f);
+                expectEquals(plain(1.0f, -1), 0.5f, "below 1: the sub-octave");
+                expectEquals(plain(0.5f, -1), 0.5f, "the bottom of the range");
+                expectEquals(plain(0.5f, 1), 1.0f);
+                expectEquals(plain(16.0f, 1), 16.0f, "the top of the range");
+                expectEquals(plain(15.0f, 3), 16.0f);
+                expectEquals(plain(2.37f, 1), 3.0f, "from in between, up lands on the harmonic above");
+                expectEquals(plain(2.37f, -1), 2.0f, "and down on the one below");
+                expectEquals(plain(0.73f, 1), 1.0f);
+                expectEquals(plain(0.73f, -1), 0.5f);
+                expectWithinAbsoluteError(fine(2.0f, 1), 2.01f, 1.0e-4f);
+                expectWithinAbsoluteError(fine(2.0f, -7), 1.93f, 1.0e-4f);
+                expectWithinAbsoluteError(fine(1.0f, 41), 1.41f, 1.0e-4f, "any ratio is reachable");
+                expectEquals(fine(16.0f, 1), 16.0f);
+                expectEquals(coarse(1.5f, 1), 3.0f, "an octave keeps the interval");
+                expectEquals(coarse(3.0f, -1), 1.5f);
+                expectEquals(coarse(12.0f, 1), 12.0f, "no octave left above: stays");
+                expectEquals(coarse(0.75f, -1), 0.75f);
+                expectEquals(spec->format(3.0f), juce::String("3"));
+                expectEquals(spec->format(3.07f), juce::String("3.07"));
+                expectEquals(spec->format(0.5f), juce::String("0.50"));
+            }
+
+            // The value the knob leaves is the frequency the operator runs at.
+            fm.setParameter(FMEngine::Op2Ratio, rat.turned(1.0f, 41, TurnStep::Fine));
+            expectWithinAbsoluteError(fm.getParameter(FMEngine::Op2Ratio), 1.41f, 1.0e-4f);
+        }
+
+        beginTest("Recording: a knob turned while the pattern records and plays is written as locks, one lap of the track");
+        {
+            Rig rig;
+            rig.seq.prepareToPlay(48000.0, 64);
+            rig.audio.setSequencer(&rig.seq);
+            rig.seq.setTempo(120.0f);
+            auto& track = rig.track();
+            track.setLength(16);
+            track.getStep(0).trig = true;
+            track.getStep(0).notes.push_back({ 60, 1.0f });
+            // The app's trig callback: a step's locks are applied when it plays.
+            rig.seq.setTrigCallback([&](int t, const Step& step) { rig.audio.applyStepLocks(t, step); });
+
+            expect(rig.param.selectPageByName("FILTR"));
+            int cutKnob = -1;
+            ParamSpec cut;
+            const auto page = rig.param.getCurrentPage();
+            for (int i = 0; i < 8; ++i)
+                if (juce::String(page.params[(size_t) i].label) == "CUT") { cutKnob = i; cut = page.params[(size_t) i]; }
+            expect(cutKnob >= 0);
+            const float own = rig.value(cut.id);
+
+            // One sixteenth at 120 BPM is 6000 samples. The refresh polls about every 1600.
+            auto run = [&](int samples)
+            {
+                for (int done = 0; done < samples; done += 64)
+                {
+                    rig.seq.processBlock(64);
+                    if (done % 1600 < 64) rig.audio.motionPoll();
+                }
+                rig.audio.motionPoll();
+            };
+
+            // Not recording: a turn is a turn, nothing is written.
+            rig.seq.start();
+            run(6000 * 2 + 100);
+            rig.param.onEncoderChange(cutKnob, 127);
+            run(6000);
+            int locks = 0;
+            for (auto& st : track.steps) locks += (int) st.paramLocks.count(cut.id);
+            expectEquals(locks, 0, "playing without recording writes no locks");
+            const float base = rig.value(cut.id);
+            expect(base < own);
+            rig.seq.stop();
+
+            // Recording: turned down over steps 2-4, then left alone.
+            rig.seq.setRecording(true);
+            rig.seq.start();
+            run(6000 * 2 + 100);                                // on step 2
+            expectEquals(rig.seq.getCurrentStep(0), 2);
+            float turned[3] = {};
+            for (int k = 0; k < 3; ++k)
+            {
+                rig.param.onEncoderChange(cutKnob, 127);
+                rig.param.onEncoderChange(cutKnob, 127);
+                turned[k] = rig.value(cut.id);
+                run(6000);
+            }
+            expect(turned[2] < turned[1] && turned[1] < turned[0] && turned[0] < base, "the knob is heard as it turns");
+            expectEquals(track.getStep(2).paramLocks[cut.id], turned[0]);
+            expectEquals(track.getStep(3).paramLocks[cut.id], turned[1]);
+            expectEquals(track.getStep(4).paramLocks[cut.id], turned[2]);
+            expect(track.getStep(3).trig && track.getStep(3).notes.empty(), "a step without a trig carries the lock without a note");
+            expectEquals((int) track.getStep(0).notes.size(), 1, "a step with notes keeps them");
+
+            // The knob left where it is: that value is written until the lap is full.
+            run(6000 * 16);
+            for (int i = 0; i < 16; ++i)
+            {
+                expect(track.getStep(i).paramLocks.count(cut.id) == 1, "step " + juce::String(i) + " has the movement");
+                if (i < 2 || i > 4)
+                    expectEquals(track.getStep(i).paramLocks[cut.id], turned[2], "step " + juce::String(i));
+            }
+            expectEquals(track.getStep(2).paramLocks[cut.id], turned[0], "the lap ends where it began: the start is not overwritten");
+            expect(!rig.audio.isMotionActive(0, cut.id));
+            expectEquals(track.soundParams[cut.id], base, "the track's own value is the one from before the movement");
+
+            // The next lap plays the movement back.
+            rig.seq.setRecording(false);
+            run(6000 * 16);
+            const int now = rig.seq.getCurrentStep(0);
+            expectEquals(rig.value(cut.id), track.getStep(now).paramLocks[cut.id], "playback: the step's value sounds");
+
+            // Stopped half-way through a lap: the steps not reached keep no lock and the own value returns.
+            for (auto& st : track.steps) st.paramLocks.clear();
+            rig.seq.stop();
+            rig.seq.setRecording(true);
+            rig.seq.start();
+            run(6000 * 4 + 100);
+            rig.param.onEncoderChange(cutKnob, 1);
+            run(6000 * 3);
+            rig.seq.setRecording(false);
+            run(6000);
+            locks = 0;
+            for (auto& st : track.steps) locks += (int) st.paramLocks.count(cut.id);
+            expect(locks >= 3 && locks <= 4, "only the steps passed: " + juce::String(locks));
+            expectEquals(track.soundParams[cut.id], base);
+            rig.seq.stop();
+        }
+
+        beginTest("TRK FX: an effect that is already synced shows its RATE as a tempo division, however SYNC came on");
+        {
+            Rig rig;
+            rig.audio.setSequencer(&rig.seq);
+            rig.audio.addInsertEffect(0, EffectType::WahEffect);
+            expect(rig.fx.selectPageByName("FX"));
+            auto rate = [&]
+            {
+                const auto page = rig.fx.getCurrentPage();
+                for (auto& cell : page.params)
+                    if (juce::String(cell.label) == "RATE") return cell;
+                return ParamSpec();
+            };
+            expect(rate().isValid() && juce::String(rate().unit) == "Hz", "free: the rate in Hz");
+
+            // SYNC switched on behind the screen (a project or preset that has it on, undo, a lock).
+            rig.audio.setTrackParameter(0, AudioEngine::INSERT_SYNC_BASE + 0, 1.0f);
+            expect(rate().kind == ParamKind::Choice && rate().id == AudioEngine::INSERT_DIV_BASE + 0,
+                   "synced: RATE chooses a division");
+            expect(rate().choices != nullptr && juce::String(rate().choices[FxSync::DEFAULT_DIVISION]) == "1/4");
+
+            rig.audio.setTrackParameter(0, AudioEngine::INSERT_SYNC_BASE + 0, 0.0f);
+            expect(juce::String(rate().unit) == "Hz", "and Hz again when it goes off");
+
+            // A synced delay replaced by the wah from outside the screen: the cells are the wah's.
+            rig.audio.setInsertEffect(0, 0, EffectType::DelayEffect);
+            rig.audio.setTrackParameter(0, AudioEngine::INSERT_SYNC_BASE + 0, 1.0f);
+            const auto synced = rig.fx.getCurrentPage();
+            rig.audio.setInsertEffect(0, 0, EffectType::WahEffect);
+            expect(rate().isValid() && juce::String(rate().unit) == "Hz", "the new effect is not synced and says so");
+            juce::ignoreUnused(synced);
+        }
+
+        beginTest("Synth ARCH: each architecture keeps what was dialled in; switching away and back loses nothing");
+        {
+            Rig rig;
+            auto all = [&]
+            {
+                std::vector<float> v;
+                for (int id = 0; id < EngineParamRange::THIRD_END; ++id)
+                    if (EngineParamRange::contains(id)) v.push_back(rig.value(id));
+                return v;
+            };
+            // Every page's ARCH cell and a way to turn any cell by its label.
+            auto turn = [&](const char* label, int clicks)
+            {
+                for (int pg = 0; pg < rig.param.getPageCount(); ++pg)
+                {
+                    rig.param.setCurrentPageIndex(pg);
+                    const auto page = rig.param.getCurrentPage();
+                    for (int i = 0; i < 8; ++i)
+                        if (juce::String(page.params[(size_t) i].label) == label)
+                        {
+                            for (int c = 0; c < std::abs(clicks); ++c)
+                                rig.param.onEncoderChange(i, clicks > 0 ? 1 : 127);
+                            return true;
+                        }
+                }
+                return false;
+            };
+
+            // A sound of the owner's on INIT.
+            expect(turn("CUT", -12) && turn("RESO", 9) && turn("WAV1", 2) && turn("XMOD", 30) && turn("ATK", 15));
+            const auto mine = all();
+            expectEquals((int) rig.value(UnifiedParam::ARCH), 0);
+
+            expect(turn("ARCH", 1));
+            expectEquals((int) rig.value(UnifiedParam::ARCH), 1);
+            const auto monoFresh = all();
+            expect(monoFresh != mine, "the first visit loads the architecture's starting sound");
+            expect(turn("CUT", -7) && turn("DEC", 11));
+            const auto monoMine = all();
+            expect(monoMine != monoFresh);
+
+            expect(turn("ARCH", -1));
+            expect(all() == mine, "back on the first architecture: the sound as it was left");
+            expectEquals(rig.track().soundParams[UnifiedParam::CUTOFF], rig.value(UnifiedParam::CUTOFF), "and stored as such");
+
+            expect(turn("ARCH", 1));
+            expect(all() == monoMine, "and the second as IT was left, not its starting sound");
+
+            // Through two others and back, in one sweep of the knob.
+            expect(turn("ARCH", 2));
+            expectEquals((int) rig.value(UnifiedParam::ARCH), 3);
+            expect(turn("ARCH", -3));
+            expect(all() == mine);
+
+            // A never-visited architecture still starts from its own sound.
+            Rig fresh;
+            fresh.param.onArrowRight();
+            auto freshAll = [&] { std::vector<float> v; for (int id = 0; id < EngineParamRange::THIRD_END; ++id) if (EngineParamRange::contains(id)) v.push_back(fresh.value(id)); return v; };
+            fresh.audio.setTrackParameter(0, UnifiedParam::ARCH, 1.0f);
+            expect(freshAll() == monoFresh, "the starting sound itself is unchanged");
+        }
+
+        beginTest("Filter key tracking runs from -100 to +100 on every engine with a filter: below 0 high notes get darker");
+        {
+            for (auto type : { EngineType::UnifiedVoice, EngineType::FM, EngineType::MacroOsc, EngineType::Wavetable,
+                               EngineType::WaveSeq, EngineType::Sampler })
+            {
+                const juce::String tag = "engine " + juce::String((int) type) + ": ";
+                // The cutoff cell and the key-tracking cell that share a page with it.
+                ParamSpec cut, key;
+                {
+                    auto e = AudioEngine::createEngine(type);
+                    for (auto& page : e->getParamPages())
+                        for (auto& cell : page.params)
+                        {
+                            const juce::String label(cell.label), unit(cell.unit);
+                            if (label == "CUT" && !cut.isValid()) cut = cell;
+                            // (the synth's MOD2 page has a KTRK of its own: key to LFO rate)
+                            if ((label == "KTRK" || label == "KEY") && cell.kind == ParamKind::Linear && !key.isValid()
+                                && page.name != "MOD2")
+                                key = cell;
+                        }
+                }
+                expect(cut.isValid() && key.isValid(), tag + "has CUT and filter key tracking");
+                if (!key.isValid()) continue;
+                expectEquals(key.minVal, -1.0f, tag + "from -100");
+                expectEquals(key.maxVal, 1.0f, tag + "to +100");
+                expectEquals(key.defaultVal, 0.0f);
+                expectEquals(key.format(-1.0f), juce::String("-100"));
+                expectEquals(key.format(1.0f), juce::String("+100"));
+
+                // A high note (C6, 1047 Hz) through a low-pass set below it (about 630 Hz): what gets
+                // through, as power, falls when the cutoff moves down with the key and rises when it moves up.
+                auto brightness = [&](float tracking)
+                {
+                    auto e = AudioEngine::createEngine(type);
+                    e->prepareToPlay(48000.0, 64);
+                    e->setParameter(cut.id, cut.fromNorm(0.5f));
+                    e->setParameter(key.id, tracking);
+                    expectEquals(e->getParameter(key.id), tracking, tag + "the value is kept");
+                    e->noteOn(84, 0.8f);
+                    juce::AudioBuffer<float> buf(2, 64);
+                    juce::MidiBuffer midi;
+                    double diff = 0.0, power = 0.0;
+                    float last = 0.0f;
+                    for (int b = 0; b < 300; ++b)
+                    {
+                        buf.clear();
+                        e->processBlock(buf, midi);
+                        for (int i = 0; i < 64; ++i)
+                        {
+                            const float x = buf.getSample(0, i);
+                            if (b >= 40) { diff += (double) (x - last) * (x - last); power += (double) x * x; }
+                            last = x;
+                        }
+                    }
+                    juce::ignoreUnused(diff);
+                    return power;
+                };
+                const double down = brightness(-1.0f), flat = brightness(0.0f), up = brightness(1.0f);
+                if (type == EngineType::Sampler)
+                    continue;       // (its default sample is a sine: a filter has nothing to take away)
+                expect(down < flat * 0.7, tag + "-100 closes the filter on a high note: " + juce::String(down, 4) + " against " + juce::String(flat, 4));
+                expect(up > flat * 1.3, tag + "+100 opens it: " + juce::String(up, 4) + " against " + juce::String(flat, 4));
+            }
+        }
     }
 };
 static ParamGrammarTests ParamGrammarTestsInstance;

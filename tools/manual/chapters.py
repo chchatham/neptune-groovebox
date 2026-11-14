@@ -272,7 +272,7 @@ moment says why there for a second instead of doing nothing: {{SAMPLER ONLY}}, {
             + table(["Pad", "Top row", "Bottom row"], [
                 ("1", fmt("{{PARAM}} — the sound engine's pages"), fmt("{{STEP}} — the step sequencer")),
                 ("2", fmt("{{TRACKS}} — mixer and engine choice"), fmt("{{DRUMS}} — drum pads")),
-                ("3", fmt("{{TRK FX}} — track effects"), fmt("{{ARP}} — arpeggiator and rolls")),
+                ("3", fmt("{{TRK FX}} — track effects"), fmt("{{CHORD}} — chord pads (the arpeggiator is on the [[Arp]] button)")),
                 ("4", fmt("{{STEP}} — the step sequencer"), fmt("{{SCALE}} — scale pads")),
                 ("5", fmt("{{PRESET}} — sound presets"), fmt("{{WAVE}} — waveform and resampling")),
                 ("6", fmt("{{SONG}} — song rows"), fmt("{{FLTR}} — the filter picture")),
@@ -306,7 +306,9 @@ an LFO's {{DEST}} list from one page's group of destinations to the next.</p>
 <h3>Help cards</h3>
 <p>Every key that changes what the other controls do while you hold it has help cards: [[Shift]], [[Func]],
 [[&gt;]], [[▲]] / [[▼]] and [[Rec]]. Hold one of them by itself. After a third of a second the display becomes a
-help card for that key, and stays for as long as you hold it. While a card is showing, the two knob-page buttons turn to the key's other cards
+help card for that key, and stays for as long as you hold it. If you used a knob, pad or button in the two seconds
+before, the key is taken for the start of a chord and the card waits two seconds instead, so [[Shift]] + turn in the
+middle of editing never covers the value you are setting. While a card is showing, the two knob-page buttons turn to the key's other cards
 (the mark at the top right, such as {{2/3}}, says which one you are on). Anything else you press or turn makes the
 card step aside for the rest of that hold and then does exactly what it always does, so a quick [[Shift]] + pad or
 [[Func]] + [[Play]] never sees a card at all. Let go and the screen is back as it was.</p>
@@ -364,7 +366,7 @@ pattern needs its button held for half a second, and whatever the edit combinati
 <p>On screens with several pages, [[Func]] + a top-row pad jumps straight to a page (on {{PARAM}}, to a section; the
 same pad again steps within it).</p>
 <h3>Pinning the playing pads</h3>
-<p>On {{DRUMS}} or {{SCALE}}, hold [[Shift]] and hold that screen's own bottom pad for half a second. {{PIN}} appears
+<p>On {{DRUMS}}, {{CHORD}} or {{SCALE}}, hold [[Shift]] and hold that screen's own bottom pad for half a second. {{PIN}} appears
 in the name bar and those pads keep playing, with pressure, on every other screen, so you can play pads with one hand
 and turn sound knobs with the other. The same gesture unpins.</p>""")),
     ]))
@@ -429,11 +431,12 @@ type). The screen follows the selected track if it is a drum track, otherwise th
 save, {{DL}} delete, {{VL}} track volume. Load, save and delete need the four clicks.</p>
 <p><b>Audition:</b> opening the screen changes nothing. As soon as the highlight moves (knob 1, [[▲]] / [[▼]], or a
 change of category or engine filter), the highlighted preset takes over the track's sound for listening only, and
-the name bar shows AUD. The track's own sound comes back when you leave the screen by any route or select another
-track. {{LD}} keeps the highlighted preset instead (the name bar shows LOAD OK): after that nothing is put back.
+the name bar shows AUD. Each preset is heard in a fresh copy of its engine, exactly as it will sound once loaded
+(notes still sounding from the previous one end). The track's own sound comes back, untouched, when you leave the
+screen by any route or select another track. {{LD}} keeps the highlighted preset instead (the name bar shows LOAD OK): after that nothing is put back.
 {{AU}} is the off switch: turned off (AU- in the name bar), the list scrolls without changing the sound, and
 {{LD}} still loads. A project saved while you are listening stores the track's own sound.</p>
-<p><b>Pads:</b> play the track, sixteen semitones up from middle C, so you can audition without reaching for the keys.
+<p><b>Pads:</b> play the track on the notes of the scale chosen on {{SCALE}} (its page and root; sixteen semitones up from middle C until you choose one, with the root lit), so you can audition without reaching for the keys.
 [[▲]] / [[▼]] also scroll the list.</p>
 <p>Your own presets are files in <i>Music / Neptune / Presets</i>.</p>""")
     screen("SETTINGS", [("SETTINGS", 1, "SETUP"), ("SETTINGS", 2, "MASTR"), ("SETTINGS", 3, "PROJ"),
@@ -460,6 +463,25 @@ modes) and you can make your own.</p>
 choose pages, {{OC}} octave, {{LK}} scale lock (the same switch as the [[Scale]] button: with the lock on, the keys
 play the nearest note of the page's scale on synth tracks, arps stay in it, and <code>SCALE</code> shows in the name
 bar). In edit mode tap a pad and press a key to assign its note.</p>""")
+    screen("CHORD — chord pads", [("CHORD", 1, "CHORD")], """
+<p><b>Storing:</b> hold a chord on the keys and press a pad. The chord is on that pad: exactly the notes you held,
+each at the level you played it. Whatever the pad had before is replaced (undo brings it back). Keys kept by the
+latch count as held, so you can latch a chord and use the same hand for the pad. While keys are down the name bar
+names the chord (<code>Cm7 &gt; PAD</code>) and the empty pads light up; afterwards it says where the chord went
+(<code>PAD 5 = Cm7</code>).</p>
+<p><b>Playing:</b> press a pad with no key held. It plays its chord on the selected track; the harder you hit, the
+louder the chord, and pressure reaches every note. Chord pads record into steps, feed the arp when it is on, and
+roll, like every other playing pad. They can be pinned (below), so a progression stays under your fingers while
+you edit the sound.</p>
+<p><b>Display:</b> the sixteen pads as two rows of eight, each with the chord's root over its kind: <code>M</code>
+major, <code>m</code> minor, <code>7</code>, <code>M7</code>, <code>m7</code>, <code>o</code> diminished,
+<code>h7</code> half-diminished, <code>+</code> augmented, <code>s2</code> / <code>s4</code> suspended,
+<code>6</code>, <code>9</code>, <code>5</code> a bare fifth, <code>*</code> anything else (named by its lowest
+note). A line under a cell marks an inversion; <code>--</code> is an empty pad. The pad lights are coloured by
+root, neighbours on the circle of fifths in neighbouring colours, so a progression reads as colours.</p>
+<p><b>Knobs:</b> {{BK}} bank (four banks of sixteen; also [[▲]] / [[▼]]), {{TR}} transpose and {{OC}} octave for
+every pad, {{VL}} whether each note keeps the level it was stored with, {{CL}} clear the bank (four clicks). Chords
+are saved with the project.</p>""")
     screen("SONG", [("SONG", 1, "SONG")], """
 <p><b>Knobs:</b> {{PA}} pattern, {{RP}} repeats, {{TR}} transpose, {{RW}} row, {{LP}} loop, {{SG}} song on / off,
 {{IN}} insert a row, {{DL}} delete the row (four clicks).</p>
@@ -622,7 +644,10 @@ own page. The {{SLICE}} page cuts the sample into slices, evenly or at its hits,
 speed without changing its pitch (all in Chapter 11). Edit the markers by eye on the {{WAVE}} screen.</p>""") + page_list(params, "Sampler")))
     eng.append(("Drums", fmt("""
 <p>Sixteen voices, each a small synthesizer with eight controls. Play and select them on {{DRUMS}}; edit the selected
-one there or on {{PARAM}}. Closed and open hats cut each other off.</p>""") + page_list(params, "Drum")
+one there or on {{PARAM}}. Closed and open hats cut each other off. The hats are six square oscillators at
+unrelated pitches through band-pass filters, the classic drum-machine recipe; {{TUNE}} moves the whole cluster and
+{{TONE}} the high-pass. The open hat is open for as long as the pad, key or step lasts and closes when it ends: tap
+it for a closed hat, hold it (or give its step a longer {{LEN}}) for an open one.</p>""") + page_list(params, "Drum")
         + "<p>Types: " + " · ".join(f"<code>{c}</code>" for c in choices(params, "Drum", "DR 1", "TYPE"))
         + fmt(""" (FM kick, analog kick, modelled kick, noise snare, FM snare, clap, closed hat, open hat, cymbal, tom,
 rim, shaker, clave, sub-bass, kick machine).</p>
@@ -904,6 +929,13 @@ sequencer and the recording start together on the beat after. During the count-i
 is recorded, and a queued pattern waits. [[Play]] during the count-in calls it off. The count-in is only for a
 recording that starts the sequencer: if the sequencer is already playing, recording switches on at once, and
 [[Play]] without recording always starts at once.</p>
+<p><b>Knob movements are recorded too.</b> On {{PARAM}}, {{TRK FX}} and {{FLTR}}, a knob turned while the
+pattern records and plays is written into the selected track as parameter locks: one on every step that passes,
+from the first turn for one lap of the track, so a filter sweep comes back exactly as you made it. A knob you stop
+turning keeps writing its value until the lap is full. A step that had no trig becomes a trig without notes that
+only carries the lock. Afterwards the track's own value is what it was before you touched the knob; hold a step and
+[[&gt;]] + turn removes a lock, and undoing the recording pass removes the whole movement. Sample choice, slicing
+and wavetable key frames cannot be locked and are not recorded.</p>
 <p><b>While recording</b> the name bar shows <code>REC FREE</code> or <code>REC QUANT</code> on every screen (a
 single <code>R</code> or <code>Q</code> when room is short) and a red light runs across the pads, one pad per step
 of the selected track. Pads that play notes keep playing them under the light; on {{STEP}} the playhead is the
@@ -955,7 +987,12 @@ A muted track keeps its place and comes back in time.</li>
 
     # =========================================================================================
     arp_modes = ["Up", "Down", "Up-down", "Random", "As played", "Chord repeat", "Walk", "Play order", "Converge",
-                 "Diverge", "Poly arp (all notes, accented)", "Random with octave jumps"]
+                 "Diverge", "Poly arp (all notes, accented)", "Random with octave jumps",
+                 "Parallel (PARA: every key runs its own climb through the octaves from the moment it is pressed, "
+                 "side by side with the others; keys pressed together climb together)",
+                 "Pedal (PEDL: the lowest note sounds before each higher one in turn — 1 2 1 3 1 4)",
+                 "Rising pedal (PDL+: the same, and after each pass the next note up becomes the pedal — "
+                 "1 2 1 3 1 4, 2 3 2 4, 3 4)"]
     ch.append(("Arpeggiator and rolls", [
         ("The arpeggiator", fmt("""
 <p>Every track has its own. [[Arp]] opens the screen; pressed again there, it switches the selected track's arp on.
@@ -1103,12 +1140,20 @@ effects, sends, master section, song, scale pages, pressure routes and ranges, a
 (<i>Music / Neptune / Projects</i>, P01 to P32).</p>
 <p>{{SETTINGS}} → {{PROJ}}: {{SLOT}} chooses, {{LOAD}}, {{SAVE}}, {{SVAS}} (save as, to the chosen slot) and {{NEW}}
 each need four clicks and answer OK or FAIL. {{AUTO}} keeps saving to the current slot as you work. The app reopens
-the last project when it starts.</p>
+the last project when it starts, and on top of it everything exactly as it was when the app was last running, saved
+or not (the app notes its state when it quits and every 15 seconds). {{SAVE}} is still what writes a project slot;
+{{NEW}} or {{LOAD}} is the way to a different starting point.</p>
 <p>Not saved: an arp's mutation state, the temporary pattern copy, the clipboards, and the keyboard split.</p>""")),
         ("Presets", fmt("""
 <p>A preset is one track's sound. The built-in ones are marked * in the list, among them a loop and a sliced preset
 for each of the sampler's drum breaks (chapter "Sampling, slicing and stretch"); yours are saved from {{PRESET}} with
 {{SV}} into <i>Music / Neptune / Presets</i>. Categories: BASS, PAD, LEAD, KEYS, FX, PERC, KIT, INIT.</p>
+<p><b>What {{SV}} saves:</b> the track's own sound, complete - every engine setting, the track's insert effects and
+their settings, the DIRT / TALK / MODFX blocks, the send levels, the volume, and the track's arpeggiator (all its
+settings, whether it is on, and its tapped rhythm). If a preset is being auditioned at
+that moment, it is still your own sound that is saved, not the one you are listening to. A preset saved this way
+brings its effects and its arpeggiator with it when it is auditioned or loaded; the built-in presets have neither of
+their own and play through whatever effects and arp the track has.</p>
 <p><b>Naming:</b> {{SV}} saves at once as User 1, User 2 and so on, so nothing waits for the Mac. The Mac then shows
 a box asking for a name: type up to 15 characters on its keyboard and press Return, or press Escape to keep the User
 name. A name already in use is refused and the name bar says so.</p>""")),

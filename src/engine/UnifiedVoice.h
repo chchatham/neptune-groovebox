@@ -261,7 +261,7 @@ public:
         OscMix,         // oscillator 1 <-> 2 balance, +-0.5
         Amp,            // level, x0..x2
         PulseWidth,     // +-0.4
-        CrossMod,       // oscillator 2 -> 1 phase modulation amount, +-1
+        CrossMod,       // oscillator 2 -> 1 through-zero FM amount, +-1
         CutoffB,        // filter B only, +-4 octaves
         Pan,            // the voice's place in the stereo field, +-1 (full left / right)
         Osc1Level,      // x0..x2
@@ -640,6 +640,22 @@ public:
         const float xmodNow = std::clamp(crossMod + lfoXmodMod + atFm, 0.0f, 1.0f);
         modOscMixOffset += atWavePos * 0.5f;
 
+        // Cross-modulation is through-zero linear FM: oscillator 2 moves oscillator 1's FREQUENCY in
+        // proportion to that frequency, and far enough the phase runs backwards. Its effect on the
+        // phase is the running sum of oscillator 2 (so a bright modulator is smoothed, not
+        // differentiated as with plain phase modulation, and whole-number tunings stay harmonic at
+        // every depth); the sum leaks below about 8 Hz, so an offset in the modulator (a narrow
+        // pulse) shifts the phase and never the pitch. With a sine at the same pitch, full XMOD is
+        // an FM index of pi, as before.
+        double xmodPhase = 0.0;
+        if (xmodNow > 0.0f || xmodSum != 0.0)
+        {
+            const double carrierInc = baseFrequency * std::exp2((oscs[0].detune + driftSemitones) / 12.0) / sampleRate;
+            xmodSum = xmodSum * (1.0 - 50.3 / sampleRate) + (double) lastOsc2 * carrierInc;
+            if (std::abs(xmodSum) < 1.0e-12) xmodSum = 0.0;
+            xmodPhase = (double) xmodNow * XMOD_INDEX * xmodSum;
+        }
+
         float oscMix = 0.0f;
         for (int i = 0; i < MAX_OSCS; ++i)
         {
@@ -674,8 +690,7 @@ public:
                 shaped.aMod = pwMod;
                 if (i == 0 && xmodNow > 0.0f)
                 {
-                    // Cross-modulation: oscillator 2 phase-modulates oscillator 1.
-                    double pm = shaped.phase + (double) (xmodNow * lastOsc2 * 0.5f);
+                    double pm = shaped.phase + xmodPhase;
                     shaped.phase = pm - std::floor(pm);
                 }
 
@@ -715,7 +730,7 @@ public:
                     tempOsc.aMod = pwMod;
                     if (i == 0 && xmodNow > 0.0f)
                     {
-                        double pm = tempOsc.phase + (double) (xmodNow * lastOsc2 * 0.5f);
+                        double pm = tempOsc.phase + xmodPhase;
                         tempOsc.phase = pm - std::floor(pm);
                     }
                     float sample = generateOsc(tempOsc, oscWaveshapeOffset[i]);
@@ -822,6 +837,7 @@ public:
         driftFiltered = 0.0f;
         softStartSamples = 0.0f;
         lastOsc2 = 0.0f;
+        xmodSum = 0.0;
         lastFilterEnv = 0.0f;
         vibratoPhase = 0.0;
         currentPitch = targetPitch;
@@ -853,7 +869,7 @@ public:
     void setFilterBaseCutoff(float hz) { filterBaseCutoff = hz; }
     // -1..1: the filter envelope sweeps the cutoff by up to FILTER_ENV_OCTAVES octaves either way.
     void setFilterEnvAmount(float amount) { filterEnvAmount = std::clamp(amount, -1.0f, 1.0f); }
-    void setFilterKeyTrack(float amount) { filterKeyTrack = std::clamp(amount, 0.0f, 1.0f); }
+    void setFilterKeyTrack(float amount) { filterKeyTrack = std::clamp(amount, -1.0f, 1.0f); }
     void setFilterVelAmount(float amount) { filterVelAmount = std::clamp(amount, 0.0f, 1.0f); }
     void setFilterMorph(float m) { filterSlot.setMorph(std::clamp(m, 0.0f, 1.0f)); }
     void setFilterBOffset(float semitones)
@@ -1275,6 +1291,8 @@ private:
     float mixDrive = 0.0f;
     float crossMod = 0.0f;
     float lastOsc2 = 0.0f;
+    double xmodSum = 0.0;                       // leaky running sum of oscillator 2, in carrier cycles
+    static constexpr double XMOD_INDEX = 6.283185307179586 * 0.5;   // full XMOD, sine at unison: index pi
 
     // Pitch
     float tuneSemitones = 0.0f;

@@ -77,7 +77,7 @@ struct ParamSpec
     float maxVal = 1.0f;
     float defaultVal = 0.0f;
     ParamKind kind = ParamKind::Linear;
-    const char* unit = "";              // "Hz", "s", "st", "ct", "x" or "" (shown as 0-100 / -100..+100)
+    const char* unit = "";              // "Hz", "s", "st", "ct", "x", "ratio" or "" (shown as 0-100 / -100..+100)
     const char* const* choices = nullptr;
     int numChoices = 0;
     float stepSize = 0.0f;              // > 0: the value moves on this grid (Shift = 1/50 of it)
@@ -113,11 +113,62 @@ struct ParamSpec
     {
         if (steps == 0)
             return clamp(current);
+        if (unitIs("ratio"))
+            return ratioTurned(clamp(current), steps, TurnStep::Plain);
         if (isDiscrete())
             return clamp(std::round(current) + (float) steps);
         if (stepSize > 0.0f)
             return clamp(std::round(current / stepSize + (float) steps) * stepSize);
         return clamp(fromNorm(toNorm(current) + (float) steps * 0.01f));
+    }
+
+    // An FM operator's frequency ratio (unit "ratio"), turned the way FM is easiest to play:
+    //   Plain   the next harmonic: ... 1/4, 1/2, 1, 2, 3, 4 ... (whatever lies inside the range).
+    //           From an in-between value the first click lands on the neighbouring harmonic.
+    //   Fine    0.01, free of the grid: every inharmonic ratio is reachable (bells, detuned pairs).
+    //   Coarse  an octave (x2, /2), which keeps a fine offset's interval; no move past the range.
+    float ratioTurned(float current, int clicks, TurnStep mode) const
+    {
+        if (mode == TurnStep::Fine)
+            return clamp(std::round(current * 100.0f + (float) clicks) / 100.0f);
+
+        float out = current;
+        for (int i = 0; i < std::abs(clicks); ++i)
+        {
+            if (mode == TurnStep::Coarse)
+            {
+                const float next = clicks > 0 ? out * 2.0f : out * 0.5f;
+                if (next < minVal - 1.0e-4f || next > maxVal + 1.0e-4f) break;
+                out = next;
+                continue;
+            }
+            const float eps = 0.004f;
+            float next = out;
+            if (clicks > 0)
+            {
+                if (out < 1.0f - eps)
+                {
+                    // Sub-harmonics: the smallest 1 / 2^k above the value.
+                    next = 1.0f;
+                    while (next * 0.5f > out + eps) next *= 0.5f;
+                }
+                else
+                    next = std::floor(out + eps) + 1.0f;
+            }
+            else
+            {
+                if (out <= 1.0f + eps)
+                {
+                    next = 0.5f;
+                    while (next >= out - eps) next *= 0.5f;
+                }
+                else
+                    next = std::ceil(out - eps) - 1.0f;
+            }
+            if (next < minVal - 1.0e-4f || next > maxVal + 1.0e-4f) break;
+            out = next;
+        }
+        return clamp(out);
     }
 
     // =========================================================================================
@@ -157,6 +208,9 @@ struct ParamSpec
             if (mode == TurnStep::Coarse) return clamp(current + n * 10.0f);
             return clamp(std::round(current) + n);
         }
+
+        if (unitIs("ratio"))
+            return ratioTurned(current, clicks, mode);
 
         const bool octaves = unitIs("st") || unitIs("note");
 
@@ -354,6 +408,8 @@ struct ParamSpec
 
         if (u == "x")
             return juce::String(v, v < 10.0f ? 2 : 1);
+        if (u == "ratio")       // whole ratios read "3", in-between ones "3.07"
+            return std::abs(v - std::round(v)) < 0.005f ? juce::String((int) std::lround(v)) : juce::String(v, 2);
 
         if (u == "bpm")     // whole unless a fine turn left a decimal
             return std::abs(v - std::round(v)) < 0.05f ? juce::String((int) std::lround(v)) : juce::String(v, 1);

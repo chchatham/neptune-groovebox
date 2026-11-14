@@ -5,8 +5,12 @@
 #include <vector>
 #include "control_grammar_tests.h"
 #include "../src/ui/screens/PresetScreen.h"
+#include "../src/engine/UnifiedVoiceEngine.h"
+#include "../src/ui/screens/ParamPageScreen.h"
 #include "../src/project/PresetManager.h"
 #include "../src/project/ProjectBridge.h"
+#include "../src/arpeggiator/Arpeggiator.h"
+#include "../src/controller/CustomScaleManager.h"
 
 // PRESET: the highlighted preset takes over the selected track's sound for listening only; the
 // track's own sound returns on every way out of the screen unless LD kept the preset.
@@ -228,6 +232,82 @@ namespace presetaudition
             return false;
         }
     };
+
+    // ---- What a sound is to the ear: level over time and energy by frequency -------------------
+    inline std::vector<float> renderFeatures(EngineBase& e, int note = 57)
+    {
+        const double sr = 48000.0;
+        const int block = 64;
+        std::vector<float> mono;
+        juce::AudioBuffer<float> buf(2, block);
+        juce::MidiBuffer midi;
+        auto run = [&](double seconds)
+        {
+            for (int b = 0; b < (int) (seconds * sr) / block; ++b)
+            {
+                buf.clear();
+                e.processBlock(buf, midi);
+                for (int i = 0; i < block; ++i)
+                    mono.push_back(0.5f * (buf.getSample(0, i) + buf.getSample(1, i)));
+            }
+        };
+        e.noteOn(note, 0.8f);
+        run(0.6);
+        e.noteOff(note);
+        run(0.3);
+        e.allNotesOff();
+        run(0.3);
+        mono.resize((size_t) (0.9 * sr));       // (the last stretch only empties the engine)
+
+        std::vector<float> f;
+        auto db = [](double power) { return (float) (10.0 * std::log10(power + 1.0e-7)); };
+        const size_t win = mono.size() / 12;
+        for (size_t w = 0; w < 12; ++w)
+        {
+            double sum = 0.0;
+            for (size_t i = w * win; i < (w + 1) * win; ++i) sum += (double) mono[i] * mono[i];
+            f.push_back(db(sum / (double) win));
+        }
+        // Energy in ten octave-wide bands (one-pole band splits are enough for a comparison).
+        double lowPrev = 0.0;
+        double total[10] = {};
+        double lp[10] = {};
+        for (float x : mono)
+        {
+            double prev = x;
+            for (int b = 9; b >= 0; --b)
+            {
+                const double fc = 31.25 * std::pow(2.0, b);
+                const double a = 1.0 - std::exp(-2.0 * juce::MathConstants<double>::pi * fc / sr);
+                lp[b] += a * (x - lp[b]);
+                const double band = prev - lp[b];
+                total[b] += band * band;
+                prev = lp[b];
+            }
+            juce::ignoreUnused(lowPrev);
+        }
+        for (double t : total) f.push_back(db(t / (double) mono.size()));
+        return f;
+    }
+
+    inline float featureDistance(const std::vector<float>& a, const std::vector<float>& b)
+    {
+        float worst = 0.0f;
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+            if (a[i] > -55.0f || b[i] > -55.0f)
+                worst = std::max(worst, std::abs(a[i] - b[i]));
+        return worst;
+    }
+
+    inline std::unique_ptr<AudioEngine> freshAudio(SequencerCore& seq, const Preset& p)
+    {
+        auto audio = std::make_unique<AudioEngine>();
+        audio->setSequencer(&seq);
+        audio->addEngine(0, AudioEngine::createEngine(p.engineType));
+        audio->getEngine(0)->prepareToPlay(48000.0, 64);
+        audio->applyAllTrackParameters(0, PresetManager::soundOf(p));
+        return audio;
+    }
 }
 
 class PresetAuditionTests : public juce::UnitTest
@@ -349,7 +429,7 @@ public:
             expect(difference(any.sound(), anyOwn).isEmpty(), difference(any.sound(), anyOwn));
         }
 
-        beginTest("Every engine: presets of the same engine are applied to the running engine and equal a fresh load");
+        beginTest("Every engine: an auditioned preset holds the values of a fresh load; the own engine returns");
         {
             PresetManager all;
             std::set<EngineType> types;
@@ -377,10 +457,10 @@ public:
                     const auto d = engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p));
                     expect(d.isEmpty(), tag + p->name + " " + d);
                 }
-                expect(rig.audio.getEngine(0) == engine, tag + "no engine was built while scrolling");
+                expect(rig.audio.getEngine(0) != engine, tag + "a preset is heard in an engine of its own");
 
                 rig.screen->onDeactivate();
-                expect(rig.audio.getEngine(0) == engine, tag + "nor on leaving");
+                expect(rig.audio.getEngine(0) == engine, tag + "the track's own engine itself is back on leaving");
                 const auto d = difference(rig.sound(), own);
                 expect(d.isEmpty(), tag + "the own sound is back exactly: " + d);
             }
@@ -763,6 +843,269 @@ public:
             expect(difference(rig.sound(), loaded).isEmpty());
         }
 
+        beginTest("Pads play the scale chosen on SCALE: its notes, its root lit; chromatic from middle C without one");
+        {
+            Rig rig;
+            std::vector<int> played;
+            rig.screen->setNoteCallback([&](int n, int) { played.push_back(n); });
+            rig.screen->setNoteOffCallback([](int) {});
+            rig.screen->onActivate();
+            rig.screen->onPadPress(0, 100); rig.screen->onPadRelease(0);
+            rig.screen->onPadPress(5, 100); rig.screen->onPadRelease(5);
+            expect(played == (std::vector<int> { 60, 65 }), "no scale given: semitones from middle C");
+
+            CustomScaleManager scales;
+            rig.screen->setPadScale([&](int pad) { return scales.getNoteForPad(pad); }, [&] { return scales.getRootNote(); });
+            played.clear();
+            for (int pad : { 0, 1, 2, 7 }) { rig.screen->onPadPress(pad, 100); rig.screen->onPadRelease(pad); }
+            expect(played == (std::vector<int> { 60, 61, 62, 67 }), "the first page is chromatic");
+
+            scales.setActivePage(1);                    // Major
+            scales.setRootNote(1, 62);                  // in D
+            played.clear();
+            for (int pad : { 0, 1, 2, 7 }) { rig.screen->onPadPress(pad, 100); rig.screen->onPadRelease(pad); }
+            expect(played == (std::vector<int> { 62, 64, 66, 74 }), "D major: D E F# ... D");
+
+            std::array<Screen::PadColour, 16> colours;
+            expect(rig.screen->getPadColours(colours));
+            auto lit = [&](int pad) { return colours[(size_t) pad].r == 100; };
+            expect(lit(0) && lit(7) && lit(14) && !lit(1) && !lit(6), "the Ds are the lit pads");
+            rig.screen->onDeactivate();
+        }
+
+        beginTest("SV: a sound shaped on the knobs comes back from its preset exactly, on every engine");
+        {
+            PresetManager all;
+            std::set<EngineType> types;
+            for (int i = 0; i < all.getPresetCount(); ++i)
+                types.insert(all.getPreset(i).engineType);
+
+            for (auto type : types)
+            {
+                const juce::String tag = "engine " + juce::String((int) type) + ": ";
+                // A track as the app starts it (nothing stored), shaped only by turning knobs on
+                // PARAM: every cell of every page, a few clicks, as a player would.
+                SequencerCore seq;
+                AudioEngine audio;
+                PresetManager mgr;
+                audio.setSequencer(&seq);
+                audio.prepare(48000.0, 64);
+                audio.addEngine(0, AudioEngine::createEngine(type));
+                seq.getPattern().getTrack(0).engineType = type;
+                ParamPageScreen param(seq, &audio);
+                PresetScreen preset(seq, &audio, mgr);
+                juce::int64 now = 1000;
+                preset.setClock([&] { return now; });
+
+                int turned = 0;
+                for (int round = 0; round < 2; ++round)
+                    for (int pg = 0; pg < param.getPageCount(); ++pg)
+                    {
+                        param.setCurrentPageIndex(pg);
+                        for (int knob = 0; knob < 8; ++knob)
+                        {
+                            const auto cell = param.getCurrentPage().params[(size_t) knob];
+                            if (!cell.isValid() || juce::String(cell.label) == "ARCH") continue;
+                            if (audio.getEngine(0)->isRebuildParam(cell.id)) continue;
+                            const int clicks = 1 + ((pg + knob + round) % 3);
+                            for (int c = 0; c < clicks; ++c)
+                                param.onEncoderChange(knob, ((pg + knob) % 2) ? 1 : 127);
+                            ++turned;
+                        }
+                    }
+                expect(turned > 20, tag + "knobs were turned");
+
+                const auto live = engineValues(*audio.getEngine(0));
+                const auto heardBefore = renderFeatures(*audio.getEngine(0));
+
+                // SV (four clicks), then the saved preset loaded into a new engine.
+                preset.onActivate();
+                const int before = mgr.getPresetCount();
+                for (int i = 0; i < 4; ++i) { preset.onEncoderChange(5, 1); now += 150; }
+                expectEquals(mgr.getPresetCount(), before + 1, tag + "saved");
+                const auto saved = mgr.getPreset(mgr.getPresetCount() - 1);
+                expect(engineDifference(engineValues(*audio.getEngine(0)), live).isEmpty(), tag + "saving changes nothing");
+
+                const auto reloaded = freshValues(saved);
+                juce::String diffs;
+                int count = 0;
+                for (size_t i = 0; i < live.size() && i < reloaded.size(); ++i)
+                    if (live[i].second != reloaded[i].second)
+                    {
+                        if (++count <= 12)
+                            diffs << " " << audio.getEngine(0)->getParameterName(live[i].first) << "(" << live[i].first << ") "
+                                  << juce::String(live[i].second, 4) << " -> " << juce::String(reloaded[i].second, 4) << ";";
+                    }
+                expect(count == 0, tag + juce::String(count) + " values differ after reload:" + diffs);
+
+                SequencerCore s2;
+                auto fresh = freshAudio(s2, saved);
+                auto calm = [](EngineBase* e)
+                {
+                    if (auto* u = dynamic_cast<UnifiedVoiceEngine*>(e))
+                        for (int v = 0; v < UnifiedVoiceEngine::MAX_VOICES; ++v)
+                            u->getVoice(v).getAnalogCharacter().enabled = false;
+                };
+                calm(fresh->getEngine(0));
+                calm(audio.getEngine(0));
+                const auto target = renderFeatures(*fresh->getEngine(0));
+                const float d = featureDistance(renderFeatures(*audio.getEngine(0)), target);
+                logMessage(tag + "reloaded sound differs by " + juce::String(d, 1) + " dB, " + juce::String(count) + " values");
+                preset.onDeactivate();
+            }
+        }
+
+        beginTest("SV while a preset is auditioned saves the track's own sound, not the one being listened to");
+        {
+            Rig rig;
+            const auto own = engineValues(*rig.audio.getEngine(0));
+            rig.screen->onActivate();
+            rig.turn(0);                                        // the highlight moves: a preset is heard
+            expect(rig.screen->isAuditioning());
+            expect(engineDifference(engineValues(*rig.audio.getEngine(0)), own).isNotEmpty());
+            const int before = rig.mgr.getPresetCount();
+            rig.confirm(5);                                     // SV
+            expectEquals(rig.mgr.getPresetCount(), before + 1);
+            const auto saved = rig.mgr.getPreset(rig.mgr.getPresetCount() - 1);
+            const auto d = engineDifference(freshValues(saved), own);
+            expect(d.isEmpty(), "the saved preset is the own sound: " + d);
+            expect(rig.screen->isAuditioning(), "and the audition goes on");
+            rig.screen->onDeactivate();
+            expect(engineDifference(engineValues(*rig.audio.getEngine(0)), own).isEmpty());
+        }
+
+        beginTest("A saved preset carries the track's effects: the insert chain, its settings, the effect blocks, the sends");
+        {
+            Rig rig;
+            rig.audio.addInsertEffect(0, EffectType::DelayEffect);
+            rig.audio.addInsertEffect(0, EffectType::WahEffect);
+            rig.set(0, AudioEngine::EFFECT_PARAM_BASE + 0, rig.audio.getTrackParameter(0, AudioEngine::EFFECT_PARAM_BASE + 0) * 0.5f + 0.01f);
+            rig.set(0, AudioEngine::EFFECT_PARAM_BASE + 4 + 1, 0.77f);
+            rig.set(0, AudioEngine::INSERT_WET_BASE + 1, 0.4f);
+            rig.set(0, AudioEngine::INSERT_SYNC_BASE + 0, 1.0f);
+            rig.set(0, AudioEngine::INSERT_DIV_BASE + 0, 5.0f);
+            auto effects = [&](int t)
+            {
+                juce::String out;
+                for (int slot = 0; slot < AudioEngine::MAX_INSERTS_PER_TRACK; ++slot)
+                {
+                    EffectType type {};
+                    if (!rig.audio.getInsertEffectType(t, slot, type)) break;
+                    out << (int) type << ":";
+                    for (int n = 0; n < 4; ++n)
+                        out << juce::String(rig.audio.getTrackParameter(t, AudioEngine::EFFECT_PARAM_BASE + slot * 4 + n), 3) << ",";
+                    for (int base : { AudioEngine::INSERT_ON_BASE, AudioEngine::INSERT_WET_BASE, AudioEngine::INSERT_SYNC_BASE, AudioEngine::INSERT_DIV_BASE })
+                        out << juce::String(rig.audio.getTrackParameter(t, base + slot), 2) << ",";
+                    out << " ";
+                }
+                for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
+                    out << juce::String(rig.audio.getTrackParameter(t, id), 2) << ",";
+                out << " send " << juce::String(rig.audio.getTrackParameter(t, MixParam::SEND_BASE), 2);
+                return out;
+            };
+            const auto mine = effects(0);
+            expect(mine.startsWith(juce::String((int) EffectType::DelayEffect) + ":"));
+
+            rig.screen->onActivate();
+            rig.confirm(5);                                     // SV
+            const juce::String savedName = rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).name;
+            rig.screen->onDeactivate();
+
+            // The track goes on to other effects; the preset brings its own back when it is heard...
+            rig.audio.removeInsertEffect(0, 0);
+            rig.set(0, TrackFxParam::DIRT_BASE, 0.0f);
+            rig.set(0, MixParam::SEND_BASE, 0.0f);
+            const auto changed = effects(0);
+            expect(changed != mine);
+            rig.screen->onActivate();
+            for (int i = 0; i < 400 && (rig.highlighted() == nullptr || rig.highlighted()->name != savedName); ++i)
+                rig.turn(0);
+            expect(rig.highlighted() != nullptr && rig.highlighted()->name == savedName);
+            expectEquals(effects(0), mine, "auditioned: the preset's effects");
+
+            // ...a factory preset has none of its own and plays through the track's...
+            rig.turn(0, -1);
+            expect(rig.highlighted() != nullptr && rig.highlighted()->isFactory);
+            expectEquals(effects(0), changed, "a preset without effects: the track's own");
+            rig.turn(0, 1);
+            expectEquals(effects(0), mine);
+
+            // ...leaving puts the track's own effects back; LD keeps the preset's.
+            rig.screen->onDeactivate();
+            expectEquals(effects(0), changed, "left: the track's own effects again");
+            rig.screen->onActivate();
+            rig.turn(0, -1); rig.turn(0, 1);
+            rig.confirm(4);                                     // LD
+            rig.screen->onDeactivate();
+            expectEquals(effects(0), mine, "loaded: the preset's effects stay");
+
+            // A preset saved on a track without inserts says so: loading it removes them.
+            Rig bare;
+            bare.screen->onActivate();
+            bare.confirm(5);
+            const juce::String bareName = bare.mgr.getPreset(bare.mgr.getPresetCount() - 1).name;
+            bare.screen->onDeactivate();
+            bare.audio.addInsertEffect(0, EffectType::WahEffect);
+            bare.screen->onActivate();
+            for (int i = 0; i < 400 && (bare.highlighted() == nullptr || bare.highlighted()->name != bareName); ++i)
+                bare.turn(0);
+            EffectType type {};
+            expect(!bare.audio.getInsertEffectType(0, 0, type), "no insert effects in the preset: none on the track");
+            bare.screen->onDeactivate();
+            expect(bare.audio.getInsertEffectType(0, 0, type), "and the track's own comes back on leaving");
+        }
+
+        beginTest("A saved preset carries the track's arpeggiator; a preset without one leaves the track's alone");
+        {
+            Rig rig;
+            Arpeggiator arp;
+            rig.screen->setArpProvider([&](int t) { return t == 0 ? &arp : nullptr; });
+            arp.setMode(Arpeggiator::Mode::Pedal);
+            arp.setRate(Arpeggiator::Rate::Sixteenth);
+            arp.setOctaveRange(3);
+            arp.setGate(0.31f);
+            arp.setEnabled(true);
+            const auto mine = ProjectBridge::captureArp(arp);
+
+            rig.screen->onActivate();
+            rig.confirm(5);                                     // SV
+            const auto saved = rig.mgr.getPreset(rig.mgr.getPresetCount() - 1);
+            expect(saved.arp == mine, "the arp is in the preset");
+            expect(Preset::fromJSON(saved.toJSON()).arp == mine, "and in its file");
+            rig.screen->onDeactivate();
+
+            // The track's arp moves on; the preset brings its own when heard.
+            arp.setMode(Arpeggiator::Mode::Up);
+            arp.setOctaveRange(1);
+            arp.setEnabled(false);
+            const auto changed = ProjectBridge::captureArp(arp);
+            rig.screen->onActivate();
+            for (int i = 0; i < 400 && (rig.highlighted() == nullptr || rig.highlighted()->name != saved.name); ++i)
+                rig.turn(0);
+            expect(ProjectBridge::captureArp(arp) == mine, "auditioned: the preset's arp, switched on as it was saved");
+            rig.turn(0, -1);                                    // a factory preset: no arp of its own
+            expect(ProjectBridge::captureArp(arp) == changed, "a preset without an arp: the track's own");
+            rig.turn(0, 1);
+            rig.screen->onDeactivate();
+            expect(ProjectBridge::captureArp(arp) == changed, "left: the track's own arp again");
+
+            rig.screen->onActivate();
+            rig.turn(0, -1); rig.turn(0, 1);
+            rig.confirm(4);                                     // LD
+            rig.screen->onDeactivate();
+            expect(ProjectBridge::captureArp(arp) == mine, "loaded: the preset's arp stays");
+
+            // SV while another preset is auditioned saves the track's own arp.
+            arp.setMode(Arpeggiator::Mode::Down);
+            const auto own2 = ProjectBridge::captureArp(arp);
+            rig.screen->onActivate();
+            rig.turn(0, -1);
+            expect(rig.screen->isAuditioning());
+            rig.confirm(5);
+            expect(rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).arp == own2);
+            rig.screen->onDeactivate();
+        }
+
         beginTest("Notes held across an audition do not hang");
         {
             Rig rig;
@@ -770,8 +1113,8 @@ public:
             rig.screen->onActivate();
             const auto* engine = rig.audio.getEngine(0);
             rig.turn(0);
-            expect(rig.audio.getEngine(0) == engine, "same engine type: the note carries on in the same engine");
-            rig.audio.getEngine(0)->noteOff(60);
+            expect(rig.audio.getEngine(0) != engine, "the preset has an engine of its own; the held note ended with the old one");
+            rig.audio.getEngine(0)->noteOff(60);            // (the key's release is harmless there)
 
             // Another engine type: the old engine and its notes are gone with it; the release of
             // the key goes to the new one and is harmless.
@@ -789,6 +1132,51 @@ public:
             rig.screen->onPadPress(3, 100);
             rig.screen->onDeactivate();
             expectEquals((int) off.size(), 1);
+        }
+        beginTest("Every engine: an auditioned preset sounds like the preset loaded into a new engine");
+        {
+            PresetManager all;
+            std::set<EngineType> types;
+            for (int i = 0; i < all.getPresetCount(); ++i)
+                types.insert(all.getPreset(i).engineType);
+            int checked = 0;
+            for (auto type : types)
+            {
+                Rig rig(type);
+                rig.audio.prepare(48000.0, 64);
+                rig.screen->onActivate();
+                const int count = rig.screen->getListSize();
+                for (int i = 0; i < 2 * count; ++i)
+                {
+                    if (i < count) rig.screen->onPadPageNext(); else rig.screen->onPadPagePrev();
+                    auto* p = rig.highlighted();
+                    if (p == nullptr || !rig.screen->isAuditioning()) continue;
+                    // Sounds with random phases or noise differ from note to note: several notes of
+                    // each, and the auditioned ones must lie as close to the fresh ones as those
+                    // lie to each other.
+                    SequencerCore s1;
+                    auto a = freshAudio(s1, *p);
+                    std::vector<std::vector<float>> fresh, heardNotes;
+                    for (int n = 0; n < 4; ++n)
+                    {
+                        fresh.push_back(renderFeatures(*a->getEngine(0)));
+                        heardNotes.push_back(renderFeatures(*rig.audio.getEngine(0)));
+                    }
+                    float natural = 0.0f, d = 1000.0f;
+                    for (size_t x = 0; x < fresh.size(); ++x)
+                        for (size_t y = 0; y < fresh.size(); ++y)
+                        {
+                            if (x < y) natural = std::max(natural, featureDistance(fresh[x], fresh[y]));
+                            d = std::min(d, featureDistance(heardNotes[x], fresh[y]));
+                        }
+                    ++checked;
+                    expect(d <= std::max(3.0f, natural),
+                           "engine " + juce::String((int) type) + " " + p->name + ": auditioned differs by "
+                           + juce::String(d, 1) + " dB (notes of a fresh load differ by up to " + juce::String(natural, 1) + ")");
+                }
+                rig.screen->onDeactivate();
+            }
+            expect(checked > 50);
         }
     }
 };

@@ -127,10 +127,10 @@ if (A4) { document.body.classList.add('a4'); document.getElementById('pagecss').
    Screens reached by Shift + pad (src/main.cpp, the setShiftPadScreen table). The key is the display's own short
    name; the value is what the skin prints: whole words, or a musician's everyday short form (FX, AT, ARP, PARAMS). */
 const WORD = { PARAM: 'PARAMS', TRACKS: 'TRACKS', 'TRK FX': 'TRACK FX', STEP: 'STEP', PRESET: 'PRESET', SONG: 'SONG',
-               SETTINGS: 'SETTINGS', 'AT ROUTE': 'AT ROUTE', DRUMS: 'DRUMS', ARP: 'ARP', SCALE: 'SCALE',
+               SETTINGS: 'SETTINGS', 'AT ROUTE': 'AT ROUTE', DRUMS: 'DRUMS', ARP: 'ARP', CHORD: 'CHORDS', SCALE: 'SCALE',
                WAVE: 'WAVEFORM', FLTR: 'FILTER' };
 const SHIFT_TOP = ['PARAM', 'TRACKS', 'TRK FX', 'STEP', 'PRESET', 'SONG', 'SETTINGS', 'AT ROUTE'];
-const SHIFT_BOT = ['STEP', 'DRUMS', 'ARP', 'SCALE', 'WAVE', 'FLTR', null, null];
+const SHIFT_BOT = ['STEP', 'DRUMS', 'CHORD', 'SCALE', 'WAVE', 'FLTR', null, null];
 let WORDS_ON_SKIN = [];            // filled while the pieces are drawn (see the count on sheet 3)
 let COUNTING = false;
 

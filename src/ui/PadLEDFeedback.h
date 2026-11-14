@@ -27,6 +27,35 @@ namespace PadColors
     static constexpr int DIM_PINK = 53;
     static constexpr int PINK = 55;
 
+    // Roughly what a palette colour looks like on a pad, 0..255 per channel (for the panel in the Mac window).
+    struct RGB { int r, g, b; };
+    inline RGB approximateRGB(int palette)
+    {
+        switch (palette)
+        {
+            case OFF:        return { 0, 0, 0 };
+            case DIM_WHITE:  return { 70, 70, 70 };
+            case WHITE:      return { 255, 255, 255 };
+            case DIM_RED:    return { 80, 8, 4 };
+            case RED:        return { 255, 24, 12 };
+            case DIM_ORANGE: return { 84, 34, 0 };
+            case ORANGE:     return { 255, 110, 0 };
+            case DIM_YELLOW: return { 80, 68, 0 };
+            case YELLOW:     return { 255, 220, 0 };
+            case DIM_GREEN:  return { 6, 76, 10 };
+            case GREEN:      return { 20, 255, 40 };
+            case DIM_CYAN:   return { 0, 70, 76 };
+            case CYAN:       return { 0, 230, 255 };
+            case DIM_BLUE:   return { 6, 20, 90 };
+            case BLUE:       return { 20, 70, 255 };
+            case DIM_PURPLE: return { 44, 12, 88 };
+            case PURPLE:     return { 150, 40, 255 };
+            case DIM_PINK:   return { 84, 10, 50 };
+            case PINK:       return { 255, 40, 160 };
+            default:         return { 90, 90, 90 };
+        }
+    }
+
     static constexpr int STEP_EMPTY = DIM_WHITE;
     static constexpr int STEP_ACTIVE = YELLOW;
     static constexpr int STEP_LOCKED = CYAN;

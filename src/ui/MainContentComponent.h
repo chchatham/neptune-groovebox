@@ -12,6 +12,7 @@ public:
     {
         addAndMakeVisible(oledMirror);
         addAndMakeVisible(virtualController);
+        virtualController.setDisplay(&display);     // the panel's small display window shows the live picture
 
         int totalW = juce::jmax(OLEDMirrorComponent::TOTAL_W, VirtualControllerComponent::CTRL_W);
         int totalH = OLEDMirrorComponent::TOTAL_H + VirtualControllerComponent::CTRL_H;
@@ -36,6 +37,7 @@ public:
 private:
     OLEDMirrorComponent oledMirror;
     VirtualControllerComponent virtualController;
+    juce::TooltipWindow tooltips { this, 500 };     // the panel's caps carry no names: the pointer says what a control is
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainContentComponent)
 };

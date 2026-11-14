@@ -118,7 +118,7 @@ public:
     void setMorph(float m)          { slot.setMorph(std::clamp(m, 0.0f, 1.0f)); }
     void setEnvAmount(float a)      { envAmount = std::clamp(a, -1.0f, 1.0f); updateNoteOctaves(); }
     void setEnvVelocity(float a)    { envVelocity = std::clamp(a, 0.0f, 1.0f); updateNoteOctaves(); }
-    void setKeyTrack(float a)       { keyTrack = std::clamp(a, 0.0f, 1.0f); updateNoteOctaves(); }
+    void setKeyTrack(float a)       { keyTrack = std::clamp(a, -1.0f, 1.0f); updateNoteOctaves(); }
     void setVelAmount(float a)      { velAmount = std::clamp(a, 0.0f, 1.0f); updateNoteOctaves(); }
     void setEnvParams(const Envelope::Params& p) { env.setParams(p); }
 
@@ -176,7 +176,7 @@ public:
         Cutoff,         // Hz
         Resonance,      // 0..1
         EnvAmount,      // -1..1 (x 7 octaves)
-        KeyTrack,       // 0..1 (1 = cutoff follows the keyboard exactly)
+        KeyTrack,       // -1..1 (1 = cutoff follows the keyboard exactly, -1 = falls as the notes rise)
         Drive,          // 0..1
         VelAmount,      // velocity -> cutoff, 0..1 (x 4 octaves)
         Attack,         // filter envelope, seconds
@@ -246,7 +246,7 @@ public:
             { "TYPE", b + Type, 0, FilterSlot::NUM_MODELS - 1, 0, C, "", FilterSlot::modelNames(), FilterSlot::NUM_MODELS },
             { "MODE", b + Mode, 0, 3, 0, C, "", FilterSlot::modeNames(FilterModel::SVF), 4 },
             { "MORP", b + Morph, 0, 1, 0, L },
-            { "KTRK", b + KeyTrack, 0, 1, 0, L } }};
+            { "KTRK", b + KeyTrack, -1, 1, 0, L } }};
         out[1].name = "F ENV"; out[1].section = "FLTR";
         out[1].params = {{
             { "ATK",  b + Attack, 0.001f, 10, 0.01f, G, "s" },
@@ -371,7 +371,7 @@ public:
                 forEachFilter([value](VoiceFilter& f) { f.setEnvAmount(value); });
                 return;
             case KeyTrack:
-                value = std::clamp(value, 0.0f, 1.0f);
+                value = std::clamp(value, -1.0f, 1.0f);
                 values[(size_t) o] = value;
                 forEachFilter([value](VoiceFilter& f) { f.setKeyTrack(value); });
                 return;

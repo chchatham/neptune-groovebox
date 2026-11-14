@@ -806,6 +806,41 @@ public:
             expectEquals(keys.log.joinIntoString(","), juce::String("on50,off50"));
         }
 
+        beginTest("Stopping lets go of latched notes: key latch and every track's arp latch; the latch stays on");
+        {
+            for (int how = 0; how < 2; ++how)       // Play to stop; Shift + Play
+            {
+                Rig r;
+                Keys keys;
+                r.mgr.setKeyboardListener(&keys);
+                juce::StringArray arpLog;
+                bool latch[8] = {};
+                ScreenManager::EngineHooks h;
+                h.arpEnabled = [&](int) { return false; };
+                h.setArpEnabled = [&](int, bool) {};
+                h.arpLatch = [&](int t) { return latch[t]; };
+                h.setArpLatch = [&](int t, bool on) { latch[t] = on; arpLog.add(juce::String(t) + (on ? "on" : "off")); };
+                r.mgr.setEngineHooks(h);
+                latch[2] = true;                    // another track's arp is latched
+
+                r.shift(true); r.tap(ARP); r.shift(false);      // key latch
+                r.keyOn(60); r.keyOn(64); r.keyOn(67);
+                r.keyOff(60); r.keyOff(64);                     // 67 is still down when stop is pressed
+                r.tap(PLAY);
+                expect(!keys.log.contains("off60"), "starting the transport lets nothing go");
+                keys.log.clear();
+
+                if (how == 1) r.shift(true);
+                r.tap(PLAY);
+                if (how == 1) r.shift(false);
+                expect(keys.log.contains("off60") && keys.log.contains("off64"), "the latched notes end with the transport");
+                expect(!keys.log.contains("off67"), "a key that is down keeps sounding");
+                expect(r.mgr.isKeyLatchOn(), "the latch is still on for the next keys");
+                expectEquals(arpLog.joinIntoString(","), juce::String("2off,2on"), "the latched arp lets go and stays latched");
+                r.keyOff(67);
+            }
+        }
+
         beginTest("Play = start / stop; Shift + Play = stop and return to the start");
         {
             Rig r;

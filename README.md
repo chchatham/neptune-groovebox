@@ -82,7 +82,9 @@ Small, individually verified patches on the stock image (`tools/build_neptune_fw
   wave sequencer; sampler with slicing, time stretch and a granular mode; a 16-voice drum kit with a kick
   machine; and a MIDI track for external gear.
 - **Sequencer**: sample-accurate, per-track length and speed, parameter locks on every cell, trig conditions,
-  live recording, song mode, MIDI clock.
+  live recording of notes, pad pressure and knob movements, song mode, MIDI clock.
+- **Playing**: scale pads, chord pads (hold a chord on the keys, press a pad, play the progression from the
+  pads), an arpeggiator per track with fifteen modes, pad rolls, presets that carry their effects and arp.
 - **Sound shaping**: five filter models with a live response picture, envelope pictures, per-voice LFOs,
   polyphonic pad pressure routed per voice, three effect blocks plus insert slots on every track, two send
   buses, master EQ / compressor / limiter.

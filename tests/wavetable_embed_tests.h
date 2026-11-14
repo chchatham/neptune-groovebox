@@ -1,4 +1,5 @@
 #pragma once
+#include <numeric>
 #include <juce_core/juce_core.h>
 #include <juce_audio_basics/juce_audio_basics.h>
 #include "../src/dsp/WaveTables.h"
@@ -637,6 +638,87 @@ public:
                         expect(MW::difference(rest, again) <= MW::MAX_REST_DIFFERENCE, p.name + ": two renders at rest differ");
                         expect(strip >= MW::MIN_DIFFERENCE, p.name + ": the strip changes the sound by only " + juce::String(strip, 3));
                     }
+        }
+
+        beginTest("XMOD is through-zero FM: in tune and harmonic with any modulator, no jumps from a bright one");
+        {
+            // Oscillator 1 a sine, heard alone; oscillator 2 the modulator, at the same pitch.
+            auto fm = [&](float amount, int wave2, float pw, float tune2 = 0.0f, int note = 57)
+            {
+                U e(1);
+                e.prepareToPlay(SR, BLOCK);
+                quiet(e);
+                e.setParameter(UnifiedParam::WAVE1, 0.0f);              // SIN
+                e.setParameter(UnifiedParam::WAVE2, (float) wave2);
+                e.setParameter(UnifiedParam::PULSE_WIDTH, pw);
+                e.setParameter(UnifiedParam::TUNE2, tune2);
+                e.setParameter(UnifiedParam::DETUNE2, 0.0f);
+                e.setParameter(UnifiedParam::AMP_SUSTAIN, 1.0f);
+                e.setParameter(UnifiedParam::CROSS_MOD, amount);
+                return play(e, note, 24000);                            // A3 = 220 Hz, well settled
+            };
+            // The share of the sound's power that lies on whole multiples of the played pitch.
+            auto harmonicShare = [&](const std::vector<float>& x, double hz = 220.0)
+            {
+                double onPitch = 0.0;
+                for (int h = 1; (double) h * hz < 18000.0; ++h)
+                {
+                    const double a = harmonic(x, hz, h);
+                    onPitch += 0.5 * a * a;
+                }
+                const double mean = std::accumulate(x.begin(), x.end(), 0.0) / (double) x.size();
+                return onPitch / std::max(1.0e-12, rms(x) * rms(x) - mean * mean);
+            };
+            auto biggestStep = [](const std::vector<float>& x)
+            {
+                float step = 0.0f, peak = 0.0f;
+                for (size_t n = 1; n < x.size(); ++n)
+                {
+                    step = std::max(step, std::abs(x[n] - x[n - 1]));
+                    peak = std::max(peak, std::abs(x[n]));
+                }
+                return step / std::max(1.0e-6f, peak);
+            };
+            const int SAW = 1, SQR = 2;
+            const auto plain = fm(0.0f, SAW, 0.5f);
+            expect(harmonicShare(plain) > 0.98, "the measure itself: a plain sine is on pitch");
+
+            for (float amount : { 0.3f, 0.7f, 1.0f })
+            {
+                const juce::String at = " at XMOD " + juce::String(amount, 1);
+                // A saw: the phase must not jump with it (plain phase modulation would follow the
+                // saw's edge), and the tone stays a harmonic one on the played pitch.
+                const auto saw = fm(amount, SAW, 0.5f);
+                expect(finite(saw) && rms(saw) > 0.02);
+                expect(changed(plain, saw) > 0.05, "XMOD is heard" + at);
+                expect(harmonicShare(saw) > 0.97, "saw modulator: harmonic" + at + ", " + juce::String(harmonicShare(saw), 3));
+                expect(biggestStep(saw) < 0.3f, "saw modulator: no jump in the wave" + at + ", " + juce::String(biggestStep(saw), 3));
+
+                // A lopsided pulse has an offset: with linear FM that is not AC-coupled the note
+                // would go out of tune. It must stay on pitch.
+                // (PW also folds the sine carrier, which adds high harmonics: an octave lower,
+                //  measured against the same patch without XMOD.)
+                const auto pulse = fm(amount, SQR, 0.15f, 0.0f, 45);
+                const auto pulseOff = fm(0.0f, SQR, 0.15f, 0.0f, 45);
+                expect(harmonicShare(pulse, 110.0) > harmonicShare(pulseOff, 110.0) - 0.03,
+                       "offset modulator: still in tune" + at + ", " + juce::String(harmonicShare(pulse, 110.0), 3)
+                       + " against " + juce::String(harmonicShare(pulseOff, 110.0), 3));
+
+                // An octave and a fifth up (ratio 3): whole-number tunings stay harmonic.
+                const auto third = fm(amount, SAW, 0.5f, 19.0f);
+                expect(harmonicShare(third) > 0.9, "modulator a twelfth up: harmonic" + at + ", " + juce::String(harmonicShare(third), 3));
+            }
+
+            // Deep enough, the frequency really passes through zero: the sine runs backwards for
+            // part of each cycle, so it turns round more often than a sine or a one-way FM would.
+            auto turns = [](const std::vector<float>& x)
+            {
+                int n = 0;
+                for (size_t i = 2; i < x.size(); ++i)
+                    if ((x[i] - x[i - 1]) * (x[i - 1] - x[i - 2]) < 0.0f) ++n;
+                return n;
+            };
+            expect(turns(fm(1.0f, 0, 0.5f)) > turns(plain) + 20, "full XMOD from a sine: the phase reverses");
         }
     }
 };

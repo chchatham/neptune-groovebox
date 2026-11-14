@@ -90,6 +90,14 @@ public:
         ampEnv.setSampleRate(sr);
         pitchEnv.setSampleRate(sr);
         filter.setSampleRate(sr);
+        for (auto* band : { &hatBandHigh, &hatBandLow })
+        {
+            band->setSampleRate(sr);
+            band->setMode(SVFilter::Mode::BandPass);
+            band->setResonance(1.6f);
+        }
+        hatBandHigh.setCutoff(7100.0f);
+        hatBandLow.setCutoff(3440.0f);
         lfos.setSampleRate(sr);
     }
 
@@ -241,10 +249,18 @@ public:
     }
 
     // Letting the pad (or the step) go. A drum is a one-shot: it rings for its DEC however short
-    // the tap was. Only SUB, the held bass note, sounds for as long as it is held and then fades
+    // the tap was. SUB, the held bass note, sounds for as long as it is held and then fades
     // over its DEC.
+    // The open hat is the other exception: it is open for as long as the pad, key or step lasts
+    // and closes when that ends, so a tap on it is a closed hat and a held hit an open one.
     void noteOff()
     {
+        if (synthType == DrumSynthType::OpenHat)
+        {
+            ampEnv.setRelease(HAT_CLOSE_SECONDS);
+            ampEnv.noteOff();
+            return;
+        }
         if (synthType != DrumSynthType::SubBass)
             return;
         ampEnv.noteOff();
@@ -463,6 +479,11 @@ private:
         osc1Phase = 0.0;
         osc2Phase = 0.0;
         filter.reset();
+        // (The hats' oscillators start every hit from the same place: the same hit every time.)
+        static constexpr double hatStart[6] = { 0.0, 0.31, 0.62, 0.17, 0.83, 0.45 };
+        for (int i = 0; i < 6; ++i) hatPhase[i] = hatStart[i];
+        hatBandHigh.reset();
+        hatBandLow.reset();
 
         // Clap burst state
         clapBurstCount = 0;
@@ -686,6 +707,10 @@ private:
 
     // Filter
     SVFilter filter;
+    SVFilter hatBandHigh, hatBandLow;           // the hats' two band-passes
+    double hatPhase[6] = {};
+    static constexpr float HAT_MAKEUP = 3.0f;
+    static constexpr float HAT_CLOSE_SECONDS = 0.045f;      // an open hat closing: the closed hat's tail
 
     // LFOs
     VoiceLfos lfos;
@@ -839,7 +864,7 @@ private:
             case DrumSynthType::ClosedHat:
             {
                 ampP.attack = 0.0f;
-                ampP.decay = 0.01f + decay * 0.07f;
+                ampP.decay = 0.03f + decay * 0.25f;         // (the kit's 0.04 = 40 ms)
                 ampP.sustain = 0.0f;
                 ampP.release = 0.005f;
                 ampP.decayCurve = -0.3f;
@@ -1129,38 +1154,42 @@ private:
         return out;
     }
 
+    // The hats: six square oscillators at fixed, unrelated pitches (the classic analog drum-machine
+    // recipe: a dense metallic cluster, the same at every hit), through two band-passes and then
+    // the TONE high-pass. TUNE moves the whole cluster (8000 = the classic pitches). The closed and
+    // the open hat are one sound with two lengths.
     float processClosedHat()
     {
         float ampEnvVal = ampEnv.process();
         (void)pitchEnv.process(); // Advance unused envelope
 
-        // 6 square-ish oscillators at inharmonic ratios
-        static constexpr double ratios[6] = { 1.0, 1.4, 1.68, 1.92, 2.34, 2.57 };
+        static constexpr double hz[6] = { 205.3, 304.4, 369.6, 522.7, 540.0, 800.0 };
+        const double scale = std::clamp((double) tune / 8000.0, 0.125, 1.5);
 
         float sum = 0.0f;
-        // Use osc1Phase for the first, derive others via offsets
-        // Since we only have two phase accumulators, we generate from noise-like sum
         for (int i = 0; i < 6; ++i)
         {
-            double freq = tune * ratios[i];
-            // Use a simple square approximation: each partial gets its own phase region
-            // We use osc1Phase as the base and derive partials
-            double partialPhase = osc1Phase * ratios[i];
-            partialPhase -= std::floor(partialPhase);
-            sum += (partialPhase < 0.5 ? 1.0f : -1.0f);
+            const double inc = hz[i] * scale / sampleRate;
+            double& ph = hatPhase[i];
+            ph += inc;
+            if (ph >= 1.0) ph -= 1.0;
+            // A band-limited square: the two edges are rounded over one sample each.
+            float sq = ph < 0.5 ? 1.0f : -1.0f;
+            sq += dsp::polyBLEP(ph, inc);
+            double half = ph + 0.5;
+            if (half >= 1.0) half -= 1.0;
+            sq -= dsp::polyBLEP(half, inc);
+            sum += sq;
         }
-        // Advance base phase
-        osc1Phase += tune / sampleRate;
-        osc1Phase = dsp::wrapPhase(osc1Phase);
-
         sum *= (1.0f / 6.0f);
-        float out = filter.process(sum) * ampEnvVal;
-        return out;
+
+        const float metal = hatBandHigh.process(sum) + 0.35f * hatBandLow.process(sum);
+        return filter.process(metal) * ampEnvVal * HAT_MAKEUP;
     }
 
     float processOpenHat()
     {
-        // Same as ClosedHat but with longer decay (configured in configureEnvelopes)
+        // The same sound with a long decay (configureEnvelopes); noteOff() closes it.
         return processClosedHat();
     }
 

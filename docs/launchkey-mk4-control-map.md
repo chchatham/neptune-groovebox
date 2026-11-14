@@ -40,7 +40,7 @@ in the owner's manual (`docs/Neptune-Groovebox-Manual.pdf`). The sections before
 |---|---|---|---|---|
 | 1 | Plug-in | PARAM | DAW | STEP |
 | 2 | Mixer | TRACKS | Drum | DRUMS |
-| 3 | Sends | TRK FX | User Chord | ARP |
+| 3 | Sends | TRK FX | User Chord | CHORD |
 | 4 | Transport | STEP | Chord Map | SCALE |
 | 5 | Custom 1 | PRESET | Custom 1 | WAVE |
 | 6 | Custom 2 | SONG | Custom 2 | FLTR |
@@ -48,7 +48,7 @@ in the owner's manual (`docs/Neptune-Groovebox-Manual.pdf`). The sections before
 | 8 | Custom 4 | AT ROUTE | Custom 4 | — |
 
 Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 4 PRESET, 5 SETTINGS, 6 FLTR, 7 ARP,
-8 SCALE, 9 SONG, 10 AT ROUTE, 11 WAVE, 12 TRK FX.
+8 SCALE, 9 SONG, 10 AT ROUTE, 11 WAVE, 12 TRK FX, 13 CHORD. ARP is reached by the Arp button only.
 
 ## ARP, SCALE AND LATCH (app side)
 - Internally the app still identifies the Arp and Scale buttons as (channel 7, CC 0x49) and (channel 7, CC 0x4A); the Mac window's keyboard shortcuts and the tests use that identity. `ScreenManager::controlChangeReceived` translates the hardware messages CC 109 / CC 110 (ch1) to it and opens SETTINGS on CC 108.
@@ -88,14 +88,12 @@ Parameter id ranges in use (engine ids 0–149, 158–189 and 400–527, send ty
 900–909, pressure ranges 1000+ / 2000+). Do not add a range that collides with them.
 
 ## VIRTUAL CONTROLLER
-- `VirtualControllerComponent.h` renders full on-screen Launchkey MK4
-- Its buttons send the hardware's messages (Func CC 105, Settings 108, Arp 109, Scale 110 on channel 1; Shift CC 63 on channel 7); its keys are tagged `KEYS_PORT_CHANNEL`, so a key is never taken for a pad whatever the octave; encoders send the app's internal step format (CC 0x15–0x1C, channel 16)
+- `VirtualControllerComponent.h` draws the panel in the Mac window as it looks with the printed overlay on: from the top edge down to just above the keys (no keys in the picture), laid out at 4 px per mm from `src/ui/PanelDimensions.h`. That table and the `DIM` table of `docs/overlay/overlay.html` must hold the same numbers, and `PanelOverlay.h` the overlay's words ("Panel Dimensions" test): change the overlay first, then the two headers
+- Its buttons send the hardware's messages (Func CC 105, Settings 108, Arp 109, Scale 110 on channel 1; Shift CC 63 on channel 7); pads send their notes on channel 1, velocity 100; encoders send the app's internal step format (CC 0x15–0x1C, channel 16); Oct − / Oct + send nothing, like the hardware's
 - Strips: drag; the pitch strip returns to centre on release, the mod strip keeps its value (`onPitchBend`, `onModStrip`, wired in `main.cpp` to the selected track like the hardware's)
-- Right-click = hold element (build combos), left-click = press, click-drag on encoders
-- Mouse wheel on encoders sends relative CC
-- Oct+/- buttons shift virtual keyboard octave range (±3 octaves)
-- `setPadColor()` API for LED feedback, callbacks: `onNoteOn`, `onNoteOff`, `onCC`, `onPitchBend`, `onModStrip`
-- CTRL_W=880, CTRL_H=400; stacked below OLED mirror in MainContentComponent
+- Right-click = hold element (build combos; Shift held lights amber, Func blue), left-click = press, click-drag or mouse wheel on encoders; the caps carry no printed names, a tooltip names the control under the pointer
+- `setPadColor()` (0–255 per channel) lights a pad; `main.cpp` → `mirrorPadsToPanel()` feeds it what the hardware's pads get, with or without a controller. `setDisplay()` shows the live display in the panel's small window, 1:1
+- CTRL_W=1378, CTRL_H=392; stacked below the OLED mirror in MainContentComponent. `NEPTUNE_SNAPSHOT_CONTROLLER=<file.png>` on the test binary writes the picture (and `<file>-lit.png`) at 2x
 
 ## CONTROL GRAMMAR (approved by the owner 2026-11-10 — this section wins over anything above it)
 Shift = where, and how finely. Func = bigger, or secondary. The same gesture means the same thing on every screen.
@@ -113,7 +111,9 @@ Shift = where, and how finely. Func = bigger, or secondary. The same gesture mea
 **Step sizes.** Plain: 1 % of a continuous range, 1 of a discrete one, on every screen. Fine (Shift): a tenth of that.
 Coarse (Func) snaps: unipolar 0 / 25 / 50 / 75 / 100 % and the default; bipolar min / centre / max and quarters; tune,
 NOTE and frequencies by octaves; BPM ±10 (Shift = 0.1); LEN and counts by 4; division lists to the straight values;
-other choice lists by 4 (LFO and envelope DEST lists: to the next group of destinations). A press of Up or Down that had a pad or knob used under it does not also page, and neither does one held long enough to show its help card.
+other choice lists by 4 (LFO and envelope DEST lists: to the next group of destinations). FM operator ratios (RAT1–6,
+RATI): plain = the next harmonic (0.5, 1, 2, 3 … 16; from an in-between value the neighbouring harmonic), Shift = 0.01,
+Func = an octave (×2, ÷2). A press of Up or Down that had a pad or knob used under it does not also page, and neither does one held long enough to show its help card.
 
 **Envelope stage curves.** Shift + turn on the ATK, DEC or REL cell of an envelope (times in seconds: the MAIN page,
 AMP, F ENV, MENV, the FM operator pages, the same cells on FLTR and on a held step's pages on STEP) does not fine-adjust the
@@ -201,7 +201,9 @@ clipboard keeps the copy.
 (the pattern key), Up / Down (either button: the Track layer) and Record**. Hold one of them alone and, after
 0.35 s, the whole display becomes a card that says what that key does on this screen (the screen is not drawn
 under it; the pad lights are the key's usual ones). SETTINGS → SETUP → HELP sets when: OFF (never), 0.35S (the
-default) or INST (at the press); the choice is kept between sessions (`Projects/help.txt`), not in a project. One
+default) or INST (at the press). A hold key pressed within 2 s of a knob turn, pad press or button press is taken
+for the start of a chord: in every mode its card then waits 2 s (and any control used meanwhile cancels it for the
+hold, as always). The choice is kept between sessions (`Projects/help.txt`), not in a project. One
 rule for all five (`ScreenManager::getHelpCardKey`, `helpKeyChanged`):
 - The card appears only if no other pad, knob or button was pressed since the key went down, and not if another of
   these keys, Play or Scale was already held (`holdDownBesides`): two keys held together show no card, whichever
@@ -259,6 +261,40 @@ still acts after a card, and its cards (`helpCardsFor`). A new hold layer needs 
 `helpKeyChanged()` call where the key goes down and comes up. Each screen supplies its own facts through
 `Screen::getEditScope`, `getPageKeyName` and `getHelpFacts` (`tapUpDown`, `allTracksTurn`, `stepLocks` for the new
 cards). The screen audit holds every key on every screen (`ScreenAudit::auditHelpCards`).
+
+**CHORD (chord pads).** Shift + bottom pad 3. Keys held (physically, or kept by the key latch; with the arp on and
+latched, the arp's notes) + a pad: the pad takes that chord, replacing what it had (undo step "STORE CHORD PAD n");
+nothing is played by the press. A pad pressed with no key held plays its chord on the selected track through the
+note-pad path (`notePadDown`, one pad slot per note: recording, arp, rolls), pad velocity scaling the chord and pad
+pressure going to every note. Four banks of sixteen (BK, Up / Down), TR / OC move all pads, VL = stored levels or
+the pad's velocity, CL (four clicks) clears the bank. Pinnable. Saved in the project (`chordPads`,
+`ChordPads::toFlat`). Not built: strum, copy / clear / paste of one pad.
+
+**Presets.** SV saves the track's own sound read from the engine, mixer and effects (`ProjectBridge::captureTrackSound`,
+with the insert chain's types); while a preset is auditioned, the remembered sound. A preset that has the insert
+type ids sets the track's insert chain when auditioned or loaded; presets without them leave the track's effects.
+A preset also holds the track's arpeggiator (`Preset::arp`, the list `ProjectBridge::captureArp` makes: settings, on /
+off, tapped rhythm); one that has it sets the track's arp, one without leaves it; leaving PRESET without LD restores
+the track's own.
+
+**ARCH.** The synth's ARCH cell loads an architecture's starting sound the first time it is chosen. From then on
+each architecture keeps what was dialled in on it: turning ARCH away and back returns the sound as it was left (per
+track, until that track's sound is replaced by a preset, a project or another engine).
+
+**Session.** The app starts in the state it was last running in: every sound, pattern and setting a project holds
+is written to `~/Music/Neptune/Projects/session.json` when the app quits and every 15 s while it runs, and put back
+at the next start on top of the project last saved or loaded (SAVE on SETTINGS still writes that project's slot).
+
+**Stop and latch.** When the transport stops (Play, or Shift + Play, which also cuts effect tails), notes that only
+a latch is holding are let go: the key latch's and those of every track's latched arp. The latch stays on for the
+next keys, and keys that are physically down keep sounding (`ScreenManager::releaseLatches`).
+
+**Recording knob movements.** While recording is on and the transport runs, a lockable knob turned on PARAM, TRK FX
+or FLTR (no step held) is written into the selected track as parameter locks: its value on every step the track
+passes, from the step of the first turn for one lap of the track (a knob left alone keeps writing its value until
+the lap is full; the lap never overwrites its own start). A step without a trig becomes a trig without notes that
+carries the lock. When the lap is full or recording ends, the track's own value is again what it was before the
+first turn. `AudioEngine::motionTouch` / `motionPoll` (the 30 Hz refresh); part of the recording pass's undo step.
 
 **Recording.** Record alone: recording on / off, acting when the button is let go (the transport is not
 touched; with recording on, Play records); held alone for 0.35 s it shows its help card, and still acts when let go. Hold Record + press Play: live recording — recording on and the transport
@@ -327,7 +363,7 @@ several pads held on PARAM, TRK FX and FLTR (lock and unlock all; all go white).
 goes white and the name bar puts the step first ("S12 FILTR"; when room is short the step is what stays).
 
 Pad pin: Shift + **hold for half a
-second** the bottom-row pad of the screen you are already on (DRUMS or SCALE) pins those playing pads; they keep
+second** the bottom-row pad of the screen you are already on (DRUMS, CHORD or SCALE) pins those playing pads; they keep
 playing with pressure on every other screen until the same gesture unpins them. A quick press does nothing (it was
 too easy to do by accident). A PIN tag shows in the name bar.
 
@@ -336,7 +372,7 @@ selected pad), 2 TRACKS (paged mixer: VOL, PAN, SND1, SND2, ENG — knob N = tra
 engine and that track's top pad commits it), 3 TRK FX (TRACK, ARPLK, DIRT, TALK, MODFX, FX — the same six pages on
 every track), 4 STEP, 5 PRESET (pads play the track; with AU on, scrolling auditions and the previous sound returns
 unless LD is used), 6 SONG, 7 SETTINGS, 8 AT ROUTE (per track; destinations from that track's engine). Bottom row:
-1 STEP, 2 DRUMS, 3 ARP, 4 SCALE, 5 WAVE, 6 FLTR. The name bar shows "T n" on every screen. Bar screens show the full
+1 STEP, 2 DRUMS, 3 CHORD, 4 SCALE, 5 WAVE, 6 FLTR. The name bar shows "T n" on every screen. Bar screens show the full
 name and value of the knob just turned in the name bar. The 4 × 2 grid stays.
 
 **Filter picture.** While a filter parameter is being turned on any page, the response curve is drawn over the half

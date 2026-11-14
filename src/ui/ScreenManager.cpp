@@ -324,7 +324,10 @@ void ScreenManager::controlChangeReceived(int channel, int cc, int value)
                                 && ((cc == CC_PLAY && !patternKeyHeld && getEditPlan(Edit::Clear).hold)
                                     || (cc == CC_PATTERN_KEY && getEditPlan(Edit::Paste).hold));
         if (pressed && (button || encoder) && !startsHold)
+        {
             dismissHelp();
+            lastControlMs = nowMs();
+        }
     }
 
     // ---- Settings: open the screen; Func + Settings = tap tempo -----------------------------------
@@ -627,6 +630,7 @@ void ScreenManager::handlePlay()
         playLocal = false;
         if (sequencer)          sequencer->resetPosition();
         leaveRecording();
+        releaseLatches();
         return;
     }
 
@@ -634,9 +638,29 @@ void ScreenManager::handlePlay()
     const bool wasRunning = isTransportRunning();
     toggleTransport();
     if (wasRunning)
+    {
         leaveRecording();
+        releaseLatches();
+    }
     else
         showCountIn();
+}
+
+// Stop means quiet: notes that only a latch is holding are let go when the transport stops (the
+// owner had a latched sound ring on through a reverb after stop). The latch itself stays on, for
+// the next keys, and a key that is physically down keeps sounding. Arps: every track's.
+void ScreenManager::releaseLatches()
+{
+    if (holdActive)
+        releaseHeldNotes();
+    if (sequencer == nullptr || !engineHooks.arpLatch || !engineHooks.setArpLatch)
+        return;
+    for (int t = 0; t < sequencer->getPattern().getTrackCount(); ++t)
+        if (engineHooks.arpLatch(t))
+        {
+            engineHooks.setArpLatch(t, false);      // lets go of the notes no key holds
+            engineHooks.setArpLatch(t, true);
+        }
 }
 
 void ScreenManager::toggleTransport()
@@ -1727,6 +1751,7 @@ void ScreenManager::handlePadPress(int padIndex, int velocity)
     padTarget[(size_t) padIndex] = nullptr;
     lastEdit = Edit::None;
     dismissHelp();
+    lastControlMs = nowMs();
     const bool topRow = padIndex < LaunchkeyController::PADS_PER_ROW;
     const int column = padIndex % LaunchkeyController::PADS_PER_ROW;
 
@@ -1820,6 +1845,8 @@ void ScreenManager::noteOnReceived(int channel, int note, int velocity)
             releaseHeldNotes();
 
         addPhysicalNote(note);
+        if (note >= 0 && note < 128)
+            keyVelocity[(size_t) note] = (juce::uint8) juce::jlimit(1, 127, velocity);
 
         if (activeScreen && activeScreen->wantsKeyboardEvents())
         {
@@ -1928,6 +1955,25 @@ void ScreenManager::sendKeyOff(int note)
         }
         keyboardListener->keyboardNoteOff(sounding);
     }
+}
+
+std::vector<std::pair<int, int>> ScreenManager::getHeldKeys() const
+{
+    std::vector<std::pair<int, int>> keys;
+    auto add = [&](int note)
+    {
+        if (note < 0 || note >= 128) return;
+        const int sounding = keySounding[(size_t) note] >= 0 ? (int) keySounding[(size_t) note] : note;
+        for (auto& k : keys)
+            if (k.first == sounding) return;
+        keys.push_back({ sounding, juce::jmax(1, (int) keyVelocity[(size_t) note]) });
+    };
+    for (int i = 0; i < physicallyHeldCount; ++i)
+        add(physicallyHeldNotes[i]);
+    if (holdActive)
+        for (int i = 0; i < heldNoteCount; ++i)
+            add(heldNotes[i]);
+    return keys;
 }
 
 void ScreenManager::addPhysicalNote(int note)
@@ -2330,7 +2376,7 @@ bool ScreenManager::holdDownBesides(HelpKey key) const
 void ScreenManager::dismissHelp()
 {
     if (helpKey != HelpKey::None && !helpDismissed && helpMode != HelpMode::Off
-        && nowMs() - helpPressMs >= helpKeyDef(helpKey).delayMs)
+        && nowMs() - helpPressMs >= helpDelayMs)
         helpShown = true;
     helpDismissed = true;
 }
@@ -2356,6 +2402,12 @@ void ScreenManager::helpKeyChanged(HelpKey key, bool pressed)
     helpPressMs = nowMs();
     helpDismissed = false;
     helpShown = false;
+    // In the middle of playing or editing (a knob, pad or button was used a moment ago) the key
+    // is far more likely the start of a chord than a question: the card waits much longer, in
+    // every help mode, so it does not cover the screen being worked on. (A pad that is still held
+    // from longer ago does not count: a held step can be asked about.)
+    helpBusy = lastControlMs > 0 && helpPressMs - lastControlMs < helpBusyWindowMs;
+    helpDelayMs = helpBusy ? HELP_BUSY_DELAY_MS : helpKeyDef(key).delayMs;
 }
 
 // True when this hold of `key` showed its card, so that letting the key go does nothing else
@@ -2365,14 +2417,14 @@ bool ScreenManager::helpCardTookHold(HelpKey key) const
 {
     if (helpKey != key || helpMode == HelpMode::Off || helpKeyDef(key).releaseActsAfterCard)
         return false;
-    return helpShown || (!helpDismissed && nowMs() - helpPressMs >= helpKeyDef(key).delayMs);
+    return helpShown || (!helpDismissed && nowMs() - helpPressMs >= helpDelayMs);
 }
 
 ScreenManager::HelpKey ScreenManager::getHelpCardKey() const
 {
     if (helpKey == HelpKey::None || helpDismissed || helpMode == HelpMode::Off || activeScreen == nullptr)
         return HelpKey::None;
-    if (helpMode == HelpMode::Delayed && nowMs() - helpPressMs < helpKeyDef(helpKey).delayMs)
+    if ((helpMode == HelpMode::Delayed || helpBusy) && nowMs() - helpPressMs < helpDelayMs)
         return HelpKey::None;
     return helpKey;
 }

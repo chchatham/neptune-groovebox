@@ -562,6 +562,70 @@ public:
             auto restored = KitPreset::fromJSON(json);
             expect(!restored.isFactory);
         }
+
+        beginTest("Hats: six metallic squares through band-passes; the open hat closes when the hit ends");
+        {
+            const double sr = 48000.0;
+            // The default kit's hats (pads 15 and 16), played for `held` seconds, 1.2 s rendered.
+            auto hit = [&](int pad, double held)
+            {
+                DrumEngine kit;
+                kit.prepareToPlay(sr, 64);
+                juce::AudioBuffer<float> buf(2, 64);
+                juce::MidiBuffer midi;
+                std::vector<float> out;
+                kit.noteOn(pad, 1.0f);
+                bool down = true;
+                while ((double) out.size() < 1.2 * sr)
+                {
+                    if (down && (double) out.size() >= held * sr) { kit.noteOff(pad); down = false; }
+                    buf.clear();
+                    kit.processBlock(buf, midi);
+                    for (int i = 0; i < 64; ++i)
+                        out.push_back(0.5f * (buf.getSample(0, i) + buf.getSample(1, i)));
+                }
+                return out;
+            };
+            auto peak = [](const std::vector<float>& x) { float p = 0; for (float v : x) p = std::max(p, std::abs(v)); return p; };
+            // Seconds until the level has fallen 40 dB below its peak for good.
+            auto length = [&](const std::vector<float>& x)
+            {
+                const float floor = peak(x) * 0.01f;
+                size_t last = 0;
+                for (size_t i = 0; i < x.size(); ++i) if (std::abs(x[i]) > floor) last = i;
+                return (double) last / sr;
+            };
+            // Share of the power above / below a frequency (one-pole split: enough for "where").
+            auto shareAbove = [&](const std::vector<float>& x, double hz)
+            {
+                const double a = 1.0 - std::exp(-2.0 * juce::MathConstants<double>::pi * hz / sr);
+                double lp = 0.0, low = 0.0, all = 0.0;
+                for (float v : x) { lp += a * (v - lp); low += lp * lp; all += (double) v * v; }
+                return 1.0 - low / std::max(1.0e-12, all);
+            };
+
+            const int CH = 14, OH = 15;
+            const auto closed = hit(CH, 0.02), openHeld = hit(OH, 1.0), openTap = hit(OH, 0.03), openEighth = hit(OH, 0.25);
+            logMessage("hat peaks: closed " + juce::String(peak(closed), 3) + ", open " + juce::String(peak(openHeld), 3)
+                       + "; lengths: closed " + juce::String(length(closed), 3) + " s, open held " + juce::String(length(openHeld), 3)
+                       + " s, open tapped " + juce::String(length(openTap), 3) + " s, open for 0.25 s " + juce::String(length(openEighth), 3)
+                       + " s; above 4 kHz: " + juce::String(shareAbove(closed, 4000.0), 2));
+
+            expect(peak(closed) > 0.05f && peak(openHeld) > 0.05f);
+            expect(shareAbove(closed, 4000.0) > 0.6, "a hat is mostly above 4 kHz");
+            expect(shareAbove(closed, 1000.0) > 0.97, "nothing of the low squares themselves comes through");
+            expect(length(closed) < 0.12, "closed: a tick");
+            expect(length(openHeld) > 0.3, "open, held: it rings");
+            expect(length(openTap) < 0.15, "open hat, tapped: it closes like the closed one");
+            expect(length(openEighth) > 0.25 && length(openEighth) < 0.36, "open for an eighth: rings that long, then closes");
+            expect(length(hit(CH, 1.0)) < 0.12, "the closed hat stays closed however long it is held");
+
+            // Metallic, not noise: two hits are the same sound (a noise hat never repeats)...
+            const auto again = hit(CH, 0.02);
+            double diff = 0.0, power = 0.0;
+            for (size_t i = 0; i < closed.size(); ++i) { diff += std::pow((double) closed[i] - again[i], 2.0); power += (double) closed[i] * closed[i]; }
+            expect(diff / power < 1.0e-6, "the same six oscillators every time");
+        }
     }
 };
 

@@ -555,6 +555,7 @@ struct ProjectData
 
     // Custom scale pages
     std::vector<ScalePage> customScalePages;
+    std::vector<float> chordPads;           // ChordPads::toFlat(); empty = no chord stored
 
     // Aftertouch routing. Per track (index = track); `aftertouchRouting` is the single list of
     // older projects, applied to every track when a project has no per-track lists.
@@ -626,6 +627,14 @@ struct ProjectData
 
         // Song
         root->setProperty("song", song.toVar());
+
+        if (!chordPads.empty())
+        {
+            juce::Array<juce::var> chordArr;
+            for (float v : chordPads)
+                chordArr.add((double) v);
+            root->setProperty("chordPads", chordArr);
+        }
 
         // Custom scale pages
         if (!customScalePages.empty())
@@ -700,6 +709,10 @@ struct ProjectData
             }
 
             proj.song = SongData::fromVar(obj->getProperty("song"));
+
+            if (auto* chordArr = obj->getProperty("chordPads").getArray())
+                for (auto& cv : *chordArr)
+                    proj.chordPads.push_back((float) (double) cv);
 
             // Custom scale pages
             if (auto* scaleArr = obj->getProperty("scalePages").getArray())

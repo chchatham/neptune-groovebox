@@ -28,7 +28,7 @@ DESC = {
     "PW": [(None, "Pulse width / shape", "Shapes both oscillators: 50 is the plain wave, and the two directions are two different sounds. Below 50 thins or sharpens: SQR and PLS narrow to a thin pulse, SIN and TRI are wavefolded, SAW gains a second, shifted saw. Above 50 thickens: SQR and PLS gain a square an octave up, SIN and TRI are pushed towards a square, SAW hollows into a square.")],
     "TUN2": [(None, "Oscillator 2 tune", "Pitch of oscillator 2 relative to oscillator 1, in semitones.")],
     "DET2": [(None, "Oscillator 2 detune", "Fine detune of oscillator 2 in cents, for beating and width.")],
-    "XMOD": [(None, "Cross-modulation", "How strongly oscillator 2 frequency-modulates oscillator 1; clangorous, bell-like tones.")],
+    "XMOD": [(None, "Cross-modulation", "How strongly oscillator 2 frequency-modulates oscillator 1: through-zero linear FM, so the note stays in tune and whole-number tunings of oscillator 2 (TUN2 at 0, 12, 19, 24) give harmonic tones at any depth; other tunings give bells and clangs.")],
     "DRIV": [
         ("Synth/OSC", "Mixer drive", "Overdrives the oscillator mix before the filter."),
         ("(Synth|FM|Macro|Wavetable|Wave seq)/FILTR", "Filter drive", "Input drive into the filter. Each type overdrives in its own way; the SVF soft-clips its input, and on COMB it darkens the feedback."),
@@ -52,7 +52,7 @@ DESC = {
     "BEND": [(None, "Bend range", "How far the pitch strip bends the sound, in semitones.")],
 
     # ---- Voice ---------------------------------------------------------------------------------
-    "ARCH": [(None, "Architecture", "Loads a starting voice architecture into the same pages: INIT, MONO, HYBR (hybrid) or POLY.")],
+    "ARCH": [(None, "Architecture", "Loads a starting voice architecture into the same pages: INIT, MONO, HYBR (hybrid) or POLY. Each one keeps what you dial in on it: switch away and back and the sound is as you left it.")],
     "MODE": [
         ('Sampler/SLICE', 'Slice mode', 'GRID: equal slices. TRNS: one slice per detected hit (transient).'),
         ('Wavetable/SCAN', 'Scan mode', 'Moves the table position by itself over a set time: OFF, RUN (once, then holds), LOOP, PING (there and back), STEP (in audible steps), RAND (random frames).'),
@@ -125,7 +125,7 @@ DESC = {
     "FFM": [(None, "Filter FM", "Oscillator 2 modulates the cutoff at audio rate.")],
     "KTRK": [
         ("Synth/MOD2", "Key track to LFO rate", "Higher notes speed the LFO up (not while SYNC is on)."),
-        (None, "Key tracking", "How far the cutoff follows the played note."),
+        (None, "Key tracking", "How far the cutoff follows the played note, -100 to +100: at +100 it rises an octave per octave played (on the sampler a tenth of its range), at 0 it stays put, below 0 it falls as the notes rise. Middle C is the centre."),
     ],
     "TYPB": [(None, "Filter B type", "Model of the second filter.")],
     "MODB": [(None, "Filter B mode", "Response of the second filter.")],
@@ -166,7 +166,7 @@ DESC = {
     ],
     "KEY": [
         ("Sampler/", "Key follow", "On: pitch follows the note. Off: every note plays the sample at its original pitch."),
-        (None, "Key tracking", "How far the cutoff follows the played note."),
+        (None, "Key tracking", "How far the cutoff follows the played note, -100 to +100: at +100 it rises an octave per octave played (on the sampler a tenth of its range), at 0 it stays put, below 0 it falls as the notes rise. Middle C is the centre."),
     ],
     "VEL": [
         (".*/F ENV", "Velocity to cutoff", "Harder notes open the filter further."),
@@ -206,7 +206,7 @@ DESC = {
         ("Wavetable/", "Key-frame algorithm", "How the frames between two keys of the KEYS table are made. LIN: a crossfade. STEP: none, the nearer key. CLSC: a crossfade kept as 128 samples of 8 bits. PHAS: level and phase of each harmonic separately, so nothing cancels on the way. TRNS: the energy glides along the harmonics (optimal transport), so a formant slides instead of fading. VOC: first the outline of the spectrum changes, then its harmonics; half way it is one key's formants on the other's harmonics."),
         (None, "Algorithm", "How the six operators are wired (8 algorithms, from one chain of six to six parallel carriers)."),
     ],
-    "RAT#": [(None, "Operator ratio", "RATIO page: frequency ratio of operators 1 to 6, one knob each.")],
+    "RAT#": [(None, "Operator ratio", "RATIO page: frequency ratio of operators 1 to 6, one knob each. A turn steps through the harmonics (0.5, 1, 2, 3 ... 16); Shift + turn moves by 0.01 for in-between ratios; Func + turn by an octave.")],
     "RATI": [
         ("FM/", "Operator ratio", "Frequency of this operator as a multiple of the note."),
         ("Macro/", "Ratio (FM model)", "Second macro of the FM model: modulator ratio."),
@@ -624,7 +624,7 @@ EXTRA = [
     ("CLVL", "Click level", "SETTINGS", "CLICK", "0–100", "Loudness of the click. Every turn plays one click, so it can be set with the sequencer stopped. The click is added after the master effects and MVOL: they do not change it, and it is never recorded into a resample."),
     ("CNT", "Count-in", "SETTINGS", "CLICK", "OFF 1BAR 2BAR", "Bars the metronome counts in before a recording starts. The count-in always clicks, also with CLCK off. Nothing plays or is recorded until it ends."),
     # ARP
-    ("MODE", "Arp mode", "ARP", "ARP", "12 modes", "Order the held notes play in (Appendix C)."),
+    ("MODE", "Arp mode", "ARP", "ARP", "15 modes", "Order the held notes play in (Appendix C)."),
     ("RATE", "Arp rate", "ARP", "ARP", "1/1–1/64T", "Note value of the arp's steps."),
     ("OCT", "Octave range", "ARP", "ARP", "1–8", "Octaves the arp spans."),
     ("GATE", "Gate", "ARP", "ARP / ROLL", "0–100", "Length of each arp note (or roll repeat) as a share of its step."),
@@ -675,6 +675,12 @@ EXTRA = [
     ("LK", "Scale lock", "SCALE", "bar", "OFF / ON", "Forces keys and arps into the scale (also the Scale button)."),
     ("NT", "Note", "SCALE", "bar (edit)", "note", "Edit mode: the selected pad's note."),
     ("PD", "Pad", "SCALE", "bar (edit)", "1–16", "Edit mode: which pad is being edited."),
+    # CHORD bar
+    ("BK", "Chord bank", "CHORD", "bar", "1–4", "Which bank of sixteen chord pads (also Up / Down)."),
+    ("TR", "Transpose", "CHORD", "bar", "−24 to +24", "Moves every chord pad by semitones; what is stored stays as played."),
+    ("OC", "Octave", "CHORD", "bar", "−3 to +3", "Moves every chord pad by octaves."),
+    ("VL", "Velocity", "CHORD", "bar", "as played / pad", "Each note at the level it was stored with, scaled by the pad; or every note at the pad's velocity."),
+    ("CL", "Clear bank", "CHORD", "bar", "four clicks", "Empties the sixteen pads of this bank (an undo step)."),
     # SONG bar
     ("PA", "Pattern", "SONG", "bar", "1–16", "Pattern this row plays."),
     ("RP", "Repeats", "SONG", "bar", "count", "Times the row repeats."),

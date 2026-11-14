@@ -142,7 +142,9 @@ Whole words, except these everyday short forms:
 | PARAMS | parameters | PARAM |
 | TRACK FX | track effects | TRK FX |
 | AT ROUTE | aftertouch routing (pad pressure) | AT ROUTE |
-| ARP | arpeggiator | ARP |
+| CHORDS | chord pads | CHORD |
+
+(Shift + bottom pad 3 was ARP until 2026-11-14; the arpeggiator is on the Arp button, which carries its own cap.)
 
 Printed whole: TRACKS, STEP (top pad 4 and bottom pad 1), PRESET, SONG, SETTINGS, DRUMS, SCALE, WAVEFORM
 (display: WAVE), FILTER (display: FLTR), KNOB PAGE, PAD PAGE, PAGE, JUMP, PATTERN, PASTE, COARSE, FINE,

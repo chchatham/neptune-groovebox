@@ -391,7 +391,21 @@ public:
             return;   // heard when the step plays; the track's own value is untouched
         }
 
+        // While recording, the movement goes into the pattern (AudioEngine::motionTouch): the
+        // track's own value is what it was before the first turn.
+        const bool motion = audioEngine != nullptr && audioEngine->isMotionRecording() && canLock(spec.id);
+        float own = 0.0f;
+        if (motion)
+        {
+            auto stored = track.soundParams.find(spec.id);
+            own = audioEngine->isMotionActive(trackIdx, spec.id) || stored == track.soundParams.end()
+                      ? spec.clamp(baseValue(spec, trackIdx)) : stored->second;
+        }
+
         setValue(spec, next, trackIdx);
+
+        if (motion)
+            audioEngine->motionTouch(trackIdx, spec.id, next, own);
     }
 
     // Why a cell has only one value. MODE cells take their list from the filter type, and OFF
@@ -1013,15 +1027,76 @@ protected:
         if (writeVirtual(spec, trackIdx, value))
             return;
 
+        // The synth's ARCH loads a whole starting sound. Each architecture keeps what was dialled in
+        // on it: the sound being left is remembered, and one that was left earlier comes back as
+        // it was instead of the architecture's starting sound (owner, 2026-11-14: switching away
+        // and back must lose nothing).
+        auto* archEngine = (audioEngine != nullptr && spec.id == UnifiedParam::ARCH) ? engineOf(trackIdx) : nullptr;
+        if (archEngine != nullptr && archEngine->getType() != EngineType::UnifiedVoice)
+            archEngine = nullptr;
+        const int archTo = (int) std::lround(value);
+        if (archEngine != nullptr && (int) std::lround(archEngine->getParameter(UnifiedParam::ARCH)) == archTo)
+            archEngine = nullptr;                       // not a switch
+        if (archEngine != nullptr)
+            rememberArchitecture(trackIdx, *archEngine);
+
         sequencer->getPattern().getTrack(trackIdx).soundParams[spec.id] = value;
         if (audioEngine)
         {
             audioEngine->setTrackParameter(trackIdx, spec.id, value);
+            if (archEngine != nullptr)
+                recallArchitecture(trackIdx, *archEngine, archTo);
 
             // A switch such as the architecture preset or the filter type changes other parameters
             // and cells too: read them back so stored values match what is sounding.
             if (spec.kind == ParamKind::Choice && EngineParamRange::contains(spec.id))
                 syncStoredParams(trackIdx);
+        }
+    }
+
+    // ---- What each architecture of a track's synth was left as (for as long as that engine lives) ----
+    struct ArchMemory
+    {
+        const EngineBase* engine = nullptr;
+        std::map<int, ParamMap> sounds;             // by ARCH value: every engine parameter
+    };
+    std::map<int, ArchMemory> archMemory;           // by track
+
+    void rememberArchitecture(int trackIdx, const EngineBase& e)
+    {
+        auto& memory = archMemory[trackIdx];
+        if (memory.engine != &e)
+        {
+            memory.engine = &e;
+            memory.sounds.clear();                  // another engine: another sound's history
+        }
+        auto& sound = memory.sounds[(int) std::lround(e.getParameter(UnifiedParam::ARCH))];
+        sound.clear();
+        for (int id = 0; id < EngineParamRange::THIRD_END; ++id)
+            if (EngineParamRange::contains(id) && id != UnifiedParam::ARCH)
+                sound[id] = e.getParameter(id);
+    }
+
+    // After ARCH was set to `arch`: the sound that architecture was left with, if it was used
+    // before on this engine. (A few passes: a parameter such as an oscillator's kind resets others.)
+    void recallArchitecture(int trackIdx, const EngineBase& e, int arch)
+    {
+        auto it = archMemory.find(trackIdx);
+        if (it == archMemory.end() || it->second.engine != &e)
+            return;
+        auto found = it->second.sounds.find(arch);
+        if (found == it->second.sounds.end())
+            return;
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            bool changed = false;
+            for (auto& [id, v] : found->second)
+                if (e.getParameter(id) != v)
+                {
+                    audioEngine->setTrackParameter(trackIdx, id, v);
+                    changed = true;
+                }
+            if (!changed) break;
         }
     }
 

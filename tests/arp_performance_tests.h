@@ -689,7 +689,7 @@ public:
             expect(!screen.usesEncoderBar());
         }
 
-        beginTest("ArpScreen: mode encoder scrolls through all 12 modes");
+        beginTest("ArpScreen: mode encoder scrolls through all 15 modes");
         {
             Arpeggiator arp;
             ArpScreen screen(arp);
@@ -701,10 +701,16 @@ public:
                 screen.onEncoderChange(0, 1); // value 1-63 = positive delta
 
             expectEquals((int)arp.getMode(), (int)Arpeggiator::Mode::RandomOctave);
+            screen.onEncoderChange(0, 1);
+            expectEquals((int)arp.getMode(), (int)Arpeggiator::Mode::Parallel);
+            screen.onEncoderChange(0, 1);
+            expectEquals((int)arp.getMode(), (int)Arpeggiator::Mode::Pedal);
+            screen.onEncoderChange(0, 1);
+            expectEquals((int)arp.getMode(), (int)Arpeggiator::Mode::PedalRise);
 
             // Can't go past last mode
             screen.onEncoderChange(0, 1);
-            expectEquals((int)arp.getMode(), (int)Arpeggiator::Mode::RandomOctave);
+            expectEquals((int)arp.getMode(), (int)Arpeggiator::Mode::PedalRise);
         }
 
         beginTest("ArpScreen: repeats encoder changes note repeats");
@@ -2697,6 +2703,130 @@ public:
             expectEquals(screen.getCellText(4, 4), juce::String("ON 2"));
             screen.onDeactivate();
             expectEquals(screen.getCellText(4, 4), juce::String("OFF"), "leaving the screen ends the capture");
+        }
+
+        beginTest("PARA: every key runs its own pass up the octaves, side by side, from its own press");
+        {
+            // What sounds on each step: the note-ons grouped by the step they fall in.
+            auto stepsOf = [&](const Events& ev)
+            {
+                std::map<int, std::multiset<int>> steps;
+                for (auto& e : ev)
+                    if (e.on)
+                        steps[(int) std::floor(((double) e.t + 20.0) / STEP)].insert(e.pitch);
+                return steps;
+            };
+            using Chord = std::multiset<int>;
+
+            // One key: its own octaves, like UP.
+            {
+                Arpeggiator arp;
+                arp.setEnabled(true);
+                arp.setMode(Arpeggiator::Mode::Parallel);
+                arp.setRate(Arpeggiator::Rate::Sixteenth);
+                arp.setGate(0.5f);
+                arp.setOctaveRange(3);
+                Events ev; int t = 0;
+                hook(arp, ev, t);
+                arp.noteOn(48, 1.0f);
+                advance(arp, t, (int) (STEP * 6) - 10);
+                auto steps = stepsOf(ev);
+                expect(steps[0] == Chord { 48 } && steps[1] == Chord { 60 } && steps[2] == Chord { 72 }
+                       && steps[3] == Chord { 48 } && steps[4] == Chord { 60 });
+            }
+
+            // A second key pressed two steps later starts at ITS bottom octave while the first
+            // carries on where it was: two notes a step, each on its own pass.
+            {
+                Arpeggiator arp;
+                arp.setEnabled(true);
+                arp.setMode(Arpeggiator::Mode::Parallel);
+                arp.setRate(Arpeggiator::Rate::Sixteenth);
+                arp.setGate(0.5f);
+                arp.setOctaveRange(3);
+                Events ev; int t = 0;
+                hook(arp, ev, t);
+                arp.noteOn(48, 1.0f);
+                advance(arp, t, (int) (STEP * 1.5));            // during step 1
+                arp.noteOn(55, 1.0f);
+                advance(arp, t, (int) (STEP * 2.0));            // during step 3
+                arp.noteOn(52, 1.0f);
+                advance(arp, t, (int) (STEP * 4.0));
+                auto steps = stepsOf(ev);
+                expect(steps[0] == Chord { 48 });
+                expect(steps[1] == Chord { 60 }, "the new key waits for the next step");
+                expect(steps[2] == (Chord { 72, 55 }), "first key on its third octave, second key on its first");
+                expect(steps[3] == (Chord { 48, 67 }));
+                expect(steps[4] == (Chord { 60, 79, 52 }), "a third key in between the two: its own pass again");
+                expect(steps[5] == (Chord { 72, 55, 64 }));
+                expect(steps[6] == (Chord { 48, 67, 76 }));
+
+                // A key let go takes only its own pass away.
+                arp.noteOff(55);
+                advance(arp, t, (int) STEP);
+                steps = stepsOf(ev);
+                expect(steps[8] == (Chord { 72, 64 }) || steps[8] == (Chord { 72, 52 }) || steps[8] == (Chord { 72, 76 }),
+                       "the others carry on");
+                expectEquals((int) steps[8].size(), 2);
+            }
+
+            // Keys pressed together are one chord and climb together, also when the first step has
+            // already begun before the last finger lands.
+            {
+                Arpeggiator arp;
+                arp.setEnabled(true);
+                arp.setMode(Arpeggiator::Mode::Parallel);
+                arp.setRate(Arpeggiator::Rate::Sixteenth);
+                arp.setGate(0.5f);
+                arp.setOctaveRange(2);
+                Events ev; int t = 0;
+                hook(arp, ev, t);
+                arp.noteOn(48, 1.0f);
+                advance(arp, t, 400);                           // 9 ms later
+                arp.noteOn(52, 1.0f);
+                advance(arp, t, 400);
+                arp.noteOn(55, 1.0f);
+                advance(arp, t, (int) (STEP * 4.0));
+                auto steps = stepsOf(ev);
+                expect(steps[1] == (Chord { 60, 64, 67 }), "the whole chord an octave up on the second step");
+                expect(steps[2] == (Chord { 48, 52, 55 }));
+                expect(steps[3] == (Chord { 60, 64, 67 }));
+            }
+
+            expectEquals(Arpeggiator::getModeLabel(Arpeggiator::Mode::Parallel), juce::String("PARA"));
+            expectEquals((int) Arpeggiator::Mode::Parallel, 12, "appended: projects store the index");
+        }
+
+        beginTest("PEDL and PDL+: the root alternates with each higher note; in PDL+ the root climbs after every pass");
+        {
+            auto run = [&](Arpeggiator::Mode mode, std::initializer_list<int> keys, int octaves, int steps)
+            {
+                Arpeggiator arp;
+                arp.setEnabled(true);
+                arp.setMode(mode);
+                arp.setRate(Arpeggiator::Rate::Sixteenth);
+                arp.setGate(0.5f);
+                arp.setOctaveRange(octaves);
+                for (int k : keys) arp.noteOn(k, 1.0f);
+                std::vector<int> pitches;
+                for (auto& e : play(arp, steps))
+                    if (e.on) pitches.push_back(e.pitch);
+                return pitches;
+            };
+            using V = std::vector<int>;
+            // Keys in any order: the lowest is the root.
+            expect(run(Arpeggiator::Mode::Pedal, { 64, 60, 67, 72 }, 1, 8) == (V { 60, 64, 60, 67, 60, 72, 60, 64 }),
+                   "PEDL: root, second, root, third, root, fourth, and round again");
+            expect(run(Arpeggiator::Mode::Pedal, { 60, 64 }, 2, 7) == (V { 60, 64, 60, 72, 60, 76, 60 }),
+                   "PEDL over two octaves: the root stays at the bottom, the others climb through both");
+            expect(run(Arpeggiator::Mode::PedalRise, { 60, 64, 67, 72 }, 1, 14)
+                       == (V { 60, 64, 60, 67, 60, 72,   64, 67, 64, 72,   67, 72,   60, 64 }),
+                   "PDL+: each pass starts from the next note up, then the whole figure begins again");
+            expect(run(Arpeggiator::Mode::Pedal, { 60 }, 1, 3) == (V { 60, 60, 60 }), "one key: just that note");
+            expect(run(Arpeggiator::Mode::PedalRise, { 60 }, 2, 4) == (V { 60, 72, 60, 72 }), "one key, two octaves");
+            expectEquals((int) Arpeggiator::Mode::Pedal, 13);
+            expectEquals((int) Arpeggiator::Mode::PedalRise, 14);
+            expectEquals(Arpeggiator::getModeLabel(Arpeggiator::Mode::PedalRise), juce::String("PDL+"));
         }
     }
 };

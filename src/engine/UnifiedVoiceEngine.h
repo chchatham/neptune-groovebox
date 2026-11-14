@@ -395,7 +395,7 @@ public:
                 { "SUS",  FENV_SUSTAIN, 0, 1, 0, L },
                 { "REL",  FENV_RELEASE, 0.001f, 10, 0.3f, G, "s" },
                 { "CURV", FENV_CURVE, -1, 1, 0, L },
-                { "KEY",  KEYTRACK, 0, 1, 0, L },
+                { "KEY",  KEYTRACK, -1, 1, 0, L },
                 { "VEL",  FILTER_VEL, 0, 1, 0, L },
                 { "PMOD", POLY_MOD, -1, 1, 0, L } }} },
             { "AMP", "AMP", {{

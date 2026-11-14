@@ -17,6 +17,9 @@ struct Preset
     // SampleBank as well, but places move when sample files are added: the name decides
     // (PresetManager::soundOf). Empty = the place alone (presets saved before this existed).
     juce::String sampleName;
+    // The track's arpeggiator as it was when the preset was saved (ProjectBridge::captureArp: its
+    // settings, on / off, the tapped rhythm). Empty = the preset has none and leaves the track's.
+    std::vector<float> arp;
 
     juce::var toVar() const
     {
@@ -50,6 +53,14 @@ struct Preset
         }
         obj->setProperty("mods", modsArray);
 
+        if (!arp.empty())
+        {
+            juce::Array<juce::var> arpArray;
+            for (float v : arp)
+                arpArray.add((double) v);
+            obj->setProperty("arp", arpArray);
+        }
+
         return juce::var(obj);
     }
 
@@ -76,6 +87,10 @@ struct Preset
                     }
                 }
             }
+
+            if (auto* arpArray = obj->getProperty("arp").getArray())
+                for (auto& av : *arpArray)
+                    p.arp.push_back((float) (double) av);
 
             if (auto* mods = obj->getProperty("mods").getArray())
             {

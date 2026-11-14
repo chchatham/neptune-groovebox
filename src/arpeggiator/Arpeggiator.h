@@ -49,6 +49,9 @@ public:
         Diverge,
         PolyArp,         // All held notes simultaneously with velocity accent pattern
         RandomOctave,     // Random note selection + random octave shift +-1-2
+        Parallel,        // Every held key runs its own pass up the octaves, from its own press, side by side
+        Pedal,           // The lowest note alternates with each higher one in turn: 1 2 1 3 1 4 ...
+        PedalRise,       // The same, and after each pass the next note up becomes the pedal: 1 2 1 3 | 2 3 ...
         NumModes
     };
 
@@ -659,6 +662,7 @@ public:
             walkPosition = 0;
             repeatSubStep = 0;
             polyArpAccentIndex = 0;
+            parallelTick = 0;
             upDownGoingUp = true;
             strumAltDown = false;
             variationCounter = 0u;
@@ -921,6 +925,15 @@ public:
             return;
 
         inputNotes[inputNoteCount] = { pitch, velocity, noteOrderCounter++, true };
+        // Parallel: a key pressed with the one before it is the same chord and starts with it; a
+        // later key starts a pass of its own at its first step.
+        if (inputNoteCount > 0 && parallelSinceAnchor < PARALLEL_CHORD_SECONDS * lastSampleRate)
+            inputNotes[inputNoteCount].joinTick = parallelAnchorJoin;
+        else
+        {
+            parallelAnchorJoin = -1;
+            parallelSinceAnchor = 0.0;
+        }
         ++inputNoteCount;
         ++physicalNoteCount;
         appendPlayLog(pitch, velocity);
@@ -934,6 +947,7 @@ public:
             walkPosition = 0;
             repeatSubStep = 0;
             polyArpAccentIndex = 0;
+            parallelTick = 0;
             strumAltDown = false;
             hitCount = 0;
             nextHit = 0;
@@ -1023,6 +1037,8 @@ public:
             fireDueHits(currentStepLength);
         }
 
+        parallelSinceAnchor += (double) numSamples;
+
         for (int i = 0; i < numSamples; ++i)
         {
             sampleCounter += 1.0;
@@ -1104,6 +1120,7 @@ public:
         repeatSubStep = 0;
         glideFromPitch = -1;
         polyArpAccentIndex = 0;
+        parallelTick = 0;
         strumAltDown = false;
         recordSampleCounter = 0.0;
         rateCurrent = 0.0;          // the next phrase starts at the set rate
@@ -1117,6 +1134,9 @@ public:
     }
 
     int getInputNoteCount() const { return inputNoteCount; }
+    // The notes the arp is working on (held, or kept by its latch), for the chord pads.
+    int getInputPitch(int i) const { return (i >= 0 && i < inputNoteCount) ? inputNotes[i].pitch : -1; }
+    float getInputVelocity(int i) const { return (i >= 0 && i < inputNoteCount) ? inputNotes[i].velocity : 0.0f; }
     int getSequenceLength() const { return sequenceLength; }
     int getCurrentStep() const { return currentStep; }
 
@@ -1156,6 +1176,9 @@ public:
             case Mode::Diverge:      return "DV";
             case Mode::PolyArp:      return "PA";
             case Mode::RandomOctave: return "RO";
+            case Mode::Parallel:     return "PL";
+            case Mode::Pedal:        return "PD";
+            case Mode::PedalRise:    return "PR";
             default:                 return "--";
         }
     }
@@ -1177,6 +1200,9 @@ public:
             case Mode::Diverge:      return "DIVG";
             case Mode::PolyArp:      return "POLY";
             case Mode::RandomOctave: return "RNOCT";
+            case Mode::Parallel:     return "PARA";
+            case Mode::Pedal:        return "PEDL";
+            case Mode::PedalRise:    return "PDL+";
             default:                 return "--";
         }
     }
@@ -1213,6 +1239,7 @@ private:
         float velocity = 0.0f;
         int order = 0;
         bool held = true;       // key still down (false: kept by latch or freeze)
+        int joinTick = -1;      // Parallel: the tick this key's own pass began on (-1: at its first step)
     };
 
     struct SeqNote
@@ -1237,6 +1264,7 @@ private:
         int walkPosition = 0;
         int repeatSubStep = 0;
         int polyArpAccentIndex = 0;
+        int parallelTick = 0;
         bool upDownGoingUp = true;
         bool strumAltDown = false;
     };
@@ -1433,6 +1461,14 @@ private:
 
     // PolyArp accent state
     int polyArpAccentIndex = 0;
+
+    // Parallel: steps counted since the first key; each key's pass is counted from its own press.
+    // Keys pressed within PARALLEL_CHORD_SECONDS of one another are one chord and move together.
+    static constexpr double PARALLEL_CHORD_SECONDS = 0.06;
+    int parallelTick = 0;
+    int parallelJoin[MAX_INPUT_NOTES] = {};     // per chord voice, in the built (ascending) order
+    int parallelAnchorJoin = -1;                // the join tick of the latest chord (-1: not sounded yet)
+    double parallelSinceAnchor = 0.0;           // samples since that chord's first key
     static constexpr float polyArpAccentPattern[4] = { 1.0f, 0.65f, 0.85f, 0.5f };
 
     // The notes of the current step and what has been sent of them
@@ -1506,7 +1542,7 @@ private:
         return rs.state >> 4;
     }
 
-    bool isChordMode() const { return mode == Mode::ChordRepeat || mode == Mode::PolyArp; }
+    bool isChordMode() const { return mode == Mode::ChordRepeat || mode == Mode::PolyArp || mode == Mode::Parallel; }
 
     // Number of steps in the tapped cycle when the taps set the step timing, else 0.
     int stepRhythmLength() const
@@ -1582,7 +1618,8 @@ private:
         // Sorting: PolyArp and RandomOctave sort ascending like Up
         if (mode == Mode::Up || mode == Mode::Down || mode == Mode::UpDown
             || mode == Mode::Walk || mode == Mode::Converge || mode == Mode::Diverge
-            || mode == Mode::PolyArp || mode == Mode::RandomOctave)
+            || mode == Mode::PolyArp || mode == Mode::RandomOctave || mode == Mode::Parallel
+            || mode == Mode::Pedal || mode == Mode::PedalRise)
         {
             for (int i = 1; i < inputNoteCount; ++i)
             {
@@ -1627,9 +1664,9 @@ private:
                 }
             }
         }
-        else if (mode == Mode::ChordRepeat || mode == Mode::PolyArp)
+        else if (isChordMode())
         {
-            // Both chord modes build the same sequence (all notes per octave)
+            // The chord modes build the same sequence (all notes per octave)
             for (int oct = 0; oct < octaves; ++oct)
             {
                 for (int i = 0; i < inputNoteCount; ++i)
@@ -1640,6 +1677,28 @@ private:
                     ++sequenceLength;
                 }
             }
+        }
+        else if (mode == Mode::Pedal || mode == Mode::PedalRise)
+        {
+            // The ladder: every held note in every octave, bottom to top.
+            SeqNote ladder[MAX_SEQUENCE_NOTES];
+            int rungs = 0;
+            for (int oct = 0; oct < octaves; ++oct)
+                for (int i = 0; i < inputNoteCount && rungs < MAX_SEQUENCE_NOTES; ++i)
+                    ladder[rungs++] = { sorted[i].pitch + oct * 12, sorted[i].velocity };
+
+            // The pedal (root) sounds before each note above it. PEDL keeps the bottom rung as the
+            // pedal; PDL+ moves the pedal up one rung after every pass, until only the top is left.
+            const int lastRoot = (mode == Mode::PedalRise) ? rungs - 2 : 0;
+            if (rungs == 1)
+                sequence[sequenceLength++] = ladder[0];
+            for (int root = 0; root <= lastRoot && rungs > 1; ++root)
+                for (int above = root + 1; above < rungs; ++above)
+                {
+                    if (sequenceLength + 2 > MAX_SEQUENCE_NOTES) break;
+                    sequence[sequenceLength++] = ladder[root];
+                    sequence[sequenceLength++] = ladder[above];
+                }
         }
         else if (mode == Mode::Down)
         {
@@ -1783,6 +1842,12 @@ private:
                 }
             }
         }
+        else if (mode == Mode::Parallel)
+        {
+            // Every key is on its own octave (buildStepNotes): only the tick moves on.
+            p.currentStep = 0;
+            ++p.parallelTick;
+        }
         else if (isChordMode())
         {
             p.currentStep += juce::jmax(1, chordSize);
@@ -1810,6 +1875,7 @@ private:
         walkPosition = p.walkPosition;
         upDownGoingUp = p.upDownGoingUp;
         polyArpAccentIndex = p.polyArpAccentIndex;
+        parallelTick = p.parallelTick;
         xorshiftState = rs.state;
     }
 
@@ -1831,7 +1897,7 @@ private:
     int cycleLength() const
     {
         int positions = sequenceLength;
-        if (isChordMode())
+        if (isChordMode())      // (Parallel: one pass of the octaves)
             positions = (sequenceLength + juce::jmax(1, chordSize) - 1) / juce::jmax(1, chordSize);
         else if (mode == Mode::UpDown && sequenceLength > 1)
             positions = 2 * (sequenceLength - 1);
@@ -1966,6 +2032,7 @@ private:
         p.walkPosition = walkPosition;
         p.repeatSubStep = repeatSubStep;
         p.polyArpAccentIndex = polyArpAccentIndex;
+        p.parallelTick = parallelTick;
         p.upDownGoingUp = upDownGoingUp;
         p.strumAltDown = strumAltDown;
         return p;
@@ -1979,6 +2046,7 @@ private:
         walkPosition = p.walkPosition;
         repeatSubStep = p.repeatSubStep;
         polyArpAccentIndex = p.polyArpAccentIndex;
+        parallelTick = p.parallelTick;
         upDownGoingUp = p.upDownGoingUp;
         strumAltDown = p.strumAltDown;
     }
@@ -2109,9 +2177,21 @@ private:
         const bool velocityLocked = lockActive[(int) LockParam::Velocity];
         const float lockedVelocity = lockValue[(int) LockParam::Velocity];
 
+        // Parallel: voice v (the v-th key from the bottom) is on the octave its own pass has reached.
+        const bool parallel = mode == Mode::Parallel && chordSize > 0 && sequenceLength >= chordSize;
+        const int parallelOctaves = parallel ? juce::jmax(1, sequenceLength / chordSize) : 1;
+        if (parallel)
+            count = juce::jmin(chordSize, (int) MAX_INPUT_NOTES);
+
         for (int i = 0; i < count; ++i)
         {
-            const int seqIdx = stepPos + indices[i];
+            int seqIdx = stepPos + indices[i];
+            if (parallel)
+            {
+                const int voice = indices[i];
+                const int passed = juce::jmax(0, p.parallelTick - parallelJoin[voice]);
+                seqIdx = voice + chordSize * (passed % parallelOctaves);
+            }
             const auto& slot = mutate.getNoteMutation(seqIdx);
             if (slot.muted)
                 continue;
@@ -2172,6 +2252,27 @@ private:
         return outCount > 0;
     }
 
+    // Parallel: a key that has not sounded yet starts its pass on this step; then every voice of the
+    // built chord (ascending pitch) is given its key's start.
+    void assignParallelJoins()
+    {
+        if (mode != Mode::Parallel)
+            return;
+        for (int i = 0; i < inputNoteCount; ++i)
+            if (inputNotes[i].joinTick < 0)
+            {
+                inputNotes[i].joinTick = parallelTick;
+                parallelAnchorJoin = parallelTick;
+            }
+        for (int v = 0; v < chordSize && v < MAX_INPUT_NOTES && v < sequenceLength; ++v)
+        {
+            parallelJoin[v] = parallelTick;
+            for (int i = 0; i < inputNoteCount; ++i)
+                if (inputNotes[i].pitch == sequence[v].pitch)
+                    parallelJoin[v] = inputNotes[i].joinTick;
+        }
+    }
+
     // Plans the step at the current position: its notes and its hits.
     void planStep()
     {
@@ -2193,6 +2294,7 @@ private:
         if (mod.skip)
             return;                                     // a dropped step
 
+        assignParallelJoins();
         PositionState p = capturePosition();
         RandomSource rs = liveRandom();
         const bool sounding = buildStepNotes(p, rs, mod.noteOffset, mod.velocityScale, strumNotes, strumNoteCount);

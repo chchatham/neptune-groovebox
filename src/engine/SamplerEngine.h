@@ -267,7 +267,7 @@ public:
                 { "MODE", FilterMode, 0, 5, 0, C, "", FilterSlot::modeNames(FilterModel::SVF), 4 },
                 { "VELF", VelToFilter, 0, 1, 0, L },
                 { "ENVF", FilterEnv, -1, 1, 0, L },
-                { "KTRK", FilterKey, 0, 1, 0, L },
+                { "KTRK", FilterKey, -1, 1, 0, L },
                 { "FDRV", FilterDrive, 0, 1, 0, L } }} },
             { "AMP", "AMP", {{
                 { "ATK",  Attack, 0.001f, 5, 0.001f, G, "s" },

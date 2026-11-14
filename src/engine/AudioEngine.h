@@ -427,6 +427,122 @@ public:
         }
     }
 
+    // The value a parameter returns to once the lock that holds it is over; with no lock holding
+    // it, the parameter itself. (setTrackParameter would also move a locked parameter now.)
+    void setTrackParameterBase(int trackIndex, int id, float value)
+    {
+        if (trackIndex >= 0 && trackIndex < MAX_TRACKS)
+        {
+            auto& locks = activeLocks[(size_t) trackIndex];
+            for (int i = 0; i < activeLockCount[(size_t) trackIndex]; ++i)
+                if (locks[(size_t) i].id == id)
+                {
+                    locks[(size_t) i].base = value;
+                    return;
+                }
+        }
+        applyTrackParameter(trackIndex, id, value);
+    }
+
+    // ================= Knob movements while recording =============================================
+    // A lockable knob turned while the sequencer records and plays is written into the pattern: a
+    // parameter lock with the knob's value on every step the track passes, from the step of the
+    // first turn for one lap of the track (so the movement loops as it was made, and a knob left
+    // somewhere stays there until the lap is full). A step without a trig becomes a trig without
+    // notes that only carries the lock. When the lap is full or recording ends, the value the
+    // track had before is its own value again: steps the lap did not reach go back to it.
+    // Called from the screens (motionTouch) and the 30 Hz refresh (motionPoll), both holding the
+    // screens' lock; never from the audio thread. The recording pass's undo step covers the locks.
+    struct Motion
+    {
+        int track = -1, id = -1;
+        float value = 0.0f, base = 0.0f;
+        int stepsLeft = 0, lastStep = -1;
+    };
+    static constexpr int MAX_MOTIONS = 16;
+
+    bool isMotionRecording() const { return sequencer != nullptr && sequencer->isRecording() && sequencer->isPlaying(); }
+
+    // `base`: the track's own value of the parameter before this turn.
+    void motionTouch(int trackIndex, int id, float value, float base)
+    {
+        if (!isMotionRecording() || trackIndex < 0 || trackIndex >= sequencer->getPattern().getTrackCount())
+            return;
+        Motion* m = nullptr;
+        for (auto& x : motions)
+            if (x.track == trackIndex && x.id == id) m = &x;
+        if (m == nullptr)
+        {
+            for (auto& x : motions)
+                if (m == nullptr && x.track < 0) m = &x;
+            if (m == nullptr)
+                return;                     // sixteen knobs in motion at once: this one is not recorded
+            const auto& track = sequencer->getPattern().getTrack(trackIndex);
+            const int length = juce::jmax(1, track.length);
+            const int now = juce::jlimit(0, length - 1, sequencer->getCurrentStep(trackIndex));
+            *m = { trackIndex, id, value, base, length, (now + length - 1) % length };
+        }
+        else
+        {
+            // Still on the step written last: it takes the newest value of the turn.
+            auto& track = sequencer->getPattern().getTrack(trackIndex);
+            if (m->lastStep >= 0 && m->lastStep < track.length
+                && m->lastStep == juce::jlimit(0, juce::jmax(1, track.length) - 1, sequencer->getCurrentStep(trackIndex)))
+                track.getStep(m->lastStep).paramLocks[id] = value;
+        }
+        m->value = value;
+        motionPoll();
+    }
+
+    void motionPoll()
+    {
+        if (sequencer == nullptr)
+            return;
+        const bool recordingNow = isMotionRecording();
+        for (auto& m : motions)
+        {
+            if (m.track < 0)
+                continue;
+            if (m.track >= sequencer->getPattern().getTrackCount())
+            {
+                m = Motion();
+                continue;
+            }
+            auto& track = sequencer->getPattern().getTrack(m.track);
+            const int length = juce::jmax(1, track.length);
+            if (recordingNow)
+            {
+                const int now = juce::jlimit(0, length - 1, sequencer->getCurrentStep(m.track));
+                int behind = ((now - m.lastStep) % length + length) % length;
+                while (behind-- > 0 && m.stepsLeft > 0)
+                {
+                    m.lastStep = (m.lastStep + 1) % length;
+                    auto& step = track.getStep(m.lastStep);
+                    step.paramLocks[m.id] = m.value;
+                    if (!step.trig)
+                    {
+                        step.notes.clear();
+                        step.trig = true;
+                    }
+                    --m.stepsLeft;
+                }
+            }
+            if (!recordingNow || m.stepsLeft <= 0)
+            {
+                track.soundParams[m.id] = m.base;
+                setTrackParameterBase(m.track, m.id, m.base);
+                m = Motion();
+            }
+        }
+    }
+
+    bool isMotionActive(int trackIndex, int id) const
+    {
+        for (auto& m : motions)
+            if (m.track == trackIndex && m.id == id) return true;
+        return false;
+    }
+
     // Send every stored parameter of a track to its engine / mixer / effects (after a preset or
     // project load, or an engine change).
     void applyAllTrackParameters(int trackIndex, const ParamMap& params)
@@ -898,6 +1014,56 @@ public:
                 it = (engineParam || engineRange) ? params.erase(it) : std::next(it);
             }
         }
+    }
+
+    // PRESET audition: a fresh engine of `type` takes the track and the engine that was there is
+    // handed back, silenced but otherwise untouched, to be returned with unparkEngine. Unlike
+    // setEngineType nothing stored is changed: the caller owns Track::soundParams and the routes.
+    std::shared_ptr<EngineBase> parkEngine(int trackIndex, EngineType type)
+    {
+        const StructureLock lock(structureMutex);
+        if (trackIndex < 0 || trackIndex >= (int) engines.size())
+            return nullptr;
+        auto parked = engines[(size_t) trackIndex];
+        auto fresh = createEngine(type);
+        if (currentSampleRate > 0)
+            fresh->prepareToPlay(currentSampleRate, currentBlockSize);
+        if (trackIndex < MAX_TRACKS)
+        {
+            if (!parked || parked->getType() != type)
+                trackRouters[(size_t) trackIndex] = defaultPressureRouter(type);
+            fresh->setAftertouchRouter(&trackRouters[(size_t) trackIndex]);
+            activeLockCount[(size_t) trackIndex] = 0;
+        }
+        fresh->setTempo(lastTempo);
+        if (parked)
+            parked->allNotesOff();
+        engines[(size_t) trackIndex] = std::move(fresh);
+        return parked;
+    }
+
+    // The parked engine takes its track back; the engine that stood in for it is retired.
+    void unparkEngine(int trackIndex, std::shared_ptr<EngineBase> parked)
+    {
+        const StructureLock lock(structureMutex);
+        if (!parked || trackIndex < 0 || trackIndex >= (int) engines.size())
+            return;
+        auto& current = engines[(size_t) trackIndex];
+        if (current)
+        {
+            current->allNotesOff();
+            retiredEngines.push_back(current);
+            if (retiredEngines.size() > 16)
+                retiredEngines.erase(retiredEngines.begin());
+        }
+        if (trackIndex < MAX_TRACKS)
+        {
+            parked->setAftertouchRouter(&trackRouters[(size_t) trackIndex]);
+            activeLockCount[(size_t) trackIndex] = 0;
+        }
+        parked->setTempo(lastTempo);
+        parked->allNotesOff();
+        engines[(size_t) trackIndex] = std::move(parked);
     }
 
     int getSendCount() const { return (int) sendBuses.size(); }
@@ -1494,6 +1660,7 @@ private:
     std::vector<EffectChain> trackInsertChains;
     std::vector<std::vector<EffectType>> insertTypes;
     float masterLevel = 0.8f;
+    std::array<Motion, MAX_MOTIONS> motions;
     double currentSampleRate = 0.0;
     int currentBlockSize = 0;
 

@@ -37,6 +37,7 @@ src/
 │   ├── PadManager          — pad modes and change-only pad LED refresh
 │   ├── DisplayRenderer     — 128x64 1-bit rendering, ack-paced SysEx frames
 │   ├── CustomScaleManager.h — custom scale pad pages
+│   ├── ChordPads.h         — chords stored on pads (the CHORD screen), their names, their place in a project
 │   ├── KeyboardSplit.h     — Shift + Oct key split, through the firmware's debug command
 │   └── BitmapBenchmark.h   — frame-rate benchmark (never run on hardware)
 ├── sequencer/
@@ -82,10 +83,12 @@ src/
 │   ├── UiClock.h           — the screens' clock (the audit can move it on)
 │   ├── screens/            — Home (TRACKS), StepView, ParamPage (PARAM, and `ParamCellScreen`, the base it shares
 │   │                         with TrackFx and FilterView), TrackFx (TRK FX), DrumPad, Preset, Settings, FilterView
-│   │                         (FLTR), Arp, CustomScale, Song, Aftertouch (AT ROUTE), Waveform (WAVE);
+│   │                         (FLTR), Arp, CustomScale, ChordPad (CHORD), Song, Aftertouch (AT ROUTE), Waveform (WAVE);
 │   │                         Mixer and SubParamOverlay are unused
 │   ├── ScreenLayout.h, BitmapFont.h, Icons.h, NoteUtils.h, ParamConstants.h, PadLEDFeedback.h, StartupAnimation.h
 │   └── OLEDMirrorComponent.h, VirtualControllerComponent.h, MainContentComponent.h — the Mac window
+│                             (the panel picture is laid out from PanelDimensions.h and wears PanelOverlay.h: the
+│                             same numbers and words as docs/overlay/overlay.html)
 ├── project/
 │   ├── Project.h, ProjectManager.h, ProjectBridge.h — project files; capture / apply of the whole live state
 │   ├── Preset.h, PresetManager.h, FactoryPresets.h — sound presets

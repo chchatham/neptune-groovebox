@@ -17,6 +17,7 @@
 #include "ui/screens/WaveformScreen.h"
 #include "ui/screens/ArpScreen.h"
 #include "ui/screens/CustomScaleScreen.h"
+#include "ui/screens/ChordPadScreen.h"
 #include "ui/screens/SongScreen.h"
 #include "ui/screens/AftertouchScreen.h"
 #include "sequencer/SequencerCore.h"
@@ -498,6 +499,7 @@ public:
             audioEngine->setTrackArpeggiator(t, arp);
         }
         scaleManager = std::make_unique<CustomScaleManager>();
+        chordPads = std::make_unique<ChordPads>();
         songMode = std::make_unique<SongMode>();
         projectManager = std::make_unique<ProjectManager>();
 
@@ -668,8 +670,9 @@ public:
         // Top row:    PARAM, TRACKS, TRK FX, STEP, PRESET, SONG, SETTINGS, AT ROUTE
         // Bottom row: STEP, DRUMS, ARP, SCALE, WAVE, FLTR, -, -   (unassigned pads do nothing)
         {
+            // (Bottom pad 3 is printed "User Chord": the chord pads. ARP has its own button.)
             static constexpr int map[16] = { SCR_PARAM, SCR_TRACKS, SCR_TRACK_FX, SCR_STEP, SCR_PRESET, SCR_SONG, SCR_SETTINGS, SCR_AT_ROUTE,
-                                             SCR_STEP, SCR_DRUMS, SCR_ARP, SCR_SCALE, SCR_WAVE, SCR_FILTER, -1, -1 };
+                                             SCR_STEP, SCR_DRUMS, SCR_CHORD, SCR_SCALE, SCR_WAVE, SCR_FILTER, -1, -1 };
             for (int pad = 0; pad < 16; ++pad)
                 screenManager->setShiftPadScreen(pad, map[pad]);
         }
@@ -749,6 +752,10 @@ public:
             auto presetScreen = std::make_unique<PresetScreen>(*sequencer, audioEngine.get(), *presetManager);
             // The pads play the selected track so a preset can be heard before it is loaded.
             presetScreen->setNoteCallback([this](int note, int velocity) { notePadDown(note, velocity); });
+            // ... on the notes of the scale chosen on SCALE (page and root), like SCALE's own pads.
+            presetScreen->setArpProvider([this](int t) { return (t >= 0 && t < (int) arps.size()) ? arps[(size_t) t].get() : nullptr; });
+            presetScreen->setPadScale([this](int pad) { return scaleManager ? scaleManager->getNoteForPad(pad) : -1; },
+                                      [this] { return scaleManager ? scaleManager->getRootNote() : 0; });
             presetScreen->setNoteOffCallback([this](int note) { notePadUp(note); });
             presetScreen->setAftertouchCallback([this](int note, int pressure)
                 {
@@ -928,6 +935,32 @@ public:
         screenManager->addScreen(std::make_unique<TrackFxScreen>(*sequencer, audioEngine.get()));
 #endif
         jassert(screenManager->getScreenCount() >= SCR_TRACK_FX);
+        {
+            // CHORD: a chord held on the keys goes onto a pad; the pads play the selected track
+            // through the same path as the SCALE pads, one pad slot per note.
+            auto chordScreen = std::make_unique<ChordPadScreen>(*chordPads);
+            chordScreen->setHeldKeysProvider([this]
+            {
+                std::vector<ChordPads::Note> held;
+                for (auto& [note, velocity] : screenManager->getHeldKeys())
+                    held.push_back({ note, (float) velocity / 127.0f });
+                // With the arp on, the keys it has latched count as held too.
+                if (auto* arp = currentArp(); held.empty() && arp != nullptr && arp->isEnabled() && arp->getLatch())
+                    for (int i = 0; i < arp->getInputNoteCount(); ++i)
+                        held.push_back({ arp->getInputPitch(i), arp->getInputVelocity(i) });
+                return held;
+            });
+            chordScreen->setNoteCallback([this](int note, int velocity) { notePadDown(note, velocity); });
+            chordScreen->setNoteOffCallback([this](int note) { notePadUp(note); });
+            chordScreen->setAftertouchCallback([this](int note, int pressure)
+            {
+                if (auto* engine = audioEngine->getEngine(sequencer->getSelectedTrack()))
+                    engine->aftertouch(note, (float) pressure / 127.0f);
+                notePadPressure(note, pressure);
+            });
+            screenManager->addScreen(std::move(chordScreen));
+        }
+        jassert(screenManager->getScreenCount() == SCR_CHORD + 1);
 
         // Screen names change with their page, so the buttons and the copy / clear / paste defaults
         // go by index. DRUMS and SCALE are the screens whose playing pads can be pinned.
@@ -935,6 +968,7 @@ public:
         screenManager->setStepScreen(SCR_STEP);     // where a recording is laid out when it ends
         screenManager->setPinnable(SCR_DRUMS, true);
         screenManager->setPinnable(SCR_SCALE, true);
+        screenManager->setPinnable(SCR_CHORD, true);
         screenManager->setScreenContext(SCR_STEP, ScreenManager::CopyContext::Steps);
         screenManager->setScreenContext(SCR_TRACKS, ScreenManager::CopyContext::Pattern);
         screenManager->setScreenContext(SCR_PARAM, ScreenManager::CopyContext::Sound);
@@ -943,8 +977,8 @@ public:
         // The screens' names on the Shift help card's pad map (four letters, one pad column each).
         {
             static const char* const mapNames[] = { "TRKS", "STEP", "PARM", "DRUM", "PRST", "SETT", "FLTR", "ARP",
-                                                    "SCAL", "SONG", "ATRT", "WAVE", "TKFX" };
-            for (int i = 0; i <= SCR_TRACK_FX; ++i)
+                                                    "SCAL", "SONG", "ATRT", "WAVE", "TKFX", "CHRD" };
+            for (int i = 0; i <= SCR_CHORD; ++i)
                 screenManager->setScreenMapName(i, mapNames[i]);
         }
         if (helpModeFile().existsAsFile())
@@ -1020,6 +1054,7 @@ public:
                     performanceControls.followStrip();
                     if (waveformScreen) waveformScreen->poll();      // a finished resample becomes a sample
                     screenManager->tick();      // a held clear acts when its time is up; recording passes
+                    audioEngine->motionPoll();  // knob movements being recorded follow the playhead
                     display->tickAckTimeout();
                     if (++splitTick >= 6) { splitTick = 0; keyboardSplit.poll(); }      // five times a second
                     if (++displayLogTick >= 300)                      // every 10 s, when frames were sent
@@ -1076,6 +1111,7 @@ public:
                     && projectSlotDir(last).getChildFile("project.json").existsAsFile())
                     projectManager->loadProject(projectSlotDir(last));
             }
+            restoreSession();
 
             screenManager->requestRedraw();
             screenManager->redrawIfNeeded();
@@ -1083,15 +1119,24 @@ public:
         else
         {
             juce::Logger::writeToLog("Launchkey not found. Connect it and restart.");
+            // No hardware pads to light: the panel in the window still shows what they would show.
+            panelPadTimer = std::make_unique<FunctionTimer>([this] { mirrorPadsToPanel(); });
+            panelPadTimer->startTimerHz(30);
             if (auditFolder().isNotEmpty())
                 juce::Timer::callAfterDelay(500, [this] { startScreenAudit(false); });     // drawing checks only
+            else if (juce::SystemStats::getEnvironmentVariable("NEPTUNE_DUMP_SCREENS", {}).isEmpty()
+                     && juce::SystemStats::getEnvironmentVariable("NEPTUNE_SNAPSHOT_CONTROLLER", {}).isEmpty())
+                restoreSession();
         }
     }
 
     void shutdown() override
     {
+        saveSession();                       // the next start begins where this one ends
+        sessionTimer.reset();
         keyboardSplit.restore();             // the keys go back to the firmware's own notes
         ledRefreshTimer.reset();
+        panelPadTimer.reset();
         startupAnimation.reset();
         if (controller)
         {
@@ -1188,6 +1233,7 @@ private:
         return (t >= 0 && t < (int) arps.size()) ? arps[(size_t) t].get() : nullptr;
     }
     std::unique_ptr<CustomScaleManager> scaleManager;
+    std::unique_ptr<ChordPads> chordPads;
     std::unique_ptr<SongMode> songMode;
     std::unique_ptr<ProjectManager> projectManager;
     std::unique_ptr<MIDIClock> midiClock;
@@ -1204,18 +1250,47 @@ private:
         std::function<void()> fn;
     };
     std::unique_ptr<FunctionTimer> ledRefreshTimer;
+    std::unique_ptr<FunctionTimer> sessionTimer;
+    std::unique_ptr<FunctionTimer> panelPadTimer;      // only without a controller (see mirrorPadsToPanel)
 
     // Screen indices (the order of addScreen in initialise).
     enum ScreenIndex
     {
         SCR_TRACKS = 0, SCR_STEP, SCR_PARAM, SCR_DRUMS, SCR_PRESET, SCR_SETTINGS, SCR_FILTER, SCR_ARP,
-        SCR_SCALE, SCR_SONG, SCR_AT_ROUTE, SCR_WAVE, SCR_TRACK_FX
+        SCR_SCALE, SCR_SONG, SCR_AT_ROUTE, SCR_WAVE, SCR_TRACK_FX, SCR_CHORD
     };
+
+    // The pads of the panel in the Mac window take the colours the hardware's pads get (only a change repaints).
+    // Called with or without a controller; takes the screens' lock itself.
+    void mirrorPadsToPanel()
+    {
+        if (mainContent == nullptr || ! screenManager || ! padManager || ! ledFeedback)
+            return;
+        auto& panel = mainContent->getVirtualController();
+        const juce::ScopedLock ui(screenManager->getLock());
+        std::array<Screen::PadColour, 16> frame;
+        if (screenManager->getPadFrame(frame) == ScreenManager::PadSource::PadMode)
+        {
+            ledFeedback->setDrumEngine(currentDrumEngine());
+            const auto mode = padManager->getMode();
+            for (int i = 0; i < 16; ++i)
+            {
+                const int palette = (mode != PadManager::Mode::Step && i == screenManager->getRecordLightPad())
+                                        ? PadColors::STEP_PLAYHEAD : ledFeedback->getColor(i, mode);
+                const auto rgb = PadColors::approximateRGB(palette);
+                panel.setPadColor(i, rgb.r, rgb.g, rgb.b);
+            }
+            return;
+        }
+        for (int i = 0; i < 16; ++i)       // full-colour frames are 0..127 per channel
+            panel.setPadColor(i, frame[(size_t) i].r * 2, frame[(size_t) i].g * 2, frame[(size_t) i].b * 2);
+    }
 
     // Pad colours, 30 times a second, only what changed: a hold layer (Shift, >, Up / Down, Func),
     // else the pinned screen, else the active screen's own colours, else the pad manager's mode.
     void refreshPads()
     {
+        mirrorPadsToPanel();
         std::array<Screen::PadColour, 16> frame;
         if (screenManager->getPadFrame(frame) == ScreenManager::PadSource::PadMode)
         {
@@ -1239,7 +1314,8 @@ private:
     ProjectBridge::Live projectLive()
     {
         return { *sequencer, *audioEngine, songMode.get(), scaleManager.get(), nullptr,
-                 [this](int t) { return (t >= 0 && t < (int) arps.size()) ? arps[(size_t) t].get() : nullptr; } };
+                 [this](int t) { return (t >= 0 && t < (int) arps.size()) ? arps[(size_t) t].get() : nullptr; },
+                 chordPads.get() };
     }
 
     // Projects are numbered slots: ~/Music/Neptune/Projects/P01 ... P32.
@@ -1282,7 +1358,7 @@ private:
                       { SCR_PRESET,   "PRESET",   false, false }, { SCR_SETTINGS, "SETTINGS", false, false },
                       { SCR_ARP,      "ARP",      false, false }, { SCR_SCALE,    "SCALE",    false, false },
                       { SCR_SONG,     "SONG",     false, false }, { SCR_AT_ROUTE, "AT ROUTE", true,  false },
-                      { SCR_WAVE,     "WAVE",     true,  false } };
+                      { SCR_WAVE,     "WAVE",     true,  false }, { SCR_CHORD,    "CHORD",    false, false } };
 
         juce::Thread::launch([this]
         {
@@ -1338,6 +1414,18 @@ private:
             screenManager->setActiveScreen(SCR_TRACK_FX);
             pages("TRK FX");
         }
+        if (screenManager->getScreenCount() > SCR_CHORD)
+        {
+            // (With a progression on the pads, so the picture shows what the screen is for.)
+            const int progression[8][4] = { { 48, 55, 64, 72 }, { 45, 52, 60, 64 }, { 41, 53, 57, 60 }, { 43, 50, 59, 65 },
+                                            { 50, 53, 57, 60 }, { 52, 55, 59, 62 }, { 52, 55, 60, 67 }, { 47, 50, 53, 59 } };
+            for (int pad = 0; pad < 8; ++pad)
+                chordPads->store(0, pad, { { progression[pad][0], 1.0f }, { progression[pad][1], 0.8f },
+                                           { progression[pad][2], 0.8f }, { progression[pad][3], 0.8f } });
+            screenManager->setActiveScreen(SCR_CHORD);
+            pages("CHORD");
+            chordPads->clearBank(0);
+        }
         const int track = sequencer->getSelectedTrack();
         for (int e = 0; e < 8; ++e)
         {
@@ -1360,6 +1448,48 @@ private:
         return juce::File::getSpecialLocation(juce::File::userMusicDirectory)
             .getChildFile("Neptune").getChildFile("Projects").getChildFile("last.txt");
     }
+    // ---- The session: everything as it was when the app was last running -------------------------
+    // Every sound, pattern and setting a project holds, written when the app quits and every 15 s
+    // while it runs (an app that is killed or crashes has no quit), and put back at the next start
+    // on top of the project last saved or loaded - which stays the project that SAVE writes to.
+    // Never read or written by the screen audit, the screen dump or the panel snapshot.
+    static juce::File sessionFile() { return lastProjectFile().getSiblingFile("session.json"); }
+
+    void restoreSession()
+    {
+        const auto json = sessionFile().loadFileAsString();
+        if (json.isNotEmpty() && projectManager && projectManager->onRebuild)
+        {
+            const auto data = ProjectData::fromJSON(json);
+            if (!data.patterns.empty() && !data.patterns[0].tracks.empty())
+            {
+                projectManager->getData() = data;
+                projectManager->onRebuild(data);
+                lastSessionJson = json;
+                juce::Logger::writeToLog("[Session] restored the state the app was last quit in");
+            }
+        }
+        sessionOn = true;
+        sessionTimer = std::make_unique<FunctionTimer>([this] { saveSession(); });
+        sessionTimer->startTimer(15000);
+    }
+
+    void saveSession()
+    {
+        if (!sessionOn || !projectManager || !projectManager->onCapture || !sequencer || !audioEngine)
+            return;
+        const auto json = projectManager->onCapture().toJSON();
+        if (json == lastSessionJson)
+            return;
+        const auto file = sessionFile();
+        file.getParentDirectory().createDirectory();
+        if (file.replaceWithText(json))
+            lastSessionJson = json;
+    }
+
+    bool sessionOn = false;
+    juce::String lastSessionJson;
+
     static void rememberProjectSlot(int slot) { lastProjectFile().replaceWithText(juce::String(slot + 1)); }
     // SETTINGS -> SETUP -> HELP (0 off, 1 after 0.35 s, 2 at once): a preference of the player, not of a project.
     static juce::File helpModeFile() { return lastProjectFile().getSiblingFile("help.txt"); }

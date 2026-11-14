@@ -70,7 +70,7 @@ public:
     // The clock used by the LD / SV / DL confirmation (tests inject their own).
     void setClock(std::function<juce::int64()> c) { clock = std::move(c); }
 
-    // ---- Pads play the selected track: 16 semitones up from the base note, with velocity and
+    // ---- Pads play the selected track: the notes of the scale chosen on SCALE, with velocity and
     // per-pad pressure, through the same callbacks the SCALE pads use. Pads never load or save.
     using NoteCallback = std::function<void(int midiNote, int velocity)>;
     void setNoteCallback(NoteCallback cb) { noteCallback = std::move(cb); }
@@ -79,6 +79,26 @@ public:
     // The note of the first pad (the C of the track's current octave); middle C without a provider.
     void setBaseNoteProvider(std::function<int()> p) { baseNoteProvider = std::move(p); }
     int getBaseNote() const { return juce::jlimit(0, 127 - 15, baseNoteProvider ? baseNoteProvider() : 60); }
+
+    // Each track's arpeggiator: saved with a preset, taken over by a preset that has one, and put
+    // back with the track's own sound.
+    void setArpProvider(std::function<Arpeggiator*(int track)> p) { arpForTrack = std::move(p); }
+
+    // The pads' notes come from the scale chosen on SCALE (its page and root), like the SCALE
+    // screen's own pads, when the app provides them: `note(pad)` and the root to mark. Without
+    // them: 16 semitones up from the base note.
+    void setPadScale(std::function<int(int pad)> note, std::function<int()> root)
+    {
+        padScaleNote = std::move(note);
+        padScaleRoot = std::move(root);
+    }
+    int getPadNote(int padIndex) const
+    {
+        if (padScaleNote)
+            if (const int n = padScaleNote(padIndex); n >= 0)
+                return juce::jlimit(0, 127, n);
+        return getBaseNote() + padIndex;
+    }
 
     bool isAuditionOn() const { return audition; }
     bool isAuditioning() const { return auditioned; }
@@ -101,6 +121,8 @@ public:
         auto& td = tracks[(size_t) snapshotTrack];
         td.engineType = snapshotType;
         td.soundParams = snapshotSaved;
+        if (!snapshotArp.empty() && snapshotTrack < (int) data.arps.size())
+            data.arps[(size_t) snapshotTrack] = snapshotArp;
         td.sampleName.clear();
         if (snapshotType == EngineType::Sampler || snapshotType == EngineType::Wavetable)
         {
@@ -337,7 +359,7 @@ public:
     void onPadPress(int padIndex, int velocity) override
     {
         if (padIndex < 0 || padIndex >= 16) return;
-        const int note = getBaseNote() + padIndex;
+        const int note = getPadNote(padIndex);
         soundingNote[(size_t) padIndex] = note;
         if (noteCallback) noteCallback(note, velocity);
     }
@@ -360,10 +382,11 @@ public:
     // All 16 pads play: the Cs marked, a held pad bright.
     bool getPadColours(std::array<PadColour, 16>& out) const override
     {
-        const int base = getBaseNote();
+        // The root of the scale (every octave of it) is marked; without a scale, the Cs.
+        const int root = padScaleRoot ? padScaleRoot() : 0;
         for (int i = 0; i < 16; ++i)
         {
-            PadColour c = ((base + i) % 12 == 0) ? PadColour { 100, 40, 0 } : PadColour { 0, 30, 40 };
+            PadColour c = ((getPadNote(i) - root) % 12 == 0) ? PadColour { 100, 40, 0 } : PadColour { 0, 30, 40 };
             if (soundingNote[(size_t) i] >= 0) c = { 127, 127, 127 };
             out[(size_t) i] = c;
         }
@@ -488,7 +511,11 @@ private:
         snapshotStored = track.soundParams;
         snapshotSaved = track.soundParams;
         snapshotEngine.clear();
+        snapshotArp.clear();
+        if (auto* arp = arpOf(snapshotTrack))
+            snapshotArp = ProjectBridge::captureArp(*arp);
         ownEngine = nullptr;
+        parkedEngine.reset();               // (a kept preset: the sound it replaced is gone)
         if (audioEngine)
         {
             snapshotRoutes = audioEngine->getPressureRouter(snapshotTrack);
@@ -543,11 +570,67 @@ private:
         }
     }
 
+    Arpeggiator* arpOf(int trackIdx) const { return arpForTrack ? arpForTrack(trackIdx) : nullptr; }
+
+    // The track's arp takes the saved state, unless it is in it already (an arp that is running
+    // is not restarted by scrolling between presets that share it).
+    void setArp(int trackIdx, const std::vector<float>& state)
+    {
+        auto* arp = arpOf(trackIdx);
+        if (arp == nullptr || state.empty() || ProjectBridge::captureArp(*arp) == state)
+            return;
+        ProjectBridge::applyArp(state, *arp);
+    }
+
+    // ---- The insert effects in a set of track values (ProjectBridge's ids) ----
+    static bool isInsertType(int id)
+    {
+        return id >= ProjectBridge::INSERT_TYPE_BASE && id < ProjectBridge::INSERT_TYPE_BASE + AudioEngine::MAX_INSERTS_PER_TRACK;
+    }
+    static void eraseInsertValues(ParamMap& values)
+    {
+        for (auto it = values.begin(); it != values.end();)
+        {
+            const int id = it->first;
+            const bool insert = isInsertType(id) || AudioEngine::isInsertSwitchParam(id)
+                                || (id >= AudioEngine::EFFECT_PARAM_BASE && id < AudioEngine::EFFECT_PARAM_BASE + AudioEngine::MAX_INSERTS_PER_TRACK * 4);
+            it = insert ? values.erase(it) : std::next(it);
+        }
+    }
+
+    // The track's insert chain becomes the one `values` names (slot by slot until the first empty
+    // one). Nothing is rebuilt when the effects are already those, so they keep ringing.
+    void setInsertChain(int trackIdx, const ParamMap& values)
+    {
+        std::vector<EffectType> wanted;
+        for (int slot = 0; slot < AudioEngine::MAX_INSERTS_PER_TRACK; ++slot)
+        {
+            auto it = values.find(ProjectBridge::INSERT_TYPE_BASE + slot);
+            if (it == values.end() || it->second < 0.5f)
+                break;
+            wanted.push_back((EffectType) (juce::jlimit(1, (int) EffectType::NumEffectTypes, (int) std::lround(it->second)) - 1));
+        }
+        std::vector<EffectType> have;
+        for (int slot = 0; slot < AudioEngine::MAX_INSERTS_PER_TRACK; ++slot)
+        {
+            EffectType type {};
+            if (!audioEngine->getInsertEffectType(trackIdx, slot, type))
+                break;
+            have.push_back(type);
+        }
+        if (wanted == have)
+            return;
+        while (audioEngine->getInsertChain(trackIdx) != nullptr && audioEngine->getInsertChain(trackIdx)->getEffectCount() > 0)
+            audioEngine->removeInsertEffect(trackIdx, 0);
+        for (auto type : wanted)
+            audioEngine->addInsertEffect(trackIdx, type);
+    }
+
     // Mixer, effect blocks, insert parameters: set what differs.
     void applyTrackLevelValues(int trackIdx, const ParamMap& values)
     {
         for (auto& [id, value] : values)
-            if (!EngineParamRange::contains(id) && !RangeParam::isRangeParam(id)
+            if (!EngineParamRange::contains(id) && !RangeParam::isRangeParam(id) && !isInsertType(id)
                 && audioEngine->getTrackParameter(trackIdx, id) != value)
                 audioEngine->setTrackParameter(trackIdx, id, value);
     }
@@ -560,21 +643,30 @@ private:
         auditioned = false;
         heardKey.clear();
         if (snapshotIsStale())
+        {
+            parkedEngine.reset();
             return;
+        }
 
         auto& track = sequencer.getPattern().getTrack(snapshotTrack);
         const bool engineChanged = track.engineType != snapshotType;
         if (audioEngine)
         {
             const auto locked = lockedIds(track);
-            // Only a sound of another engine type needs a new engine.
-            if (audioEngine->getEngineTypeOf(snapshotTrack) != snapshotType)
+            // The track's own engine was set aside untouched when the first preset was heard:
+            // it comes back as it was, with whatever it holds that no parameter reaches.
+            if (parkedEngine)
+                audioEngine->unparkEngine(snapshotTrack, std::move(parkedEngine));
+            else if (audioEngine->getEngineTypeOf(snapshotTrack) != snapshotType)
                 audioEngine->setEngineType(snapshotTrack, snapshotType, true);
+            parkedEngine.reset();
             track.engineType = snapshotType;
             track.soundParams = snapshotStored;
             driveEngineTo(snapshotTrack, snapshotEngine, locked);
+            setInsertChain(snapshotTrack, snapshotSaved);
             applyTrackLevelValues(snapshotTrack, snapshotSaved);
             audioEngine->setPressureRouter(snapshotTrack, snapshotRoutes);
+            setArp(snapshotTrack, snapshotArp);
             ownEngine = audioEngine->getEngine(snapshotTrack);
         }
         else
@@ -641,34 +733,42 @@ private:
         ParamMap trackLevel = snapshotSaved;
         // The preset's values, its sample found by name (its place in the bank may have moved).
         const ParamMap sound = PresetManager::soundOf(preset);
+        // A preset saved with its effects replaces the track's insert chain and everything set on
+        // it; one without (the factory presets, user presets from before 2026-11-14) plays through
+        // the track's own effects.
+        if (sound.count(ProjectBridge::INSERT_TYPE_BASE) != 0)
+        {
+            eraseInsertValues(trackLevel);
+            eraseInsertValues(stored);
+        }
         for (auto& [id, value] : sound)
         {
             stored[id] = value;
             trackLevel[id] = value;
         }
 
-        // What a fresh engine holds after the preset: worked out on an engine that is not playing.
-        auto reference = AudioEngine::createEngine(preset.engineType);
-        const int master = reference->getMasterParamId();
-        if (auto it = sound.find(master); master >= 0 && it != sound.end())
-            reference->setParameter(master, it->second);
-        for (auto& [id, value] : sound)
-            if (id != master && EngineParamRange::contains(id))
-                reference->setParameter(id, value);
-
-        // A preset of the engine already running is applied to it; another type needs a new engine
-        // (built under AudioEngine::structure() by setEngineType; its notes end with the old one).
-        const bool newEngine = audioEngine->getEngine(trackIdx) == nullptr
-                               || audioEngine->getEngineTypeOf(trackIdx) != preset.engineType;
-        const auto locked = lockedIds(track);
-        if (newEngine)
+        // Always a new engine, exactly as a load: an engine nudged over from another sound keeps
+        // what no parameter reaches (the owner heard "the existing patch plus the preset"). The
+        // track's own engine is set aside on the first audition and comes back on leaving.
+        const bool sameType = audioEngine->getEngine(trackIdx) != nullptr
+                              && audioEngine->getEngineTypeOf(trackIdx) == preset.engineType;
+        if (!auditioned && !parkedEngine)
+            parkedEngine = audioEngine->parkEngine(trackIdx, preset.engineType);
+        else
             audioEngine->setEngineType(trackIdx, preset.engineType, true);
         track.engineType = preset.engineType;
         track.soundParams = stored;
-        driveEngineTo(trackIdx, readEngine(*reference), locked);
+        ParamMap engineSound;
+        for (auto& [id, value] : sound)
+            if (EngineParamRange::contains(id))
+                engineSound[id] = value;
+        audioEngine->applyAllTrackParameters(trackIdx, engineSound);
+        setInsertChain(trackIdx, trackLevel);
         applyTrackLevelValues(trackIdx, trackLevel);
+        // The preset's arpeggiator, or (a preset without one) the track's own again.
+        setArp(trackIdx, preset.arp.empty() ? snapshotArp : preset.arp);
         // Back on the remembered sound's engine type: its pressure routes, not the type's defaults.
-        if (newEngine && preset.engineType == snapshotType)
+        if (!sameType && preset.engineType == snapshotType)
             audioEngine->setPressureRouter(trackIdx, snapshotRoutes);
         ownEngine = audioEngine->getEngine(trackIdx);
 
@@ -713,6 +813,41 @@ private:
         while (taken("User " + juce::String(number))) ++number;
         juce::String name = "User " + juce::String(number);
         auto preset = PresetManager::fromTrack(track, name, "INIT");
+        if (audioEngine != nullptr)
+        {
+            // What is saved is the track's OWN sound, complete: every value as the engine, the mixer
+            // and the effects hold it (not the stored parameters, which need not have them all),
+            // with the insert effects themselves. While a preset is being auditioned that is the
+            // remembered sound, never the preset being listened to (the owner's saves came back as
+            // the factory preset the highlight happened to be on).
+            if (auditioned && !snapshotIsStale())
+            {
+                preset.engineType = snapshotType;
+                preset.soundParams = snapshotSaved;
+                for (auto& [id, value] : snapshotEngine)
+                    if (preset.soundParams.count(id) != 0)
+                        preset.soundParams[id] = value;
+            }
+            else
+            {
+                preset.engineType = audioEngine->getEngineTypeOf(trackIdx);
+                preset.soundParams = ProjectBridge::captureTrackSound(ProjectBridge::Live { sequencer, *audioEngine },
+                                                                      trackIdx, track.soundParams);
+                // A step lock may be holding a parameter away from its own value right now.
+                for (int id : lockedIds(track))
+                    if (auto it = track.soundParams.find(id); it != track.soundParams.end())
+                        preset.soundParams[id] = it->second;
+            }
+            // The arpeggiator: the track's own (the remembered one while a preset is auditioned).
+            if (auditioned && !snapshotIsStale())
+                preset.arp = snapshotArp;
+            else if (auto* arp = arpOf(trackIdx))
+                preset.arp = ProjectBridge::captureArp(*arp);
+            // "This preset says what the track's effects are" (none, when slot 1 is 0).
+            if (preset.soundParams.count(ProjectBridge::INSERT_TYPE_BASE) == 0)
+                preset.soundParams[ProjectBridge::INSERT_TYPE_BASE] = 0.0f;
+            preset.sampleName = PresetManager::sampleNameOf(preset.engineType, preset.soundParams);
+        }
         presetManager.addPreset(preset);
         rebuildFilteredList();
         if (onUserPresetsChanged) onUserPresetsChanged();
@@ -751,12 +886,17 @@ private:
     ParamMap snapshotEngine;            // every engine value
     AftertouchRouter snapshotRoutes;
     const EngineBase* ownEngine = nullptr;      // the track's engine as this screen last left it
+    std::shared_ptr<EngineBase> parkedEngine;   // the track's own engine while a preset is heard
+    std::vector<float> snapshotArp;             // the track's own arpeggiator
+    std::function<Arpeggiator*(int)> arpForTrack;
     TurnConfirm confirm;
     std::function<juce::int64()> clock;
     NoteCallback noteCallback;
     std::function<void(int)> noteOffCallback;
     std::function<void(int, int)> aftertouchCallback;
     std::function<int()> baseNoteProvider;
+    std::function<int(int)> padScaleNote;
+    std::function<int()> padScaleRoot;
     std::array<int, 16> soundingNote = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
     juce::String flash;
     PresetLoadCallback loadCallback;
