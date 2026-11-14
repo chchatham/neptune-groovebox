@@ -119,6 +119,13 @@
 #include "bench.h"
 #include "bitmap_benchmark_tests.h"
 #include "display_latency_tests.h"
+#include "button_led_tests.h"
+#include "virtual_controller_ui_tests.h"
+#include "midi_sync_tests.h"
+#include "keyboard_setup_tests.h"
+#include "click_audit_tests.h"
+#include "cymbal_machine_tests.h"
+#include "robustness_tests.h"
 
 class MidiMessageTests : public juce::UnitTest
 {
@@ -9927,7 +9934,14 @@ int main(int argc, char** argv)
             || name == "Sync Wiring"
             || name == "Onset Clicks"
             || name == "Display Latency"
-            || name == "Breakbeats")
+            || name == "Breakbeats"
+            || name == "Button LEDs"
+            || name == "Virtual Controller UI"
+            || name == "MIDI Sync"
+            || name == "Keyboard Setup"
+            || name == "Click Audit"
+            || name == "Cymbal Machine"
+            || name == "Robustness")
             ours.add(t);
     }
 

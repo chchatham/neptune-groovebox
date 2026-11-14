@@ -41,10 +41,13 @@ DESC = {
         ("Synth/", "Oscillator 3 level", "Level of oscillator 3 (sub)."),
         (None, "Operator level", "Output level of the operator shown by the number (FMMIX page: one knob per operator)."),
     ],
-    "NOIS": [(None, "Noise level", "Level of the noise source.")],
+    "NOIS": [
+        ("Drums/", "Cymbal noise", "Cymbal machine: the texture of the wash, from pure ringing partials (0, a cluster of bells) to a hiss (100). On METL and RING it blurs the oscillators' pitches."),
+        (None, "Noise level", "Level of the noise source."),
+    ],
     "NCOL": [(None, "Noise colour", "Tone of the noise, from dark to bright.")],
     "TUNE": [
-        ("Drums/", "Tune", "Pitch of the drum voice in Hz."),
+        ("Drums/", "Tune", "Pitch of the drum voice in Hz. On CSYN, the cymbal machine, the size of the instrument: 8000 is the model's own pitch, 4000 an octave lower."),
         ("TRK FX DIRT/", "Feedback tune", "Frequency the DIRT block's feedback path resonates at."),
         (None, "Tune", "Coarse pitch of the whole sound in semitones."),
     ],
@@ -113,7 +116,7 @@ DESC = {
         (None, "Envelope amount", "How far the filter envelope moves the cutoff; negative closes the filter. Up to 7 octaves."),
     ],
     "TYPE": [
-        ("Drums/", "Drum type", "Synthesis model of this drum voice (15 models; Appendix C). KSYN, the kick machine, adds the KICK page."),
+        ("Drums/", "Drum type", "Synthesis model of this drum voice (16 models; Appendix C). KSYN, the kick machine, adds the KICK page; CSYN, the cymbal machine, the CYM page."),
         ("TRK FX DIRT/", "Distortion type", "SOFT, HARD, FOLD (wavefolder) or ASYM (asymmetric)."),
         ("TRK FX/FX", "Insert effect type", "Which effect is in the selected insert slot (30 types; Appendix C). Changing it replaces the effect and its four values."),
         (None, "Filter type", "Filter model: SVF, SEM, LADR (ladder), DIOD (diode), COMB, or OFF."),
@@ -224,7 +227,10 @@ DESC = {
     ],
 
     # ---- Macro oscillator ----------------------------------------------------------------------
-    "MODL": [(None, "Model", "Synthesis model: VA, FM, FOLD, FORM, HARM, PLCK, DUST, BOW. Knobs 2 to 5 are renamed to suit the model.")],
+    "MODL": [
+        ("Drums/", "Cymbal model", "Cymbal machine: which instrument. METL six square oscillators (the analog drum-machine cymbal), RING the same multiplied in pairs, RIDE, BELL (the ride's cup), CRSH, CHNA, SPLS, GONG (a gong with a note), TAM (a tam-tam)."),
+        (None, "Model", "Synthesis model: VA, FM, FOLD, FORM, HARM, PLCK, DUST, BOW. Knobs 2 to 5 are renamed to suit the model."),
+    ],
     "SAWS": [(None, "Saws (virtual analog model)", "First macro of the VA model: number and blend of stacked saws.")],
     "HARM": [("Wavetable/", "Highest harmonic", "The highest harmonic kept of every key of the KEYS table, 1 to 127."),
              (None, "Harmonics (virtual analog model)", "Third macro of the VA model. 50 is the saws as they are; below, each fades into a sine; above, a saw an octave up is mixed in."),
@@ -259,6 +265,7 @@ DESC = {
     "NUM": [(None, "Number (harmonic model)", "Third macro of the HARM model: number of harmonics.")],
     "DAMP": [
         ("Macro/", "Damping (string models)", "Macro of the PLCK and BOW models: string damping."),
+        ("Drums/", "Cymbal damping", "Cymbal machine: how much sooner the highs die than the lows. 0: everything rings equally long; higher: the top is gone first, as on a real cymbal."),
         ("TRK FX DIRT/", "Damping", "Darkens the DIRT block's feedback."),
         (None, "Damping", "How quickly high frequencies die away in the tail."),
     ],
@@ -268,7 +275,10 @@ DESC = {
         ("ARP/", "Density", "Variation macro: how many of the arp's steps actually sound."),
         (None, "Grain density", "Grains started per second."),
     ],
-    "COLR": [(None, "Colour (particle noise model)", "Second macro of the DUST model: tone of the particles.")],
+    "COLR": [
+        ("Drums/", "Cymbal colour", "Cymbal machine: where the wash is strongest, from dark through the model's own (50) to bright. On METL and RING it moves the two bands."),
+        (None, "Colour (particle noise model)", "Second macro of the DUST model: tone of the particles."),
+    ],
     "PRES": [
         ("Macro/", "Pressure (bowed string model)", "First macro of the BOW model: bow pressure, from a light, glassy bow to a pressed, rough one."),
         (None, "Pressure to LFO depth", "The voice's own pad pressure adds to the LFO's depth."),
@@ -377,7 +387,7 @@ DESC = {
     "PTCH": [(None, "Pitch", "Transposition of the sample in semitones.")],
     "BITS": [(None, "Bit reduction", "Lowers the bit depth for digital grit.")],
     "TONE": [
-        ("Drums/", "Tone", "Brightness, in the way of each type: the click of FMKK, how far KICK's pitch falls, MKIK's resonance, the noise band of the snares, the width of CLAP's band, the high-pass of the hats and cymbal, TOM's stick noise, RIM's noise, a broad hiss to a pitched rattle on SHKR, CLAV's upper partial, sine to square on SUB, a low-pass on KSYN."),
+        ("Drums/", "Tone", "Brightness, in the way of each type: the click of FMKK, how far KICK's pitch falls, MKIK's resonance, the noise band of the snares, the width of CLAP's band, the high-pass of the hats and cymbal, TOM's stick noise, RIM's noise, a broad hiss to a pitched rattle on SHKR, CLAV's upper partial, sine to square on SUB, a low-pass on KSYN, the level of everything above about 2.5 kHz on CSYN (50 = the cymbal as it is)."),
         (None, "Tone", "Brightness of the effect."),
     ],
     "PAN": [
@@ -413,7 +423,7 @@ DESC = {
         (None, 'Frames', "How a sample is cut into the USER table: 64, 128 or 256 equal pieces, or A64 / A128 / A256, aligned to the sound's pitch period so scanning is smooth and plays in tune."),
     ],
     # ---- Drums ---------------------------------------------------------------------------------
-    "SNAP": [(None, "Snap", "The front edge of the hit. 50 leaves the drum as it is; below, the onset is softened; above, the first milliseconds are lifted and the tonal drums get a click. TOM and KSYN set their attack time with it, CLAP also the length of each clap.")],
+    "SNAP": [(None, "Snap", "The front edge of the hit. 50 leaves the drum as it is; below, the onset is softened; above, the first milliseconds are lifted and the tonal drums get a click. TOM and KSYN set their attack time with it, CLAP also the length of each clap. On CSYN it is what strikes the cymbal: a soft mallet (0), a stick (50), a hard tip with a loud tick (100).")],
     # ---- Kick machine (drum type KSYN) -----------------------------------------------------------
     "SWEP": [(None, "Kick sweep", "Kick machine: how far above TUNE the pitch starts, in semitones.")],
     "SWPT": [(None, "Kick sweep time", "Kick machine: how long the pitch takes to fall to TUNE.")],
@@ -422,6 +432,11 @@ DESC = {
     "KTON": [(None, "Knock tone", "Kick machine: from a dull thud of about 12 ms to a bright tick of about 1.5 ms.")],
     "HOLD": [(None, "Kick hold", "Kick machine: time at full level before the decay starts.")],
     "ACRV": [(None, "Kick decay curve", "Kick machine: shape of the decay; negative falls fast then lingers.")],
+    # ---- Cymbal machine (drum type CSYN); its MODL, COLR, NOIS and DAMP are above ---------------
+    "PING": [(None, "Ping / wash", "Cymbal machine: the balance of the two layers. 0: only the wash; 50: both; 100: only the ping, the partials the stick brings out. On METL and RING: the lower band against the upper one.")],
+    "BLOM": [(None, "Bloom", "Cymbal machine: the highs arrive after the stroke and louder, as the energy of a hard stroke climbs into them: a few hundredths of a second on a crash, a second or more on TAM. The harder the hit, the more. On GONG and TAM the pitch also glides as it settles.")],
+    "VSNS": [(None, "Velocity sensitivity", "Cymbal machine: how much a harder hit is also brighter and longer. 0: velocity is level only.")],
+    "LOFI": [(None, "Lo-fi", "Cymbal machine: the grain of an early sampled drum-machine cymbal: the sound is read out at a low rate with few steps of level (0 = off). Around 45 for the house ride; the tail turns to grit and stops sooner.")],
 
     # ---- LFO pages -----------------------------------------------------------------------------
     "DPTH": [
@@ -629,7 +644,7 @@ EXTRA = [
     ("OCT", "Octave range", "ARP", "ARP", "1–8", "Octaves the arp spans."),
     ("GATE", "Gate", "ARP", "ARP / ROLL", "0–100", "Length of each arp note (or roll repeat) as a share of its step."),
     ("RPT", "Repeats", "ARP", "ARP", "1–8", "Times each note is repeated before moving on."),
-    ("LTCH", "Latch", "ARP", "ARP / ROL2", "OFF / ON", "ARP: the arp keeps playing after the keys are released (also Shift + Arp). ROL2: a pad press starts a roll that runs until pressed again."),
+    ("LTCH", "Latch", "ARP", "ARP / ROL2", "OFF / ON", "ARP: the arp keeps playing after the keys are released (also Shift + Arp). ROL2: a pad press starts a roll that runs until pressed again; this one is off after every start and every project load."),
     ("STRM", "Strum", "ARP", "PLAY", "OFF / ON", "Plays held notes as a strummed chord."),
     ("TIME", "Strum time", "ARP", "PLAY", "0–100 ms", "Gap between strummed notes."),
     ("DIR", "Strum direction", "ARP", "PLAY", "UP DOWN ALT", "Direction of the strum."),
@@ -658,8 +673,8 @@ EXTRA = [
     ("TAP", "Tap rhythm", "ARP", "ACFG", "OFF / ON", "While on, every pad press taps a step of a custom rhythm."),
     ("RHYT", "Rhythm", "ARP", "ACFG", "OFF / ON", "Plays the arp in the tapped rhythm."),
     ("ROLL", "Roll", "ARP", "ROLL", "OFF / ON", "Hold-to-ratchet for every pad that plays a note."),
-    ("BASE", "Base rate", "ARP", "ROLL", "division or Hz", "Repeat rate at the lightest pressure."),
-    ("MAX", "Maximum rate", "ARP", "ROLL", "division or Hz", "Repeat rate at full pressure."),
+    ("BASE", "Base rate", "ARP", "ROLL", "division or Hz", "Repeat rate at the lightest pressure (1/8 to begin with)."),
+    ("MAX", "Maximum rate", "ARP", "ROLL", "division or Hz", "Repeat rate at full pressure (1/128 to begin with). Pressing harder steps through every rate from BASE to MAX."),
     ("P>V", "Pressure to velocity", "ARP", "ROLL", "0–100", "How much pressure sets each repeat's velocity."),
     ("ACNT", "Accent", "ARP", "ROL2", "every Nth", "Accents every Nth repeat."),
     ("PROB", "Repeat probability", "ARP", "ROL2", "0–100", "Chance each repeat sounds."),

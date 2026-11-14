@@ -70,6 +70,7 @@ public:
         Div1_32T,
         Div1_64,
         Div1_64T,
+        Div1_128,
         kNumDivisions
     };
 
@@ -99,7 +100,7 @@ public:
     static const char* const* getDivisionNames()
     {
         static const char* const names[kNumDivisions] = {
-            "1/2", "1/4", "1/4T", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/32T", "1/64", "1/64T"
+            "1/2", "1/4", "1/4T", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/32T", "1/64", "1/64T", "1/128"
         };
         return names;
     }
@@ -113,7 +114,7 @@ public:
     static double getDivisionBeats(int division)
     {
         static const double beats[kNumDivisions] = {
-            2.0, 1.0, 2.0 / 3.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125, 1.0 / 12.0, 0.0625, 1.0 / 24.0
+            2.0, 1.0, 2.0 / 3.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125, 1.0 / 12.0, 0.0625, 1.0 / 24.0, 0.03125
         };
         return beats[juce::jlimit(0, (int) kNumDivisions - 1, division)];
     }
@@ -841,7 +842,7 @@ private:
     std::atomic<bool> enabled { false };
     std::atomic<int> mode { 0 };
     std::atomic<int> baseDivision { (int) Div1_8 };
-    std::atomic<int> maxDivision { (int) Div1_32 };
+    std::atomic<int> maxDivision { (int) Div1_128 };
     std::atomic<float> baseRateHz { 2.0f };
     std::atomic<float> maxRateHz { 40.0f };
     std::atomic<float> pressureDepth { 1.0f };

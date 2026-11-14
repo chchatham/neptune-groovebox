@@ -34,27 +34,38 @@ public:
     {
         static const char* const names[] = { "TUNE", "DECAY", "TONE", "DRIVE", "SNAP", "LEVEL", "PAN", "TYPE" };
         static const char* const kickNames[] = { "SWEEP", "SWEEP TIME", "SWEEP CURVE", "SHAPE", "KNOCK", "KNOCK TONE", "HOLD", "DECAY CURVE" };
+        static const char* const cymbalNames[] = { "MODEL", "PING", "COLOUR", "NOISE", "DAMPING", "BLOOM", "VEL SENS", "LO-FI" };
         auto* e = engine();
         if (!e || selectedVoice < 0 || encoderIndex < 0 || encoderIndex >= 8) return {};
         auto spec = currentPage().params[(size_t) encoderIndex];
-        return juce::String(onKickPage() ? kickNames[encoderIndex] : names[encoderIndex]) + " " + spec.format(e->getParameter(spec.id));
+        return juce::String(onKickPage() ? kickNames[encoderIndex] : onCymbalPage() ? cymbalNames[encoderIndex] : names[encoderIndex])
+             + " " + spec.format(e->getParameter(spec.id));
     }
 
     // A pad whose TYPE is KSYN (the kick machine) has a second knob page: sweep, shape, knock.
+    // So has one whose TYPE is CSYN (the cymbal machine): model, ping, colour, bloom.
     bool hasKickPage() const
     {
         auto* e = engine();
         return e != nullptr && selectedVoice >= 0 && e->isKickMachine(selectedVoice);
     }
+    bool hasCymbalPage() const
+    {
+        auto* e = engine();
+        return e != nullptr && selectedVoice >= 0 && e->isCymbalMachine(selectedVoice);
+    }
+    bool hasMachinePage() const { return hasKickPage() || hasCymbalPage(); }
     bool onKickPage() const { return kickPage && hasKickPage(); }
+    bool onCymbalPage() const { return kickPage && hasCymbalPage(); }
     ParamPage currentPage() const
     {
-        return onKickPage() ? DrumEngine::kickPage(selectedVoice) : DrumEngine::voicePage(selectedVoice);
+        return onKickPage() ? DrumEngine::kickPage(selectedVoice)
+             : onCymbalPage() ? DrumEngine::cymbalPage(selectedVoice) : DrumEngine::voicePage(selectedVoice);
     }
-    int getPageCount() const override { return hasKickPage() ? 2 : 1; }
-    int getPageIndex() const override { return onKickPage() ? 1 : 0; }
-    void onArrowLeft() override  { if (hasKickPage()) kickPage = !kickPage; }
-    void onArrowRight() override { if (hasKickPage()) kickPage = !kickPage; }
+    int getPageCount() const override { return hasMachinePage() ? 2 : 1; }
+    int getPageIndex() const override { return onKickPage() || onCymbalPage() ? 1 : 0; }
+    void onArrowLeft() override  { if (hasMachinePage()) kickPage = !kickPage; }
+    void onArrowRight() override { if (hasMachinePage()) kickPage = !kickPage; }
 
     void render(DisplayRenderer& display) override
     {
@@ -97,8 +108,9 @@ public:
     {
         static const char* names[] = { "TN", "DC", "TO", "DV", "SN", "LV", "PN", "TY" };
         static const char* kickNames[] = { "SW", "ST", "SC", "SH", "KN", "KT", "HD", "AC" };
+        static const char* cymbalNames[] = { "MD", "PG", "CL", "NS", "DP", "BL", "VS", "LF" };
         if (encoderIndex < 0 || encoderIndex >= 8 || selectedVoice < 0 || !engine()) return {};
-        return onKickPage() ? kickNames[encoderIndex] : names[encoderIndex];
+        return onKickPage() ? kickNames[encoderIndex] : onCymbalPage() ? cymbalNames[encoderIndex] : names[encoderIndex];
     }
 
     void onPadPress(int padIndex, int velocity) override
@@ -191,7 +203,8 @@ public:
             case DrumSynthType::Clap:          return { 127, 0, 90 };     // clap: pink
             case DrumSynthType::ClosedHat:
             case DrumSynthType::OpenHat:       return { 0, 110, 127 };    // hats: cyan
-            case DrumSynthType::Cymbal:        return { 0, 30, 127 };     // cymbal: blue
+            case DrumSynthType::Cymbal:
+            case DrumSynthType::CymbalSynth:   return { 0, 30, 127 };     // cymbals: blue
             case DrumSynthType::Tom:           return { 70, 0, 127 };     // tom: violet
             case DrumSynthType::Rim:
             case DrumSynthType::Shaker:
@@ -242,7 +255,7 @@ private:
     std::function<void(int, float)> paramSetter;
     PadHooks padHooks;
     int selectedVoice = 8;
-    bool kickPage = false;          // the second knob page, while the selected pad is a kick machine
+    bool kickPage = false;          // the second knob page, while the selected pad is a kick or cymbal machine
     std::array<bool, 16> padDown {};
     float lastVelocity[DrumEngine::NUM_VOICES] = {};
 };

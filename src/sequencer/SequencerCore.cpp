@@ -3,7 +3,10 @@
 
 SequencerCore::SequencerCore()
 {
-    int trackCount = patterns[activePattern].getTrackCount();
+    // Every track a pattern can have has its place from the start: a project with more tracks than
+    // the pattern here was built with (ProjectBridge::apply gives every pattern up to 32) is then
+    // played without these being resized, and they are indexed by track on the audio thread.
+    const int trackCount = juce::jmax(MAX_TRACKS, patterns[activePattern].getTrackCount());
     stepAccumulators.resize(trackCount, 0.0);
     currentSteps.resize(trackCount, 0);
     trigCounts.resize(trackCount, 0);
@@ -90,6 +93,15 @@ void SequencerCore::processBlock(int numSamples)
         return;
 
     auto& pat = patterns[activePattern];
+    // A tempo change keeps every track where it is within its step (and the beat within the beat):
+    // the time gone by is counted in samples, which are now a different part of a step.
+    if (cachedSamplesPerStep > 0.0 && currentSamplesPerStep != cachedSamplesPerStep)
+    {
+        const double scale = currentSamplesPerStep / cachedSamplesPerStep;
+        beatAccumulator *= scale;
+        for (auto& acc : stepAccumulators)
+            acc *= scale;
+    }
     cachedSamplesPerStep = currentSamplesPerStep;
 
     for (int s = firstSample; s < numSamples; ++s)
@@ -135,7 +147,9 @@ void SequencerCore::processBlock(int numSamples)
         if (barBoundary && pendingPattern >= 0 && pendingChangeMode == ChangeMode::NextBar)
             applyPatternChange();
 
-        for (int trackIdx = 0; trackIdx < pat.getTrackCount(); ++trackIdx)
+        // (never more tracks than there is state for, whatever the pattern holds)
+        const int playedTracks = juce::jmin(pat.getTrackCount(), (int) stepAccumulators.size(), (int) MAX_TRACKS);
+        for (int trackIdx = 0; trackIdx < playedTracks; ++trackIdx)
         {
             auto& track = pat.getTrack(trackIdx);
 

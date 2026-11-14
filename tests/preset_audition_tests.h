@@ -344,7 +344,8 @@ public:
                 expectEquals(rig.seq.getPattern().getTrack(0).soundParams[id], v, "and stores its values");
             // The mixer, the effect block and the pressure routes are the track's own.
             expectEquals(rig.audio.getTrackParameter(0, MixParam::VOLUME), 0.33f);
-            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), own.values[own.values.size() - (size_t) (TrackFxParam::END - TrackFxParam::DIRT_BASE)].second);
+            // (the effect blocks are the preset's too: a built-in preset has them as they come)
+            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), TrackFx().get(TrackFxParam::DIRT_BASE));
             expect(rig.sound().routes == own.routes);
 
             // Up / Down.
@@ -1023,10 +1024,13 @@ public:
             expect(rig.highlighted() != nullptr && rig.highlighted()->name == savedName);
             expectEquals(effects(0), mine, "auditioned: the preset's effects");
 
-            // ...a factory preset has none of its own and plays through the track's...
+            // ...a factory preset has none of its own: the track then has none either...
             rig.turn(0, -1);
             expect(rig.highlighted() != nullptr && rig.highlighted()->isFactory);
-            expectEquals(effects(0), changed, "a preset without effects: the track's own");
+            {
+                EffectType none {};
+                expect(! rig.audio.getInsertEffectType(0, 0, none), "a preset without effects: no insert effects");
+            }
             rig.turn(0, 1);
             expectEquals(effects(0), mine);
 
@@ -1065,6 +1069,8 @@ public:
             arp.setOctaveRange(3);
             arp.setGate(0.31f);
             arp.setEnabled(true);
+            arp.setLatch(true);
+            arp.setMutateEnabled(true);
             const auto mine = ProjectBridge::captureArp(arp);
 
             rig.screen->onActivate();
@@ -1078,6 +1084,8 @@ public:
             arp.setMode(Arpeggiator::Mode::Up);
             arp.setOctaveRange(1);
             arp.setEnabled(false);
+            arp.setLatch(false);
+            arp.setMutateEnabled(false);
             const auto changed = ProjectBridge::captureArp(arp);
             rig.screen->onActivate();
             for (int i = 0; i < 400 && (rig.highlighted() == nullptr || rig.highlighted()->name != saved.name); ++i)
@@ -1094,6 +1102,7 @@ public:
             rig.confirm(4);                                     // LD
             rig.screen->onDeactivate();
             expect(ProjectBridge::captureArp(arp) == mine, "loaded: the preset's arp stays");
+            expect(arp.isEnabled() && arp.getLatch() && arp.isMutateEnabled(), "on, latched and mutating as it was saved");
 
             // SV while another preset is auditioned saves the track's own arp.
             arp.setMode(Arpeggiator::Mode::Down);
@@ -1103,6 +1112,171 @@ public:
             expect(rig.screen->isAuditioning());
             rig.confirm(5);
             expect(rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).arp == own2);
+            rig.screen->onDeactivate();
+        }
+
+        beginTest("A saved preset carries the keyboard: split and octave; heard, loaded, put back, and left alone by hand");
+        {
+            Rig rig;
+            KeyboardSetup keys { 2, 1 };                        // split 2 octaves down, octave +1
+            int sets = 0;
+            rig.screen->setKeyboardProvider([&] { return keys; },
+                                            [&](const KeyboardSetup& k)
+                                            {
+                                                ++sets;
+                                                if (k.split >= 0) keys.split = k.split;
+                                                if (k.octave != KeyboardSetup::UNKNOWN) keys.octave = k.octave;
+                                            });
+            rig.screen->onActivate();
+            rig.confirm(5);                                     // SV
+            const auto saved = rig.mgr.getPreset(rig.mgr.getPresetCount() - 1);
+            expect(saved.keyboard == KeyboardSetup { 2, 1 }, "the keyboard is in the preset");
+            expect(Preset::fromJSON(saved.toJSON()).keyboard == saved.keyboard, "and in its file");
+            expect(Preset::fromJSON(rig.mgr.getPreset(0).toJSON()).keyboard == KeyboardSetup(), "a factory preset stores none");
+            rig.screen->onDeactivate();
+
+            auto toSaved = [&]
+            {
+                for (int i = 0; i < 400 && (rig.highlighted() == nullptr || rig.highlighted()->name != saved.name); ++i)
+                    rig.turn(0);
+            };
+
+            // The player's keyboard moves on; the preset brings its own when heard.
+            keys = { 0, -1 };
+            rig.screen->onActivate();
+            toSaved();
+            expect(keys == KeyboardSetup { 2, 1 }, "auditioned: the preset's keyboard");
+            rig.turn(0, -1);                                    // a factory preset: no keyboard of its own
+            expect(keys == KeyboardSetup { 0, -1 }, "a preset without one: the player's own");
+            rig.turn(0, 1);
+            expect(keys == KeyboardSetup { 2, 1 });
+
+            // A project saved now holds the player's keyboard, not the one being listened to.
+            ProjectData data;
+            data.patterns[0].tracks.resize(1);
+            data.keyboard = keys;
+            rig.screen->keepOriginalInSave(data);
+            expect(data.keyboard == KeyboardSetup { 0, -1 });
+
+            rig.screen->onDeactivate();
+            expect(keys == KeyboardSetup { 0, -1 }, "left: the player's own keyboard again");
+
+            // An octave button pressed while a preset is heard is the player's choice: it stays.
+            rig.screen->onActivate();
+            rig.turn(0, -1); rig.turn(0, 1);
+            expect(keys == KeyboardSetup { 2, 1 });
+            keys.octave = 3;                                    // Oct + twice, by hand
+            rig.screen->onDeactivate();
+            expect(keys == KeyboardSetup { 0, 3 }, "the split goes back, the octave set by hand stays");
+
+            // LD keeps the preset's keyboard.
+            keys = { 0, 0 };
+            rig.screen->onActivate();
+            rig.turn(0, -1); rig.turn(0, 1);
+            rig.confirm(4);                                     // LD
+            rig.screen->onDeactivate();
+            expect(keys == KeyboardSetup { 2, 1 }, "loaded: the preset's keyboard stays");
+
+            // SV while another preset is heard saves the player's keyboard.
+            keys = { 1, 0 };
+            rig.screen->onActivate();
+            rig.turn(0, -1); rig.turn(0, 1);
+            expect(rig.screen->isAuditioning() && keys == KeyboardSetup { 2, 1 });
+            rig.confirm(5);
+            expect(rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).keyboard == KeyboardSetup { 1, 0 });
+            rig.screen->onDeactivate();
+
+            // Nothing auditioned: the keyboard is not touched at all.
+            sets = 0;
+            rig.screen->onActivate();
+            rig.screen->onDeactivate();
+            expectEquals(sets, 0);
+        }
+
+        beginTest("A preset with no effects of its own takes the track's effects away; leaving an audition brings them back");
+        {
+            Rig rig;
+            rig.audio.addInsertEffect(0, EffectType::DelayEffect);
+            rig.audio.addInsertEffect(0, EffectType::ReverbEffect);
+            const TrackFx plain;
+            const float ownDirt = rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE);
+            expect(ownDirt != plain.get(TrackFxParam::DIRT_BASE));
+            EffectType type {};
+
+            rig.screen->onActivate();
+            rig.turn(0, 2);                                     // a built-in preset
+            expect(rig.screen->isAuditioning() && rig.highlighted() != nullptr && rig.highlighted()->isFactory);
+            expect(! rig.audio.getInsertEffectType(0, 0, type), "no insert effects under a built-in preset");
+            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), plain.get(TrackFxParam::DIRT_BASE));
+            expectEquals(rig.audio.getTrackParameter(0, MixParam::VOLUME), 0.33f, "the mixer is the track's");
+            rig.screen->onDeactivate();
+            expect(rig.audio.getInsertEffectType(0, 0, type) && type == EffectType::DelayEffect, "left: the own effects again");
+            expect(rig.audio.getInsertEffectType(0, 1, type) && type == EffectType::ReverbEffect);
+            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), ownDirt);
+
+            rig.screen->onActivate();
+            rig.turn(0, 2);
+            rig.confirm(4);                                     // LD
+            rig.screen->onDeactivate();
+            expect(! rig.audio.getInsertEffectType(0, 0, type), "loaded: the old effects are gone");
+            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), plain.get(TrackFxParam::DIRT_BASE));
+            const auto saved = ProjectBridge::capture({ rig.seq, rig.audio }, "P");
+            expect(saved.patterns[0].tracks[0].soundParams.count(ProjectBridge::INSERT_TYPE_BASE) == 0
+                   || saved.patterns[0].tracks[0].soundParams.at(ProjectBridge::INSERT_TYPE_BASE) < 0.5f, "and a project saved now has none");
+        }
+
+        beginTest("The save box: it offers the name of the preset the sound came from, Return saves over it, Cancel takes the save back");
+        {
+            Rig rig;
+            auto users = [&] { int n = 0; for (int i = 0; i < rig.mgr.getPresetCount(); ++i) if (! rig.mgr.getPreset(i).isFactory) ++n; return n; };
+            auto last = [&] { return rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).name; };
+            int changes = 0;
+            rig.screen->onUserPresetsChanged = [&] { ++changes; };
+            rig.screen->onActivate();
+
+            // A sound that came from no preset of the player's: the box offers the name it was saved under.
+            rig.confirm(5);                                     // SV
+            const auto first = last();
+            expectEquals(rig.screen->suggestedName(first), first);
+            expect(rig.screen->nameSavedPreset(first, "Bells"));
+            expectEquals(users(), 1);
+            expectEquals(last(), juce::String("Bells"));
+
+            // Saved again: the box offers "Bells"; Return saves over it (one preset, the new sound).
+            rig.set(0, MixParam::PAN, 0.5f);
+            rig.confirm(5);
+            const auto second = last();
+            expect(second != "Bells");
+            expectEquals(rig.screen->suggestedName(second), juce::String("Bells"));
+            expect(rig.screen->nameSavedPreset(second, "bells"), "the same name in other letters is that preset too");
+            expectEquals(users(), 1);
+            expectEquals(last(), juce::String("bells"));
+            expectEquals(rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).soundParams.at(MixParam::PAN), 0.5f);
+
+            // Cancel: nothing was saved.
+            rig.confirm(5);
+            const auto third = last();
+            changes = 0;
+            expect(rig.screen->cancelSavedPreset(third));
+            expectEquals(users(), 1);
+            expectEquals(last(), juce::String("bells"));
+            expect(changes > 0, "the folder is written again");
+            expect(! rig.screen->cancelSavedPreset(third), "once");
+
+            // A built-in preset's name is refused, an empty one too: the preset keeps the name it was saved under.
+            rig.confirm(5);
+            const auto fourth = last();
+            expect(! rig.screen->nameSavedPreset(fourth, rig.mgr.getPreset(0).name));
+            expect(! rig.screen->nameSavedPreset(fourth, "   "));
+            expectEquals(last(), fourth);
+            expectEquals(users(), 2);
+
+            // A preset loaded with LD is the track's name from then on.
+            for (int i = 0; i < 400 && (rig.highlighted() == nullptr || rig.highlighted()->name != "bells"); ++i)
+                rig.turn(0);
+            rig.confirm(4);                                     // LD
+            rig.confirm(5);
+            expectEquals(rig.screen->suggestedName(last()), juce::String("bells"));
             rig.screen->onDeactivate();
         }
 

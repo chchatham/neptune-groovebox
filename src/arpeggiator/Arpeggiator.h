@@ -303,7 +303,7 @@ public:
         rhythmLength = 0;
         rhythmEnabled = false;
         if (v == nullptr || count < 2) return;
-        const int n = juce::jlimit(0, (int) MAX_RHYTHM_EVENTS, (int) v[1]);
+        const int n = (int) juce::jlimit(0.0f, (float) MAX_RHYTHM_EVENTS, std::isfinite(v[1]) ? v[1] : 0.0f);
         if (n < 2 || count < 2 + n * 3) return;
         for (int i = 0; i < n; ++i)
         {

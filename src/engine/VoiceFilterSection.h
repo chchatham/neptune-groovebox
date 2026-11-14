@@ -43,6 +43,8 @@ public:
         sampleRate = (float) sr;
         maxHz = std::min(MAX_HZ, sampleRate * 0.49f);
         smoothCoeff = 1.0f - std::exp(-1.0f / (0.005f * sampleRate));   // 5 ms
+        octaveStep = 8.0f / (0.004f * sampleRate);                      // 8 octaves in 4 ms
+        driveStep = 1.0f / (0.004f * sampleRate);
         env.setSampleRate(sr);
         slot.setSampleRate(sr);
         lastHz = -1.0f;
@@ -60,6 +62,10 @@ public:
         currentNote = note;
         currentVelocity = velocity;
         updateNoteOctaves();
+        // The new note takes its own values at once, as they stand at its first sample (a voice
+        // struck again is declicked by its owner).
+        struck = true;
+        fresh = true;
         env.noteOn();
     }
 
@@ -70,6 +76,12 @@ public:
         slot.reset();
         env.reset();
         baseSmoothed = baseTarget;
+        struck = false;
+        envOctavesNow = envOctaves;
+        noteOctavesNow = noteOctaves;
+        externalNow = externalOctaves;
+        driveNow = driveTarget;
+        slot.setDrive(0, driveNow);
     }
 
     float process(float in)
@@ -87,7 +99,31 @@ public:
                 baseSmoothed = baseTarget;
         }
 
-        const float oct = e * envOctaves + noteOctaves + externalOctaves + lfoOctaves;
+        // What is set from outside under a sounding note (the envelope amount by a step lock,
+        // strip and pressure once per block, the drive) is moved to over a few milliseconds:
+        // opening or closing a filter in one sample is a click. The envelope itself is not held.
+        if (fresh)
+        {
+            fresh = false;
+            envOctavesNow = envOctaves;
+            noteOctavesNow = noteOctaves;
+            externalNow = externalOctaves;
+            if (driveNow != driveTarget)
+            {
+                driveNow = driveTarget;
+                slot.setDrive(0, driveNow);
+            }
+        }
+        if (envOctavesNow != envOctaves)    envOctavesNow = dsp::towards(envOctavesNow, envOctaves, octaveStep);
+        if (noteOctavesNow != noteOctaves)  noteOctavesNow = dsp::towards(noteOctavesNow, noteOctaves, octaveStep);
+        if (externalNow != externalOctaves) externalNow = dsp::towards(externalNow, externalOctaves, octaveStep);
+        if (driveNow != driveTarget)
+        {
+            driveNow = dsp::towards(driveNow, driveTarget, driveStep);
+            slot.setDrive(0, driveNow);
+        }
+
+        const float oct = e * envOctavesNow + noteOctavesNow + externalNow + lfoOctaves;
         float hz = baseSmoothed;
         if (oct != 0.0f)
             hz *= std::exp2(oct);
@@ -114,7 +150,15 @@ public:
         resonance = std::clamp(r, 0.0f, 1.0f);
         slot.setResonance(0, std::clamp(resonance + resonanceMod, 0.0f, 1.0f));
     }
-    void setDrive(float d)          { slot.setDrive(0, std::clamp(d, 0.0f, 1.0f)); }
+    void setDrive(float d)
+    {
+        driveTarget = std::clamp(d, 0.0f, 1.0f);
+        if (! struck)       // nothing sounding yet: as set (process() glides to it under a note)
+        {
+            driveNow = driveTarget;
+            slot.setDrive(0, driveNow);
+        }
+    }
     void setMorph(float m)          { slot.setMorph(std::clamp(m, 0.0f, 1.0f)); }
     void setEnvAmount(float a)      { envAmount = std::clamp(a, -1.0f, 1.0f); updateNoteOctaves(); }
     void setEnvVelocity(float a)    { envVelocity = std::clamp(a, 0.0f, 1.0f); updateNoteOctaves(); }
@@ -150,6 +194,9 @@ private:
 
     FilterSlot slot;
     Envelope env;
+    float envOctavesNow = 0.0f, noteOctavesNow = 0.0f, externalNow = 0.0f, octaveStep = 0.04f;
+    float driveTarget = 0.0f, driveNow = 0.0f, driveStep = 0.005f;
+    bool struck = false, fresh = true;
     float sampleRate = 44100.0f;
     float maxHz = MAX_HZ;
     float smoothCoeff = 0.0045f;
@@ -199,6 +246,13 @@ public:
     }
 
     int id(Offset o) const { return base + (int) o; }
+    // True when setting paramId to value changes the filter's type or mode (a jump in the sound
+    // of a note that is held: EngineBase::soundSwapped).
+    bool swaps(int paramId, float value) const
+    {
+        const int o = paramId - base;
+        return (o == (int) Type || o == (int) Mode) && (int) std::lround(value) != (int) std::lround(values[(size_t) o]);
+    }
     bool owns(int paramId) const { return (paramId >= base && paramId < base + (int) Count) || isStageCurve(paramId); }
     float get(int paramId) const
     {

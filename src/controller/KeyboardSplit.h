@@ -17,9 +17,27 @@
 //     an octave button is pressed, so while a split is on the octave is read a few times a second
 //     and the lower keys are written again after every change.
 // The firmware still does all octave handling. Nothing here runs on the audio thread.
+//
+// A preset or a project stores the keyboard (KeyboardSetup) and sets it again: the split, and the
+// octave, which is written into the firmware's own octave word, then the keys as the firmware
+// would have written them. For that the octave is read every two seconds while nothing else is
+// going on (the octave buttons send nothing).
+
+// The keyboard as a preset or a project stores it. A negative split / an UNKNOWN octave = not
+// stored: left as it is.
+struct KeyboardSetup
+{
+    static constexpr int UNKNOWN = -100;
+    int split = -1;                 // octaves the lower twelve keys are moved down, 0-3
+    int octave = UNKNOWN;           // the octave the Oct buttons had chosen
+    bool operator== (const KeyboardSetup& o) const { return split == o.split && octave == o.octave; }
+    bool operator!= (const KeyboardSetup& o) const { return ! (*this == o); }
+};
+
 class KeyboardSplit
 {
 public:
+    static constexpr int IDLE_POLLS = 10;                          // polls between two idle reads of the octave
     static constexpr juce::uint32 FW_BASE = 0x08008000;
     static constexpr juce::uint32 PEEK32 = FW_BASE + 0xA190;       // ldr r0,[r0]; bx lr
     static constexpr juce::uint32 POKE32 = FW_BASE + 0x0196;       // str r1,[r0]; bx lr
@@ -50,20 +68,52 @@ public:
 
     void setSplit(int octavesDown)
     {
-        split = juce::jlimit(0, MAX_SPLIT, octavesDown);
+        octavesDown = juce::jlimit(0, MAX_SPLIT, octavesDown);
+        if (octavesDown == split) return;
+        split = octavesDown;
         if (known) writeKeys(octave);
     }
 
-    // Call a few times a second (message thread). Asks the firmware for its transpose and octave —
-    // but only when the answer can matter: until the octave is first known, while Shift is held or
+    // The octave, as the Oct buttons would have set it. Before the firmware's octave is known the
+    // wish is kept and carried out when it is.
+    void setOctave(int newOctave)
+    {
+        newOctave = juce::jlimit(-8, 8, newOctave);
+        if (! known) { wantedOctave = newOctave; return; }
+        if (newOctave == octave) return;
+        octave = newOctave;
+        if (send)
+        {
+            send(call(POKE32, OCTAVE, (juce::uint32) newOctave));
+            send(call(POKE32, OCTAVE_SHOWN, (juce::uint32) newOctave));
+        }
+        writeNoteTable(octave);
+        writeKeyRecords(octave);
+        writeKeys(octave);
+    }
+
+    KeyboardSetup getSetup() const { return { split, known ? octave : KeyboardSetup::UNKNOWN }; }
+    void apply(const KeyboardSetup& k)
+    {
+        if (k.octave != KeyboardSetup::UNKNOWN) setOctave(k.octave);
+        if (k.split >= 0) setSplit(k.split);
+    }
+
+    // Call a few times a second (message thread). Asks the firmware for its transpose and octave
+    // when the answer matters at once: until the octave is first known, while Shift is held or
     // was just released (the gesture), and while a split is on (an octave press undoes it). The
-    // rest of the time nothing is sent, which keeps the debug channel free for the host-side tools.
+    // rest of the time only the octave is read, every IDLE_POLLS-th call, which leaves the debug
+    // channel almost free for the host-side tools.
     void poll()
     {
         const bool shift = isShiftHeld && isShiftHeld();
         if (shift) lastShiftMs = clock();
         if (known && split == 0 && ! shift && clock() - lastShiftMs > SHIFT_GRACE_MS)
+        {
+            if (++idlePolls >= IDLE_POLLS) { idlePolls = 0; ask(Awaiting::Octave); }
             return;
+        }
+        idlePolls = 0;
         ask(Awaiting::Transpose);
     }
 
@@ -156,6 +206,12 @@ private:
         if (keysStale || (changed && split != 0))
             writeKeys(octave);
         keysStale = false;
+        if (wantedOctave != KeyboardSetup::UNKNOWN)
+        {
+            const int wanted = wantedOctave;
+            wantedOctave = KeyboardSetup::UNKNOWN;
+            setOctave(wanted);
+        }
     }
 
     void writeKeys(int forOctave)
@@ -196,6 +252,7 @@ private:
     }
 
     int split = 0, octave = 0;
+    int wantedOctave = KeyboardSetup::UNKNOWN, idlePolls = 0;
     bool known = false, keysStale = false;
     int undone = 0;                          // the transpose just cancelled, until its stored copy is cleared
     Awaiting awaiting = Awaiting::Nothing;

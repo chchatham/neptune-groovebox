@@ -228,6 +228,7 @@ public:
         std::function<void(int track, bool on)> setArpEnabled;
         std::function<bool(int track)> arpLatch;
         std::function<void(int track, bool on)> setArpLatch;
+        std::function<bool()> rollLatched;                // pad rolls are on and their latch is on (ARP -> ROL2)
             // Everything that defines how a track sounds (engine parameters, mixer, effects), read from
         // the engine / written back with a fresh engine of `type`. One sound per track, all patterns.
         std::function<ParamMap(int track)> captureSound;
@@ -468,7 +469,7 @@ public:
     // the screen's status text) and the page mark ("2/5"). Drawn from exactly this.
     struct NameBar { juce::String left, tags, text, pages; };
     NameBar composeNameBar() const;
-    // "REC FREE" / "REC QUANT", "ARP", "LATCH", "SCALE", "PIN", "FILL" (those that are on)
+    // "REC FREE" / "REC QUANT", "ARP", "LATCH", "ROLL", "SCALE", "PIN", "FILL" (those that are on)
     juce::StringArray getNameBarTags() const;
 
     // Call after a project was loaded (and once at start): > + Play reloads a pattern from here

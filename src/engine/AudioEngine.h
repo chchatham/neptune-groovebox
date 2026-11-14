@@ -266,6 +266,7 @@ public:
             fx->prepare(currentSampleRate, currentBlockSize);
         trackInsertChains[(size_t) trackIndex].addEffect(std::move(fx));
         insertTypes[(size_t) trackIndex].push_back(type);
+        declickTrack(trackIndex, false);
     }
 
     void removeInsertEffect(int trackIndex, int slot)
@@ -274,6 +275,7 @@ public:
         if (trackIndex < 0 || trackIndex >= (int) trackInsertChains.size())
             return;
         trackInsertChains[(size_t) trackIndex].removeEffect(slot);
+        declickTrack(trackIndex, false);
         if (trackIndex < (int) insertTypes.size() && slot >= 0 && slot < (int) insertTypes[(size_t) trackIndex].size())
             insertTypes[(size_t) trackIndex].erase(insertTypes[(size_t) trackIndex].begin() + slot);
     }
@@ -296,6 +298,19 @@ public:
         if (!fx) return;
         chain.replaceEffect(slot, std::move(fx));
         insertTypes[(size_t) trackIndex][(size_t) slot] = type;
+        declickTrack(trackIndex, false);
+    }
+
+    // What is on a track is about to be cut or swapped between two blocks (its engine replaced or
+    // silenced, an effect put in, taken out or exchanged): the jump is carried off over 2 ms
+    // instead of being heard as a click. engineToo: the jump is in the engine's own output.
+    void declickTrack(int trackIndex, bool engineToo)
+    {
+        if (trackIndex < 0 || trackIndex >= MAX_TRACKS)
+            return;
+        trackDeclickArm[(size_t) trackIndex].store(true, std::memory_order_relaxed);
+        if (engineToo)
+            engineDeclickArm[(size_t) trackIndex].store(true, std::memory_order_relaxed);
     }
 
     // Type of the effect in a slot; false when the slot is empty.
@@ -997,6 +1012,7 @@ public:
                 retiredEngines.erase(retiredEngines.begin());
         }
         engines[(size_t) trackIndex] = std::move(newEngine);
+        declickTrack(trackIndex, true);
 
         // The old engine's stored parameters mean nothing to the new one (every engine has its
         // own ids). Keep only the mixer and insert-effect values.
@@ -1039,6 +1055,7 @@ public:
         if (parked)
             parked->allNotesOff();
         engines[(size_t) trackIndex] = std::move(fresh);
+        declickTrack(trackIndex, true);
         return parked;
     }
 
@@ -1064,6 +1081,7 @@ public:
         parked->setTempo(lastTempo);
         parked->allNotesOff();
         engines[(size_t) trackIndex] = std::move(parked);
+        declickTrack(trackIndex, true);
     }
 
     int getSendCount() const { return (int) sendBuses.size(); }
@@ -1166,6 +1184,13 @@ public:
         masterEQ.setSampleRate(currentSampleRate);
         masterComp.setSampleRate(currentSampleRate);
         masterLimiter.setSampleRate(currentSampleRate);
+
+        for (auto& pair : engineDeclick)
+            for (auto& d : pair) d.setSampleRate(currentSampleRate);
+        for (auto& pair : trackDeclick)
+            for (auto& d : pair) d.setSampleRate(currentSampleRate);
+        for (auto& d : masterDeclick)
+            d.setSampleRate(currentSampleRate);
     }
 
     void audioDeviceStopped() override
@@ -1227,12 +1252,41 @@ public:
     {
         if (numOutputChannels < 2) return;
 
+        // Everything below is sized for the prepared block. A device may hand over more than it
+        // announced (JUCE does not promise the size): a longer block is rendered in pieces, and
+        // one that comes before prepare() is silence.
+        const int maxBlock = (int) juce::jmin(scratchL.size(), scratchR.size());
+        if (numSamples > maxBlock)
+        {
+            if (maxBlock <= 0)
+            {
+                juce::FloatVectorOperations::clear(outputChannelData[0], juce::jmax(0, numSamples));
+                juce::FloatVectorOperations::clear(outputChannelData[1], juce::jmax(0, numSamples));
+                return;
+            }
+            for (int done = 0; done < numSamples; done += maxBlock)
+            {
+                float* part[2] = { outputChannelData[0] + done, outputChannelData[1] + done };
+                audioDeviceIOCallbackWithContext(nullptr, 0, part, 2, juce::jmin(maxBlock, numSamples - done), {});
+            }
+            return;
+        }
+
         // A rebuild is in progress on another thread: one silent block, then carry on.
         const juce::CriticalSection::ScopedTryLockType structureLock(structureMutex);
         if (! structureLock.isLocked())
         {
             juce::FloatVectorOperations::clear(outputChannelData[0], numSamples);
             juce::FloatVectorOperations::clear(outputChannelData[1], numSamples);
+            // Not cut off: what was sounding is carried down to the silence over 2 ms, and the
+            // sound is carried back up from it when it returns.
+            for (int c = 0; c < 2; ++c)
+            {
+                if (! masterSkipped)
+                    masterDeclick[(size_t) c].arm();
+                masterDeclick[(size_t) c].process(outputChannelData[c], numSamples);
+            }
+            masterSkipped = true;
             skippedBlocks.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -1242,6 +1296,8 @@ public:
         // (send buses, inserts), here on the audio thread, between two blocks.
         if (silenceRequested.exchange(false, std::memory_order_relaxed))
         {
+            for (auto& d : masterDeclick)
+                d.arm();        // the output is shut from this block on: faded, not cut
             silenceNow();
             // What a voice still gives while it stops would start the effects ringing again: the
             // output stays shut for a quarter of a second and the effects are emptied once more.
@@ -1264,6 +1320,8 @@ public:
 
         if (midiClock)
             midiClock->processBlock(numSamples, currentSampleRate);
+        if (midiClock && sequencer)
+            followExternalClock();
 
         if (sequencer)
         {
@@ -1308,6 +1366,31 @@ public:
             trackMidi.clear();
             e->processBlock(trackBuf, trackMidi);
 
+            if (t < MAX_TRACKS)
+            {
+                const int jump = e->takeJump();
+                if (engineDeclickArm[(size_t) t].exchange(false, std::memory_order_relaxed) || jump == EngineBase::SoundCut)
+                    for (auto& d : engineDeclick[(size_t) t])
+                        d.armTail();
+                else if (jump == EngineBase::SoundSwapped)
+                    for (auto& d : engineDeclick[(size_t) t])
+                        d.arm();
+                engineDeclick[(size_t) t][0].process(scratchL.data(), numSamples);
+                engineDeclick[(size_t) t][1].process(scratchR.data(), numSamples);
+            }
+
+            // The last line: a number that is not one (a voice gone wrong) must not get into the
+            // memories of the effects, the sends or the speakers. The block is dropped and the
+            // engine's notes are let go. Counted, so that it is seen (getNonFiniteBlocks).
+            if (! blockIsFinite(scratchL.data(), scratchR.data(), numSamples))
+            {
+                std::fill(scratchL.begin(), scratchL.begin() + numSamples, 0.0f);
+                std::fill(scratchR.begin(), scratchR.begin() + numSamples, 0.0f);
+                e->allNotesOff();
+                nonFiniteBlocks.fetch_add(1, std::memory_order_relaxed);
+                nonFiniteTrack.store(t, std::memory_order_relaxed);
+            }
+
             if (!trackMidi.isEmpty() && midiOutput)
                 midiOutput->sendBlockOfMessagesNow(trackMidi);
 
@@ -1334,11 +1417,29 @@ public:
                             duck->setSidechainBuffers(trackTapL[(size_t) src].data(), trackTapR[(size_t) src].data());
                     }
                 chain.processStereo(scratchL.data(), scratchR.data(), numSamples);
+
+                // An insert effect gone wrong: its block is dropped and the chain's memory emptied.
+                if (! blockIsFinite(scratchL.data(), scratchR.data(), numSamples))
+                {
+                    std::fill(scratchL.begin(), scratchL.begin() + numSamples, 0.0f);
+                    std::fill(scratchR.begin(), scratchR.begin() + numSamples, 0.0f);
+                    chain.reset();
+                    nonFiniteBlocks.fetch_add(1, std::memory_order_relaxed);
+                    nonFiniteTrack.store(t + 1000, std::memory_order_relaxed);
+                }
             }
             if (t < (int) trackTapL.size() && (int) trackTapL[(size_t) t].size() >= numSamples)
             {
                 std::copy(scratchL.begin(), scratchL.begin() + numSamples, trackTapL[(size_t) t].begin());
                 std::copy(scratchR.begin(), scratchR.begin() + numSamples, trackTapR[(size_t) t].begin());
+            }
+            if (t < MAX_TRACKS)
+            {
+                if (trackDeclickArm[(size_t) t].exchange(false, std::memory_order_relaxed))
+                    for (auto& d : trackDeclick[(size_t) t])
+                        d.arm();
+                trackDeclick[(size_t) t][0].process(scratchL.data(), numSamples);
+                trackDeclick[(size_t) t][1].process(scratchR.data(), numSamples);
             }
             // Resampling one track: after its effects, before its fader and pan.
             if (resampler.getSource() == t)
@@ -1368,8 +1469,13 @@ public:
                 int numSends = juce::jmin((int) sendBuses.size(), MixParam::MAX_SENDS);
                 for (int s = 0; s < numSends; ++s)
                 {
-                    float sendLevel = m.sends[(size_t) s].load();
-                    if (sendLevel > 0.0f)
+                    // A send level that was moved is ramped across the block, like the fader.
+                    const float sendLevel = m.sends[(size_t) s].load();
+                    const float from = m.lastSend[(size_t) s];
+                    m.lastSend[(size_t) s] = sendLevel;
+                    if (from != sendLevel)
+                        sendBuses[s].addInputRamped(scratchL.data(), scratchR.data(), numSamples, from, sendLevel);
+                    else if (sendLevel > 0.0f)
                         sendBuses[s].addInput(scratchL.data(), scratchR.data(), numSamples, sendLevel);
                 }
             }
@@ -1397,6 +1503,20 @@ public:
             mainR[i] *= masterLevel;
         }
 
+        // The same last line for the sum (a send or the master section gone wrong): silence, and
+        // the master section's memory emptied.
+        if (! blockIsFinite(mainL, mainR, numSamples))
+        {
+            juce::FloatVectorOperations::clear(mainL, numSamples);
+            juce::FloatVectorOperations::clear(mainR, numSamples);
+            masterEQ.reset();
+            masterComp.reset();
+            masterLimiter.reset();
+            for (auto& bus : sendBuses)
+                bus.getChain().reset();
+            nonFiniteBlocks.fetch_add(1, std::memory_order_relaxed);
+        }
+
         if (silenceSamplesLeft > 0)
         {
             juce::FloatVectorOperations::clear(mainL, numSamples);
@@ -1405,6 +1525,17 @@ public:
             if (silenceSamplesLeft <= 0)
                 silenceNow();
         }
+
+        // Where the output was shut (above) or a block was skipped (a rebuild), the jump to and
+        // from silence is carried off over 2 ms. Costs nothing while neither happens.
+        if (masterSkipped)
+        {
+            masterSkipped = false;
+            for (auto& d : masterDeclick)
+                d.arm();
+        }
+        masterDeclick[0].process(mainL, numSamples);
+        masterDeclick[1].process(mainR, numSamples);
 
         if (resampler.getSource() == Resampler::MASTER)
             resampler.process(mainL, mainR, numSamples, beatAtStart, beatsPerSample, seqPlaying);
@@ -1477,13 +1608,55 @@ public:
         }
     }
 
-    void setMasterLevel(float level) { masterLevel = level; }
+    void setMasterLevel(float level) { if (std::isfinite(level)) masterLevel = juce::jlimit(0.0f, 1.0f, level); }   // (MVOL is 0..1; a file may hold anything)
     float getMasterLevel() const { return masterLevel; }
 
     void setMIDIOutput(juce::MidiOutput* output) { midiOutput = output; }
     juce::MidiOutput* getMIDIOutput() const { return midiOutput; }
 
     void setMIDIClock(MIDIClock* clock) { midiClock = clock; }
+
+    // CLK EXT, or AUTO while a clock comes in: the external MIDI clock leads. Its Start (with the
+    // first tick after it) and Stop move the transport, its tempo is the tempo, and the sequencer's
+    // position is pulled onto the clock's, by 3 % of the tempo at most. Play on the controller still
+    // starts and stops the sequencer by hand. Audio thread.
+    void followExternalClock()
+    {
+        const bool following = midiClock->isFollowingExternal();
+        const bool clockRuns = following && midiClock->isRunning() && midiClock->getExternalTickCount() > 0;
+        if (clockRuns != extClockRan)
+        {
+            extClockRan = clockRuns;
+            if (clockRuns)
+            {
+                if (! sequencer->isPlaying())
+                    sequencer->start();
+                extSeqPlayed = false;           // (the position is taken below)
+            }
+            else if (following)
+                sequencer->stop();
+        }
+        if (! clockRuns)
+            return;
+
+        const double bpm = midiClock->getDetectedTempo();
+        const bool playing = sequencer->isPlaying();
+        if (playing && ! extSeqPlayed)
+            extBeatOffset = midiClock->getExternalBeat() - sequencer->getBeatPosition();
+        extSeqPlayed = playing;
+        if (bpm <= 0.0)
+            return;
+
+        double pull = 0.0;
+        if (playing)
+        {
+            const double error = (midiClock->getExternalBeat() - extBeatOffset) - sequencer->getBeatPosition();
+            pull = juce::jlimit(-0.03, 0.03, error * 0.25);
+        }
+        const float target = (float) (bpm * (1.0 + pull));
+        if (std::abs(target - sequencer->getTempo()) > 0.005f)
+            sequencer->setTempo(target);
+    }
     MIDIClock* getMIDIClock() const { return midiClock; }
 
 private:
@@ -1491,6 +1664,13 @@ private:
     {
         if (trackIndex < 0 || RangeParam::isRangeParam(id))
             return;     // range ends are data for the parameter screen, not sound parameters
+
+        // Not a number, or infinite (a damaged file, a lock made from one): no parameter has such a
+        // value, and jlimit / std::clamp would hand a NaN on to the mixer or an engine.
+        if (! std::isfinite(value))
+            return;
+        // (and nothing is larger than this: a whole-number cast further down stays defined)
+        value = juce::jlimit(-1.0e9f, 1.0e9f, value);
 
         if (MixParam::isMixParam(id))
         {
@@ -1598,6 +1778,7 @@ private:
         std::array<std::atomic<float>, MixParam::MAX_SENDS> sends;
         float lastGainL = MixParam::DEFAULT_VOLUME;   // audio thread only
         float lastGainR = MixParam::DEFAULT_VOLUME;
+        std::array<float, MixParam::MAX_SENDS> lastSend {};
     };
     struct ActiveLock { int id = -1; float base = 0.0f; };
 
@@ -1655,6 +1836,8 @@ private:
     SequencerCore* sequencer = nullptr;
     Arpeggiator* arpeggiator = nullptr;
     MIDIClock* midiClock = nullptr;
+    bool extClockRan = false, extSeqPlayed = false;     // followExternalClock
+    double extBeatOffset = 0.0;
     juce::MidiOutput* midiOutput = nullptr;
     std::vector<std::shared_ptr<EngineBase>> engines;
     std::vector<EffectChain> trackInsertChains;
@@ -1668,8 +1851,17 @@ private:
     Metronome metronome;
     juce::CriticalSection structureMutex;
     std::atomic<int> skippedBlocks { 0 };
+    std::atomic<int> nonFiniteBlocks { 0 };
+    std::atomic<int> nonFiniteTrack { -1 };
     std::atomic<bool> silenceRequested { false };
     int silenceSamplesLeft = 0;         // audio thread only
+
+    // Jumps between two blocks carried off over 2 ms (declickTrack, the silence, a skipped block):
+    // on each track after its engine and after its inserts, and on the master output.
+    std::array<std::array<dsp::BlockDeclick, 2>, MAX_TRACKS> engineDeclick, trackDeclick;
+    std::array<std::atomic<bool>, MAX_TRACKS> engineDeclickArm {}, trackDeclickArm {};
+    std::array<dsp::BlockDeclick, 2> masterDeclick;
+    bool masterSkipped = false;         // audio thread only
 
     // Audio thread: every note off, every insert chain and send bus emptied.
     void silenceNow()
@@ -1686,6 +1878,20 @@ public:
     // The way out of any effect that rings on (Shift + Play).
     void requestSilence() { silenceRequested.store(true, std::memory_order_relaxed); }
     int getSkippedBlocks() const { return skippedBlocks.load(); }     // blocks silenced by a rebuild
+    // Blocks dropped because an engine, an insert chain or the sum held a number that is not finite.
+    // It stays 0 while everything is right: the robustness tests fail on any other value.
+    int getNonFiniteBlocks() const { return nonFiniteBlocks.load(std::memory_order_relaxed); }
+    // Where the last one came from: a track's engine (the track), its insert effects (1000 + the
+    // track), or -1.
+    int getNonFiniteTrack() const { return nonFiniteTrack.load(std::memory_order_relaxed); }
+    static bool blockIsFinite(const float* left, const float* right, int numSamples)
+    {
+        // (x - x is 0 for a finite x and NaN for an infinite one or a NaN: one test for the sum)
+        float sum = 0.0f;
+        for (int i = 0; i < numSamples; ++i)
+            sum += (left[i] - left[i]) + (right[i] - right[i]);
+        return sum == 0.0f;
+    }
 private:
     std::vector<float> scratchL;
     std::vector<std::vector<float>> trackTapL, trackTapR;     // each track's output after its inserts (sidechain sources)

@@ -1240,6 +1240,8 @@ public:
         lfos.setSampleRate(sr);
         declick.setSampleRate(sr);
         gainDeclick.setSampleRate(sr);
+        positionStep = (float) (1.0 / (0.003 * sr));    // the whole table in 3 ms (a STEP of a sixteenth: 0.2 ms)
+        levelStep = (float) (1.0 / (0.004 * sr));       // a level's whole range in 4 ms
     }
 
     void setWavetable(const Wavetable* wt) { wavetable = wt; }
@@ -1261,6 +1263,8 @@ public:
             declick.arm();      // struck again while sounding: the phase restart must not jump,
             gainDeclick.arm();  // nor the step to the new velocity
         }
+        else
+            lfos.snapSlews();
         // An LFO on a page cell is read before the first sample (the engine sets the cell then).
         if (lfos.keyed()) lfos.noteOnAndSample(); else lfos.noteOn();
         filter.noteOn(currentNote, currentVelocity, active);
@@ -1269,6 +1273,7 @@ public:
         else
             ampEnv.noteOn();
         active = true;
+        struck = true;          // the new note takes every glided value as it stands
         phase = 0.0;
         phase2 = 0.25;
         subPhase = 0.0;
@@ -1298,6 +1303,7 @@ public:
     void setPitchOffset(float semitones) { pitchOffset = semitones; }           // tune, bend, vibrato
     void setPositionMod(float m) { positionMod = m; }                           // pressure
     void setGainMod(float g) { gainMod = g; }
+    void setLevel(float l) { level = l; }                                       // the engine's LEVL
     void setMorphDepth(float d) { morphDepth = juce::jlimit(0.0f, 1.0f, d); }
     void setEnvToPosition(float a) { envToPos = juce::jlimit(-1.0f, 1.0f, a); }
     void setVelToPosition(float a) { velToPos = juce::jlimit(0.0f, 1.0f, a); }
@@ -1339,8 +1345,8 @@ public:
             subLevel = juce::jlimit(0.0f, 1.0f, subLevel + lfos.amount(LfoSub));
             filter.setLfoOctaves(lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES);
             filter.setResonanceMod(lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE);
-            lfoGain = juce::jlimit(0.0f, 2.0f, 1.0f + lfos.amount(LfoAmp));
-            lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.amount(LfoPan));
+            lfoGain = lfos.gain(LfoAmp);
+            lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.panAmount(LfoPan));
         }
         else if (lfoApplied)
         {
@@ -1350,6 +1356,7 @@ public:
             filter.setResonanceMod(0.0f);
             lfoGain = 1.0f;
             lfoPan = 0.0f;
+            lfos.snapSlews();
             lfoApplied = false;
         }
 
@@ -1361,8 +1368,8 @@ public:
         if (morphSpeed > 0.0f)
         {
             morphPhase += morphSpeed / (float) sampleRate;
-            while (morphPhase >= 1.0f)
-                morphPhase -= 1.0f;
+            if (morphPhase >= 1.0f)
+                morphPhase = (float) dsp::wrapPhase((double) morphPhase);
             // Sinusoidal LFO modulation of position
             effectivePosition = basePosition + 0.5f * morphDepth * std::sin(morphPhase * 2.0f * juce::MathConstants<float>::pi);
             if (! scanning)
@@ -1376,6 +1383,34 @@ public:
         float posOffset = positionMod + envToPos * lastEnv + velToPos * currentVelocity + lfoPosition;
         if (posOffset != 0.0f || scanning)
             effectivePosition = juce::jlimit(0.0f, 1.0f, effectivePosition + posOffset);
+
+        // Nothing that is set or stepped under a sounding note is jumped to (a jump of the frame
+        // read, or of a level, is a click): the position, the sub level, the spread coming in or
+        // going out, velocity's share, pressure's and the LEVL cell move on at a limited rate: the
+        // whole table in three milliseconds, a level's whole range in four. A change that is slower than that - any knob sweep,
+        // any smooth LFO, a running scan - passes exactly. STEP and RAND still step to the ear.
+        // The first sample of a note takes everything as it stands.
+        const float velGain = 1.0f - velSens + velSens * currentVelocity;
+        if (struck)
+        {
+            struck = false;
+            positionNow = effectivePosition;
+            subNow = subLevel;
+            spreadMix = spread > 0.0f ? 1.0f : 0.0f;
+            velGainNow = velGain;
+            gainModNow = gainMod;
+            levelNow = level;
+        }
+        else
+        {
+            positionNow = dsp::towards(positionNow, effectivePosition, positionStep);
+            subNow = dsp::towards(subNow, subLevel, levelStep);
+            spreadMix = dsp::towards(spreadMix, spread > 0.0f ? 1.0f : 0.0f, levelStep);
+            velGainNow = dsp::towards(velGainNow, velGain, levelStep);
+            gainModNow = dsp::towards(gainModNow, gainMod, 2.0f * levelStep);
+            levelNow = dsp::towards(levelNow, level, levelStep);
+        }
+        effectivePosition = positionNow;
 
         if (baseFrequency != targetFrequency)
         {
@@ -1394,27 +1429,23 @@ public:
         // Read from wavetable with position-based frame interpolation
         float sample = readWavetable(mipLevel, phase);
 
-        // Spread: a second copy up to 30 cents away, mixed equally.
-        if (spread > 0.0f)
+        // Spread: a second copy up to 30 cents away, mixed equally (faded in and out where the
+        // spread starts or ends under a sounding note).
+        if (spread > 0.0f || spreadMix > 0.0f)
         {
-            sample = (sample + readWavetable(mipLevel, phase2)) * 0.7071f;
-            phase2 += phaseInc * std::exp2((double) spread * 30.0 / 1200.0);
-            while (phase2 >= 1.0)
-                phase2 -= 1.0;
+            const float both = (sample + readWavetable(mipLevel, phase2)) * 0.7071f;
+            sample = spreadMix >= 1.0f ? both : sample + spreadMix * (both - sample);
+            phase2 = dsp::wrapPhase(phase2 + phaseInc * std::exp2((double) spread * 30.0 / 1200.0));
         }
 
         // Sub oscillator: a sine one octave below
         float sub = 0.0f;
-        if (subLevel > 0.0f)
-            sub = subLevel * std::sin((float) subPhase * juce::MathConstants<float>::twoPi);
-        subPhase += phaseInc * 0.5;
-        while (subPhase >= 1.0)
-            subPhase -= 1.0;
+        if (subNow > 0.0f)
+            sub = subNow * std::sin((float) subPhase * juce::MathConstants<float>::twoPi);
+        subPhase = dsp::wrapPhase(subPhase + phaseInc * 0.5);
 
         // Advance phase
-        phase += phaseInc;
-        while (phase >= 1.0)
-            phase -= 1.0;
+        phase = dsp::wrapPhase(phase + phaseInc);       // (never a loop: a huge or infinite step must not hang)
 
         // Envelope: use chain if enabled, otherwise simple ADSR
         float envVal;
@@ -1437,7 +1468,7 @@ public:
             spread = setSpreadValue;
             subLevel = setSubValue;
         }
-        return gainDeclick.process(filter.process(declick.process(sample + sub)) * envVal * (1.0f - velSens + velSens * currentVelocity) * gainMod * lfoGain);
+        return gainDeclick.process(filter.process(declick.process(sample + sub)) * envVal * velGainNow * gainModNow * lfoGain * levelNow);
     }
 
     void reset()
@@ -1545,6 +1576,11 @@ private:
     float pitchOffset = 0.0f;
     float positionMod = 0.0f;
     float gainMod = 1.0f;
+    float level = 1.0f;
+    // The values above as they are heard: moved to, never jumped to, under a sounding note.
+    bool struck = true;
+    float positionNow = 0.0f, subNow = 0.0f, spreadMix = 0.0f, velGainNow = 1.0f, gainModNow = 1.0f, levelNow = 1.0f;
+    float positionStep = 0.007f, levelStep = 0.005f;
     float morphDepth = 1.0f;
     float envToPos = 0.0f;
     float velToPos = 0.0f;
@@ -1667,7 +1703,10 @@ public:
 
         // Point all voices at the first table
         for (auto& v : voices)
+        {
             v.setWavetable(tables[0]);
+            v.setLevel(masterLevel);
+        }
         setScanSeed(0x4E455054u);
 
         allocator.setNoteOnCallback([this](int voiceIdx, const Voice& v)
@@ -2050,8 +2089,8 @@ public:
                 sampleR += pan < 0.0f ? s * (1.0f + pan) : s;
             }
 
-            sampleL *= masterLevel * 0.7f;
-            sampleR *= masterLevel * 0.7f;
+            sampleL *= 0.7f;        // LEVL is applied by each voice (so that a note takes it whole)
+            sampleR *= 0.7f;
 
             if (right)
             {
@@ -2065,6 +2104,7 @@ public:
         }
 
         lfoSection.endBlock(numSamples, EngineLfoSection::each(voices));
+        lfoSection.afterLetGo([this](int key) { setParameter(key, getParameter(key)); });
     }
 
     void releaseResources() override
@@ -2085,6 +2125,7 @@ public:
 
     void allNotesOff() override
     {
+        soundCut();
         allocator.allNotesOff();
         for (auto& v : voices)
             v.reset();
@@ -2129,6 +2170,8 @@ public:
     {
         if (filterSection.owns(id))
         {
+            if (filterSection.swaps(id, value))
+                soundSwapped();
             filterSection.set(id, value, VoiceFilterSection::each(voices));
             lfoSection.baseChanged(id, filterSection.get(id), EngineLfoSection::each(voices));
             return;
@@ -2147,6 +2190,9 @@ public:
             setStageCurve(id, value);
             return;
         }
+        if ((id == TableSelect || id == InterpMode || id == EnvChainMode || id == EnvChainStages || id == EnvChainCombine)
+            && params[id] != value)
+            soundSwapped();
         params[id] = value;
         applyParameter(id, value);
         lfoSection.baseChanged(id, value, EngineLfoSection::each(voices));
@@ -2514,6 +2560,8 @@ private:
 
             case Level:
                 masterLevel = juce::jlimit(0.0f, 1.0f, value);
+                for (auto& v : voices)
+                    v.setLevel(masterLevel);
                 break;
 
             case Octave:

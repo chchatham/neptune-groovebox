@@ -2168,6 +2168,8 @@ juce::StringArray ScreenManager::getNameBarTags() const
     if (isRecordArmed())       tags.add(recordModeText());
     if (arpOn(currentTrack())) tags.add("ARP");
     if (isLatchOn())           tags.add("LATCH");
+    // A latched pad roll goes on after the pad is let go: say so wherever the player is.
+    if (engineHooks.rollLatched && engineHooks.rollLatched()) tags.add("ROLL");
     if (scaleLocked)           tags.add("SCALE");
     if (pinnedIndex >= 0)      tags.add("PIN");
     if (fillHeld || (sequencer != nullptr && sequencer->isFillActive())) tags.add("FILL");
@@ -2176,8 +2178,9 @@ juce::StringArray ScreenManager::getNameBarTags() const
 
 // Name bar, the same on every screen, 20 characters wide:
 //   left    screen / page name and the selected track ("TRACKS T1")
-//   tags    REC FREE / REC QUANT, ARP, LATCH, SCALE, PIN, FILL — as words when there is room, else as
-//           their first letters ("RALSPF"; quantized recording is "Q")
+//   tags    REC FREE / REC QUANT, ARP, LATCH, ROLL (a latched pad roll), SCALE, PIN, FILL — as words
+//           when there is room, else as their first letters ("RALSPF"; quantized recording is "Q",
+//           ROLL is "O")
 //   text    the screen's status text, right-aligned (when there is no room: its leading words)
 //   pages   "n/N" at the far right whenever the screen has more than one page
 // For a moment the text is something else: a confirmation ("COPY TRK", "126 BPM") for a second, or,
@@ -2202,7 +2205,7 @@ ScreenManager::NameBar ScreenManager::composeNameBar() const
     const auto tagWords = tagList.joinIntoString(" ");
     juce::String tagLetters;
     for (auto& tag : tagList)
-        tagLetters += (tag == "REC QUANT") ? juce::String("Q") : tag.substring(0, 1);
+        tagLetters += (tag == "REC QUANT") ? juce::String("Q") : (tag == "ROLL" ? juce::String("O") : tag.substring(0, 1));
 
     auto room = [total](const juce::String& left, const juce::String& tags, const juce::String& pages)
     {

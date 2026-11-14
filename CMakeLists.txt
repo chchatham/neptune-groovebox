@@ -110,6 +110,7 @@ target_sources(NeptuneGroovebox PRIVATE
     src/ui/screens/ArpScreen.h
     src/sequencer/SongMode.h
     src/sync/MIDIClock.h
+    src/sync/MIDIRouter.h
     src/project/FactoryPresets.h
     src/project/ProjectManager.h
     src/ui/OLEDMirrorComponent.h
@@ -149,6 +150,61 @@ target_link_libraries(NeptuneGroovebox PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_warning_flags
 )
+
+# ---- AU / VST3 plugin target ------------------------------------------------
+# Neptune as a DAW instrument plugin. Loads inside Ableton, Logic, etc. and
+# receives MIDI + transport while outputting stereo audio.
+juce_add_plugin(NeptunePlugin
+    PRODUCT_NAME "Neptune Groovebox"
+    COMPANY_NAME "Neptune"
+    BUNDLE_ID "com.neptune.groovebox.plugin"
+    PLUGIN_MANUFACTURER_CODE Nept
+    PLUGIN_CODE Ngrb
+    FORMATS AU VST3
+    IS_SYNTH TRUE
+    NEEDS_MIDI_INPUT TRUE
+    NEEDS_MIDI_OUTPUT TRUE
+    IS_MIDI_EFFECT FALSE
+    EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+    COPY_PLUGIN_AFTER_BUILD TRUE
+)
+
+target_sources(NeptunePlugin PRIVATE
+    src/plugin/PluginProcessor.h
+    src/plugin/PluginProcessor.cpp
+    src/engine/VoiceAllocator.cpp
+    src/sequencer/SequencerCore.cpp
+)
+
+target_include_directories(NeptunePlugin PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_definitions(NeptunePlugin PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_DISPLAY_SPLASH_SCREEN=0
+    JUCE_VST3_CAN_REPLACE_VST2=0
+)
+
+target_link_libraries(NeptunePlugin PRIVATE
+    juce::juce_audio_basics
+    juce::juce_audio_devices
+    juce::juce_audio_formats
+    juce::juce_audio_processors
+    juce::juce_audio_utils
+    juce::juce_core
+    juce::juce_events
+    juce::juce_graphics
+    juce::juce_gui_basics
+    juce::juce_gui_extra
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags
+)
+
+if(TARGET NeptuneBreakData)
+    target_link_libraries(NeptunePlugin PRIVATE NeptuneBreakData)
+endif()
 
 enable_testing()
 

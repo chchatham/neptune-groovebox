@@ -33,6 +33,8 @@ public:
         : allocator(maxVoices)
     {
         voices.resize((size_t) maxVoices);
+        for (auto& voice : voices)
+            voice.setLevel(masterLevel);
 
         allocator.setNoteOnCallback([this](int voiceIdx, const Voice& v)
         {
@@ -176,8 +178,8 @@ public:
                 sampleR += pan < 0.0f ? s * (1.0f + pan) : s;
             }
 
-            sampleL *= masterLevel * HEADROOM;
-            sampleR *= masterLevel * HEADROOM;
+            sampleL *= HEADROOM;        // LEVL is applied by each voice (so that a note takes it whole)
+            sampleR *= HEADROOM;
 
             if (right)
             {
@@ -191,6 +193,7 @@ public:
         }
 
         lfoSection.endBlock(numSamples, EngineLfoSection::each(voices));
+        lfoSection.afterLetGo([this](int key) { setParameter(key, getParameter(key)); });
     }
 
     void releaseResources() override
@@ -211,6 +214,7 @@ public:
 
     void allNotesOff() override
     {
+        soundCut();
         allocator.allNotesOff();
         for (auto& v : voices)
             v.reset();
@@ -248,6 +252,8 @@ public:
     {
         if (filterSection.owns(id))
         {
+            if (filterSection.swaps(id, value))
+                soundSwapped();
             filterSection.set(id, value, VoiceFilterSection::each(voices));
             lfoSection.baseChanged(id, filterSection.get(id), EngineLfoSection::each(voices));
             return;
@@ -268,6 +274,8 @@ public:
         }
         if (id == AlgorithmParam)
             value = (float) juce::jlimit(0, (int) FMVoice::Algorithm::Count - 1, (int) std::lround(value));
+        if (id == AlgorithmParam && params[id] != value)
+            soundSwapped();
         params[id] = value;
         applyParameter(id, value);
         lfoSection.baseChanged(id, value, EngineLfoSection::each(voices));
@@ -339,7 +347,9 @@ private:
 
         if (id == MasterLevel)
         {
-            masterLevel = value;
+            masterLevel = juce::jlimit(0.0f, 1.0f, value);      // (LEVL's own range: a file may hold anything)
+            for (auto& voice : voices)
+                voice.setLevel(masterLevel);
             return;
         }
 

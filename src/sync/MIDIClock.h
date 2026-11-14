@@ -65,15 +65,14 @@ public:
 
         if (currentMode == Mode::Auto)
         {
-            if (externalClockSeen.load())
+            // A second without a tick: the external clock is gone, this one sends again.
+            if (extClockSampleCount.load() > sr)
             {
+                externalClockSeen.store(false);
+                autoModeSending.store(true);
+            }
+            else if (externalClockSeen.load())
                 autoModeSending.store(false);
-            }
-            else
-            {
-                if (extClockSampleCount > sr)
-                    autoModeSending.store(true);
-            }
         }
 
         bool shouldSend = (currentMode == Mode::Internal)
@@ -91,8 +90,8 @@ public:
                 {
                     clockAccumulator -= samplesPerTick;
                     pushEvent({ ClockEvent::Clock, 0 });
-                    clockTickCount++;
-                    currentBeat.store(static_cast<double>(clockTickCount) / 24.0);
+                    const int ticks = clockTickCount.fetch_add(1) + 1;
+                    currentBeat.store(static_cast<double>(ticks) / 24.0);
                 }
             }
         }
@@ -110,14 +109,20 @@ public:
         if (msg.isMidiClock())
         {
             if (currentMode == Mode::External || currentMode == Mode::Auto)
-                handleExternalClock();
+                handleExternalClock(msg.getTimeStamp());
             return;
         }
 
         if (msg.isMidiStart())
         {
-            if (currentMode == Mode::External
-                || (currentMode == Mode::Auto && !autoModeSending.load()))
+            // AUTO: a Start from outside is an external clock arriving (its ticks follow).
+            if (currentMode == Mode::Auto)
+            {
+                externalClockSeen.store(true);
+                autoModeSending.store(false);
+                extClockSampleCount.store(0);
+            }
+            if (currentMode == Mode::External || currentMode == Mode::Auto)
             {
                 clockTickCount = 0;
                 currentBeat.store(0.0);
@@ -153,7 +158,7 @@ public:
             {
                 int posBeats = msg.getSongPositionPointerMidiBeat();
                 clockTickCount = posBeats * 6;
-                currentBeat.store(static_cast<double>(clockTickCount) / 24.0);
+                currentBeat.store(static_cast<double>(posBeats * 6) / 24.0);
             }
             return;
         }
@@ -221,7 +226,7 @@ public:
         if (currentMode == Mode::Internal
             || (currentMode == Mode::Auto && autoModeSending.load()))
         {
-            int posBeats = clockTickCount / 6;
+            int posBeats = clockTickCount.load() / 6;
             pushEvent({ ClockEvent::SongPosition, posBeats });
         }
     }
@@ -260,22 +265,53 @@ public:
     bool isExternalClockDetected() const { return externalClockSeen.load(); }
     bool isAutoModeSending() const { return autoModeSending.load(); }
 
+    // An external clock leads now: its tempo and its Start / Stop are the transport's.
+    bool isFollowingExternal() const
+    {
+        const Mode m = mode.load();
+        return m == Mode::External || (m == Mode::Auto && ! autoModeSending.load());
+    }
+    int getExternalTickCount() const { return clockTickCount.load(); }
+    // Where the external clock is, in quarter notes, with the part of a tick that has gone by.
+    // The first tick after Start is the start itself (position 0).
+    double getExternalBeat() const
+    {
+        const int ticks = clockTickCount.load();
+        if (ticks < 1) return 0.0;
+        const double interval = smoothedInterval.load();
+        const double part = interval > 0.0 ? juce::jmin(1.0, (double) extClockSampleCount.load() / interval) : 0.0;
+        return ((double) (ticks - 1) + part) / 24.0;
+    }
+
 private:
-    void handleExternalClock()
+    // `stamp`: when the tick arrived, in seconds (a MIDI input's time stamp), or 0 when unknown.
+    // With a stamp the tempo is measured from it; without, from the audio blocks gone by (which is
+    // only as fine as a block).
+    void handleExternalClock(double stamp)
     {
         externalClockSeen.store(true);
 
         if (running.load())
         {
-            clockTickCount++;
-            currentBeat.store(static_cast<double>(clockTickCount) / 24.0);
+            const int ticks = clockTickCount.fetch_add(1) + 1;
+            currentBeat.store(static_cast<double>(ticks) / 24.0);
         }
 
-        double interval = static_cast<double>(extClockSampleCount);
-        extClockSampleCount = 0;
+        double interval = static_cast<double>(extClockSampleCount.exchange(0));
+        if (stamp > 0.0 && lastExternalClockTime > 0.0)
+            interval = (stamp - lastExternalClockTime) * sampleRate;
+        lastExternalClockTime = stamp;
 
         if (interval <= 0.0)
             return;
+        // A pause (the clock was stopped and comes back) is not a tick length: measure afresh.
+        if (interval > sampleRate)
+        {
+            extIntervalsFilled = 0;
+            extClockTickIndex = 0;
+            smoothedInterval.store(0.0);
+            return;
+        }
 
         extIntervals[extClockTickIndex % TEMPO_AVERAGE_TICKS] = interval;
         extClockTickIndex++;
@@ -287,15 +323,16 @@ private:
             sum += extIntervals[i];
         double avgInterval = sum / static_cast<double>(extIntervalsFilled);
 
-        if (smoothedInterval <= 0.0)
-            smoothedInterval = avgInterval;
+        double smoothed = smoothedInterval.load();
+        if (smoothed <= 0.0)
+            smoothed = avgInterval;
         else
-            smoothedInterval = smoothedInterval * JITTER_SMOOTH_COEFF
-                             + avgInterval * (1.0 - JITTER_SMOOTH_COEFF);
+            smoothed = smoothed * JITTER_SMOOTH_COEFF + avgInterval * (1.0 - JITTER_SMOOTH_COEFF);
+        smoothedInterval.store(smoothed);
 
-        if (smoothedInterval > 0.0 && sampleRate > 0.0)
+        if (smoothed > 0.0 && sampleRate > 0.0)
         {
-            double bpm = (60.0 * sampleRate) / (smoothedInterval * 24.0);
+            double bpm = (60.0 * sampleRate) / (smoothed * 24.0);
             bpm = juce::jlimit(20.0, 300.0, bpm);
             detectedTempo.store(bpm);
         }
@@ -330,12 +367,12 @@ private:
 
     double sampleRate = 44100.0;
     double clockAccumulator = 0.0;
-    int clockTickCount = 0;
+    std::atomic<int> clockTickCount { 0 };
 
-    int extClockSampleCount = 0;
+    std::atomic<int> extClockSampleCount { 0 };
     int extClockTickIndex = 0;
     std::array<double, TEMPO_AVERAGE_TICKS> extIntervals {};
     int extIntervalsFilled = 0;
-    double smoothedInterval = 0.0;
+    std::atomic<double> smoothedInterval { 0.0 };
     double lastExternalClockTime = 0.0;
 };

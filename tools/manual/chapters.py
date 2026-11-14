@@ -124,8 +124,11 @@ would act on right now, before you press anything. Any other control makes the c
 usual.</div>""")))
     qs.append(("Before you start", fmt("""
 <ul>
-<li>Plug the Launchkey into the Mac. It needs the Neptune firmware (tag NPE), which is already on your unit.</li>
-<li>Start <i>Neptune Groovebox</i>. The display shows the {{TRACKS}} screen within a couple of seconds.</li>
+<li>Plug the Launchkey into the Mac. It needs the Neptune firmware (tag NPF), which is already on your unit.</li>
+<li>Start <i>Neptune Groovebox</i>. The display shows the {{TRACKS}} screen within a couple of seconds, and
+[[Up]], [[Down]], [[>]] and [[Func]] light up white.</li>
+<li>The Mac window shows the display and a picture of the Launchkey with every button named. It can be clicked
+when the controller is out of reach: pads light as they are pressed and the two strips show where they stand.</li>
 <li>Use headphones or an audio interface if you can. The Mac's built-in speakers add a noticeable delay of their own.</li>
 <li>The app reopens the project you last used. For a clean start: [[Settings]], press the lower knob-page button
 twice to reach {{PROJ}}, and turn {{NEW}} (knob 5) four clicks clockwise.</li>
@@ -257,7 +260,9 @@ on the display (see <i>Help cards</i> below).</li>
 </ul>""")),
         ("The display", '<div class="side"><div>' + fmt("""
 <p>The top line is the name bar: the screen or page name on the left, the selected track ({{T 1}}) on the right, and
-tags when something is engaged: {{ARP}}, {{LATCH}}, {{PIN}}, {{SPLIT}}.</p>
+tags when something is engaged: {{ARP}}, {{LATCH}}, {{ROLL}} (pad rolls are on with their own latch, {{LTCH}} on
+the {{ROL2}} page: a pad keeps rolling after you let go), {{PIN}}, {{SPLIT}}. When there is no room for the words
+they shrink to letters: A, L, O for the roll, P.</p>
 <p><b>Grid screens</b> show eight cells in two rows of four. Knobs 1 to 4 are the top row, 5 to 8 the bottom row.</p>
 <p><b>Bar screens</b> show a picture or list with a strip of eight two-letter labels along the bottom, one per knob.
 When you turn a knob the name bar spells out its full name and value. A knob that has nothing to act on at the
@@ -408,7 +413,8 @@ the pressure is played (0 to 200 %; 0 plays none and keeps the recording), {{>LC
     screen("PARAM — the sound", [("PARAM synth", 1, "Synth, MAIN (the landing page)"), ("PARAM synth", 7, "Synth, FILTR"), ("PARAM FM", 2, "FM, FMMIX")], """
 <p><b>Knobs:</b> the pages of the selected track's engine (Chapter 5), opening on {{MAIN}}: cutoff, resonance and
 the level envelope, the same on every engine that has a filter. A drum track shows one {{DR}} page for the pad last
-selected on {{DRUMS}} (and its {{KICK}} page when that pad is a kick machine), then its LFOs.</p>
+selected on {{DRUMS}} (and its {{KICK}} page when that pad is a kick machine, its {{CYM}} page when it is a cymbal
+machine), then its LFOs.</p>
 <p><b>Pads:</b> the track's steps, for locks: dim = empty, green = has a note, orange = has locks, white = held. A
 bottom-row pad under a knob that has a pressure range is violet and plays that range instead.</p>""")
     screen("TRK FX — track effects", [("TRK FX", 1, "TRACK"), ("TRK FX", 6, "FX")], """
@@ -563,12 +569,23 @@ filter and envelope. With everything at zero, successive notes are identical; ra
     eng.append(("FM — six operators", fmt("""
 <p>Six sine operators, eight algorithms. {{FMMIX}} puts all six operator levels under knobs 1 to 6 so you can play
 the timbre directly; {{RATIO}} does the same for their frequency ratios. Each operator then has its own page with
-ratio, level, detune, feedback and envelope.</p>""") + page_list(params, "FM Synth")
+ratio, level, detune, feedback and envelope.</p>
+<p>The preset <i>Anthem Bell</i> is the struck tubular bell of 1980s film themes, built the way six-operator FM
+made it: algorithm 3, three pairs side by side. Two pairs are the bell (a modulator at 3.5 times its carrier,
+one pair tuned slightly flat, one slightly sharp, so the tone beats as it rings for seconds); the third is the
+strike, at an unrelated ratio with feedback, gone in a third of a second.</p>""") + page_list(params, "FM Synth")
         + "<p>Algorithms: " + " · ".join(f"<code>{html.escape(c)}</code>" for c in choices(params, "FM Synth", "FMMIX", "ALGO")) + ".</p>"))
     eng.append(("Macro — eight models, four knobs", fmt("""
 <p>One oscillator that can be eight different things. {{MODL}} chooses the model, and knobs 2 to 5 are renamed to
 suit it.</p>""") + table(["Model", "What it is", "Knobs 2–5"],
                           [(f"<code>{m}</code>", d, " ".join(f"<code>{x}</code>" for x in k.split())) for m, d, k in ctx["macro_models"]])
+        + fmt("""<p>Four built-in presets for each model but the last show where its knobs lead (on {{PRESET}} set {{EN}} to this engine):
+VA - Super Saw Lead, Hollow Sq Bass, Soft Sine Pad, Octave Strings. FM - FM Glass Keys, FM Growl Bass, Detuned
+Chime, Feedback Scream. FOLD - Fold Lead, West Coast Bass, Cheby Organ, Fold Sweep Pad. FORM - Choir Aah, Talking
+Lead, Whisper Wind, Vox Bass. HARM - Pure Organ, Stiff Bell, Clarinet Tone, Glass Harmonics. PLCK - Nylon Guitar,
+Pluck Bass, Koto Snap, String Drum (and Resonator Pluck). DUST - Vinyl Crackle, Pitched Rain, Hiss Riser, Dust Hat
+(and Grain Cloud). BOW has none yet. Load one, look at knobs 2 to 5 on the first
+page, and turn them: each preset sits at one corner of its model.</p>""")
         + page_list(params, "Macro Oscillator")))
     eng.append(("Wavetable", fmt("""
 <p>{{TABL}} picks a built-in table, {{USER}}, a table built from any sample (64 frames, so {{POS}} scans
@@ -587,7 +604,11 @@ waves, {{PRIM}} prime-numbered harmonics, {{OCTV}} octaves only, {{PDST}} phase 
 <p>Each of the fourteen has at least one factory preset on {{PRESET}} (Vowel Lead, Sync Sweep Lead, Fold Bass,
 FM Table Keys, Glass Pluck, Struck Bar, Drawbar Organ, Noise To Tone, Reso Sweep Bass, Walsh Stepper, Prime
 Shimmer, Octave Climb, Phase Bass, Comb Phase Pad and others), and three play a table through {{CLSC}}: Eight
-Bit Vowels, Glassy Bell and Raw Sync Lead. The same 23 built-in tables can be played by the synth's oscillator
+Bit Vowels, Glassy Bell and Raw Sync Lead. One of the vowel presets speaks: hold a key on <i>I You We
+Yeah</i> and the {{SCAN}} page's {{PING}} run walks the vowels there and back, which comes out as those four words,
+over and over (A to I is "I", I to U is "you", and back again "we" and "yeah"); it sounds most like a voice around
+the A in the middle of the keys. {{TIME}} on {{SCAN}} is how fast it talks (set LFO 1's rate to two divided by it,
+so the words keep their shape). The same 23 built-in tables can be played by the synth's oscillator
 slots (kind {{WT}}).</p>
 <p>The {{SCAN}} page moves the position by itself over a set time, whatever note you play: this is time stretch
 for a wavetable. {{MODE}} runs once and holds ({{RUN}}), loops, goes there and back ({{PING}}), moves in audible
@@ -650,7 +671,7 @@ unrelated pitches through band-pass filters, the classic drum-machine recipe; {{
 it for a closed hat, hold it (or give its step a longer {{LEN}}) for an open one.</p>""") + page_list(params, "Drum")
         + "<p>Types: " + " · ".join(f"<code>{c}</code>" for c in choices(params, "Drum", "DR 1", "TYPE"))
         + fmt(""" (FM kick, analog kick, modelled kick, noise snare, FM snare, clap, closed hat, open hat, cymbal, tom,
-rim, shaker, clave, sub-bass, kick machine).</p>
+rim, shaker, clave, sub-bass, kick machine, cymbal machine).</p>
 <p>The five sound cells act on every type. {{DEC}} is the length: a drum is a one-shot and rings for its {{DEC}}
 however short the pad press or the step ({{SUB}}, the bass note, is the exception: it sounds while held and fades
 over {{DEC}} afterwards). {{TONE}} is brightness in the way of each drum (Appendix A lists them). {{DRIV}} is
@@ -674,8 +695,46 @@ about 12 ms to a bright tick of about 1.5 ms.</li>
 <li>{{HOLD}}: time at full level before the decay starts, up to 0.3 s, for long, flat 808-style bodies.
 {{ACRV}}: the shape of the decay.</li>
 </ul>
-<p>Every one of these can be locked per step and given a pressure range, like any other cell. The other fourteen
+<p>Every one of these can be locked per step and given a pressure range, like any other cell. The other
 types are unchanged and ignore the {{KICK}} page.</p>
+<h3>The cymbal machine (CSYN)</h3>
+<p>Set a pad's {{TYPE}} to {{CSYN}} and it becomes a cymbal machine: cymbals, rides, bells, crashes and gongs from
+one voice, with a second page, {{CYM}}. On {{DRUMS}} press a knob-page button (the labels become
+{{MD PG CL NS DP BL VS LF}}); on {{PARAM}} it is the page after the pad's own. {{CYMB}}, the older cymbal type, is
+unchanged.</p>
+<p>{{MODL}} chooses the instrument. {{METL}} is the cymbal of the analog drum machines: six square oscillators at
+unrelated pitches through two band-pass filters, each band with its own decay. {{RING}} multiplies the oscillators
+in pairs for a denser, rougher metal. The other seven ({{RIDE}}, {{BELL}}, {{CRSH}}, {{CHNA}}, {{SPLS}}, {{GONG}},
+{{TAM}}) are built as a real cymbal is: forty-eight ringing modes, twelve of them the clear partials a stick brings
+out (the ping) and thirty-six a dense wash above them, every mode dying at its own speed, the high ones first. A
+stroke adds to what is still ringing, so a ride pattern builds its wash and no two strokes are quite alike.</p>
+<ul>
+<li>On the pad's first page: {{TUNE}} is the size of the instrument (8000 is the model's own pitch, lower is
+larger), {{DEC}} how long it rings, {{TONE}} how much top it has (50 = as it is), {{DRIV}} saturation, and {{SNAP}}
+what strikes it: a soft mallet at 0, a stick at 50, a hard tip with a loud tick at 100.</li>
+<li>{{PING}}: the ping against the wash. 0 is wash only, 50 both, 100 the partials alone.</li>
+<li>{{COLR}}: where the wash is strongest, dark to bright. {{NOIS}}: its texture, from pure ringing partials to a
+hiss.</li>
+<li>{{DAMP}}: how much sooner the highs die than the lows. {{BLOM}}: the highs arrive after the stroke, and louder,
+the harder the hit; on {{GONG}} and {{TAM}} this is the slow swell, and the pitch glides as it settles.</li>
+<li>{{VSNS}}: how much a harder hit is also brighter and longer. {{LOFI}}: the grain of an early sampled
+drum-machine cymbal.</li>
+</ul>
+<p>Letting the pad go does not stop a cymbal; another drum of its choke group does, as a hand would, and pad
+pressure on {{DEC}} lets it ring on. The cells are read at each stroke ({{LOFI}} and {{TONE}} at once) and can be
+locked per step and given a pressure range.</p>
+<p><b>Ready-made cymbals.</b> Two kits on {{PRESET}} ([[Shift]] + top pad 5, {{CT}} = KIT) hold ten settings to play
+and take apart. <i>Cymbal Works</i>: bottom pads 1 to 6 are an analog cymbal, a house ride, a ride, a ride bell, a
+crash and a china; top pads 5 to 8 a splash, a ring cymbal, a gong and a tam-tam. <i>House Kit</i> is a kit to play at
+once: kick machine on bottom pad 1, crash, house ride and ride bell on pads 2 to 4, snare, clap and hats on 5 to 8,
+an analog cymbal and a splash on top pads 7 and 8. A new project's own kit has the machine's crash and ride on top
+pads 7 and 8; the older cymbal type is still there to choose with {{TYPE}}.</p>
+<p><b>A house ride:</b> {{MODL}} {{RIDE}}, {{TUNE}} down to about 6400, {{SNAP}} 75 for the tick, {{PING}} 60,
+{{LOFI}} 45; shorten it with {{DEC}}, and for a drier one lower {{NOIS}}. <b>A crash:</b> {{MODL}} {{CRSH}}, {{DEC}}
+1.5 or more, {{PING}} 40, {{BLOM}} 50; play it hard, {{VSNS}} decides how much the velocity matters. <b>A ride
+bell:</b> {{MODL}} {{BELL}}, {{PING}} 80, {{NOIS}} 20. <b>A tam-tam:</b> {{MODL}} {{TAM}}, {{SNAP}} 15 (a mallet),
+{{BLOM}} 80, a long {{DEC}}: the low cluster sounds at once and the shimmer swells over the first second.
+<b>A gong:</b> {{MODL}} {{GONG}}, {{SNAP}} 20, {{BLOM}} 60 for the falling pitch; {{TUNE}} sets its note.</p>
 <h3>Playing the kit</h3>
 <p>The pads play the kit on {{DRUMS}} ([[Shift]] + bottom pad 2); on the other screens the pads do that screen's own
 job, unless {{DRUMS}} is pinned. The keys play the kit on every screen while a drum track is selected. From the
@@ -981,8 +1040,26 @@ A muted track keeps its place and comes back in time.</li>
 <p>{{SONG}} is an ordered list of rows, each a pattern, a repeat count and a transposition for pitched tracks. Switch
 {{SG}} on and [[Play]] follows the list; {{LP}} loops it.</p>""")),
         ("Clock", fmt("""
-<p>{{CLK}} on {{SETTINGS}} sets MIDI clock: {{INT}} (Neptune is the clock), {{EXT}} (follow incoming clock) or
-{{AUTO}}. {{LINK}} is listed for the future and does nothing yet.</p>""")),
+<p>{{CLK}} on {{SETTINGS}} sets MIDI clock: {{INT}} (Neptune is the clock and sends it), {{EXT}} (follow incoming
+clock) or {{AUTO}} (follow a clock while one comes in, be the clock when none does). {{LINK}} is listed for the
+future and does nothing yet.</p>
+<p>While Neptune follows, the other machine's Start and Stop start and stop the sequencer, its tempo is the tempo,
+and the sequencer is kept on its beat (it is pulled back gently, by 3 % of the tempo at most, so after a large
+tempo jump it can take some seconds to be exactly on the beat again). A start is always from the top of the
+pattern. [[Play]] still starts and stops by hand. In {{AUTO}}, when the clock goes away without a Stop the music
+carries on at the last tempo and Neptune sends clock again after a second.</p>""")),
+        ("With Ableton Live or another DAW", fmt("""
+<p><b>Tempo and transport from the DAW.</b> While the app runs, the Mac has a MIDI port called <i>Neptune Clock
+In</i>. In Live: Settings → Link, Tempo &amp; MIDI → under MIDI Ports find the output <i>Neptune Clock In</i> and
+switch <b>Sync</b> on. On the Launchkey set {{CLK}} to {{EXT}} or {{AUTO}}. Live's play and stop now start and stop
+Neptune and its tempo leads. If Neptune is early or late against Live, adjust the port's <i>MIDI Clock Sync
+Delay</i> in Live. Any other program that sends MIDI clock works the same way. The Launchkey's own ports are never
+taken as a clock.</p>
+<p><b>Neptune's sound in the DAW.</b> Neptune plays through the Mac's audio output. To record it on a track of the
+DAW, send that output into the DAW: with an audio interface, by cable; inside the Mac, with a loopback audio device
+(BlackHole and Loopback are two) chosen as Neptune's output and as the track's input. A plug-in build (AU and VST3)
+exists as an experiment only: it plays the starting synth sound from the DAW's notes and has neither the
+controller, the screens nor your project yet.</p>""")),
     ]))
 
     # =========================================================================================
@@ -1102,6 +1179,12 @@ tempo if you change it: a loop recorded at any speed locks to the sequencer. {{S
 grain of the stretch, and {{SPRD}} widens {{GRAN}} and {{SMER}}.</p>
 <p>The LFO destination {{SPD}} moves the speed by up to two octaves either way: tape-stop dives, or a stretch
 that breathes.</p>
+<p>A preset to learn granular playing from: <i>Abyss Drone</i> (PAD) reads the built-in cymbal two octaves down
+in {{GRAN}} mode - long grains ({{SIZE}} 0.35 s), about ten at a time ({{DENS}} 30), the read position creeping
+({{SCAN}} 0.05) through the cymbal's ring, every grain starting somewhere else ({{SPRY}}), half of them backwards
+({{RVRS}}), spread between the speakers ({{SPRD}}), under a low-pass that LFO 2 lets drift. Turn each of those
+cells towards its other end to hear what it contributes: short {{SIZE}} or low {{DENS}} breaks the drone into
+drops, {{SCAN}} at 1 plays the cymbal's own decay, {{SPRY}} at 0 makes it buzz on one spot.</p>
 <p>In {{GRAN}} play mode the grain page is in charge and {{ALGO}} is ignored, but {{SYNC}} still works: {{SCAN}} at
 1.00 then means the region lasts {{LEN}}.</p>""") + '<div class="shots">' + S.svg("PARAM sampler", 5, "Sampler, STRCH") + "</div>"),
         ("Granular", fmt("""
@@ -1143,24 +1226,40 @@ each need four clicks and answer OK or FAIL. {{AUTO}} keeps saving to the curren
 the last project when it starts, and on top of it everything exactly as it was when the app was last running, saved
 or not (the app notes its state when it quits and every 15 seconds). {{SAVE}} is still what writes a project slot;
 {{NEW}} or {{LOAD}} is the way to a different starting point.</p>
-<p>Not saved: an arp's mutation state, the temporary pattern copy, the clipboards, and the keyboard split.</p>""")),
+<p>A project also holds the keyboard: its split and the octave chosen with [[Oct−]] / [[Oct+]]; both are set again
+when it loads and when the app starts.</p>
+<p>Not saved: the notes an arp has mutated to (whether mutate is running is saved), the temporary pattern copy and
+the clipboards.</p>""")),
         ("Presets", fmt("""
 <p>A preset is one track's sound. The built-in ones are marked * in the list, among them a loop and a sliced preset
 for each of the sampler's drum breaks (chapter "Sampling, slicing and stretch"); yours are saved from {{PRESET}} with
 {{SV}} into <i>Music / Neptune / Presets</i>. Categories: BASS, PAD, LEAD, KEYS, FX, PERC, KIT, INIT.</p>
 <p><b>What {{SV}} saves:</b> the track's own sound, complete - every engine setting, the track's insert effects and
-their settings, the DIRT / TALK / MODFX blocks, the send levels, the volume, and the track's arpeggiator (all its
-settings, whether it is on, and its tapped rhythm). If a preset is being auditioned at
+their settings, the DIRT / TALK / MODFX blocks, the send levels, the volume, the track's arpeggiator (all its
+settings, whether it is on, its latch, whether mutate runs, and its tapped rhythm), and the keyboard: the split
+and the octave. If a preset is being auditioned at
 that moment, it is still your own sound that is saved, not the one you are listening to. A preset saved this way
-brings its effects and its arpeggiator with it when it is auditioned or loaded; the built-in presets have neither of
-their own and play through whatever effects and arp the track has.</p>
-<p><b>Naming:</b> {{SV}} saves at once as User 1, User 2 and so on, so nothing waits for the Mac. The Mac then shows
-a box asking for a name: type up to 15 characters on its keyboard and press Return, or press Escape to keep the User
-name. A name already in use is refused and the name bar says so.</p>""")),
+brings its effects, its arpeggiator and its keyboard with it when it is auditioned or loaded. A preset always
+replaces the track's effects: one that stores none (every built-in preset) leaves the track with no insert effects
+and the DIRT / TALK / MODFX blocks switched to their starting values, so nothing of the previous sound's effects
+is left; the track's volume, pan and sends stay unless the preset stores them. Leaving an audition without {{LD}}
+puts the track's own effects back. The built-in presets have no arp or keyboard of their own and leave those
+alone. Presets you saved before
+these were stored (effects and arp: 14 November 2026; latch and keyboard: after it) do not have them: load the
+preset, set things as you want them and save it again.</p>
+<p>The keyboard is one for all tracks, so a preset that stores it moves the keys for every track. While you audition,
+leaving puts your own split and octave back - unless you pressed [[Oct−]] / [[Oct+]] or changed the split yourself
+in the meantime: what you set by hand stays. The app learns of an octave press within two seconds (the buttons
+send nothing), so give it that long before saving.</p>
+<p><b>The save box:</b> {{SV}} saves at once as User 1, User 2 and so on, so nothing waits for the Mac. The Mac
+then shows a box with a name in it: the name of the preset of yours this track's sound was last loaded from or
+saved as, or else the User name. Return (Save) saves under the name shown or typed, up to 15 characters; if one
+of your presets already has that name, it is saved over. Escape (Cancel) takes the save back: nothing is kept. A
+built-in preset's name is refused (the name bar says NAME IN USE) and the preset stays under its User name.</p>""")),
         ("Keyboard split", fmt("""
 <p>[[Shift]] + [[Oct−]] drops the lowest twelve keys by one further octave, then two, then three, then back to
 normal; [[Shift]] + [[Oct+]] steps the other way. The name bar shows {{SPLIT -1 OCT}}. Plain [[Oct−]] / [[Oct+]]
-still shift the whole keyboard.</p>""")),
+still shift the whole keyboard. Split and octave are saved with projects and with your presets (see "Presets").</p>""")),
         ("Latency and headroom", fmt("""
 <p>Neptune adds about 1.3 ms of its own between a key and its sound. What you hear beyond that is the audio output:
 an interface or wired headphones add a few milliseconds, the Mac's built-in speakers about 19 ms.</p>
@@ -1245,7 +1344,7 @@ per meaning. Values shown as 0–100 are the display's scale.</p>""") + ctx["glo
         ("Trig conditions", "ALL PROB A:B FILL !FIL 1ST !1ST PRE !PRE"),
         ("Arp modes", "; ".join(arp_modes)),
         ("Arp rates", "1/1 1/2 1/4 1/4T 1/8 1/8T 1/16 1/16T 1/32 1/32T 1/64 1/64T (the knob runs slowest to fastest)"),
-        ("Roll divisions", "1/2 1/4 1/4T 1/8 1/8T 1/16 1/16T 1/32 1/32T 1/64 1/64T"),
+        ("Roll divisions", "1/2 1/4 1/4T 1/8 1/8T 1/16 1/16T 1/32 1/32T 1/64 1/64T 1/128"),
         ("Track speeds", "1/4 1/2 1x 2x 4x"),
         ("Scale pages (built in)", "Chrom Major Minor Penta Blues Whole Dorian Mixo HrMin mPent Phryg Lydia"),
         ("Preset categories", "ALL INIT BASS PAD LEAD KEYS FX PERC KIT"),

@@ -57,18 +57,22 @@ public:
         filter.setSampleRate(sr);
         lfos.setSampleRate(sr);
         declick.setSampleRate(sr);
+        levelStep = (float) (1.0 / (0.004 * sr));
     }
 
     void noteOn(int note, float velocity)
     {
         if (active)
             declick.arm();      // struck again while sounding: the phase restart must not jump
+        else
+            lfos.snapSlews();
         // An LFO on a page cell is read before the first sample (the engine sets the cell then).
         if (lfos.keyed()) lfos.noteOnAndSample(); else lfos.noteOn();
         filter.noteOn(note, velocity, active);
         for (auto& op : ops)
             op.noteOn(note, velocity);
         active = true;
+        struck = true;
     }
 
     void noteOff()
@@ -92,7 +96,8 @@ public:
 
     void setPitchMul(float m) { for (auto& op : ops) op.setPitchMul(m); }
     void setModSensitivity(float s) { for (auto& op : ops) op.setModSensitivity(s); }
-    void setGain(float g) { gain = g; }
+    void setGain(float g) { gain = g; }                 // pressure
+    void setLevel(float l) { level = l; }               // the engine's LEVL
 
     float process()
     {
@@ -191,7 +196,21 @@ public:
         if (!anyActive)
             active = false;
 
-        return filter.process(declick.process(output)) * gain * lfoGain;
+        // Pressure's share of the level and the LEVL cell are moved to over a few milliseconds
+        // under a sounding note (both arrive between blocks: a jump would be a click); the first
+        // sample of a note takes them as they stand.
+        if (struck)
+        {
+            struck = false;
+            gainNow = gain;
+            levelNow = level;
+        }
+        else
+        {
+            if (gainNow != gain)   gainNow = dsp::towards(gainNow, gain, 2.0f * levelStep);
+            if (levelNow != level) levelNow = dsp::towards(levelNow, level, levelStep);
+        }
+        return filter.process(declick.process(output)) * gainNow * lfoGain * levelNow;
     }
 
     void reset()
@@ -225,8 +244,8 @@ private:
 
         filter.setLfoOctaves(lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES);
         filter.setResonanceMod(lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE);
-        lfoGain = std::clamp(1.0f + lfos.amount(LfoAmp), 0.0f, 2.0f);
-        lfoPan = std::clamp(lfos.amount(LfoPan), -1.0f, 1.0f);
+        lfoGain = lfos.gain(LfoAmp);
+        lfoPan = std::clamp(lfos.panAmount(LfoPan), -1.0f, 1.0f);
     }
 
     void clearLfos()
@@ -238,6 +257,7 @@ private:
         lfoGain = 1.0f;
         lfoPan = 0.0f;
         lfoApplied = false;
+        lfos.snapSlews();
     }
 
     std::array<FMOperator, NUM_OPS> ops;
@@ -249,5 +269,7 @@ private:
     dsp::Declick declick;    // on the operators' sum, before the filter (whose state smears a jump)
     Algorithm algorithm = Algorithm::Algo1;
     bool active = false;
-    float gain = 1.0f;
+    float gain = 1.0f, level = 1.0f;
+    float gainNow = 1.0f, levelNow = 1.0f, levelStep = 0.005f;
+    bool struck = true;
 };

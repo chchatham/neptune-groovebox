@@ -1,6 +1,6 @@
 # Firmware Specification — Neptune Groovebox
 
-Current build: **NPE**. Verified map: `docs/launchkey-mk4-firmware-map.md` section 0. Constraints: `docs/launchkey-mk4-firmware-rules.md`.
+Current build: **NPF** (flashed 2026-11-14; rollback `firmware/neptune-fw-NPE.syx`). Verified map: `docs/launchkey-mk4-firmware-map.md` section 0. Constraints: `docs/launchkey-mk4-firmware-rules.md`.
 All addresses below are **file offsets** into the stock image (true VMA = file offset + 0x08008000).
 
 ## Purpose
@@ -37,7 +37,7 @@ ioreg -l -w0 | grep kUSBString        # the HID interface string must end with t
 - `43 00` is not part of the procedure and no longer exists in NP5+.
 - Wait ~12 s after a flash before running other MIDI tools.
 
-## Patches in NPE
+## Patches in NPF (the first table is NPE; NPF adds the one patch below it)
 | File offset | Change | Effect |
 |---|---|---|
 | 0xB16A | "HID" → 3-character tag | build id readable from the host (USB HID interface string) |
@@ -54,6 +54,13 @@ ioreg -l -w0 | grep kUSBString        # the HID interface string must end with t
 | 0x1A80C, 0xE0AC, 0x1A808, 0x1A862 | `pad_value` pressure listener (chains to stock 0xDE74), `pad_release` | pressure rainbow on held pads; host colour restored on release |
 | 0x10D6A | `bl 0x10786` → `movs r0,#1; nop` | **early display ready reply** (NPE): the reply is sent on the main-loop pass after a frame is latched, not after the push to the OLED; the host streams the next frame meanwhile |
 | 0x1053A | `cbnz r0,0x10556` → `b 0x10556` | **no pop-up redraws** (NPE): the layer check never accepts layer 1, so encoder / control pop-ups no longer force a redraw of the host frame |
+
+**NPF — flashed 2026-11-14, running** (`firmware/neptune-fw-NPF.syx`; NPE + this one patch):
+| File offset | Change | Effect |
+|---|---|---|
+| 0x18F14 | `cbz r0,0x18F2E` → `b 0x18F2E` (`58 b1` → `0b e0`) | **Shift + encoder turn reaches the host**: the encoder input layer no longer replaces the step count with 0 while Shift is held, so CC 0x55–0x5C are sent with Shift down (firmware map 0.7, "Encoder path and the Shift gate") |
+
+NPF on the device, 2026-11-14: verified flash (6038 acks, `73 7F 7F 7F`, USB string ends `NPF`; `0b e0` read back from flash at 0x08020F14). **Verified with the firmware's input simulation, same test on NPE just before the flash and on NPF after it:** with Shift held (Shift state byte 0x2000F506 = 1, `B6 3F 7F` sent), simulated turns of each of the eight encoders gave no message on NPE and `BF 55`–`BF 5C` with `41` (one way) and `3F` (the other) on NPF, all before `B6 3F 00`. Unchanged on NPF (same results as NPE): DAW mode (pad layout 2), relative encoders without Shift, display frame latched and read back with its ready reply (44–48 ms), debug SysEx, Shift alone = `B6 3F 7F` / `00`, pad note + polyphonic aftertouch with and without Shift, Oct ± (octave word), Shift + Oct ± (transpose word 0x2000F444 0 → 1 → 0), a key's note on the MIDI port. **Not yet done by hand:** a real Shift + knob turn (the app's log shows `[Encoder n]` lines between `[Shift DOWN]` and `[Shift UP]`), and pad colours by eye (sent and accepted; the camera did not see the device).
 
 Full detail (stock bytes, sizes, verification evidence) is in `docs/launchkey-mk4-firmware-map.md` section 0.8 and in the build script.
 

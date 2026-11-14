@@ -26,7 +26,7 @@ A macOS standalone application (C++ with JUCE) that turns a Novation Launchkey M
 ## Architecture
 
 Most classes are header-only; the only `.cpp` files are `main.cpp`, `DisplayRenderer`, `LaunchkeyController`,
-`PadManager`, `VoiceAllocator`, `SequencerCore` and `ScreenManager`. Exact list: `find src -type f`.
+`PadManager`, `VoiceAllocator`, `SequencerCore`, `ScreenManager` and the plug-in's `PluginProcessor`. Exact list: `find src -type f`.
 
 ```
 src/
@@ -38,7 +38,8 @@ src/
 │   ├── DisplayRenderer     — 128x64 1-bit rendering, ack-paced SysEx frames
 │   ├── CustomScaleManager.h — custom scale pad pages
 │   ├── ChordPads.h         — chords stored on pads (the CHORD screen), their names, their place in a project
-│   ├── KeyboardSplit.h     — Shift + Oct key split, through the firmware's debug command
+│   ├── KeyboardSplit.h     — Shift + Oct key split and the octave (read, and set from presets / projects), through
+│   │                         the firmware's debug command
 │   └── BitmapBenchmark.h   — frame-rate benchmark (never run on hardware)
 ├── sequencer/
 │   ├── SequencerCore       — sample-accurate clock, pattern bank, trig conditions, recording, pressure lanes, mute/solo
@@ -58,6 +59,7 @@ src/
 │   ├── Resampler.h         — records a track or the master into a new sample
 │   ├── Metronome.h         — the recording click and count-in tick (mixed after the master chain)
 │   ├── DrumEngine.h, DrumVoice.h, DrumLane.h — drum kit; one drum's hits among a step's notes (STEP's drum lanes)
+│   ├── CymbalMachine.h     — the cymbal machine (drum type CSYN): oscillator bank or 48 ringing modes; its CYM page
 │   ├── MIDITrack.h         — external MIDI output track
 │   ├── VoiceFilterSection.h, EngineLfoSection.h — per-voice filter; two LFOs, their destination lists and the
 │   │                         STRIP page, shared by the non-unified engines
@@ -92,9 +94,13 @@ src/
 ├── project/
 │   ├── Project.h, ProjectManager.h, ProjectBridge.h — project files; capture / apply of the whole live state
 │   ├── Preset.h, PresetManager.h, FactoryPresets.h — sound presets
+│   ├── CymbalPresets.h     — the cymbal machine's ten ready-made sounds and the two factory kits made of them
 │   ├── UndoHistory.h       — 15 levels of undo / redo; ScreenManager fills and applies it
 │   └── DrumKit.h, KitPreset.h, SamplePool.h — KitPreset, SamplePool not used by the app yet
-└── sync/                   — MIDIClock.h (clock out; no clock input is wired); AbletonLink.h (wrapper, no library)
+├── sync/                   — MIDIClock.h (clock out; external clock measured, followed by `AudioEngine::followExternalClock`);
+│                             MIDIRouter.h (the virtual port "Neptune Clock In"); AbletonLink.h (wrapper, no library)
+└── plugin/                 — PluginProcessor: AU / VST3 target `NeptunePlugin`, a bare shell (default synths, host
+                              notes and tempo; no controller, screens or project)
 ```
 
 Tests: `tests/main_test.cpp` plus `tests/*_tests.h` (JUCE unit tests, one console binary). Firmware patches:
@@ -102,20 +108,23 @@ Tests: `tests/main_test.cpp` plus `tests/*_tests.h` (JUCE unit tests, one consol
 
 ## Key Interfaces
 
-### Controller → App (MIDI In) — Neptune firmware NPE; full map in `docs/launchkey-mk4-control-map.md`
+### Controller → App (MIDI In) — Neptune firmware NPF; full map in `docs/launchkey-mk4-control-map.md`
 - DAW port — pads: Note On/Off channel 1 (notes 96–103 top row, 112–119 bottom row), velocity + polyphonic aftertouch (status A0h; needs feature 0x6C = 2)
 - DAW port — encoders: 8 endless rotaries, relative, CC 0x55–0x5C channel 16, value 64 ± steps (needs feature 0x45 = 127); the app translates them to its internal CC 0x15–0x1C step format
 - DAW port — buttons: Shift CC 63 ch7; Settings CC 108, Arp CC 109, Scale CC 110 on ch1 (127 press / 0 release); Func CC 105; button right of top pad row CC 104; Up/Down CC 106/107 (CC 102/103 with Shift); encoder-bank up/down CC 51/52; Play CC 115; Record CC 117
 - MIDI port — keys: Note On/Off (notes 48–72 at octave 0), velocity, on the channel set by feature 0x64 (the app sets channel 1); pitch strip: pitch bend; mod strip: CC 1
 - Octave up/down is handled inside the firmware and sends nothing
 - SysEx: ready-for-next-frame acknowledgement
-- Clock and transport messages from the controller's ports are ignored
+- Clock and transport messages from the controller's ports are ignored; MIDI clock for CLK EXT / AUTO comes in on
+  the app's own virtual port "Neptune Clock In"
 
 ### App → Controller (MIDI Out / SysEx)
 - Pad LED colors: per-pad RGB via SysEx
 - OLED display: 1,216-byte bitmap SysEx (19 bytes × 64 rows, 7 pixels per byte) to the stationary target (the firmware never draws over it)
 - Feature controls (CC on channel 7, DAW port): 0x45 relative encoders, 0x64 keys channel, 0x6C pad aftertouch, 0x6E = 0 device MIDI clock output off, 0x1D pad layout, 0x1E encoder layout
 - SysEx: DAW mode negotiation
+- Debug SysEx (MIDI port): keyboard split and octave (`KeyboardSplit.h`), the lights of Up / Down / > / Func
+  (`LaunchkeyController::illuminateNavigationButtons`)
 
 ### Step Data Model (`src/sequencer/Step.h`)
 ```
@@ -158,7 +167,7 @@ Arpeggiator settings live in the per-track `Arpeggiator` objects, insert chains 
 - **Language:** C++17
 - **Framework:** JUCE 9.0.5, fetched by CMake (standalone app target, later AU/VST3)
 - **Platform:** macOS (Apple Silicon + Intel)
-- **Controller:** Novation Launchkey Mini 25 MK4, USB-C, bus powered, running Neptune firmware NPE
+- **Controller:** Novation Launchkey Mini 25 MK4, USB-C, bus powered, running Neptune firmware NPF
 - **Build:** `cmake --build build` is Debug, for the tests. The app runs from the optimised build: `cmake --build build-release` → `build-release/NeptuneGroovebox_artefacts/Release/Neptune Groovebox.app`
 - **Test commands:** `cmake --build build --target NeptuneTests && (cd build && ctest)` (binary `build/NeptuneTests_artefacts/Debug/NeptuneTests`)
 - **Everything else** (lag pass, manual build, screen dump, bench): `.ralph/progress.md` → How to run

@@ -133,6 +133,29 @@ void LaunchkeyController::disableFirmwareScale()
     juce::Logger::writeToLog("[LK] Firmware scale mode disabled");
 }
 
+void LaunchkeyController::setButtonLED(int controlId, int r, int g, int b)
+{
+    if (!midiOutput) return;
+    juce::uint32 color = ((juce::uint32)(r & 0xFF) << 16)
+                       | ((juce::uint32)(g & 0xFF) << 8)
+                       | (juce::uint32)(b & 0xFF);
+    // Build the debug SysEx: call led_set(controlId, color) on the MIDI port.
+    // Format: 00 20 29 00 7D <addr:5><a0:5><a1:5> (5×7-bit encoding, MSB first; addr with Thumb bit).
+    std::vector<juce::uint8> body { 0x00, 0x20, 0x29, 0x00, 0x7D };
+    for (juce::uint32 v : { FW_LED_SET | 1u, (juce::uint32) controlId, color })
+        for (int s = 28; s >= 0; s -= 7)
+            body.push_back((juce::uint8) ((v >> s) & 0x7F));
+    const juce::ScopedLock sl(midiLock);
+    midiOutput->sendMessageNow(juce::MidiMessage::createSysExMessage(body.data(), (int) body.size()));
+}
+
+void LaunchkeyController::illuminateNavigationButtons()
+{
+    for (int id : { BTN_UP, BTN_DOWN, BTN_PATTERN, BTN_FUNC })
+        setButtonLED(id, 63, 63, 63);
+    juce::Logger::writeToLog("[LK] Navigation button LEDs illuminated");
+}
+
 void LaunchkeyController::setPadColor(int padIndex, int paletteColor)
 {
     if (!dawOutput)

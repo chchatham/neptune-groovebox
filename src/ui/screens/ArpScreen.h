@@ -562,7 +562,7 @@ private:
             cells[2] = cell({ "BASE", 0, 0, lastDiv, 3, C, "", PadRatchet::getDivisionNames(), PadRatchet::getNumDivisions() },
                             [this] { return (float) (int) ratchet->getBaseDivision(); },
                             [this](float v) { ratchet->setBaseDivision((PadRatchet::Division) (int) v); });
-            cells[3] = cell({ "MAX", 0, 0, lastDiv, 7, C, "", PadRatchet::getDivisionNames(), PadRatchet::getNumDivisions() },
+            cells[3] = cell({ "MAX", 0, 0, lastDiv, (float) (int) PadRatchet::Div1_128, C, "", PadRatchet::getDivisionNames(), PadRatchet::getNumDivisions() },
                             [this] { return (float) (int) ratchet->getMaxDivision(); },
                             [this](float v) { ratchet->setMaxDivision((PadRatchet::Division) (int) v); });
         }

@@ -3,6 +3,7 @@
 #include "EngineBase.h"
 #include "DrumVoice.h"
 #include "../project/DrumKit.h"
+#include "../project/CymbalPresets.h"
 #include <array>
 #include <atomic>
 
@@ -84,6 +85,7 @@ public:
     void prepareToPlay(double sampleRate, int /*samplesPerBlock*/) override
     {
         sr = sampleRate;
+        panStep = (float) (1.0 / (0.004 * std::max(sampleRate, 1.0)));
         for (auto& v : voices)
             v.setSampleRate(sampleRate);
     }
@@ -111,8 +113,15 @@ public:
                 pan = std::clamp(pan, 0.0f, 1.0f);
                 // Constant-power pan (-3 dB at centre). The earlier linear law put a centred voice
                 // 6 dB down on each side, which left the whole kit far below the synth tracks.
-                float left = sample * std::sqrt(1.0f - pan);
-                float right = sample * std::sqrt(pan);
+                // The two gains are moved to over at most 4 ms where the pan is set under a
+                // ringing drum (a step lock, pad pressure, an LFO's edge); a hit takes them as
+                // they stand.
+                const float gainL = std::sqrt(1.0f - pan), gainR = std::sqrt(pan);
+                panGainL[v] = panStruck[v] ? gainL : dsp::towards(panGainL[v], gainL, panStep);
+                panGainR[v] = panStruck[v] ? gainR : dsp::towards(panGainR[v], gainR, panStep);
+                panStruck[v] = false;
+                float left = sample * panGainL[v];
+                float right = sample * panGainR[v];
                 mixL += left;
                 mixR += right;
             }
@@ -136,6 +145,7 @@ public:
 
         applyChokeGroups(vi);
         voices[vi].noteOn(velocity);
+        panStruck[(size_t) vi] = true;
     }
 
     void noteOff(int note, int /*voiceIndex*/ = -1) override
@@ -153,6 +163,7 @@ public:
 
     void allNotesOff() override
     {
+        soundCut();
         for (int i = 0; i < NUM_VOICES; ++i)
         {
             voices[i].reset();
@@ -211,6 +222,18 @@ public:
             return;
         }
 
+        // The cymbal-machine page of each pad (ids 528-655).
+        if (isCymbalParam(id))
+        {
+            const int voice = (id - CYMBAL_BASE) / CymbalMachine::NumParams, param = (id - CYMBAL_BASE) % CymbalMachine::NumParams;
+            value = cymbalSpec(voice, param).clamp(value);
+            if (param == CymbalMachine::ParModel)
+                value = (float) std::lround(value);
+            voices[voice].setCymbalParam(param, value);
+            cymbalValues[(size_t) (id - CYMBAL_BASE)] = value;
+            return;
+        }
+
         int voiceIdx = id / PARAMS_PER_VOICE;
         int param = id % PARAMS_PER_VOICE;
         if (voiceIdx < 0 || voiceIdx >= NUM_VOICES) return;
@@ -227,6 +250,8 @@ public:
             case PAN:   value = std::clamp(value, 0.0f, 1.0f); voicePan[voiceIdx] = value; break;
             case TYPE:
                 value = (float) std::clamp((int) std::lround(value), 0, NUM_DRUM_TYPES - 1);
+                if (v.isActive() && v.getType() != static_cast<DrumSynthType>((int) value))
+                    soundSwapped();     // another drum takes over a hit that is ringing
                 v.setType(static_cast<DrumSynthType>((int) value));
                 break;
         }
@@ -242,6 +267,8 @@ public:
             return paramValues[(size_t) id];
         if (isKickParam(id))
             return kickValues[(size_t) (id - KICK_BASE)];
+        if (isCymbalParam(id))
+            return cymbalValues[(size_t) (id - CYMBAL_BASE)];
         return 0.0f;
     }
 
@@ -269,7 +296,7 @@ public:
         return k < 8 ? k + 8 : k - 8;
     }
 
-    static constexpr int NUM_DRUM_TYPES = 15;
+    static constexpr int NUM_DRUM_TYPES = 16;
 
     // ---- The kick machine's page (type KSYN): eight more cells per pad, ids 400 + pad * 8 + n ------
     static constexpr int KICK_BASE = EngineParamRange::THIRD_BASE;
@@ -316,6 +343,46 @@ public:
         return list;
     }
 
+    // ---- The cymbal machine's page (type CSYN): eight more cells per pad, ids 528 + pad * 8 + n ----
+    static constexpr int CYMBAL_BASE = KICK_BASE + NUM_VOICES * DrumVoice::NumKickParams;
+    static bool isCymbalParam(int id) { return id >= CYMBAL_BASE && id < CYMBAL_BASE + NUM_VOICES * CymbalMachine::NumParams; }
+
+    static ParamSpec cymbalSpec(int voice, int param)
+    {
+        auto L = ParamKind::Linear; auto C = ParamKind::Choice;
+        const int b = CYMBAL_BASE + voice * CymbalMachine::NumParams;
+        const float d = CymbalMachine::paramDefault(param);
+        switch (param)
+        {
+            case CymbalMachine::ParModel:   return { "MODL", b + param, 0, CymbalMachine::NumModels - 1, d, C, "", CymbalMachine::modelNames(), CymbalMachine::NumModels };
+            case CymbalMachine::ParPing:    return { "PING", b + param, 0, 1, d, L };
+            case CymbalMachine::ParColour:  return { "COLR", b + param, 0, 1, d, L };
+            case CymbalMachine::ParNoise:   return { "NOIS", b + param, 0, 1, d, L };
+            case CymbalMachine::ParDamp:    return { "DAMP", b + param, 0, 1, d, L };
+            case CymbalMachine::ParBloom:   return { "BLOM", b + param, 0, 1, d, L };
+            case CymbalMachine::ParVelSens: return { "VSNS", b + param, 0, 1, d, L };
+            default:                        return { "LOFI", b + param, 0, 1, d, L };
+        }
+    }
+
+    static ParamPage cymbalPage(int voice)
+    {
+        ParamPage p;
+        p.name = "CYM";
+        p.section = "CYM";
+        for (int n = 0; n < CymbalMachine::NumParams; ++n)
+            p.params[(size_t) n] = cymbalSpec(voice, n);
+        return p;
+    }
+
+    bool isCymbalMachine(int voice) const
+    {
+        return voice >= 0 && voice < NUM_VOICES && voices[voice].getType() == DrumSynthType::CymbalSynth;
+    }
+
+    // The pages each pad has in getParamPages(): its DR page, its KICK page, its CYM page.
+    static constexpr int PAGES_PER_PAD = 3;
+
     static ParamPage kickPage(int voice)
     {
         ParamPage p;
@@ -334,7 +401,7 @@ public:
     static const char* const* typeNames()
     {
         static const char* const names[NUM_DRUM_TYPES] = {
-            "FMKK", "KICK", "MKIK", "SNAR", "FMSN", "CLAP", "HAT", "OHAT", "CYMB", "TOM", "RIM", "SHKR", "CLAV", "SUB", "KSYN" };
+            "FMKK", "KICK", "MKIK", "SNAR", "FMSN", "CLAP", "HAT", "OHAT", "CYMB", "TOM", "RIM", "SHKR", "CLAV", "SUB", "KSYN", "CSYN" };
         return names;
     }
 
@@ -369,6 +436,9 @@ public:
         // for the others). The two LFO pages stay last, as on every engine.
         for (int v = 0; v < NUM_VOICES; ++v)
             out.push_back(kickPage(v));
+        // And every pad's cymbal-machine page (TYPE CSYN), in the same way.
+        for (int v = 0; v < NUM_VOICES; ++v)
+            out.push_back(cymbalPage(v));
         lfoSection.appendPages(out);
         return out;
     }
@@ -487,6 +557,7 @@ public:
             case DrumSynthType::Clave:         return "CL";
             case DrumSynthType::SubBass:       return "SB";
             case DrumSynthType::KickSynth:     return "KS";
+            case DrumSynthType::CymbalSynth:   return "CS";
         }
         return "--";
     }
@@ -501,9 +572,17 @@ private:
         for (size_t i = 0; i < a.size(); ++i) a[i] = DrumVoice::kickDefault((int) (i % DrumVoice::NumKickParams));
         return a;
     }();
+    std::array<float, NUM_VOICES * CymbalMachine::NumParams> cymbalValues = [] {
+        std::array<float, NUM_VOICES * CymbalMachine::NumParams> a {};
+        for (size_t i = 0; i < a.size(); ++i) a[i] = CymbalMachine::paramDefault((int) (i % CymbalMachine::NumParams));
+        return a;
+    }();
     int selectedVoice = 8;      // the first pad of the bottom row, as on DRUMS
     float wheel = 0.0f;         // the mod strip as sent
     std::array<float, NUM_VOICES> voicePanAT;  // aftertouch pan modulation
+    std::array<float, NUM_VOICES> panGainL {}, panGainR {};    // the pan as it is heard (processBlock)
+    std::array<bool, NUM_VOICES> panStruck {};
+    float panStep = 0.005f;
     std::array<int, NUM_VOICES> chokeGroups;
     PadMapping mapping;
     DrumKit currentKit;
@@ -521,6 +600,15 @@ private:
             if (i != triggeringVoice && chokeGroups[i] == group && voices[i].isActive())
                 voices[i].choke();
         }
+    }
+
+    // A pad as one of the cymbal machine's ready settings: its own page and its CYM page.
+    void configureCymbal(int index, const CymbalPresets::Sound& s, float pan)
+    {
+        configureVoice(index, { DrumSynthType::CymbalSynth, s.tune, s.decay, s.tone, s.drive, s.snap, s.level }, pan);
+        const float cym[CymbalMachine::NumParams] = { (float) s.model, s.ping, s.colour, s.noise, s.damp, s.bloom, s.velSens, s.lofi };
+        for (int p = 0; p < CymbalMachine::NumParams; ++p)
+            setParameter(CYMBAL_BASE + index * CymbalMachine::NumParams + p, cym[p]);
     }
 
     void configureVoice(int index, const DrumKitVoiceConfig& cfg, float pan = 0.5f, int choke = 0)
@@ -585,9 +673,10 @@ private:
         configureVoice(4, { DrumSynthType::SubBass, 49.00f, 0.1f, 0.0f, 0.0f, 0.5f, 0.85f }, 0.55f);
         configureVoice(5, { DrumSynthType::SubBass, 58.27f, 0.1f, 0.0f, 0.0f, 0.5f, 0.85f }, 0.55f);
 
-        // Top row pads 6-7: Cymbals
-        configureVoice(6, { DrumSynthType::Cymbal, 7000.0f, 1.0f, 0.6f, 0.0f, 0.5f, 0.3f }, 0.35f);
-        configureVoice(7, { DrumSynthType::Cymbal, 9000.0f, 1.5f, 0.7f, 0.0f, 0.5f, 0.3f }, 0.65f);
+        // Top row pads 6-7: the cymbal machine's crash and ride (owner, 2026-11-14; before, two
+        // of the older CYMB type at TUNE 7000 and 9000).
+        configureCymbal(6, CymbalPresets::crash, 0.35f);
+        configureCymbal(7, CymbalPresets::ride, 0.65f);
 
         // Bottom row pads 8-10: Three kicks
         // The lower left pad is the kick machine (its KICK page starts from DrumVoice::kickDefault).

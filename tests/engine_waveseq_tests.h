@@ -52,7 +52,9 @@ public:
             };
 
             float uniformPattern = renderWithLaneLengths(4, 4);
-            float polymetricPattern = renderWithLaneLengths(4, 2);
+            // (A pitch lane of 3, not 2: the steps alternate, so a lane of 2 plays the very notes a
+            // lane of 4 does. The suite was never registered, so this was never seen. 2026-11-14)
+            float polymetricPattern = renderWithLaneLengths(4, 3);
             expect(std::abs(uniformPattern - polymetricPattern) > 0.01f,
                    "Different pitch lane length should produce a different pattern");
         }
@@ -291,7 +293,9 @@ public:
             expectEquals(engine.getParameterName(WaveSeqEngine::EnvChainMode), juce::String("Env Chain"));
             expectEquals(engine.getParameterName(WaveSeqEngine::EnvChainStages), juce::String("Chain Stg"));
             expectEquals(engine.getParameterName(WaveSeqEngine::EnvChainCombine), juce::String("Chain Comb"));
-            expectEquals(engine.getParameterCount(), 16);
+            expectEquals(engine.getParameterCount(), 96);      // (16 when this was written; the suite was never run)
         }
     }
 };
+
+static WaveSeqExtendedTests waveSeqExtendedTests;

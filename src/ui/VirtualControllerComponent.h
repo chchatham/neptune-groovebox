@@ -791,6 +791,7 @@ private:
     }
 
     // A low rubber cap: a faint bevel, sunk a little when down; its backlight shows through while it is held.
+    // Button labels are drawn on the cap face: text for most, icons for Play and Record.
     void drawButton(juce::Graphics& g, const Element& el, int idx, bool down, bool held, bool hovered) const
     {
         auto b = el.bounds;
@@ -803,7 +804,6 @@ private:
 
         if (held)
         {
-            // light from under the cap, in the overlay's colour for that modifier
             const juce::Colour light = idx == shiftIdx ? PanelOverlay::SHIFT : idx == funcIdx ? PanelOverlay::FUNC : juce::Colour(0xFFF4F1EA);
             juce::Graphics::ScopedSaveState save(g);
             juce::Path cap;
@@ -834,10 +834,113 @@ private:
             g.setGradientFill(juce::ColourGradient(black(0.0f), 0.0f, b.getCentreY(), black(0.30f), 0.0f, b.getBottom(), false));
             g.drawRoundedRectangle(b.reduced(0.5f), CAP_RADIUS, 1.0f);
         }
+
+        drawButtonLabel(g, el, idx, b, down, held);
+    }
+
+    // The label or icon printed on a button cap.
+    void drawButtonLabel(juce::Graphics& g, const Element& el, int idx,
+                         juce::Rectangle<float> b, bool down, bool held) const
+    {
+        const float labelAlpha = held ? 1.0f : (down ? 0.6f : 0.72f);
+
+        if (el.label == "Play")
+        {
+            const float sz = juce::jmin(b.getWidth(), b.getHeight()) * 0.38f;
+            const float cx = b.getCentreX() + sz * 0.06f, cy = b.getCentreY();
+            juce::Path tri;
+            tri.addTriangle(cx - sz * 0.36f, cy - sz * 0.44f,
+                            cx + sz * 0.46f, cy,
+                            cx - sz * 0.36f, cy + sz * 0.44f);
+            g.setColour(white(labelAlpha));
+            g.fillPath(tri);
+            return;
+        }
+        if (el.label == "Rec")
+        {
+            const float sz = juce::jmin(b.getWidth(), b.getHeight()) * 0.38f;
+            g.setColour(juce::Colour(0xFFE04040).withAlpha(labelAlpha));
+            g.fillEllipse(b.getCentreX() - sz * 0.42f, b.getCentreY() - sz * 0.42f, sz * 0.84f, sz * 0.84f);
+            return;
+        }
+
+        // Up / Down arrows get chevrons instead of text
+        if (el.label == "Up" || el.label == "Down")
+        {
+            const float cx = b.getCentreX(), cy = b.getCentreY();
+            const float sz = juce::jmin(b.getWidth(), b.getHeight()) * 0.30f;
+            const int dir = el.label == "Up" ? -1 : 1;
+            juce::Path chev;
+            chev.startNewSubPath(cx - sz, cy + dir * sz * 0.5f);
+            chev.lineTo(cx, cy - dir * sz * 0.5f);
+            chev.lineTo(cx + sz, cy + dir * sz * 0.5f);
+            g.setColour(white(labelAlpha));
+            g.strokePath(chev, juce::PathStrokeType(1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            return;
+        }
+
+        // Bank Up / Bank Down: small chevrons
+        if (el.label == "Bank Up" || el.label == "Bank Down")
+        {
+            const float cx = b.getCentreX(), cy = b.getCentreY();
+            const float sz = juce::jmin(b.getWidth(), b.getHeight()) * 0.22f;
+            const int dir = el.label == "Bank Up" ? -1 : 1;
+            juce::Path chev;
+            chev.startNewSubPath(cx - sz, cy + dir * sz * 0.5f);
+            chev.lineTo(cx, cy - dir * sz * 0.5f);
+            chev.lineTo(cx + sz, cy + dir * sz * 0.5f);
+            g.setColour(white(labelAlpha * 0.65f));
+            g.strokePath(chev, juce::PathStrokeType(1.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            return;
+        }
+
+        // Pattern key (>): a right-pointing chevron
+        if (el.label == "Pattern")
+        {
+            const float cx = b.getCentreX(), cy = b.getCentreY();
+            const float sz = juce::jmin(b.getWidth(), b.getHeight()) * 0.26f;
+            juce::Path chev;
+            chev.startNewSubPath(cx - sz * 0.5f, cy - sz);
+            chev.lineTo(cx + sz * 0.5f, cy);
+            chev.lineTo(cx - sz * 0.5f, cy + sz);
+            g.setColour(white(labelAlpha));
+            g.strokePath(chev, juce::PathStrokeType(1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            return;
+        }
+
+        // Text label for everything else
+        juce::String text = el.label;
+        if (text == "Oct -") text = "OCT-";
+        else if (text == "Oct +") text = "OCT+";
+        else text = text.toUpperCase();
+
+        const bool isTall = b.getHeight() > b.getWidth() * 1.3f;
+        const float fontSize = isTall ? juce::jmin(b.getWidth() * 0.52f, 9.0f) : juce::jmin(b.getHeight() * 0.38f, 9.0f);
+        const juce::Font font(juce::FontOptions(buttonFontName(), "Bold", 12.0f).withPointHeight(fontSize));
+        const juce::Colour labelCol = (idx == shiftIdx && held) ? PanelOverlay::SHIFT
+                                    : (idx == funcIdx && held)  ? PanelOverlay::FUNC
+                                    : white(labelAlpha);
+        g.setColour(labelCol);
+        g.setFont(font);
+        g.drawText(text, b.reduced(1.0f), juce::Justification::centred, false);
+    }
+
+    static const juce::String& buttonFontName()
+    {
+        static const juce::String name = []
+        {
+            const auto installed = juce::Font::findAllTypefaceNames();
+            for (const char* n : { "DIN Condensed", "Avenir Next Condensed", "Arial Narrow", "Helvetica Neue" })
+                if (installed.contains(n))
+                    return juce::String(n);
+            return juce::Font::getDefaultSansSerifFontName();
+        }();
+        return name;
     }
 
     // A pad of milky silicone over an LED: unlit it is grey rubber; lit, the colour comes up through it,
-    // brightest over the lamp, and spills a little onto the panel. Pressed, it sinks.
+    // brightest over the lamp, and spills a little onto the panel. Pressed, it sinks and brightens;
+    // an unlit pressed pad gets a white flash so the press is always visible.
     void drawPad(juce::Graphics& g, const Element& el, bool down, bool held, bool hovered) const
     {
         int padIdx = -1;
@@ -847,12 +950,19 @@ private:
 
         const int peak = juce::jmax(pc.r, pc.g, pc.b);
         const float level = (float) peak / 255.0f;
-        const float glow = peak > 0 ? std::pow(level, 0.68f) : 0.0f;          // dim LEDs still read as lit
+        const float glow = peak > 0 ? std::pow(level, 0.68f) : 0.0f;
         const juce::Colour hue = peak > 0 ? juce::Colour((juce::uint8) (pc.r * 255 / peak), (juce::uint8) (pc.g * 255 / peak), (juce::uint8) (pc.b * 255 / peak))
                                           : juce::Colours::black;
 
         auto b = el.bounds;
-        if (glow > 0.02f && ! down)
+        // pressed pad: brighter halo
+        if (down && glow > 0.02f)
+            for (int i = 1; i <= 5; ++i)
+            {
+                g.setColour(hue.withAlpha(glow * 0.30f / (float) i));
+                g.drawRoundedRectangle(b.expanded((float) i * 2.0f - 0.4f), CAP_RADIUS + (float) i * 2.0f, 2.2f);
+            }
+        else if (glow > 0.02f && ! down)
             for (int i = 1; i <= 4; ++i)
             {
                 g.setColour(hue.withAlpha(glow * 0.20f / (float) i));
@@ -883,6 +993,15 @@ private:
                 g.setGradientFill(lamp);
                 g.fillRect(b);
             }
+            // unlit pad pressed: a white flash so the press is always visible
+            if (down && glow < 0.05f)
+            {
+                const float reach = b.getWidth() * 0.70f;
+                juce::ColourGradient flash(white(0.28f), b.getCentreX(), b.getCentreY(),
+                                           white(0.06f), b.getCentreX() + reach, b.getCentreY(), true);
+                g.setGradientFill(flash);
+                g.fillRect(b);
+            }
             // a soft sheen on the far half of the surface, and shade toward the near edge
             g.setGradientFill(juce::ColourGradient(white(down ? 0.02f : 0.10f), 0.0f, b.getY(), white(0.0f), 0.0f, b.getY() + b.getHeight() * 0.5f, false));
             g.fillRect(b.withHeight(b.getHeight() * 0.5f));
@@ -898,7 +1017,6 @@ private:
         }
         if (! down)
         {
-            // the rounded edge of the rubber
             g.setGradientFill(juce::ColourGradient(white(0.36f), 0.0f, b.getY(), white(0.0f), 0.0f, b.getY() + b.getHeight() * 0.6f, false));
             g.drawRoundedRectangle(b.reduced(0.6f), CAP_RADIUS, 1.2f);
         }
@@ -909,19 +1027,58 @@ private:
             g.setColour(white(0.75f));
             g.drawRoundedRectangle(b.reduced(1.6f), CAP_RADIUS - 1.0f, 1.2f);
         }
+        // pressed border highlight
+        if (down && ! held)
+        {
+            const juce::Colour pressCol = glow > 0.05f ? hue.withAlpha(0.70f) : white(0.50f);
+            g.setColour(pressCol);
+            g.drawRoundedRectangle(b.reduced(1.6f), CAP_RADIUS - 1.0f, 1.4f);
+        }
     }
 
     // Where the finger is: the pitch strip rests in the middle, the mod strip where it was left.
+    // When active (dragging), a filled region shows the extent from the rest position to the finger.
     void drawStripMark(juce::Graphics& g, const Element& el, int idx, bool active) const
     {
         const auto b = el.bounds;
         const bool isPitch = idx == pitchStripIdx;
         const float pos = isPitch ? pitchPosition : modPosition;
         const float inset = 7.0f;
-        const float y = b.getBottom() - inset - pos * (b.getHeight() - 2.0f * inset);
+        const float trackTop = b.getY() + inset;
+        const float trackBot = b.getBottom() - inset;
+        const float trackH = trackBot - trackTop;
+        const float y = trackBot - pos * trackH;
         const bool resting = isPitch && std::abs(pos - 0.5f) < 0.001f && ! active;
         const juce::Colour light(0xFFDCE9F5);
         const float strength = resting ? 0.35f : (active ? 1.0f : 0.8f);
+
+        // filled region: pitch strip fills from centre, mod strip fills from bottom
+        if (active && ! resting)
+        {
+            const float regionInset = 8.0f;
+            const float regionW = b.getWidth() - 2.0f * regionInset;
+            float fillTop, fillBot;
+            if (isPitch)
+            {
+                const float centreY = trackBot - 0.5f * trackH;
+                fillTop = juce::jmin(y, centreY);
+                fillBot = juce::jmax(y, centreY);
+            }
+            else
+            {
+                fillTop = y;
+                fillBot = trackBot;
+            }
+            if (fillBot - fillTop > 0.5f)
+            {
+                const juce::Colour fill = isPitch ? juce::Colour(0xFF55C6F5) : juce::Colour(0xFF66DD88);
+                g.setColour(fill.withAlpha(0.18f));
+                g.fillRoundedRectangle(b.getX() + regionInset, fillTop, regionW, fillBot - fillTop, 2.0f);
+                g.setColour(fill.withAlpha(0.35f));
+                g.drawRoundedRectangle(b.getX() + regionInset, fillTop, regionW, fillBot - fillTop, 2.0f, 0.8f);
+            }
+        }
+
         for (int i = 3; i >= 1; --i)
         {
             g.setColour(light.withAlpha(strength * 0.09f));

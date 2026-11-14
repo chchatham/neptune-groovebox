@@ -4,6 +4,7 @@
 #include "../dsp/DSPUtils.h"
 #include "../dsp/filters/SVFilter.h"
 #include "EngineLfoSection.h"
+#include "CymbalMachine.h"
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
@@ -17,7 +18,8 @@ enum class DrumSynthType
     ClosedHat, OpenHat,
     Cymbal, Tom, Rim, Shaker, Clave,
     SubBass,
-    KickSynth       // the kick machine: its own page of sweep, shape and knock controls (appended: projects store the number)
+    KickSynth,      // the kick machine: its own page of sweep, shape and knock controls (appended: projects store the number)
+    CymbalSynth     // the cymbal machine (CymbalMachine.h): its own page, CYM
 };
 
 // Per-slot aftertouch destination enum (matches DrumATDest in DrumKit.h)
@@ -40,13 +42,15 @@ enum class DrumVoiceATDest
 //         pitch falls (0 = no fall); MKIK the resonance of its filter; SNAR / FMSN the noise
 //         band (and FMSN's FM index); CLAP the band's width; hats and cymbal the high-pass; TOM
 //         the stick noise; RIM its noise; SHKR from a broad hiss to a narrow, pitched rattle;
-//         CLAV the upper partial; SUB sine -> triangle -> squared-off; KSYN a low-pass.
+//         CLAV the upper partial; SUB sine -> triangle -> squared-off; KSYN a low-pass; CSYN how
+//         much of the top there is (the middle = the cymbal as it is).
 //   DRIV  saturation (a soft clip that keeps the peak level) on every type; SNAR / FMSN also
 //         shift from the body to the noise with it, CLAP adds claps, SHKR deepens its rattle.
 //   SNAP  the front edge, 0.5 = the drum as it is: below, the onset is softened (it fades in
 //         over up to about 12 ms); above, the first milliseconds are lifted (to +6 dB) and the
 //         drums that start from a sine get a short noise click. TOM and KSYN set their attack
-//         time with it instead, CLAP also the length of each clap.
+//         time with it instead, CLAP also the length of each clap. CSYN: what strikes the cymbal,
+//         from a soft mallet (0) through a stick (0.5) to a hard tip with a loud tick (1).
 class DrumVoice
 {
 public:
@@ -98,10 +102,18 @@ public:
         }
         hatBandHigh.setCutoff(7100.0f);
         hatBandLow.setCutoff(3440.0f);
+        cym.setSampleRate(sr);
         lfos.setSampleRate(sr);
+        strikeDeclick.setSampleRate(sr);
+        levelStep = (float) (1.0 / (0.004 * sr));       // a level's whole range in 4 ms
     }
 
-    void setType(DrumSynthType type) { synthType = type; }
+    void setType(DrumSynthType type)
+    {
+        if (synthType == DrumSynthType::CymbalSynth && type != synthType)
+            cym.reset();
+        synthType = type;
+    }
     DrumSynthType getType() const { return synthType; }
 
     void setTune(float hz)   { tune = hz; }
@@ -138,6 +150,13 @@ public:
         static constexpr float defaults[NumKickParams] = { 36.0f, 0.06f, -0.6f, 0.0f, 0.3f, 0.5f, 0.0f, -0.4f };
         return (index >= 0 && index < NumKickParams) ? defaults[index] : 0.0f;
     }
+
+    // --- The cymbal machine (type CymbalSynth) -----------------------------------------------------
+    // TUNE is its size (8000 = the model's own pitch), DEC how long it rings, TONE its brightness,
+    // SNAP what strikes it; the eight cells of CymbalMachine::Param are the rest. Read at the strike
+    // (LOFI at once).
+    void setCymbalParam(int index, float value) { cym.setParam(index, value); }
+    float getCymbalParam(int index) const { return cym.getParam(index); }
 
     // --- Per-slot expression routing ---
     void setAftertouchDest(DrumVoiceATDest dest) { atDest = dest; }
@@ -212,6 +231,11 @@ public:
     void applyDecayPressure()
     {
         const float longer = 1.0f + 2.0f * atDecayMod;
+        if (synthType == DrumSynthType::CymbalSynth)
+        {
+            cym.setDecayStretch(longer);        // its modes ring on
+            return;
+        }
         if (synthType == DrumSynthType::KickSynth || synthType == DrumSynthType::SubBass)
             ampEnv.setRelease(struckRelease * longer);
         else
@@ -234,8 +258,16 @@ public:
 
     void noteOn(float vel)
     {
+        // Struck again while it rings: its oscillators and filter start over, which would cut the
+        // ringing off at whatever value it had (a click). That value is carried down over 2 ms under
+        // the new hit, whose own first sample is not touched. (The cymbal machine does not start
+        // over: a second stroke adds to what is ringing.)
+        if (active && synthType != DrumSynthType::CymbalSynth)
+            strikeDeclick.armTail();
+        struck = true;
         // The LFOs are read at the strike (decay, snap, ...) and run on from that value.
         lfos.noteOnAndSample();
+        lfos.snapSlews();       // a strike starts the drum again
         lfoGain = 1.0f;
         lfoPan = 0.0f;
         if (! lfos.anyOn())
@@ -270,6 +302,11 @@ public:
     // Cut short by another drum of its choke group (the closed hat stops the open one).
     void choke()
     {
+        if (synthType == DrumSynthType::CymbalSynth)
+        {
+            cym.choke();                        // a hand on it: gone in about a twentieth of a second
+            return;
+        }
         if (synthType == DrumSynthType::KickSynth)
         {
             // Its decay is its envelope's release: stop it over a few milliseconds instead.
@@ -291,7 +328,8 @@ public:
         {
             lfoGain = 1.0f;
             lfoPan = 0.0f;
-            return processCore();
+            lfos.snapSlews();
+            return strikeDeclick.process(processCore());
         }
 
         // The voice's parameters are moved for this sample only (the set values stay).
@@ -299,9 +337,9 @@ public:
         const SetValues set = applyLfos();
         if (lfos.routed(LfoTone) && tone != lastLfoTone)
             retuneFilterForTone();
-        lfoGain = std::clamp(1.0f + lfos.amount(LfoAmp), 0.0f, 2.0f);
-        lfoPan = std::clamp(lfos.amount(LfoPan) * 0.5f, -0.5f, 0.5f);
-        const float out = processCore() * lfoGain;
+        lfoGain = lfos.gain(LfoAmp);
+        lfoPan = std::clamp(lfos.panAmount(LfoPan) * 0.5f, -0.5f, 0.5f);
+        const float out = strikeDeclick.process(processCore() * lfoGain);
         restore(set);
         return out;
     }
@@ -387,10 +425,17 @@ private:
             case DrumSynthType::Shaker:
                 filter.setResonance(shakerQ(tone));
                 break;
+            case DrumSynthType::CymbalSynth:
+                cymTop = cymbalTop(tone);
+                break;
             default:
                 break;
         }
     }
+
+    // The cymbal machine's TONE while it sounds: the gain of everything above about 2.5 kHz,
+    // -18 dB .. 0 (the middle) .. +9 dB.
+    static float cymbalTop(float tone) { return std::exp2((tone - 0.5f) * (tone < 0.5f ? 6.0f : 3.0f)); }
 
     // The shaker's band: Q 0.5 (a broad hiss) .. 2 at the middle .. 8 (a narrow, pitched rattle).
     static float shakerQ(float tone) { return 2.0f * std::pow(4.0f, 2.0f * (tone - 0.5f)); }
@@ -430,25 +475,33 @@ private:
     // SNAP on every type but TOM and KSYN (their attack time): 0.5 leaves the drum as it is.
     bool usesCommonSnap() const
     {
-        return synthType != DrumSynthType::Tom && synthType != DrumSynthType::KickSynth;
+        return synthType != DrumSynthType::Tom && synthType != DrumSynthType::KickSynth
+            && synthType != DrumSynthType::CymbalSynth;
     }
 
     // DRIV and SNAP after the drum itself.
     float finish(float sample)
     {
-        if (drive > 0.0f && usesCommonDrive())
+        const bool driven = drive > 0.0f && usesCommonDrive();
+        if (driven || driveMix > 0.0f)
         {
             // Gain 1..7 into a soft clipper (flat from +-3 on, where the tanh approximation reaches
             // exactly 1), then down by gain^0.3: the body is squared off and the tail comes up, and
             // a kit with every drum driven stays about as loud as it was.
-            if (drive != finishDrive)
+            if (driven && drive != finishDrive)
             {
                 finishDrive = drive;
                 finishGain = 1.0f + drive * 6.0f;
                 finishTrim = std::pow(finishGain, -0.3f);
             }
-            sample = dsp::fastTanh(std::clamp(sample * finishGain, -3.0f, 3.0f)) * finishTrim;
+            // (The clipper is not transparent at its lowest drive: where the drive comes in or
+            // goes out under a ringing drum, the stage is faded in or out over 4 ms.)
+            const float clipped = dsp::fastTanh(std::clamp(sample * finishGain, -3.0f, 3.0f)) * finishTrim;
+            driveMix = hitFirst ? (driven ? 1.0f : 0.0f) : dsp::towards(driveMix, driven ? 1.0f : 0.0f, levelStep);
+            sample = driveMix >= 1.0f ? clipped : sample + driveMix * (clipped - sample);
         }
+        else if (hitFirst)
+            driveMix = 0.0f;
         if (struckSnap != 0.5f && usesCommonSnap() && edgeEnv > 1.0e-4f)
         {
             if (struckSnap < 0.5f)
@@ -478,7 +531,9 @@ private:
 
         osc1Phase = 0.0;
         osc2Phase = 0.0;
-        filter.reset();
+        // (A cymbal machine that is still ringing is struck again: nothing of it starts over.)
+        if (! (synthType == DrumSynthType::CymbalSynth && cym.isActive()))
+            filter.reset();
         // (The hats' oscillators start every hit from the same place: the same hit every time.)
         static constexpr double hatStart[6] = { 0.0, 0.31, 0.62, 0.17, 0.83, 0.45 };
         for (int i = 0; i < 6; ++i) hatPhase[i] = hatStart[i];
@@ -567,6 +622,21 @@ private:
                 knockPhase = 0.0;
                 break;
             }
+            case DrumSynthType::CymbalSynth:
+            {
+                filter.setMode(SVFilter::Mode::LowPass);
+                filter.setCutoff(2500.0f);
+                filter.setResonance(0.5f);
+                cymTop = cymbalTop(tone);
+                CymbalMachine::Strike hit;
+                hit.velocity = velocity;
+                hit.tune = tune * bendRatio * std::exp2(atPitchMod);
+                hit.decay = decay;
+                hit.tone = tone;
+                hit.snap = struckSnap;
+                cym.strike(hit);
+                break;
+            }
             default:
                 break;
         }
@@ -589,17 +659,30 @@ private:
             lastPressedTune = tune;
         }
         // Pad pressure on DRIV (the mod strip's drive comes through its STRIP route, which sets `drive`).
+        // (Under a ringing hit the drive, the level and the tone are moved to, not jumped to - pad
+        // pressure and step locks arrive between two blocks; a hit takes them as they stand. The
+        // drive's range is a gain of 1 to 7: it takes 8 ms, the others 4.)
         const float setDrive = drive;
-        drive = std::min(1.0f, drive + atDriveMod);
+        const float driveTarget = std::min(1.0f, drive + atDriveMod), levelTarget = getEffectiveLevel();
+        const bool first = struck;
+        struck = false;
+        hitFirst = first;
+        driveNow = first ? driveTarget : dsp::towards(driveNow, driveTarget, 0.5f * levelStep);
+        levelNow = first ? levelTarget : dsp::towards(levelNow, levelTarget, levelStep);
+        atFilterNow = first ? atFilterMod : dsp::towards(atFilterNow, atFilterMod, levelStep);
+        drive = driveNow;
         // Pad pressure on TONE.
         const float setTone = tone;
-        if (atFilterMod != 0.0f || tonePressed)
+        if (atFilterNow != 0.0f || tonePressed)
         {
-            tone = std::min(1.0f, tone + atFilterMod);
-            tonePressed = atFilterMod != 0.0f;
+            tone = std::min(1.0f, tone + atFilterNow);
+            tonePressed = atFilterNow != 0.0f;
             if (tone != lastLfoTone)
                 retuneFilterForTone();
         }
+        // (What reads the tone as it sounds - the bass's shape - hears it on the same lead.)
+        toneNow = first ? tone : dsp::towards(toneNow, tone, levelStep);
+        tone = toneNow;
 
         switch (synthType)
         {
@@ -618,6 +701,7 @@ private:
             case DrumSynthType::Clave:         sample = processClave(); break;
             case DrumSynthType::SubBass:       sample = processSubBass(); break;
             case DrumSynthType::KickSynth:     sample = processKickSynth(); break;
+            case DrumSynthType::CymbalSynth:   sample = processCymbalSynth(); break;
         }
         sample = finish(sample);
 
@@ -627,13 +711,17 @@ private:
             pitchEnv.noteOff();
         }
 
-        if (!ampEnv.isActive() && !pitchEnv.isActive())
+        if (synthType == DrumSynthType::CymbalSynth)
+            active = cym.isActive();            // it has no envelope here: it rings until its modes have died
+        else if (!ampEnv.isActive() && !pitchEnv.isActive())
             active = false;
 
         tune = setTune;
         drive = setDrive;
         tone = setTone;
-        return sample * getEffectiveLevel() * velocity;
+        // (The cymbal machine takes the velocity at each stroke: a soft stroke does not turn down
+        // what a hard one left ringing.)
+        return sample * levelNow * (synthType == DrumSynthType::CymbalSynth ? 1.0f : velocity);
     }
 
 public:
@@ -647,7 +735,9 @@ public:
         active = false;
         clapBurstCount = 0;
         clapBurstSample = 0;
+        cym.reset();
         clearAftertouch();
+        strikeDeclick.reset();
     }
 
 private:
@@ -690,6 +780,10 @@ private:
     float knockLevel = 0.0f, knockDecay = 0.0f;
     double knockPhase = 0.0;
 
+    // Cymbal machine
+    CymbalMachine cym;
+    float cymTop = 1.0f;           // TONE: the gain of its top
+
     // Noise
     uint32_t noiseSeed = 12345;
 
@@ -726,6 +820,11 @@ private:
     static constexpr float CLICK_SECONDS = 0.0012f;
     static constexpr float CLICK_LEVEL = 0.5f;
     float finishDrive = -1.0f, finishGain = 1.0f, finishTrim = 1.0f;
+    dsp::Declick strikeDeclick;     // on the voice's output: a hit on a drum that still rings (noteOn)
+    bool struck = true;             // the next sample is a hit's first
+    bool hitFirst = false;          // ... and this one is
+    float driveMix = 0.0f;          // how much of the drive stage is heard (finish)
+    float driveNow = 0.0f, levelNow = 0.8f, toneNow = 0.5f, atFilterNow = 0.0f, levelStep = 0.005f;
     float struckSnap = 0.5f;
     float struckDecay = 0.3f, struckRelease = 0.01f;       // the amp envelope's times as struck
     float edgeEnv = 0.0f, edgeDecay = 0.0f, clickEnv = 0.0f, clickDecay = 0.0f;
@@ -970,6 +1069,19 @@ private:
                 ampP.release = decay * 0.5f;        // DEC: the fade once it is let go (50 ms at 0.1)
                 ampP.decayCurve = 0.0f;
 
+                pitchP.attack = 0.0f;
+                pitchP.decay = 0.001f;
+                pitchP.sustain = 0.0f;
+                pitchP.release = 0.001f;
+                break;
+            }
+            case DrumSynthType::CymbalSynth:
+            {
+                // (Not used: the cymbal machine's modes each have their own decay.)
+                ampP.attack = 0.0f;
+                ampP.decay = decay;
+                ampP.sustain = 1.0f;
+                ampP.release = 0.01f;
                 pitchP.attack = 0.0f;
                 pitchP.decay = 0.001f;
                 pitchP.sustain = 0.0f;
@@ -1328,6 +1440,16 @@ private:
             out = dsp::fastTanh(out * gain) / dsp::fastTanh(gain);
         }
         return filter.process(out);
+    }
+
+    // The cymbal machine (CymbalMachine.h), then TONE: everything above about 2.5 kHz turned
+    // down or up (the split is a 6 dB / octave one, so it tilts more than it cuts).
+    float processCymbalSynth()
+    {
+        // (The offset keeps the split's filter out of denormal numbers when LOFI has gated the tail to nothing.)
+        const float in = cym.process(tune) + 1.0e-18f;
+        const float low = filter.process(in);
+        return low + cymTop * (in - low);
     }
 
     float processSubBass()

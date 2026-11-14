@@ -700,6 +700,19 @@ public:
             r.a->sub = "OK";
             expectEquals(r.mgr.composeNameBar().tags, juce::String("ARP LATCH"));
             expectEquals(r.text(), juce::String("OK"));
+
+            // A latched pad roll (ROLL on with ROL2's LTCH) is said on every screen: ROLL, or O among the letters.
+            arp[0] = latch[0] = false;
+            bool rollLatch = false;
+            h.rollLatched = [&] { return rollLatch; };
+            r.mgr.setEngineHooks(h);
+            expect(r.mgr.getNameBarTags().isEmpty());
+            rollLatch = true;
+            expectEquals(r.mgr.composeNameBar().tags, juce::String("ROLL"));
+            arp[0] = latch[0] = true;
+            r.a->sub = "STATUS";
+            expectEquals(r.mgr.composeNameBar().tags, juce::String("ALO"));
+            r.a->sub = "OK";
         }
 
         beginTest("Arp button: first the ARP screen, pressed again there it switches the selected track's arp");

@@ -35,7 +35,9 @@ public:
     {
         sampleRate = sr;
         // Max delay = 20ms + some headroom for modulation
-        maxDelaySamples = (int)(0.025 * sr) + 1;
+        // (held to the lines there are: above 204.8 kHz the write position ran past them, and the
+        // app died at 384 kHz)
+        maxDelaySamples = std::clamp((int)(0.025 * std::clamp(sr, 1.0, 1.0e6)) + 1, 4, MAX_DELAY_SAMPLES);
         for (auto& line : delayLineL)
             std::fill(line.begin(), line.end(), 0.0f);
         for (auto& line : delayLineR)
@@ -91,7 +93,7 @@ public:
             float modRange = depth * 0.006f; // up to +/-6ms
             float delaySec = centerDelay + lfoVal * modRange;
             delaySec = std::clamp(delaySec, 0.001f, 0.020f);
-            float delaySamples = (float)(delaySec * sampleRate);
+            float delaySamples = std::clamp((float)(delaySec * sampleRate), 1.0f, (float)(maxDelaySamples - 2));
 
             // Write to delay line
             delayLineL[v][writePos[v]] = left;

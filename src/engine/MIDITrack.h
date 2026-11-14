@@ -162,7 +162,7 @@ public:
         {
             MIDIEvent evt;
             evt.note = id;
-            evt.value = juce::jlimit(0, 127, (int)(value * 127.0f));
+            evt.value = juce::jlimit(0, 127, (int)(juce::jlimit(0.0f, 1.0f, value) * 127.0f));
             pushEvent(evt);
         }
     }

@@ -49,6 +49,23 @@ public:
         }
     }
 
+    /** The same with the level moving in a straight line from one value to another across the
+        block (a send level that jumps is a click in the effect). */
+    void addInputRamped(const float* left, const float* right, int numSamples, float from, float to)
+    {
+        int n = (numSamples < currentBlockSize) ? numSamples : currentBlockSize;
+        if (n <= 0)
+            return;
+        const float step = (to - from) / (float) n;
+        float level = from;
+        for (int i = 0; i < n; ++i)
+        {
+            level += step;
+            bufferL[(size_t) i] += left[i] * level;
+            bufferR[(size_t) i] += right[i] * level;
+        }
+    }
+
     /** Process the accumulated input through the effect chain. */
     void process()
     {

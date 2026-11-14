@@ -146,7 +146,7 @@ public:
         static const DrumSound sounds[DrumEngine::NUM_DRUM_TYPES] = {
             { 50, 0.5f }, { 52, 0.6f }, { 55, 0.7f }, { 200, 0.2f }, { 200, 0.2f }, { 1200, 0.3f }, { 8000, 0.04f },
             { 8000, 0.5f }, { 7000, 1.0f }, { 100, 0.3f }, { 800, 0.3f }, { 5000, 0.2f }, { 2500, 0.3f }, { 40, 0.1f },
-            { 48, 0.5f } };
+            { 48, 0.5f }, { 8000, 0.3f } };
         return sounds[type];
     }
 
@@ -372,6 +372,11 @@ public:
                     // The page is pad 1's: that pad is struck, as a kick machine for its KICK page.
                     if (page == "KICK")
                         set(DrumEngine::TYPE, (float) (int) DrumSynthType::KickSynth);
+                    if (page == "CYM")      // (and as a cymbal machine for its CYM page)
+                    {
+                        set(DrumEngine::TYPE, (float) (int) DrumSynthType::CymbalSynth);
+                        set(DrumEngine::TUNE, 8000.0f);
+                    }
                     for (auto& ev : plan.events)
                         ev.note = 0;
                 }
@@ -479,6 +484,9 @@ public:
                     continue;       // the other fifteen pads' pages: the drum tests go through every type
                 if (type == EngineType::Drum && spec.id >= DrumEngine::KICK_BASE + DrumVoice::NumKickParams
                     && DrumEngine::isKickParam(spec.id))
+                    continue;
+                if (type == EngineType::Drum && spec.id >= DrumEngine::CYMBAL_BASE + CymbalMachine::NumParams
+                    && DrumEngine::isCymbalParam(spec.id))
                     continue;
                 const juce::String pageName = page.name;
                 const ParamSpec cell = spec;

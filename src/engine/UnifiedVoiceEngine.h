@@ -47,7 +47,7 @@ public:
         modWheelNow = smoothWheel(modWheelNow, modWheelValue, numSamples, sampleRate);
         updatePressure();
 
-        const float gain = HEADROOM * outputLevel * unisonGain;
+        const float gain = HEADROOM * unisonGain;       // LEVL is applied by each voice (UnifiedVoice::setLevel)
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -110,6 +110,7 @@ public:
 
     void allNotesOff() override
     {
+        soundCut();
         monoStackCount = 0;
         monoNote = -1;
         monoPressure = 0.0f;
@@ -216,7 +217,14 @@ public:
             value = (float) juce::jlimit(0, FilterSlot::modeCount(model) - 1, (int) std::lround(value));
         }
         else if (const ParamSpec* spec = findSpec(id))
+        {
             value = spec->isDiscrete() ? std::round(spec->clamp(value)) : spec->clamp(value);
+            // A selector (waveform, filter type, routing, stack ...) turned under a held note.
+            if (spec->kind == ParamKind::Choice && flatParams[(size_t) id] != value)
+                soundSwapped();
+        }
+        if ((id == UnifiedParam::MODE_A || id == UnifiedParam::MODE_B) && flatParams[(size_t) id] != value)
+            soundSwapped();
         flatParams[(size_t) id] = value;
         applyParameter(id, value);
 
@@ -910,7 +918,11 @@ private:
             case FENV_ATTACK: case FENV_DECAY: case FENV_SUSTAIN: case FENV_RELEASE: case FENV_CURVE:
                 applyEnvelope(true);
                 break;
-            case LEVEL:    outputLevel = value; break;
+            case LEVEL:
+                outputLevel = value;
+                for (auto& v : voices)
+                    v.setLevel(outputLevel);
+                break;
 
             case ARCH:
                 if (iv <= 0)

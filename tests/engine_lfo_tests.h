@@ -458,7 +458,7 @@ public:
                 for (auto& p : pages[i].params)
                 {
                     expect(p.isValid(), rig.name + " " + pages[i].name + " has an empty cell");
-                    expect(p.id < 150 || (p.id >= 158 && p.id <= 181) || DrumEngine::isKickParam(p.id), rig.name + " id outside its ranges: " + juce::String(p.id));
+                    expect(p.id < 150 || (p.id >= 158 && p.id <= 181) || DrumEngine::isKickParam(p.id) || DrumEngine::isCymbalParam(p.id), rig.name + " id outside its ranges: " + juce::String(p.id));
                     expect(S::ownsLfo(p.id) == (i + 2 >= pages.size()), rig.name + " " + pages[i].name + ": LFO ids only on the LFO pages");
                     expect(S::ownsStrip(p.id) == (i + 3 == pages.size()), rig.name + " " + pages[i].name + ": STRIP ids only on the STRIP page");
                 }
@@ -581,6 +581,35 @@ public:
             const auto sum = render(*both, 0.2, events);
             expectWithinAbsoluteError(lfoValueAt(sum.l, off.l, 0.1), 0.7f, 0.01f, rig.name + " two LFOs add");
         }
+
+        beginTest("AMP and PAN: a square LFO does not step the level (no click at its edges)");
+        for (auto& rig : all)
+            for (const char* label : { "AMP", "PAN" })
+            {
+                // A sine with the LFO's edges every 3675 samples, each at a different point of the wave.
+                // The largest step from one sample to the next in the 10 ms around the edges
+                // against the largest anywhere else: a stepped gain is a jump of up to the whole wave.
+                auto e = rig.make(false);
+                const int dest = destIndex(*e, label);
+                expect(dest > 0, rig.name + " has " + label);
+                setLfo(*e, 0, dest, 0.8f, SQR, KEY, 6.0f);
+                const auto on = render(*e, 1.05, { { 0.0, Ev::On, rig.note } });
+                for (auto* ch : { &on.l, &on.r })
+                {
+                    float atEdges = 0.0f, elsewhere = 0.0f, peak = 0.0f;
+                    for (size_t i = 2205; i < ch->size(); ++i)
+                    {
+                        const float step = std::abs((*ch)[i] - (*ch)[i - 1]);
+                        const size_t fromEdge = (i + 220) % 3675;
+                        float& worst = fromEdge < 441 ? atEdges : elsewhere;
+                        worst = std::max(worst, step);
+                        peak = std::max(peak, std::abs((*ch)[i]));
+                    }
+                    expect(peak > 0.01f, rig.name + " " + label + " sounds");
+                    expect(atEdges <= elsewhere + 0.1f * peak, rig.name + " " + label + ": " + juce::String(atEdges, 4)
+                           + " at the edges, " + juce::String(elsewhere, 4) + " elsewhere, peak " + juce::String(peak, 4));
+                }
+            }
 
         beginTest("PTCH: vibrato at the LFO rate, 12 semitones x depth squared");
         for (auto& rig : all)

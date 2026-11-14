@@ -1415,8 +1415,8 @@ protected:
             out = UnifiedVoiceEngine::basePages();   // no audio engine attached (tests, previews)
         else if (auto* drums = dynamic_cast<DrumEngine*>(e))
         {
-            // One page for the selected pad instead of sixteen; a kick machine (TYPE KSYN) adds
-            // its own page. Then the kit's LFO pages.
+            // One page for the selected pad instead of sixteen; a kick machine (TYPE KSYN) or a
+            // cymbal machine (TYPE CSYN) adds its own page. Then the kit's LFO pages.
             const auto all = drums->getParamPages();
             const int pad = shownDrumPad(drums);
             ParamPage voice = DrumEngine::voicePage(pad);
@@ -1428,7 +1428,13 @@ protected:
                 kick.section = "DRUM";
                 out.push_back(kick);
             }
-            for (size_t i = (size_t) (2 * DrumEngine::NUM_VOICES); i < all.size(); ++i)
+            if (drums->isCymbalMachine(pad))
+            {
+                ParamPage cymbal = DrumEngine::cymbalPage(pad);
+                cymbal.section = "DRUM";
+                out.push_back(cymbal);
+            }
+            for (size_t i = (size_t) (DrumEngine::PAGES_PER_PAD * DrumEngine::NUM_VOICES); i < all.size(); ++i)
                 out.push_back(all[i]);
         }
         else
@@ -1502,7 +1508,8 @@ protected:
     int pageStateKey() const override
     {
         if (auto* drums = dynamic_cast<DrumEngine*>(engine()))
-            return shownDrumPad(drums) + (drums->isKickMachine(shownDrumPad(drums)) ? 100 : 0);
+            return shownDrumPad(drums) + (drums->isKickMachine(shownDrumPad(drums)) ? 100 : 0)
+                 + (drums->isCymbalMachine(shownDrumPad(drums)) ? 200 : 0);
         return -1;
     }
 

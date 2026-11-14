@@ -88,6 +88,7 @@ public:
         lfos.setSampleRate(sr);
         declick.setSampleRate(sr);
         gainDeclick.setSampleRate(sr);
+        levelStep = (float) (1.0 / (0.004 * sr));
     }
 
     void setNote(int note, float vel)
@@ -104,6 +105,8 @@ public:
             declick.arm();      // struck again while sounding: the restart must not jump,
             gainDeclick.arm();  // nor the step to the new velocity
         }
+        else
+            lfos.snapSlews();
         // An LFO on a page cell is read before the first sample (the engine sets the cell then).
         if (lfos.keyed()) lfos.noteOnAndSample(); else lfos.noteOn();
         filter.noteOn(currentNote, velocity, active);
@@ -140,6 +143,7 @@ public:
         prevTimingStep = lanes[TimingLane].currentStep;
         sequenceFinished = false;
         interpProgress = 0.0f;
+        struck = true;
     }
 
     void noteOff()
@@ -170,6 +174,7 @@ public:
             lfoGain = 1.0f;
             lfoPan = 0.0f;
             lfoApplied = false;
+            lfos.snapSlews();
             return processCore();
         }
 
@@ -188,8 +193,8 @@ public:
         lfoSemis = lfos.pitchSemitones(LfoPitch);
         filter.setLfoOctaves(lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES);
         filter.setResonanceMod(lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE);
-        lfoGain = juce::jlimit(0.0f, 2.0f, 1.0f + lfos.amount(LfoAmp));
-        lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.amount(LfoPan));
+        lfoGain = lfos.gain(LfoAmp);
+        lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.panAmount(LfoPan));
 
         const float out = processCore();
 
@@ -224,6 +229,12 @@ private:
                 active = false;
                 return 0.0f;
             }
+        }
+
+        if (shapeSwitched)
+        {
+            shapeSwitched = false;
+            declick.arm();
         }
 
         // Read each lane from its own current position
@@ -283,6 +294,7 @@ private:
             float prevLevel = steps[(size_t) prevTimingStep].level;
             output = prevSample * prevLevel * fadeOut
                    + currentSample * stepLevel * fadeIn;
+            stepLevelNow = stepLevel;
 
             // Advance crossfade phase
             float crossfadeDuration = stepDuration * crossfadeAmount * speedMultiplier * tempoScale;
@@ -293,7 +305,11 @@ private:
         }
         else
         {
-            output = currentSample * stepLevel;
+            // A step's level is moved to over at most 4 ms where the sequence steps without a
+            // crossfade, or where the level is set under the step that sounds: the step is still
+            // heard as a step, without the click of a level that jumps in one sample.
+            stepLevelNow = struck ? stepLevel : dsp::towards(stepLevelNow, stepLevel, levelStep);
+            output = currentSample * stepLevelNow;
         }
 
         // Advance oscillator phase
@@ -318,7 +334,23 @@ private:
             interpProgress = 0.0f;
         }
 
-        return gainDeclick.process(filter.process(declick.process(output)) * ampVal * (1.0f - velSens + velSens * velocity) * masterLevel * gainMod * lfoGain);
+        // Velocity's share, LEVL and pressure's share of the level are moved to over a few
+        // milliseconds under a sounding note; the first sample of a note takes them as they stand.
+        const float velGain = 1.0f - velSens + velSens * velocity;
+        if (struck)
+        {
+            struck = false;
+            velGainNow = velGain;
+            masterLevelNow = masterLevel;
+            gainModNow = gainMod;
+        }
+        else
+        {
+            if (velGainNow != velGain)         velGainNow = dsp::towards(velGainNow, velGain, levelStep);
+            if (masterLevelNow != masterLevel) masterLevelNow = dsp::towards(masterLevelNow, masterLevel, levelStep);
+            if (gainModNow != gainMod)         gainModNow = dsp::towards(gainModNow, gainMod, 2.0f * levelStep);
+        }
+        return gainDeclick.process(filter.process(declick.process(output)) * ampVal * velGainNow * masterLevelNow * gainModNow * lfoGain);
     }
 
 public:
@@ -551,10 +583,16 @@ private:
         prevTimingStep = lanes[TimingLane].currentStep;
         prevOscPhase = oscPhase;
         crossfadePhase = 0.0f;
+        const Waveform shapeBefore = steps[(size_t) lanes[ShapeLane].currentStep].shape;
 
         // Advance all lanes independently
         for (int i = 0; i < NUM_LANES; ++i)
             advanceLane(i);
+
+        // Another waveform takes over in mid-cycle: without a crossfade that is a jump. The jump is
+        // carried off over 2 ms (the step is heard as a step, not as a click).
+        // (Armed with the next sample, the first of the new waveform.)
+        shapeSwitched = crossfadeAmount <= 0.001f && steps[(size_t) lanes[ShapeLane].currentStep].shape != shapeBefore;
 
         // Update legacy fields
         currentStep = lanes[TimingLane].currentStep;
@@ -614,6 +652,8 @@ private:
     float pitchOffsetSemis = 0.0f;
     float velSens = 1.0f;
     float gainMod = 1.0f;
+    float velGainNow = 1.0f, masterLevelNow = 0.8f, gainModNow = 1.0f, stepLevelNow = 1.0f, levelStep = 0.005f;
+    bool struck = true, shapeSwitched = false;
     float tempoScale = 1.0f;
     LoopMode loopMode = LoopMode::Forward;
 
@@ -859,6 +899,7 @@ public:
         }
 
         lfoSection.endBlock(numSamples, EngineLfoSection::each(voices));
+        lfoSection.afterLetGo([this](int key) { setParameter(key, getParameter(key)); });
     }
 
     void releaseResources() override
@@ -879,6 +920,7 @@ public:
 
     void allNotesOff() override
     {
+        soundCut();
         allocator.allNotesOff();
         for (auto& v : voices)
             v.reset();
@@ -906,6 +948,8 @@ public:
     {
         if (filterSection.owns(id))
         {
+            if (filterSection.swaps(id, value))
+                soundSwapped();
             filterSection.set(id, value, VoiceFilterSection::each(voices));
             lfoSection.baseChanged(id, filterSection.get(id), EngineLfoSection::each(voices));
             return;
@@ -926,6 +970,8 @@ public:
                 applyAmpEnvelope();
             return;
         }
+        if ((id == EnvChainMode || id == EnvChainStages || id == EnvChainCombine) && params[id] != value)
+            soundSwapped();
         params[id] = value;
         applyParameter(id, value);
         lfoSection.baseChanged(id, value, EngineLfoSection::each(voices));

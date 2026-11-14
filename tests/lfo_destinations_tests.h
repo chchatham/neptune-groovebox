@@ -414,6 +414,17 @@ public:
             default:
                 break;
         }
+        // EVEL (how much velocity scales the filter envelope) has little to do at velocity 0.7.
+        // It used to be "heard" through the click of the cutoff jumping at each edge of the
+        // LFO; that click is gone (the click audit), so the note is played softly, where EVEL
+        // itself is plainly heard.
+        if (label == "EVEL")
+        {
+            variant << "soft ";
+            for (auto& ev : plan.events)
+                if (ev.velocity > 0.0f)
+                    ev.velocity = 0.25f;
+        }
         return plan;
     }
 

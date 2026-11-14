@@ -580,3 +580,5 @@ public:
         }
     }
 };
+
+static MIDITrackOutputTests midiTrackOutputTests;

@@ -259,14 +259,41 @@ public:
         sampleRate = sr > 0.0 ? sr : 44100.0;
         for (auto& l : lfos)
             l.setSampleRate(sampleRate);
+        gainSlew.setSampleRate(sampleRate);
+        panSlew.setSampleRate(sampleRate);
+        glideStep = (float) (2.0 / (GLIDE_SECONDS * sampleRate));
+        stripStep = (float) (1.0 / (STRIP_GLIDE_SECONDS * sampleRate));
     }
 
     // restart: begin again from a new LFO (used when the trigger mode changes, so that the voices
     // of an engine are in step with each other afterwards).
+    //
+    // An LFO that is taken off its destination (DEST changed, or switched off by DEST or DPTH)
+    // under a sounding voice lets go of it first: its output glides to zero over a few
+    // milliseconds, and only then do the new settings apply (a snap back would be a click).
     void apply(int i, const Settings& s, bool restart)
     {
         if (i < 0 || i >= NUM_LFOS)
             return;
+        const bool stays = s.dest == dest[(size_t) i] && s.dest != 0 && s.depth != 0.0f;
+        if (on[(size_t) i] && ! stays && sounding() && glide[(size_t) i] != 0.0f)
+        {
+            pending[(size_t) i] = s;
+            pendingRestart[(size_t) i] = restart || (closing[(size_t) i] && pendingRestart[(size_t) i]);
+            closing[(size_t) i] = true;
+            anyClosing = true;
+            return;
+        }
+        closing[(size_t) i] = false;
+        applyNow(i, s, restart);
+    }
+
+    // True while an LFO or a strip route is still letting go of a destination (see apply).
+    bool isClosing() const { return anyClosing; }
+
+private:
+    void applyNow(int i, const Settings& s, bool restart)
+    {
         auto& l = lfos[(size_t) i];
         if (restart)
         {
@@ -287,7 +314,12 @@ public:
         absDepth[(size_t) i] = std::abs(s.depth);
         on[(size_t) i] = s.dest != 0 && s.depth != 0.0f;
         if (! on[(size_t) i])
+        {
             out[(size_t) i] = 0.0f;
+            glide[(size_t) i] = 0.0f;
+        }
+        edged[(size_t) i] = hasEdge((LFO::Shape) s.shape);
+        catchUp[(size_t) i] = true;         // whatever changed, the output may have jumped
         anyActive = on[0] || on[1] || stripLive;
 
         key[(size_t) i] = on[(size_t) i] ? s.key : -1;
@@ -302,6 +334,16 @@ public:
         updateCross();
     }
 
+    // The shapes that jump: at the turn of the cycle, or (the two decays) when it starts again.
+    static bool hasEdge(LFO::Shape s)
+    {
+        return s != LFO::Shape::Sine && s != LFO::Shape::Triangle && s != LFO::Shape::SmoothRandom;
+    }
+
+    // True when this voice was heard in this block or the last one.
+    bool sounding() const { return ticks > 0 || wasSounding; }
+
+public:
     // ---- The mod strip's routes --------------------------------------------------------------
     struct StripRoute
     {
@@ -316,10 +358,28 @@ public:
     };
 
     // A route's settings (EngineLfoSection, when a STRIP cell is set).
+    // A route taken off its destination under a sounding voice lets go of it first, like an LFO.
     void applyStrip(int r, const StripRoute& s)
     {
         if (r < 0 || r >= NUM_STRIP)
             return;
+        const auto i = (size_t) r;
+        const bool stays = s.dest == sDest[i] && s.dest != 0 && s.amount != 0.0f;
+        if (sOn[i] && ! stays && sounding() && sGlide[i] != 0.0f)
+        {
+            sPending[i] = s;
+            sClosing[i] = true;
+            anyClosing = true;
+            sOut[i] = 0.0f;
+            return;
+        }
+        sClosing[i] = false;
+        applyStripNow(r, s);
+    }
+
+private:
+    void applyStripNow(int r, const StripRoute& s)
+    {
         const auto i = (size_t) r;
         sDest[i] = s.dest;
         sAmount[i] = s.amount * s.scale;
@@ -335,6 +395,7 @@ public:
         refreshStrip();
     }
 
+public:
     // The strip's position (0..1, smoothed) and the vibrato it brings (semitones, this block),
     // which is added to pitch destination `pitchDest`.
     void setStrip(float position, float vibratoSemitones, int pitchDest)
@@ -404,6 +465,17 @@ public:
     // Note-on: see LFO::trigger for what each trigger mode does with it.
     void noteOn()
     {
+        // A new note takes everything as it stands: nothing left to let go of, nothing to glide from.
+        // (Only while the LFOs run: one that is switched on later, or the strip coming up, glides
+        // in from nothing under the note.)
+        if (anyClosing)
+            finishClosing(true);
+        if (landing)
+        {
+            sGlide.fill(0.0f);
+            refreshStrip();
+        }
+        fresh = anyActive;
         for (auto& l : lfos)
             l.trigger();
     }
@@ -435,7 +507,15 @@ public:
     void endBlock(int numSamples)
     {
         int idle = numSamples - ticks;
+        wasSounding = ticks > 0;
         ticks = 0;
+        if (anyClosing && ! wasSounding)
+            finishClosing(true);        // nobody is listening: let go at once
+        if (landing && ! wasSounding)
+        {
+            sGlide.fill(0.0f);
+            refreshStrip();
+        }
         if (idle <= 0 || ! anyActive)
             return;
         for (int i = 0; i < NUM_LFOS; ++i)
@@ -460,11 +540,18 @@ public:
     // Sum of the LFOs (and strip routes) routed to destination d, -1..1 each (0 if none is).
     float amount(int d) const
     {
-        const float a = (dest[0] == d ? out[0] : 0.0f) + (dest[1] == d ? out[1] : 0.0f);
+        const float a = (dest[0] == d ? glide[0] : 0.0f) + (dest[1] == d ? glide[1] : 0.0f);
         if (! stripLive)
             return a;
-        return a + (sDest[0] == d ? sOut[0] : 0.0f) + (sDest[1] == d ? sOut[1] : 0.0f) + (sDest[2] == d ? sOut[2] : 0.0f);
+        return a + (sDest[0] == d ? sGlide[0] : 0.0f) + (sDest[1] == d ? sGlide[1] : 0.0f) + (sDest[2] == d ? sGlide[2] : 0.0f);
     }
+
+    // A level destination as the gain the voice applies, 0..2, and a pan destination's amount:
+    // once per sample, after tick(). Neither ever steps (dsp::GainSlew), whatever the shape.
+    float gain(int d) { return gainSlew.process(std::clamp(1.0f + amount(d), 0.0f, 2.0f)); }
+    float panAmount(int d) { return panSlew.process(amount(d)); }
+    // A voice that starts from silence, or whose LFOs were off, has nothing to step from.
+    void snapSlews() { gainSlew.snap(); panSlew.snap(); }
 
     // The same for a pitch destination, in semitones (depth squared, see the top of the file).
     float pitchSemitones(int d) const
@@ -482,10 +569,48 @@ public:
     float getOutput(int i) const { return out[(size_t) std::clamp(i, 0, NUM_LFOS - 1)]; }
 
 private:
+    // What every destination but pitch reads is the output on a lead: `glide` follows `out`
+    // exactly while it moves smoothly, and at no more than the whole swing (2) in GLIDE_SECONDS
+    // where it jumps: at the edge of a square, ramp, random or decay shape, when a setting was
+    // changed, while one LFO moves the other's depth, and while it lets go of a destination. The
+    // level or timbre still changes abruptly to the ear; only the one-sample jump (a click on
+    // whatever is sounding) is gone. Pitch reads `out` itself: a pitch step is no click (the phase
+    // goes on from where it is). A note-on takes everything as it stands (fresh).
     void run()
     {
-        if (on[0]) out[0] = lfos[0].process();
-        if (on[1]) out[1] = lfos[1].process();
+        if (anyClosing)
+            finishClosing(false);
+        for (int i = 0; i < NUM_LFOS; ++i)
+        {
+            if (! on[(size_t) i])
+                continue;
+            const float raw = lfos[(size_t) i].process();
+            out[(size_t) i] = closing[(size_t) i] ? 0.0f : raw;
+            const float d = out[(size_t) i] - glide[(size_t) i];
+            const bool held = edged[(size_t) i] || catchUp[(size_t) i] || anyCross || closing[(size_t) i];
+            if (fresh || ! held || std::abs(d) <= glideStep)
+            {
+                glide[(size_t) i] = out[(size_t) i];
+                catchUp[(size_t) i] = false;
+            }
+            else
+                glide[(size_t) i] += d > 0.0f ? glideStep : -glideStep;
+        }
+        if (stripLive || anyClosing)
+            for (int r = 0; r < NUM_STRIP; ++r)
+            {
+                // The strip arrives once per block: its routes move on at no more than the whole
+                // strip in STRIP_GLIDE_SECONDS.
+                const float d = sOut[(size_t) r] - sGlide[(size_t) r];
+                const float step = stripStep * std::max(1.0f, std::abs(sAmount[(size_t) r]));
+                if (fresh || std::abs(d) <= step)
+                    sGlide[(size_t) r] = sOut[(size_t) r];
+                else
+                    sGlide[(size_t) r] += d > 0.0f ? step : -step;
+            }
+        fresh = false;
+        if (landing && sGlide[0] == 0.0f && sGlide[1] == 0.0f && sGlide[2] == 0.0f)
+            refreshStrip();     // the strip has been let go of: at rest
         if (anyCross)
         {
             // An LFO moving the other one (and the strip moving both): heard from the next sample on.
@@ -528,11 +653,18 @@ private:
     void refreshStrip()
     {
         bool live = false, keyedNow = false, crossChanged = false;
+        landing = false;
         for (int r = 0; r < NUM_STRIP; ++r)
         {
             const auto i = (size_t) r;
-            sOn[i] = sUsed[i] && stripPosition > 0.0f;
-            sOut[i] = sOn[i] ? stripPosition * sAmount[i] : 0.0f;
+            // (A strip that is brought down at once - the drum kit does not smooth it - is still
+            // let go of over a few milliseconds by a voice that sounds: landing.)
+            const bool down = stripPosition <= 0.0f && sGlide[i] != 0.0f && sounding();
+            landing = landing || (sUsed[i] && down);
+            sOn[i] = sUsed[i] && (stripPosition > 0.0f || down);
+            sOut[i] = sOn[i] && ! sClosing[i] ? stripPosition * sAmount[i] : 0.0f;
+            if (! sOn[i])
+                sGlide[i] = 0.0f;       // at rest
             sKey[i] = sOn[i] ? sSetKey[i] : -1;
             const int c = sOn[i] ? sSetCross[i] : 0;
             crossChanged = crossChanged || c != sCross[i];
@@ -548,16 +680,48 @@ private:
             updateCross();
     }
 
+    // The LFOs and routes that have let go (their output has come to zero) take their new
+    // settings; now: all of them, whether they have or not.
+    void finishClosing(bool now)
+    {
+        bool left = false;
+        for (int i = 0; i < NUM_LFOS; ++i)
+            if (closing[(size_t) i])
+            {
+                if (now || glide[(size_t) i] == 0.0f)
+                {
+                    closing[(size_t) i] = false;
+                    glide[(size_t) i] = 0.0f;
+                    applyNow(i, pending[(size_t) i], pendingRestart[(size_t) i]);
+                }
+                else
+                    left = true;
+            }
+        for (int r = 0; r < NUM_STRIP; ++r)
+            if (sClosing[(size_t) r])
+            {
+                if (now || sGlide[(size_t) r] == 0.0f)
+                {
+                    sClosing[(size_t) r] = false;
+                    sGlide[(size_t) r] = 0.0f;
+                    applyStripNow(r, sPending[(size_t) r]);
+                }
+                else
+                    left = true;
+            }
+        anyClosing = left;
+    }
+
     float movedByStrip(int r, float v) const
     {
-        const float o = sOut[(size_t) r] * sSpan[(size_t) r];
+        const float o = sGlide[(size_t) r] * sSpan[(size_t) r];
         v = sLog[(size_t) r] ? v * std::exp2(o) : v + o;
         return std::clamp(v, sLo[(size_t) r], sHi[(size_t) r]);
     }
 
     float moved(int i, float v) const
     {
-        const float o = out[(size_t) i] * span[(size_t) i];
+        const float o = glide[(size_t) i] * span[(size_t) i];
         v = isLog[(size_t) i] ? v * std::exp2(o) : v + o;
         return std::clamp(v, lo[(size_t) i], hi[(size_t) i]);
     }
@@ -584,6 +748,18 @@ private:
     bool sampledAhead = false;
     int ticks = 0;
     double sampleRate = 44100.0;
+    dsp::GainSlew gainSlew, panSlew;
+
+    // The outputs on a lead (see run) and the settings waiting for an LFO or route to let go.
+    static constexpr double GLIDE_SECONDS = 0.004, STRIP_GLIDE_SECONDS = 0.005;
+    float glideStep = 0.01f, stripStep = 0.005f;
+    std::array<float, NUM_LFOS> glide {};
+    std::array<float, NUM_STRIP> sGlide {};
+    std::array<bool, NUM_LFOS> edged {}, catchUp {}, closing {}, pendingRestart {};
+    std::array<bool, NUM_STRIP> sClosing {};
+    std::array<Settings, NUM_LFOS> pending {};
+    std::array<StripRoute, NUM_STRIP> sPending {};
+    bool fresh = true, anyClosing = false, wasSounding = false, landing = false;
 };
 
 // The engine side: parameter ids, page descriptions, true values, and applying a change to every
@@ -752,9 +928,13 @@ public:
         }
 
         const VoiceLfos::Settings copy = s;
-        forEachVoice([lfo, &copy, restart](VoiceLfos& v) { v.apply(lfo, copy, restart); });
+        bool closing = false;
+        forEachVoice([lfo, &copy, restart, &closing](VoiceLfos& v) { v.apply(lfo, copy, restart); closing = closing || v.isClosing(); });
+        letGo = letGo || closing;
 
         const int keyNow = keyOf(lfo);
+        if (keyBefore >= 0 && keyBefore != keyNow)
+            noteLetGo(keyBefore);
         return keyBefore >= 0 && keyBefore != keyNow && keyBefore != keyOf(1 - lfo) ? keyBefore : -1;
     }
 
@@ -873,13 +1053,31 @@ public:
     template <typename ForEachVoice>
     void endBlock(int numSamples, const ForEachVoice& forEachVoice) const
     {
-        if (! anyOn())
-            return;
-        forEachVoice([numSamples](VoiceLfos& v) { v.endBlock(numSamples); });
+        bool closing = false;
+        forEachVoice([numSamples, &closing](VoiceLfos& v) { v.endBlock(numSamples); closing = closing || v.isClosing(); });
+        letGo = closing;
     }
 
+    // For engines that push values into their voices: once every voice has let go of the cells an
+    // LFO or route was taken off, restore(key) is called for each (a voice that stopped sounding
+    // part-way was left holding a value on the way back). Call after endBlock.
+    template <typename Restore>
+    void afterLetGo(const Restore& restore)
+    {
+        if (letGo || numLetGo == 0)
+            return;
+        const int n = numLetGo;
+        numLetGo = 0;
+        for (int i = 0; i < n; ++i)
+            restore(letGoKeys[(size_t) i]);
+    }
+
+    // True while an LFO has a destination and a depth, and for the few milliseconds a voice needs
+    // to let go of one that has just been switched off (VoiceLfos::apply).
     bool anyOn() const
     {
+        if (letGo)
+            return true;
         for (auto& s : lfoSettings)
             if (s.dest != 0 && s.depth != 0.0f)
                 return true;
@@ -1010,8 +1208,12 @@ private:
         else
             route.amount = std::clamp(value, -1.0f, 1.0f);
         const VoiceLfos::StripRoute copy = route;
-        forEachVoice([r, &copy](VoiceLfos& v) { v.applyStrip(r, copy); });
+        bool closing = false;
+        forEachVoice([r, &copy, &closing](VoiceLfos& v) { v.applyStrip(r, copy); closing = closing || v.isClosing(); });
+        letGo = letGo || closing;
         const int keyNow = route.dest != 0 && route.amount != 0.0f ? route.key : -1;
+        if (keyBefore >= 0 && keyBefore != keyNow)
+            noteLetGo(keyBefore);
         return keyBefore >= 0 && keyBefore != keyNow ? keyBefore : -1;
     }
 
@@ -1024,4 +1226,16 @@ private:
     int destCount;
     const LfoDestList* list = nullptr;
     std::array<VoiceLfos::Settings, NUM_LFOS> lfoSettings {};
+    mutable bool letGo = false;     // a voice is still letting go of a destination
+    std::array<int, 8> letGoKeys {};    // ... and the cells to put back when all have (afterLetGo)
+    int numLetGo = 0;
+
+    void noteLetGo(int key)
+    {
+        for (int i = 0; i < numLetGo; ++i)
+            if (letGoKeys[(size_t) i] == key)
+                return;
+        if (numLetGo < (int) letGoKeys.size())
+            letGoKeys[(size_t) numLetGo++] = key;
+    }
 };

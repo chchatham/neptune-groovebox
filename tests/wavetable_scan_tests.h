@@ -2,6 +2,7 @@
 #include <juce_core/juce_core.h>
 #include <juce_audio_basics/juce_audio_basics.h>
 #include "../src/engine/WavetableEngine.h"
+#include "../src/project/FactoryPresets.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -287,8 +288,111 @@ public:
         return s;
     }
 
+    // The share of the sound between 1.9 and 2.8 kHz in the 60 ms around `seconds` (left channel):
+    // where the second formant of "ee" is, and where "ah" and "oo" have next to nothing.
+    static double eeShare(const std::vector<float>& stereo, double seconds)
+    {
+        const int n = (int) (0.06 * SR), from = (int) (seconds * SR) - n / 2;
+        auto band = [&](double lo, double hi)
+        {
+            double sum = 0.0;
+            for (double hz = lo; hz < hi; hz += 1.0 / 0.06)
+            {
+                double re = 0.0, im = 0.0;
+                for (int i = 0; i < n; ++i)
+                {
+                    const double x = stereo[(size_t) (from + i) * 2] * (0.5 - 0.5 * std::cos(6.283185307179586 * i / n));
+                    re += x * std::cos(6.283185307179586 * hz * i / SR);
+                    im += x * std::sin(6.283185307179586 * hz * i / SR);
+                }
+                sum += re * re + im * im;
+            }
+            return sum;
+        };
+        const double all = band(60.0, 4000.0);
+        return all > 0.0 ? band(1900.0, 2800.0) / all : 0.0;
+    }
+
     void runTest() override
     {
+        beginTest("The preset I You We Yeah: a held key says the four words, ee between each pair, each word leaning on its start");
+        {
+            const Preset* preset = nullptr;
+            static const auto all = FactoryPresets::getAll();
+            for (auto& p : all)
+                if (p.name == "I You We Yeah") preset = &p;
+            expect(preset != nullptr);
+            if (preset != nullptr)
+            {
+                WavetableEngine e;
+                e.prepareToPlay(SR, 64);
+                for (auto& [id, value] : preset->soundParams)
+                    e.setParameter(id, value);
+                e.noteOn(57, 0.8f, 0);                      // the A in the middle of the keys: 110 Hz
+                std::vector<float> out;
+                renderInto(out, e, (int) (4.0 * SR));
+
+                // One way across the table is 0.9 s and two words: I (ah to ee, 0 to 0.45 s) and you (ee to
+                // oo, to 0.9 s); the way back is we (oo to ee, to 1.35 s) and yeah (ee to ah, to 1.8 s).
+                // The band is fullest a little before the ee itself, where the second formant climbs through it.
+                const double ah = eeShare(out, 0.04), ee1 = eeShare(out, 0.36), oo = eeShare(out, 0.85),
+                             ee2 = eeShare(out, 1.44), ah2 = eeShare(out, 1.76), eeAgain = eeShare(out, 1.8 + 0.36);
+                expect(ee1 > 3.0 * ah && ee1 > 50.0 * oo, "towards ee in I, away from it in you: " + juce::String(ah, 5) + " " + juce::String(ee1, 5) + " " + juce::String(oo, 6));
+                expect(ee2 > 50.0 * oo && ee2 > 3.0 * ah2, "and back through ee in we and yeah: " + juce::String(ee2, 5) + " " + juce::String(ah2, 5));
+                expectWithinAbsoluteError(eeAgain / ee1, 1.0, 0.25, "the four words come round again");
+
+                // Each word starts strong and falls away: the level just after a word's start
+                // against just before its end, for all four.
+                auto level = [&](double seconds)
+                {
+                    double sq = 0.0;
+                    const int n = (int) (0.04 * SR), from = (int) (seconds * SR);
+                    for (int i = 0; i < n; ++i) sq += (double) out[(size_t) (from + i) * 2] * out[(size_t) (from + i) * 2];
+                    return std::sqrt(sq / n);
+                };
+                for (int word = 0; word < 4; ++word)
+                    expect(level(word * 0.45 + 0.06) > 1.5 * level(word * 0.45 + 0.39), "word " + juce::String(word + 1)
+                           + ": " + juce::String(level(word * 0.45 + 0.06), 3) + " " + juce::String(level(word * 0.45 + 0.39), 3));
+            }
+        }
+
+        beginTest("The preset I You We Yeah: no click where a word starts, the scan turns or the pitch fall starts again");
+        {
+            const Preset* preset = nullptr;
+            static const auto all = FactoryPresets::getAll();
+            for (auto& p : all)
+                if (p.name == "I You We Yeah") preset = &p;
+            expect(preset != nullptr);
+            if (preset != nullptr)
+            {
+                WavetableEngine e;
+                e.prepareToPlay(SR, 64);
+                for (auto& [id, value] : preset->soundParams)
+                    e.setParameter(id, value);
+                e.noteOn(57, 0.8f, 0);
+                std::vector<float> out;
+                renderInto(out, e, (int) (8.0 * SR));
+
+                // The largest step from one sample to the next. LFO 1's ramp jumps from its lowest
+                // level to its highest at every word (0.45 s), the scan turns every 0.9 s and LFO 2
+                // starts again every 3.6 s: the 2 ms around each may not step harder than the
+                // 50 ms of the louder word after it.
+                auto maxStep = [&](int from, int to)
+                {
+                    float m = 0.0f;
+                    for (int i = from; i < to; ++i)
+                        m = std::max(m, std::abs(out[(size_t) i * 2] - out[(size_t) (i - 1) * 2]));
+                    return m;
+                };
+                for (int word = 1; word <= 17; ++word)
+                {
+                    const int at = (int) std::lround(word * 0.45 * SR);
+                    const float around = maxStep(at - 48, at + 48), after = maxStep(at + 48, at + 2400);
+                    expect(around <= 1.2f * after, "word " + juce::String(word) + ": " + juce::String(around, 4) + " against " + juce::String(after, 4));
+                }
+            }
+        }
+
         beginTest("The measurement: the heard position is the POS knob (MODE = OFF)");
         {
             for (float pos : { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f })
@@ -322,7 +426,11 @@ public:
             e->setParameter(P::ScanTime, 0.5f);
             e->noteOn(69, 0.9f, -1);
             auto t = track(*e, 80);
-            expectTrack(t, [](double s) { return frac(s / 0.5); }, 0.03f, "LOOP 0.5 s");
+            // (The window that starts at a wrap holds the 3 ms the position takes to go back to the
+            // start of the table - it moves there, it does not jump - and reads up to 0.06 high.)
+            for (int w = 1; w < (int) t.size(); ++w)
+                expectWithinAbsoluteError(t[(size_t) w], (float) frac(timeOf(w) / 0.5), w % 20 == 0 ? 0.08f : 0.03f,
+                                          "LOOP 0.5 s, window " + juce::String(w));
             int wraps = 0;
             for (size_t w = 1; w < t.size(); ++w)
                 if (t[w] < t[w - 1] - 0.5f)
@@ -407,8 +515,10 @@ public:
                     std::set<int> frames;
                     for (int hold = 0; hold < 16; ++hold)
                     {
-                        const float v = t[(size_t) hold * 8];
-                        for (int w = 1; w < 8; ++w)
+                        // (From the plateau's second window on: its first holds the move from the
+                        // frame before, up to a millisecond long - the position never jumps.)
+                        const float v = t[(size_t) hold * 8 + 1];
+                        for (int w = 2; w < 8; ++w)
                             expectWithinAbsoluteError(t[(size_t) (hold * 8 + w)], v, 0.004f, "flat between the jumps");
                         expectWithinAbsoluteError(v * 63.0f, std::round(v * 63.0f), 0.2f, "a whole frame");
                         frames.insert((int) std::lround(v * 63.0f));

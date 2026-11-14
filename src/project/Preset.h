@@ -2,6 +2,7 @@
 
 #include "../engine/EngineBase.h"
 #include "../dsp/ModMatrix.h"
+#include "../controller/KeyboardSplit.h"
 #include <juce_core/juce_core.h>
 #include <vector>
 
@@ -20,6 +21,9 @@ struct Preset
     // The track's arpeggiator as it was when the preset was saved (ProjectBridge::captureArp: its
     // settings, on / off, the tapped rhythm). Empty = the preset has none and leaves the track's.
     std::vector<float> arp;
+    // The keyboard when the preset was saved: its split and its octave. A part that is not stored
+    // (a preset from before, a factory preset) leaves the keyboard as it is.
+    KeyboardSetup keyboard;
 
     juce::var toVar() const
     {
@@ -61,6 +65,11 @@ struct Preset
             obj->setProperty("arp", arpArray);
         }
 
+        if (keyboard.split >= 0)
+            obj->setProperty("split", keyboard.split);
+        if (keyboard.octave != KeyboardSetup::UNKNOWN)
+            obj->setProperty("octave", keyboard.octave);
+
         return juce::var(obj);
     }
 
@@ -91,6 +100,11 @@ struct Preset
             if (auto* arpArray = obj->getProperty("arp").getArray())
                 for (auto& av : *arpArray)
                     p.arp.push_back((float) (double) av);
+
+            if (auto splitVar = obj->getProperty("split"); !splitVar.isVoid())
+                p.keyboard.split = juce::jlimit(0, 3, (int) splitVar);
+            if (auto octaveVar = obj->getProperty("octave"); !octaveVar.isVoid())
+                p.keyboard.octave = juce::jlimit(-8, 8, (int) octaveVar);
 
             if (auto* mods = obj->getProperty("mods").getArray())
             {

@@ -46,6 +46,7 @@ public:
         if (stage == Stage::Attack)       rebend(params.attackCurve, p.attackCurve);
         else if (stage == Stage::Decay)   rebend(params.decayCurve, p.decayCurve);
         else if (stage == Stage::Release) rebend(params.releaseCurve, p.releaseCurve);
+        retarget(p.sustain, p.decayCurve);
         params = p;
         cachedAttackExp = computeExponent(p.attackCurve);
         cachedDecayExp = computeExponent(p.decayCurve);
@@ -54,7 +55,7 @@ public:
 
     void setAttack(float v) { params.attack = v; }
     void setDecay(float v) { params.decay = v; }
-    void setSustain(float v) { params.sustain = v; }
+    void setSustain(float v) { retarget(v, params.decayCurve); params.sustain = v; }
     void setRelease(float v) { params.release = v; }
     const Params& getParams() const { return params; }
 
@@ -102,6 +103,7 @@ public:
                     stage = Stage::Decay;
                     stageProgress = 0.0f;
                     startLevel = 1.0f;
+                    decayFrom = 1.0f;
                 }
                 else
                 {
@@ -122,13 +124,19 @@ public:
                 }
                 else
                 {
-                    currentLevel = 1.0f + (params.sustain - 1.0f) * applyCurveFast(stageProgress, params.decayCurve, cachedDecayExp);
+                    currentLevel = decayFrom + (params.sustain - decayFrom) * applyCurveFast(stageProgress, params.decayCurve, cachedDecayExp);
                 }
                 break;
             }
 
             case Stage::Sustain:
-                currentLevel = params.sustain;
+                // A sustain level that is set under a held note (a step lock, an LFO with an
+                // edge) is moved to over at most 4 ms, never jumped to: a jump is a click.
+                if (currentLevel != params.sustain)
+                {
+                    const float d = params.sustain - currentLevel, step = dt * 250.0f;
+                    currentLevel = std::abs(d) <= step ? params.sustain : currentLevel + (d > 0.0f ? step : -step);
+                }
                 break;
 
             case Stage::Release:
@@ -157,6 +165,17 @@ public:
     bool isActive() const { return stage != Stage::Idle; }
 
 private:
+    // The sustain level changed while the decay is on its way to it: the decay goes on from the
+    // present level towards the new one (its start is moved, so nothing jumps).
+    void retarget(float sustain, float curve)
+    {
+        if (stage != Stage::Decay || sustain == params.sustain)
+            return;
+        const float c = applyCurve(stageProgress, curve);
+        if (c < 0.999f)
+            decayFrom = (currentLevel - sustain * c) / (1.0f - c);
+    }
+
     void rebend(float oldCurve, float newCurve)
     {
         if (oldCurve != newCurve && stageProgress > 0.0f && stageProgress < 1.0f)
@@ -197,6 +216,7 @@ private:
     float currentLevel = 0.0f;
     float stageProgress = 0.0f;
     float startLevel = 0.0f;
+    float decayFrom = 1.0f;         // where the decay started (1, unless the sustain moved under it)
     float cachedAttackExp = 1.0f;
     float cachedDecayExp = 1.0f;
     float cachedReleaseExp = 1.0f;

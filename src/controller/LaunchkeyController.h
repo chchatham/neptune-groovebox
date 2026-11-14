@@ -57,6 +57,11 @@ public:
     void disableFirmwareArp();
     void disableFirmwareScale();
     void configureNeptuneFirmware();
+
+    // Button LEDs: calls the firmware's led_set(id, 0xRRGGBB) through the debug SysEx (MIDI port).
+    // Control ids: 0x10 = >, 0x11 = Func, 0x22 = Up, 0x23 = Down.
+    void setButtonLED(int controlId, int r, int g, int b);
+    void illuminateNavigationButtons();
     // The feature-control messages configureNeptuneFirmware() sends, in order (DAW port, channel 7).
     static std::vector<juce::MidiMessage> neptuneConnectMessages();
     // System common / real-time messages (MIDI clock F8, start / continue / stop, song position, ...).
@@ -131,6 +136,14 @@ public:
     static constexpr int FC_ENCODER_RELATIVE = 0x45; // 127 = encoders send relative steps on CC 0x55-0x5C, ch16
     static constexpr int ENCODER_REL_CC_FIRST = 0x55;
     static constexpr int KEYS_PORT_CHANNEL = 17;     // tag for notes that came from the MIDI (keybed) port
+
+    // Firmware LED function address (VMA = 0x08008000 + file 0x22612)
+    static constexpr juce::uint32 FW_LED_SET = 0x0802A612;
+    // Button control ids
+    static constexpr int BTN_PATTERN = 0x10;   // > (right of top pad row)
+    static constexpr int BTN_FUNC    = 0x11;   // Func (right of bottom pad row)
+    static constexpr int BTN_UP      = 0x22;   // Up arrow
+    static constexpr int BTN_DOWN    = 0x23;   // Down arrow
 
     // Encoder modes
     static constexpr int ENCODER_MODE_MIXER = 0x01;

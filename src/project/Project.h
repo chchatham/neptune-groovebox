@@ -574,6 +574,9 @@ struct ProjectData
     // Arpeggiator settings per track, each in the order written by ProjectBridge (empty = defaults).
     std::vector<std::vector<float>> arps;
 
+    // The keyboard: its split and its octave. Not stored (an older project) = left as it is.
+    KeyboardSetup keyboard;
+
     // Master section as on the MASTR page: EQ low / mid gain, mid frequency, high gain,
     // compressor threshold / ratio / make-up, limiter ceiling. Empty = defaults.
     std::vector<float> master;
@@ -611,6 +614,10 @@ struct ProjectData
             }
             root->setProperty("arps", allArps);
         }
+        if (keyboard.split >= 0)
+            root->setProperty("keyboardSplit", keyboard.split);
+        if (keyboard.octave != KeyboardSetup::UNKNOWN)
+            root->setProperty("keyboardOctave", keyboard.octave);
         if (!master.empty())
         {
             juce::Array<juce::var> masterArr;
@@ -697,6 +704,10 @@ struct ProjectData
                             values.push_back((float)(double) av);
                     proj.arps.push_back(values);
                 }
+            if (auto splitVar = obj->getProperty("keyboardSplit"); !splitVar.isVoid())
+                proj.keyboard.split = juce::jlimit(0, 3, (int) splitVar);
+            if (auto octaveVar = obj->getProperty("keyboardOctave"); !octaveVar.isVoid())
+                proj.keyboard.octave = juce::jlimit(-8, 8, (int) octaveVar);
             if (auto* masterArr = obj->getProperty("master").getArray())
                 for (auto& mv : *masterArr)
                     proj.master.push_back((float)(double) mv);

@@ -64,21 +64,52 @@ public:
             // engine defaults
             { "FM", 0.172f, 208, 252, -0.4f },              { "Macro oscillator", 0.335f, 536, 305, -0.6f },
             { "Wavetable", 0.825f, 196, 604, -4.2f },       { "Wave sequencer", 0.363f, 633, 635, -0.0f },
-            { "Sampler", 0.653f, 347, 495, 4.0f },          { "Drums", 0.302f, 105, 235, -0.0f },
+            { "Sampler", 0.653f, 347, 495, 4.0f },          { "Drums", 0.347f, 57, 154, -0.0f },
             // factory presets of these engines
             { "FM Bass 2", 0.116f, 199, 212, 0.5f },        { "FM Bell Pad", 0.128f, 421, 408, 0.3f },
+            { "Anthem Bell", 0.266f, 221, 391, -0.0f },     // (2026-11-14)
+            { "Abyss Drone", 0.677f, 889, 1680, 1.5f },     // (2026-11-14; the strip opens its filter)
+            // The macro oscillator's thirty-two (2026-11-14), each model's own strip routes.
+            { "Super Saw Lead", 0.255f, 452, 301, -1.0f },
+            { "Hollow Sq Bass", 0.165f, 180, 136, -0.8f },
+            { "Soft Sine Pad", 0.337f, 303, 181, 1.0f },
+            { "Octave Strings", 0.301f, 668, 475, -2.3f },
+            { "FM Glass Keys", 0.644f, 1415, 2130, -0.1f },
+            { "FM Growl Bass", 0.457f, 342, 265, -1.2f },
+            { "Detuned Chime", 0.640f, 1589, 2084, -0.2f },
+            { "Feedback Scream", 0.378f, 1167, 1329, 0.2f },
+            { "Fold Lead", 0.657f, 749, 1904, 0.4f },
+            { "West Coast Bass", 0.382f, 194, 650, -1.3f },
+            { "Cheby Organ", 0.480f, 441, 1037, 2.9f },
+            { "Fold Sweep Pad", 0.340f, 538, 1124, -1.5f },
+            { "Choir Aah", 0.472f, 879, 2323, -7.0f },
+            { "Talking Lead", 0.434f, 726, 1792, -9.2f },
+            { "Whisper Wind", 0.259f, 2894, 1157, -2.0f },
+            { "Vox Bass", 0.348f, 414, 643, -11.5f },
+            { "Pure Organ", 0.236f, 203, 206, -1.7f },
+            { "Stiff Bell", 0.333f, 203, 274, -3.7f },
+            { "Clarinet Tone", 0.316f, 197, 210, -1.6f },
+            { "Glass Harmonics", 0.526f, 249, 496, -3.1f },
+            { "Nylon Guitar", 0.372f, 916, 4996, -4.7f },
+            { "Pluck Bass", 0.259f, 4572, 7269, -2.6f },
+            { "Koto Snap", 0.541f, 1454, 5949, -7.4f },
+            { "String Drum", 0.229f, 8669, 7974, -1.0f },
+            { "Vinyl Crackle", 0.172f, 8159, 7674, 4.3f },
+            { "Pitched Rain", 0.113f, 226, 226, 1.8f },
+            { "Hiss Riser", 0.111f, 6262, 5182, 0.3f },
+            { "Dust Hat", 0.106f, 7713, 7548, 1.2f },
             { "FM Pluck", 0.171f, 216, 289, 0.6f },         { "Electric Piano", 0.119f, 202, 248, -0.0f },
             { "Rhodes", 0.089f, 200, 211, 0.2f },           { "FM Metallic", 0.125f, 288, 292, -0.1f },
-            { "808 Kit 2", 0.313f, 103, 252, -0.5f },        { "FM Kit", 0.323f, 156, 359, -0.6f },
-            { "Electro Kit", 0.300f, 108, 274, -0.5f },      { "Minimal Kit", 0.311f, 94, 237, -1.0f },
-            { "Industrial Kit", 0.307f, 126, 335, -0.7f },   { "Percussion Kit", 0.334f, 104, 263, -1.0f },
+            { "808 Kit 2", 0.355f, 55, 162, -0.5f },        { "FM Kit", 0.357f, 94, 229, -0.6f },
+            { "Electro Kit", 0.337f, 60, 183, -0.5f },      { "Minimal Kit", 0.361f, 50, 142, -1.0f },
+            { "Industrial Kit", 0.346f, 76, 235, -0.7f },   { "Percussion Kit", 0.359f, 54, 160, -1.0f },
             { "Grain Cloud", 0.130f, 4972, 2938, 0.0f },    { "Resonator Pluck", 0.505f, 1631, 5380, -5.2f },
             { "Digital Choir", 0.553f, 2486, 4057, -2.1f }, { "Frozen Sweep", 0.490f, 2613, 1152, -2.2f },
             { "Glitch Table", 0.239f, 197, 201, 0.0f },     { "Sequenced Bells", 0.609f, 5114, 5513, -0.2f },
             { "Morphing Texture", 0.590f, 613, 2007, 2.0f }, { "Glass Marimba", 0.175f, 207, 280, 0.0f },
             { "Metallic Stab", 0.140f, 234, 244, 0.0f },    { "FM Pad", 0.117f, 207, 227, 1.1f },
             { "Lo-Fi Tape", 0.298f, 407, 532, 0.3f },       { "Granular Pad", 0.686f, 334, 483, 4.6f },
-            { "Vinyl Scratch", 0.307f, 476, 568, 1.2f },    { "Lo-Fi Kit", 0.285f, 104, 253, -0.8f },
+            { "Vinyl Scratch", 0.307f, 476, 568, 1.2f },    { "Lo-Fi Kit", 0.331f, 56, 157, -0.8f },
             // The drum-break presets (measured when they were added, 2026-11-11): the sampler's own routes,
             // drive and sample-rate reduction, on a break that loops in time and on its slices.
             { "Break 100 Loop", 0.395f, 317, 290, 2.5f }, { "Break 100 Slices", 0.531f, 90, 104, 2.0f },
@@ -89,7 +120,9 @@ public:
             { "Break 120 Loop", 0.243f, 187, 178, 3.6f }, { "Break 120 Slices", 0.249f, 112, 90, 3.8f },
             { "Break 157 Loop", 0.223f, 1265, 968, 4.1f }, { "Break 157 Slices", 0.236f, 1662, 1167, 4.2f },
             { "Break 160 Loop", 0.264f, 207, 228, 3.2f }, { "Break 160 Slices", 0.265f, 150, 145, 3.1f },
-            { "Minimal Techno Kit", 0.324f, 95, 238, -1.1f },
+            { "Minimal Techno Kit", 0.376f, 49, 141, -1.0f },
+            // The cymbal machine's two kits (2026-11-14): the strip's routes are the kit's own (DEC, DRIV).
+            { "Cymbal Works", 0.334f, 61, 280, -0.8f },     { "House Kit", 0.351f, 57, 187, -0.6f },
             // The presets for the wavetable engine's newer tables (measured when they were added,
             // 2026-11-11): the engine's own route, POS +60 and vibrato. The strip walks the vowels
             // (Vowel Choir ends on the dark O / U, so its brightness stays), raises the sync, FM and
@@ -98,6 +131,7 @@ public:
             // further towards the tone (darker), and holds Reso Sweep Pad's slow sweep at the open
             // end of its table (its resonance then sits above most of the harmonics: a touch darker).
             { "Vowel Lead", 0.263f, 611, 741, -0.2f },       { "Vowel Choir", 0.229f, 385, 384, 0.1f },
+            { "I You We Yeah", 0.215f, 307, 236, 0.5f },     // (2026-11-14; the strip moves where its four words start)
             { "Sync Sweep Lead", 0.349f, 822, 1524, 0.1f },  { "Fold Bass", 0.357f, 390, 596, 0.3f },
             { "FM Table Keys", 0.468f, 471, 1068, -0.2f },   { "Glass Pluck", 0.425f, 1046, 1768, 0.2f },
             { "Struck Bar", 0.343f, 1296, 2270, -1.4f },     { "Drawbar Organ", 0.681f, 364, 2179, -1.7f },
@@ -330,7 +364,7 @@ public:
                 checkAgainstReference(preset.name, measureStrip(preset.engineType, &preset.soundParams));
                 ++checked;
             }
-            expectEquals(checked, 62, "the factory presets of the six engines (27, two for each of the eight drum breaks, 19 for the newer wavetables)");
+            expectEquals(checked, 95, "the factory presets of the six engines (59, two for each of the eight drum breaks, 20 for the newer wavetables)");
         }
 
         beginTest("Defaults: the macro oscillator's models and the sampler's play modes");

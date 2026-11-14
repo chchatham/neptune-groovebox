@@ -69,10 +69,41 @@ public:
         lfos.setSampleRate(sr);
         declick.setSampleRate(sr);
         gainDeclick.setSampleRate(sr);
+        levelStep = (float) (1.0 / (0.004 * sr));
         shaper.setSampleRate(sr);
-        // Clear the KS / bowed-string delay line
-        std::fill(delayLine.begin(), delayLine.end(), 0.0f);
+        // The string's line is as long as the lowest pitch needs at this rate: sized here, never
+        // while playing.
+        const size_t length = delayLineLength(sr);
+        if (delayLine.size() != length)
+            delayLine.assign(length, 0.0f);
+        else
+            std::fill(delayLine.begin(), delayLine.end(), 0.0f);
         delayWritePos = 0;
+        delayDirty = 0;
+    }
+
+    // The lowest pitch the string models have a string for: MIDI note 0 with TUNE and FINE at the
+    // bottom and the widest bend all the way down (49 semitones below it, 0.482 Hz). An LFO or
+    // pressure pulling further stops there: the pitch is held, never the read position.
+    static constexpr double STRING_MIN_HZ = 0.48;
+    static constexpr double MAX_STRING_SAMPLE_RATE = 192000.0;     // above it the lowest pitch rises with the rate
+
+    // Slots in the string's line at a sample rate: 400 kB a voice at 48 kHz.
+    static size_t delayLineLength(double sr)
+    {
+        const double rate = sr >= 1.0 ? std::min(sr, MAX_STRING_SAMPLE_RATE) : 44100.0;
+        return (size_t) std::ceil(rate / STRING_MIN_HZ) + 4;
+    }
+
+    // The string's length in samples for a pitch, always one the line can give: 1 to
+    // lineLength - 2, whatever the pitch is (zero and not-a-number are the longest string).
+    static float stringDelay(double sr, double hz, int lineLength)
+    {
+        const double longest = (double) (lineLength - 2);
+        const double d = sr / hz;
+        if (! (d <= longest))
+            return (float) longest;
+        return d < 1.0 ? 1.0f : (float) d;
     }
 
     void setNote(int note, float velocity)
@@ -93,6 +124,8 @@ public:
             declick.arm();      // struck again while sounding: the restart must not jump,
             gainDeclick.arm();  // nor the step to the new velocity
         }
+        else
+            lfos.snapSlews();
         // An LFO on a page cell is read before the first sample (the engine sets the cell then).
         if (lfos.keyed()) lfos.noteOnAndSample(); else lfos.noteOn();
         filter.noteOn(currentNote, currentVelocity, active);
@@ -100,6 +133,7 @@ public:
         if (envChainEnabled)
             envChain.noteOn();
         active = true;
+        struck = true;
 
         // Karplus-Strong: fill delay line with filtered noise burst on note-on
         if (model == Model::PluckedString)
@@ -142,8 +176,8 @@ public:
                 baseFrequency *= (double) std::exp2(semis / 12.0f);
             filter.setLfoOctaves(lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES);
             filter.setResonanceMod(lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE);
-            lfoGain = juce::jlimit(0.0f, 2.0f, 1.0f + lfos.amount(LfoAmp));
-            lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.amount(LfoPan));
+            lfoGain = lfos.gain(LfoAmp);
+            lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.panAmount(LfoPan));
         }
         else if (lfoApplied)
         {
@@ -151,6 +185,7 @@ public:
             filter.setResonanceMod(0.0f);
             lfoGain = 1.0f;
             lfoPan = 0.0f;
+            lfos.snapSlews();
             lfoApplied = false;
         }
 
@@ -196,7 +231,20 @@ public:
                 active = false;
         }
 
-        return gainDeclick.process(sample * env * currentVelocity * level * gainMod * lfoGain);
+        // LEVL and pressure's share of the level are moved to over a few milliseconds under a
+        // sounding note (a jump would be a click); the first sample of a note takes them as they stand.
+        if (struck)
+        {
+            struck = false;
+            levelNow = level;
+            gainModNow = gainMod;
+        }
+        else
+        {
+            if (levelNow != level)     levelNow = dsp::towards(levelNow, level, levelStep);
+            if (gainModNow != gainMod) gainModNow = dsp::towards(gainModNow, gainMod, 2.0f * levelStep);
+        }
+        return gainDeclick.process(sample * env * currentVelocity * levelNow * gainModNow * lfoGain);
     }
 
     void reset()
@@ -209,7 +257,7 @@ public:
         active = false;
         phase = 0.0;
         modPhase = 0.0;
-        std::fill(delayLine.begin(), delayLine.end(), 0.0f);
+        clearString();
         delayWritePos = 0;
         bowForce = 0.0f;
     }
@@ -538,29 +586,16 @@ private:
     // ===================================================================
     float processPluckedString()
     {
-        float delaySamples = (float)(sampleRate / baseFrequency);
-        int delayLen = juce::jlimit(1, (int)DELAY_LINE_SIZE - 1, (int)delaySamples);
+        const float delaySamples = stringDelay(sampleRate, baseFrequency, (int) delayLine.size());
+        const int delayLen = (int) delaySamples;
 
-        // Read from delay line with linear interpolation
-        float readPos = (float)delayWritePos - delaySamples;
-        if (readPos < 0.0f)
-            readPos += DELAY_LINE_SIZE;
-        int readIdx0 = (int)readPos;
-        int readIdx1 = (readIdx0 + 1) % (int)DELAY_LINE_SIZE;
-        float frac = readPos - (float)readIdx0;
-        readIdx0 = readIdx0 % (int)DELAY_LINE_SIZE;
-
-        float sample = delayLine[readIdx0] * (1.0f - frac) + delayLine[readIdx1] * frac;
+        float sample = readString(delaySamples);
 
         // Pick position: comb filter (notch at harmonics of the pick position)
         if (color > 0.01f)
         {
-            int pickDelay = juce::jlimit(1, delayLen / 2, (int)(color * (float)delayLen * 0.5f));
-            float pickReadPos = (float)delayWritePos - (float)pickDelay;
-            if (pickReadPos < 0.0f)
-                pickReadPos += DELAY_LINE_SIZE;
-            int pickIdx = (int)pickReadPos % (int)DELAY_LINE_SIZE;
-            sample = (sample + delayLine[pickIdx]) * 0.5f;
+            int pickDelay = juce::jlimit(1, juce::jmax(1, delayLen / 2), (int)(color * (float)delayLen * 0.5f));
+            sample = (sample + delayLine[tapIndex(pickDelay)]) * 0.5f;
         }
 
         // Low-pass filter in feedback loop (damping from timbre)
@@ -571,8 +606,7 @@ private:
         float feedback = 0.95f + harmonics * 0.049f; // very close to 1 for long sustain
         if (morph > 0.0f && dsp::xorshiftFloat(noiseState) < morph * 0.5f)
             feedback = -feedback;
-        delayLine[delayWritePos] = ksFilterState * feedback;
-        delayWritePos = (delayWritePos + 1) % (int)DELAY_LINE_SIZE;
+        writeString(ksFilterState * feedback);
 
         return sample;
     }
@@ -653,17 +687,9 @@ private:
     // ===================================================================
     float processBowedString()
     {
-        float delaySamples = (float)(sampleRate / baseFrequency);
+        const float delaySamples = stringDelay(sampleRate, baseFrequency, (int) delayLine.size());
 
-        // Read from delay line with linear interpolation
-        float readPos = (float)delayWritePos - delaySamples;
-        if (readPos < 0.0f)
-            readPos += DELAY_LINE_SIZE;
-        int readIdx0 = ((int)readPos) % (int)DELAY_LINE_SIZE;
-        int readIdx1 = (readIdx0 + 1) % (int)DELAY_LINE_SIZE;
-        float frac = readPos - std::floor(readPos);
-
-        float delayOut = delayLine[readIdx0] * (1.0f - frac) + delayLine[readIdx1] * frac;
+        float delayOut = readString(delaySamples);
 
         // Bow velocity (from morph parameter — represents bow speed)
         float bowVelocity = 0.2f + morph * 0.6f;
@@ -681,23 +707,55 @@ private:
 
         // Bow position comb filter (similar to pick position in KS)
         float bowPos = 0.05f + color * 0.45f; // 5%-50% along string
-        int bowDelay = juce::jlimit(1, (int)delaySamples / 2,
+        int bowDelay = juce::jlimit(1, juce::jmax(1, (int)delaySamples / 2),
                                      (int)(bowPos * delaySamples));
-        float bowReadPos = (float)delayWritePos - (float)bowDelay;
-        if (bowReadPos < 0.0f)
-            bowReadPos += DELAY_LINE_SIZE;
-        int bowIdx = (int)bowReadPos % (int)DELAY_LINE_SIZE;
-        float bowReflection = (delayOut + delayLine[bowIdx]) * 0.5f;
+        float bowReflection = (delayOut + delayLine[tapIndex(bowDelay)]) * 0.5f;
 
         // One-pole damping filter in the loop
         float dampCoeff = 0.03f + harmonics * harmonics * 0.88f;     // 0.25 at the middle, as before
         bowFilterState = bowFilterState * dampCoeff + (bowReflection + excitation) * (1.0f - dampCoeff);
 
         // Write back to delay line
-        delayLine[delayWritePos] = bowFilterState * 0.995f; // slight loss
-        delayWritePos = (delayWritePos + 1) % (int)DELAY_LINE_SIZE;
+        writeString(bowFilterState * 0.995f); // slight loss
 
         return delayOut;
+    }
+
+    // --- The string's line (both string models) ---
+    // The slot written `back` samples ago (1 = the last one). Held to 1..size - 1, so that one
+    // wrap always lands inside the line.
+    size_t tapIndex(int back) const
+    {
+        const int size = (int) delayLine.size();
+        const int i = delayWritePos - juce::jlimit(1, size - 1, back);
+        return (size_t) (i < 0 ? i + size : i);
+    }
+
+    // The string `delaySamples` ago (from stringDelay), between two slots. The whole samples and
+    // the fraction are taken apart before the write position comes in: one float holding both
+    // has no bits left for the fraction far into a long line.
+    float readString(float delaySamples) const
+    {
+        const int whole = (int) delaySamples;
+        const float frac = 1.0f - (delaySamples - (float) whole);      // towards the newer slot
+        return delayLine[tapIndex(whole + 1)] * (1.0f - frac) + delayLine[tapIndex(whole)] * frac;
+    }
+
+    void writeString(float value)
+    {
+        delayLine[(size_t) delayWritePos] = value;
+        if (delayWritePos >= delayDirty)
+            delayDirty = delayWritePos + 1;
+        if (++delayWritePos >= (int) delayLine.size())
+            delayWritePos = 0;
+    }
+
+    // Silence in the line: only the part written since the last time (a note-on must not pay
+    // for the whole line of a short note).
+    void clearString()
+    {
+        std::fill(delayLine.begin(), delayLine.begin() + juce::jlimit(0, (int) delayLine.size(), delayDirty), 0.0f);
+        delayDirty = 0;
     }
 
     // --- Helper: a band-limited saw at phase t (0..1) ---
@@ -733,9 +791,8 @@ private:
     // --- Karplus-Strong init: fill delay line with noise burst behind writePos ---
     void initKarplusStrong()
     {
-        std::fill(delayLine.begin(), delayLine.end(), 0.0f);
-        float delaySamples = (float)(sampleRate / baseFrequency);
-        int burstLen = juce::jlimit(1, (int)DELAY_LINE_SIZE - 1, (int)delaySamples);
+        clearString();
+        int burstLen = (int) stringDelay(sampleRate, baseFrequency, (int) delayLine.size());
 
         // Use a simple PRNG seeded from the note for deterministic-ish results
         uint32_t seed = (uint32_t)(currentNote * 7919 + 12345);
@@ -747,15 +804,16 @@ private:
         {
             seed = seed * 1664525u + 1013904223u;
             float noise = ((float)(seed >> 8) / 16777216.0f) * 2.0f - 1.0f;
-            delayLine[i] = noise * currentVelocity;
+            delayLine[(size_t) i] = noise * currentVelocity;
         }
+        delayDirty = burstLen;
         ksFilterState = 0.0f;
     }
 
     // --- Bowed string init ---
     void initBowedString()
     {
-        std::fill(delayLine.begin(), delayLine.end(), 0.0f);
+        clearString();
         bowFilterState = 0.0f;
         bowForce = 0.0f;
     }
@@ -779,7 +837,6 @@ private:
     }
 
     // --- Constants ---
-    static constexpr size_t DELAY_LINE_SIZE = 8192; // enough for MIDI note 0 at 44100 Hz
     static constexpr int MAX_SAWS = 7;
     static constexpr int MAX_HARMONICS = 32;
     static constexpr float FM_FEEDBACK = 1.6f;          // radians of feedback at the top of the macro
@@ -796,6 +853,8 @@ private:
     double noteFrequency = 440.0;
     float pitchRatio = 1.0f;
     float gainMod = 1.0f;
+    float levelNow = 0.8f, gainModNow = 1.0f, levelStep = 0.005f;
+    bool struck = true;
     int currentNote = 60;
     float currentVelocity = 1.0f;
     bool active = false;
@@ -830,9 +889,10 @@ private:
     double modPhase = 0.0;
     std::array<double, MAX_SAWS> sawPhases = {};
 
-    // Delay line for KS and bowed string (pre-allocated, no heap on audio thread)
-    std::array<float, DELAY_LINE_SIZE> delayLine = {};
-    int delayWritePos = 0;
+    // Delay line for KS and bowed string (sized in setSampleRate, no heap on audio thread)
+    std::vector<float> delayLine = std::vector<float>(delayLineLength(44100.0), 0.0f);
+    int delayWritePos = 0;      // always inside the line
+    int delayDirty = 0;         // slots from the start that may hold sound
     float ksFilterState = 0.0f;
 
     // Bowed string state
@@ -1119,6 +1179,7 @@ public:
         }
 
         lfoSection.endBlock(numSamples, EngineLfoSection::each(voices));
+        lfoSection.afterLetGo([this](int key) { setParameter(key, getParameter(key)); });
     }
 
     void releaseResources() override
@@ -1139,6 +1200,7 @@ public:
 
     void allNotesOff() override
     {
+        soundCut();
         allocator.allNotesOff();
         for (auto& v : voices)
             v.reset();
@@ -1180,6 +1242,8 @@ public:
     {
         if (filterSection.owns(id))
         {
+            if (filterSection.swaps(id, value))
+                soundSwapped();
             filterSection.set(id, value, VoiceFilterSection::each(voices));
             lfoSection.baseChanged(id, filterSection.get(id), EngineLfoSection::each(voices));
             return;
@@ -1198,6 +1262,8 @@ public:
             setStageCurve(id, value);
             return;
         }
+        if ((id == ModelParam || id == EnvChainMode || id == EnvChainStages || id == EnvChainCombine) && params[id] != value)
+            soundSwapped();
         params[id] = value;
         // The legacy decay id and the amp decay are the same control.
         if (id == DecayParam) params[AmpDecay] = value;

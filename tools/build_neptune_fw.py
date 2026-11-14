@@ -33,6 +33,11 @@ PATCHES = [
     # (0x10530), so encoder / control pop-ups no longer mark the screen dirty. With the display lock each of those
     # caused a full 8-page redraw of the host frame (35 ms of I2C per event), which starved host frames.
     (0x1053A, bytes.fromhex("60b9"), b16(0x1053A, 0x10556), "no pop-up redraws: cbnz r0 -> b 0x10556 (layer 1 never accepted)"),
+    # Shift + encoder turn reaches the host (NPF). The encoder input layer (value listener 0x18EDA) asks for the
+    # Shift state (0x13E12(0) = byte 0x2000F506, set by feature 0x3F) and, while Shift is held, hands its three
+    # relative-listener lists a step count of 0 ("show the value, change nothing"). The relative-CC generator
+    # (class 0xE5, 0x1819E) sends nothing for 0 steps. Always take the normal branch instead.
+    (0x18F14, bytes.fromhex("58b1"), b16(0x18F14, 0x18F2E), "Shift + encoder sends: cbz r0 -> b 0x18F2E (no zero-step peek while Shift is held)"),
     # Hands-free update: once the 3 s prompt delay has passed (73 01), confirm without the right-arrow press
     (0x0C692, bytes.fromhex("a8b9"), b16(0xC692, 0xC6C0), "auto-confirm update: cbnz r0 -> b 0xC6C0"),
     # Shift module (0x0E) refresh at 0x1AC5E: never claim pads 0x00-0x0F / 0x28-0x2C / keys for the Shift layer.

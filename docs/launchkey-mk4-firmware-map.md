@@ -112,7 +112,7 @@ Known handlers: 0x28A34 display (04/06/09/6F), 0x28E00 update (71/72/73/7C), 0x2
 | 0x20 / 0x21 | Oct − / Oct + | handled in firmware (module 0x0B); no host message seen |
 | 0x22 / 0x23 | Up / Down | CC 0x6A / 0x6B (106/107) ch1, DAW port *(channel inferred from Func)* |
 | 0x24 / 0x25 | encoder bank down / up (small buttons right of encoders) | CC 0x34 / 0x33 |
-| 0x38–0x3F | encoders 1–8 | default: CC 0x15–0x1C (21–28) on ch16, DAW port, running absolute value. With feature 0x45 on: CC 0x55–0x5C, value 64 ± steps (what the app uses) |
+| 0x38–0x3F | encoders 1–8 | default: CC 0x15–0x1C (21–28) on ch16, DAW port, running absolute value. With feature 0x45 on: CC 0x55–0x5C, value 64 ± steps (what the app uses). **Nothing is sent while Shift is held** up to NPE; NPF sends them with Shift held too (see "Encoder path and the Shift gate" below) |
 | 0x42 | Scale | stock: none (toggles firmware scale mode; module 0x0F claims encoders + bank buttons, module 0x02 claims pads). **NP9: CC 0x6E (110) ch1, DAW port, 127/0** |
 | 0x48 / 0x4A | Play / Record | CC 0x73 / 0x75 |
 | 0x28–0x30 | 9 controls mapped 0x0B–0x13 (not yet identified) | |
@@ -180,7 +180,44 @@ word (0x20008170 + 4·(0x80 + key) = 0x21000000 | note); the firmware rewrites a
 press from the per-key records (20 bytes each from 0x2000371C, note as a word) and the 128-byte note table at
 0x2000E194, and again from the records when the host connects. Poking a mapping word changes the note a key sends.
 
-### 0.8 Neptune patches (all in `tools/build_neptune_fw.py`; running build = NPE)
+**Encoder path and the Shift gate** *(disassembly of stock 1563, 2026-11-14. Verified on the device the same day, with simulated input on NPE and NPF: the Shift state byte and the gate, marked below; everything else here is code only)*:
+- Encoders are control ids 0x38–0x3F (control type 3; `0xC546(id)` = "is an encoder"). The layout builder 0x148C4 gives
+  each a descriptor through 0x14840(id, cc): descriptor byte +0x0E = 0x25 (absolute), 0x26 (feature 0x44) or
+  **0x27 when feature 0x45 is on** (flag byte 0x2000F505, written by 0x14B1A). The mapping builder (0x17978–0x179D4)
+  turns types 0x25 / 0x26 into mapping class 0xE4 and **type 0x27 into class 0xE5 = relative encoder**
+- Encoder input layer (`inputrelative.cpp`): init 0x19054, state 0x200000A4 (previous position per encoder at +0x18,
+  two accelerated running counts at +0x28 and +0x38), index table 0x2000DF14[id]. Its value listener **0x18EDA(id, position)**
+  (registered on list 0x2000F090 by the literal at 0x19168) takes the difference from the previous position, applies
+  acceleration, and calls three relative-listener lists as `f(id, running count, steps)`: 0x2000F210 (registered
+  through 0x190EA: generic 0xDEF8, modules 0xE4EA), 0x2000F224 (0x19100: 0xDF30, the 14-bit mappings) and 0x2000F238
+  (0x1912A: 0xDF72, modules 0xE4C2)
+- Generic relative listener 0xDEF8 → 0x189C0 (CC-family classes, 0x188DA), 0x181EA → **0x18128 (classes 0xE4 / 0xE5)**,
+  0x1835C (class 0xF2). Class 0xE5 at 0x1819E: steps = r2 & 0x3FFF; **0 steps → 0x18C88 (display notification only);
+  otherwise** `set(0xE5, …)` and 0x18C4C, the output listeners that send the CC
+- **Shift state** = byte 0 of 0x2000F506, read by `0x13E12(0)`, written by `0x13E00(0, on)` from the feature apply
+  switch (0xD524, case 0x3F at 0xD5CC). The Shift button's press / release handlers 0x1D5A8 / 0x1D610 (state 0x2000F24C)
+  set feature 0x3F through 0xD9F6, which is also what reports CC 63 to the host. The Shift module's own held flag
+  0x2000F514 is read only inside module 0x0E. *Measured (NPE and NPF, simulated Shift):* 0x2000F506 byte 0 reads 1 while
+  Shift is down and 0 after release, 0x2000F514 likewise, feature 0x3F value 127, and `B6 3F 7F` / `B6 3F 00` go to the host
+- **The gate:** 0x18F0C `bl 0x13E12` / 0x18F14 `cbz r0, 0x18F2E`. With Shift held, 0x18EDA skips the step arithmetic
+  and calls all three lists with **steps = 0** (0x18F16–0x18F2C; stock "hold Shift and turn to see the value"). The
+  class-0xE5 generator sends nothing for 0 steps, so no encoder CC leaves the device while Shift is down; the display
+  lock hides the pop-up. The module listeners (Arp 0x1B9E8 / 0x1BB48, Scale 0x196F8, Settings 0x1C4D8, 0x1CD6C / 0x1CE3C)
+  each check ownership first and own no encoder on Neptune builds. *Measured:* on NPE simulated turns of all eight encoders
+  with Shift held sent nothing (and `BF 55`–`5C` without Shift); on NPF, with `b 0x18F2E` at 0x18F14, the same turns sent
+  `BF 55`–`5C 41` / `3F` between `B6 3F 7F` and `B6 3F 00`
+- Every reader of the Shift state (callers of 0x13E12): 0x18F0C (above); 0x188AE and 0x18966 (CC-family classes
+  0x10–0x60: with Shift a moved control stores its value and shows it but does not send; no encoder mapping uses these
+  classes in the layouts read); 0xE3EA (Shift + Settings starts a 2000 ms timer); 0x1A560 (picks parameter 0x73 or
+  0x74 of class 0xF0); 0x1D704; 0xD5D8 (the feature switch itself)
+- **Shift id remap:** `0x13DC8(id)` (called from 0xC9CC and the Shift handlers) maps ids through the table at file
+  0x280D0 while Shift is on: 0x1C → 0x1E, 0x1E → 0x60, 0x1F → 0x61, **0x20 / 0x21 (Oct − / +) → 0x64 / 0x65 (transpose)**,
+  0x22 / 0x23 (Up / Down) → 0x63 / 0x62, 0x40 / 0x41 → 0x66 / 0x67, 0x42 → 0x12, 0x43 → 0x13. Encoders and pads are not remapped
+- **Shift latch:** in 0x1D5CC a second Shift press within 500 ms (timer 0x2000F24C+0x10) sets the latch byte
+  0x2000F24C+1; the release handler then leaves Shift on, and the next press switches it off. So a double tap would
+  leave the host with CC 63 = 127 and no 0 until Shift is pressed again
+
+### 0.8 Neptune patches (all in `tools/build_neptune_fw.py`; running build = NPF, flashed 2026-11-14)
 | File offset | Change | Effect | Verified |
 |---|---|---|---|
 | 0xB16A | "HID" → 3-char tag | build id readable from host (`ioreg … kUSBString`) | yes |
@@ -197,6 +234,7 @@ press from the per-key records (20 bytes each from 0x2000371C, note as a word) a
 | 0x29020 (50 B), 0x1A8A8 (32 B), 0x1A6DC, 0x1A6E0 | `neptune-patches/ccbtn.S`: stock `43 01` handler disabled; press/release stubs → send CC 0x6C/0x6D/0x6E (Settings/Arp/Scale), status B0, on the DAW port list | those three buttons report to the host | yes (MIDI log, NP9) |
 | 0x10D6A | `ff f7 0c fd` (`bl 0x10786`) → `01 20 00 bf` (`movs r0,#1; nop`) | early display ready reply: sent the pass after a host frame is latched instead of when the display is idle; the reply context is still cleared after the one reply | yes (NPE: reply 78 → 46 ms idle; two frames back to back give two replies) |
 | 0x1053A | `60 b9` (`cbnz r0,0x10556`) → `0c e0` (`b 0x10556`) | layer check never accepts layer 1: firmware pop-ups no longer set content or the dirty flag | yes (NPE: 40 encoder steps/s, 0 of 52 frames timed out; 12 of 13 on NPD) |
+| 0x18F14 | `58 b1` (`cbz r0,0x18F2E`) → `0b e0` (`b 0x18F2E`) | **NPF.** Encoder input layer never takes the Shift branch: turns keep their real step count while Shift is held, so the relative CCs 0x55–0x5C are sent with Shift down. The Shift state, CC 63, the id remap (Shift + Oct = transpose) and everything else are untouched. `firmware/neptune-fw-NPF.syx` differs from NPE in these 2 bytes and the tag | yes, with simulated input (NPF, 2026-11-14; bytes `0b e0` read back from flash): Shift held, each of the eight encoders stepped both ways → `BF 55–5C 41 / 3F` on the DAW port between `B6 3F 7F` and `B6 3F 00` (none on NPE in the same test); Shift + Oct ± still moves the transpose word (0 → 1 → 0), Shift + pad still sends the note and aftertouch, Shift alone still sends CC 63. Not yet by hand: a real Shift + knob turn |
 
 ### 0.8b LEDs (pad and button colours)
 | Item | Value |

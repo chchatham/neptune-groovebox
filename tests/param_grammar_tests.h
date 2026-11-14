@@ -251,8 +251,8 @@ public:
             expect(drums != nullptr);
             if (drums == nullptr) return;
             const auto all = drums->getParamPages();
-            // The engine lists a DR page and a KICK page for each of the 16 pads, then STRIP and its LFO pages.
-            const int extra = (int) all.size() - 2 * DrumEngine::NUM_VOICES;
+            // The engine lists a DR, a KICK and a CYM page for each of the 16 pads, then STRIP and its LFO pages.
+            const int extra = (int) all.size() - DrumEngine::PAGES_PER_PAD * DrumEngine::NUM_VOICES;
             expectEquals(extra, 3);
             // The default kit's lower left pad (the one DRUMS starts on) is a kick machine, which
             // has a page more; this part is about an ordinary pad, the kick's page comes below.
@@ -264,7 +264,7 @@ public:
             expectEquals(rig.param.getPageName(), juce::String("DR 9"));
             auto names = pageNames(rig.param);
             for (int i = 0; i < extra; ++i)
-                expectEquals(names[1 + i], all[(size_t) (2 * DrumEngine::NUM_VOICES + i)].name);
+                expectEquals(names[1 + i], all[(size_t) (DrumEngine::PAGES_PER_PAD * DrumEngine::NUM_VOICES + i)].name);
             int drPages = 0;
             for (auto& n : names) drPages += n.startsWith("DR ") ? 1 : 0;
             expectEquals(drPages, 1);

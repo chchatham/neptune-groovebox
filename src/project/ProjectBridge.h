@@ -35,9 +35,13 @@ namespace ProjectBridge
         AftertouchRouter* pressure = nullptr;     // legacy single router (optional); the routes are per track in `audio`
         std::function<Arpeggiator*(int track)> arpForTrack;     // one arpeggiator per track
         ChordPads* chords = nullptr;              // the CHORD screen's pads
+        std::function<KeyboardSetup()> getKeyboard;               // the keys' split and octave
+        std::function<void(const KeyboardSetup&)> setKeyboard;
     };
 
-    // Arpeggiator settings as a flat list; the order is the file format (append only).
+    // Arpeggiator settings as a flat list; the order is the file format. Nothing can be appended
+    // (the tapped rhythm is the tail), so index 29 holds three switches: 1 = on, 2 = latch,
+    // 4 = mutate running. Files written before latch and mutate were stored hold 0 or 1 there.
     inline std::vector<float> captureArp(const Arpeggiator& a)
     {
         std::vector<float> v {
@@ -51,7 +55,7 @@ namespace ProjectBridge
             (float) (int) a.getPressureTarget(), a.getPressureAmount(),
             (float) (int) a.getRecordMode(), (float) (int) a.getMacroInteraction(),
             (float) a.getMutate().getInterval(), (float) (int) a.getMutate().getMode(),
-            a.isEnabled() ? 1.0f : 0.0f,
+            (float) ((a.isEnabled() ? 1 : 0) | (a.getLatch() ? 2 : 0) | (a.isMutateEnabled() ? 4 : 0)),
             (float) (int) a.getStripTarget() };
         // Index 31 on: the tapped rhythm.
         auto rhythm = a.getRhythmState();
@@ -59,9 +63,17 @@ namespace ProjectBridge
         return v;
     }
 
+    // A number from a file where a setting is expected: what is not a number (or infinite) counts as
+    // missing, and nothing is so large that a whole-number cast of it is undefined. (jlimit hands a
+    // NaN straight through: an arpeggiator with a NaN gate or velocity played NaN notes.)
+    inline float storedValue(const std::vector<float>& v, size_t i, float fallback)
+    {
+        return i < v.size() && std::isfinite(v[i]) ? juce::jlimit(-1.0e9f, 1.0e9f, v[i]) : fallback;
+    }
+
     inline void applyArp(const std::vector<float>& v, Arpeggiator& a)
     {
-        auto at = [&](size_t i, float fallback) { return i < v.size() ? v[i] : fallback; };
+        auto at = [&](size_t i, float fallback) { return storedValue(v, i, fallback); };
         if (v.empty()) return;
         a.setMode((Arpeggiator::Mode) juce::jlimit(0, (int) Arpeggiator::Mode::NumModes - 1, (int) at(0, 0)));
         a.setRate((Arpeggiator::Rate) juce::jlimit(0, (int) Arpeggiator::Rate::NumRates - 1, (int) at(1, 4)));
@@ -92,9 +104,12 @@ namespace ProjectBridge
         a.setMacroInteraction((Arpeggiator::MacroInteraction) juce::jlimit(0, 3, (int) at(26, 0)));
         a.getMutate().setInterval((int) at(27, 4));
         a.getMutate().setMode((MutateSystem::Mode) juce::jlimit(0, 1, (int) at(28, 0)));
-        a.setEnabled(at(29, 0) > 0.5f);
+        const int switches = juce::jlimit(0, 7, (int) std::lround(at(29, 0)));
+        a.setLatch((switches & 2) != 0);
+        a.setMutateEnabled((switches & 4) != 0);
+        a.setEnabled((switches & 1) != 0);
         a.setStripTarget((Arpeggiator::StripTarget) juce::jlimit(0, (int) Arpeggiator::StripTarget::NumTargets - 1, (int) at(30, 0)));
-        if (v.size() > 32)
+        if (v.size() > 32 && std::all_of(v.begin() + 31, v.end(), [](float x) { return std::isfinite(x); }))
             a.setRhythmState(v.data() + 31, (int) v.size() - 31);
         else
             a.clearRhythmTemplate();
@@ -120,19 +135,29 @@ namespace ProjectBridge
 
     inline void applyStep(const TrackData::StepData& d, Step& s)
     {
+        // A file may hold anything: every number is brought inside what a step can hold here, where
+        // it comes in (a velocity that was not a number played notes that were not; a length that
+        // was not one never let its note go).
+        auto within = [](float v, float lo, float hi, float fallback) { return std::isfinite(v) ? juce::jlimit(lo, hi, v) : fallback; };
         s.clear();
         s.trig = d.trig;
         s.notes = d.notes;
-        s.velocity = d.velocity;
-        s.length = d.length;
-        s.microTiming = d.microTiming;
-        s.trigCondition.type = d.trigConditionType;
-        s.trigCondition.a = d.trigA;
-        s.trigCondition.b = d.trigB;
-        s.trigCondition.probability = d.trigProbability;
+        for (auto& n : s.notes)
+        {
+            n.pitch = juce::jlimit(0, 127, n.pitch);
+            n.velocity = within(n.velocity, 0.0f, 1.0f, 1.0f);
+        }
+        s.velocity = within(d.velocity, 0.0f, 1.0f, 1.0f);
+        s.length = within(d.length, 0.0f, 1024.0f, 1.0f);
+        s.microTiming = within(d.microTiming, -0.5f, 0.5f, 0.0f);
+        const int type = (int) d.trigConditionType;
+        s.trigCondition.type = type >= 0 && type <= (int) TrigCondition::NotPrevTrig ? d.trigConditionType : TrigCondition::Always;
+        s.trigCondition.a = juce::jlimit(0, 1024, d.trigA);
+        s.trigCondition.b = juce::jlimit(0, 1024, d.trigB);
+        s.trigCondition.probability = within(d.trigProbability, 0.0f, 1.0f, 1.0f);
         s.paramLocks = d.paramLocks;
         s.pageChangeLock = d.pageChangeLock;
-        s.pressureScale = d.pressureScale;
+        s.pressureScale = within(d.pressureScale, 0.0f, 2.0f, 1.0f);
     }
 
     // Everything that defines how track `t` sounds, read from the engine / mixer / effects (they are
@@ -290,7 +315,7 @@ namespace ProjectBridge
                           (float) (int) r.getBaseDivision(), (float) (int) r.getMaxDivision(),
                           r.getBaseRateHz(), r.getMaxRateHz(), r.getPressureDepth(), r.getGate(),
                           r.getPressureToVelocity(), r.getVelocityDecay(),
-                          r.getSwing(), r.getGlide(), r.getThreshold(), r.isLatch() ? 1.0f : 0.0f,
+                          r.getSwing(), r.getGlide(), r.getThreshold(), 0.0f /* (was LTCH: not stored) */,
                           r.getHumanize(), (float) r.getAccent(), r.getProbability(), (float) r.getMaxRepeats() };
         }
 
@@ -300,6 +325,9 @@ namespace ProjectBridge
                 auto* arp = live.arpForTrack(t);
                 data.arps.push_back(arp != nullptr ? captureArp(*arp) : std::vector<float>());
             }
+
+        if (live.getKeyboard)
+            data.keyboard = live.getKeyboard();
 
         // Pad-pressure routes, one list per track.
         for (int t = 0; t < live.sequencer.getPattern().getTrackCount() && t < AudioEngine::MAX_TRACKS; ++t)
@@ -336,7 +364,7 @@ namespace ProjectBridge
             // Stored master settings, or the defaults for a project without them.
             static const float defaults[AudioEngine::NUM_MASTER_PARAMS] = { 0, 0, 1000, 0, 0, 1, 0, -0.3f };
             for (int i = 0; i < AudioEngine::NUM_MASTER_PARAMS; ++i)
-                live.audio.setMasterParam(i, i < (int) data.master.size() ? data.master[(size_t) i] : defaults[i]);
+                live.audio.setMasterParam(i, storedValue(data.master, (size_t) i, defaults[i]));
         }
         live.audio.setSequencer(&live.sequencer);
 
@@ -370,7 +398,10 @@ namespace ProjectBridge
                 // One sound per track for all patterns.
                 if (t < (int) soundTracks.size())
                 {
-                    track.engineType = soundTracks[(size_t) t].engineType;
+                    // (a number that is no engine, from a damaged file, is the engine a new track has)
+                    const int stored = (int) soundTracks[(size_t) t].engineType;
+                    track.engineType = stored >= 0 && stored <= (int) EngineType::MIDITrack ? soundTracks[(size_t) t].engineType
+                                                                                          : EngineType::UnifiedVoice;
                     track.soundParams = soundTracks[(size_t) t].soundParams;
                 }
             }
@@ -480,12 +511,12 @@ namespace ProjectBridge
         {
             // Stored roll settings, or the defaults for a project without them.
             auto& r = live.audio.getPadRatchet();
-            auto at = [&](size_t i, float fallback) { return i < data.roll.size() ? data.roll[i] : fallback; };
+            auto at = [&](size_t i, float fallback) { return storedValue(data.roll, i, fallback); };
             r.allOff();
             r.setEnabled(at(0, 0) > 0.5f);
             r.setMode(at(1, 0) > 0.5f ? PadRatchet::Mode::Free : PadRatchet::Mode::Quantized);
             r.setBaseDivision((PadRatchet::Division) (int) at(2, 3));
-            r.setMaxDivision((PadRatchet::Division) (int) at(3, 7));
+            r.setMaxDivision((PadRatchet::Division) (int) at(3, (float) (int) PadRatchet::Div1_128));
             r.setBaseRateHz(at(4, 2));
             r.setMaxRateHz(at(5, 40));
             r.setPressureDepth(at(6, 1));
@@ -495,7 +526,9 @@ namespace ProjectBridge
             r.setSwing(at(10, 0));
             r.setGlide(at(11, 0));
             r.setThreshold(at(12, 0));
-            r.setLatch(at(13, 0) > 0.5f);
+            // LTCH is never brought back: a roll latch left on would make every pad roll on and on
+            // after a start or a load, with nothing on the display to say why. It starts off.
+            r.setLatch(false);
             r.setHumanize(at(14, 0));
             r.setAccent((int) at(15, 0));
             r.setProbability(at(16, 1));
@@ -511,6 +544,9 @@ namespace ProjectBridge
                         applyArp(data.arps[(size_t) t], *arp);
                 }
 
+        if (live.setKeyboard)
+            live.setKeyboard(data.keyboard);
+
         // Pad-pressure routes. A project with per-track lists: each track gets its own. An older
         // project with one list: every track whose engine uses a router gets that list (it never
         // reached the drum kits, which keep their default). Neither: each engine's default.
@@ -522,7 +558,8 @@ namespace ProjectBridge
             {
                 const auto& e = list.routes[(size_t) i];
                 router.setRoute(i, { static_cast<AftertouchRouter::Destination>(juce::jlimit(0, AftertouchRouter::DEST_COUNT - 1, e.destination)),
-                                     e.depth, e.bipolar });
+                                     std::isfinite(e.depth) ? juce::jlimit(-1.0f, 1.0f, e.depth) : 0.0f,     // (DPTH is -1..1)
+                                     e.bipolar });
             }
             return router;
         };

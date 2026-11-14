@@ -171,6 +171,7 @@ public:
             case DrumSynthType::Clave:         return PadColors::GREEN;
             case DrumSynthType::SubBass:       return PadColors::PURPLE;
             case DrumSynthType::KickSynth:     return PadColors::RED;
+            case DrumSynthType::CymbalSynth:   return PadColors::DIM_CYAN;
         }
         return PadColors::DIM_WHITE;
     }

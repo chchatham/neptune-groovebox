@@ -2,6 +2,7 @@
 
 #include "../src/project/FactoryPresets.h"
 #include "../src/project/PresetManager.h"
+#include "../src/engine/DrumEngine.h"
 #include <juce_core/juce_core.h>
 #include <set>
 
@@ -148,7 +149,9 @@ public:
                     expect(id >= 0,
                            "Negative param ID " + juce::String(id)
                            + " in preset: " + preset.name);
-                    expect(id <= maxValidId,
+                    // (A drum kit may also set its pads' kick-machine and cymbal-machine pages.)
+                    expect(id <= maxValidId
+                           || (preset.engineType == EngineType::Drum && (DrumEngine::isKickParam(id) || DrumEngine::isCymbalParam(id))),
                            "Param ID " + juce::String(id) + " exceeds max ("
                            + juce::String(maxValidId) + ") for "
                            + engineTypeName(preset.engineType)
@@ -250,14 +253,14 @@ private:
         switch (type)
         {
             case EngineType::UnifiedVoice: return UnifiedParam::MAX_ID - 1;
-            // These four end with the per-voice filter (FILTR / F ENV pages, ids 100-115), where a
-            // preset keeps its cutoff and its mod strip amount (WHL).
+            // These four have the per-voice filter (FILTR / F ENV pages, ids 100-115), where a
+            // preset keeps its cutoff and its mod strip amount (WHL), ...
             case EngineType::FM:
             case EngineType::MacroOsc:
             case EngineType::Wavetable:
-            case EngineType::WaveSeq:      return 115;
-            case EngineType::Sampler:      return 55;  // SamplerEngine::NumParams - 1: the break presets use the
-                                                       // SAMPL, SLICE and STRCH cells (22 VOX .. 51 LEN)
+            case EngineType::WaveSeq:      return EngineLfoSection::STRIP_BASE - 1;   // ... and with the two LFOs
+                                                                                      // (158-173), not the STRIP page
+            case EngineType::Sampler:      return EngineLfoSection::STRIP_BASE - 1;   // its cells (0-55) and its two LFOs
             case EngineType::Drum:         return 127; // 15 voices * 8 + 7
             case EngineType::MIDITrack:    return 29;
             default:                       return 29;

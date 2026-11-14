@@ -476,9 +476,10 @@ namespace EngineParamRange
     static constexpr int FIRST_END = 150;
     static constexpr int EXT_BASE = 158;
     static constexpr int EXT_END = 190;
-    // Third block, 400-527: the drum kit's kick-machine page (16 pads x 8), see DrumEngine.
+    // Third block, 400-655: the drum kit's kick-machine page (400-527, 16 pads x 8) and its
+    // cymbal-machine page (528-655), see DrumEngine.
     static constexpr int THIRD_BASE = 400;
-    static constexpr int THIRD_END = 528;
+    static constexpr int THIRD_END = 656;
     static constexpr bool contains(int id)
     {
         return (id >= 0 && id < FIRST_END) || (id >= EXT_BASE && id < EXT_END) || (id >= THIRD_BASE && id < THIRD_END);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include "../ScreenManager.h"
 #include "../ScreenLayout.h"
 #include "../NoteUtils.h"
@@ -83,6 +84,13 @@ public:
     // Each track's arpeggiator: saved with a preset, taken over by a preset that has one, and put
     // back with the track's own sound.
     void setArpProvider(std::function<Arpeggiator*(int track)> p) { arpForTrack = std::move(p); }
+    // The keyboard (split and octave): saved with a preset, set by a preset that has one, and put
+    // back with the track's own sound.
+    void setKeyboardProvider(std::function<KeyboardSetup()> get, std::function<void(const KeyboardSetup&)> set)
+    {
+        getKeyboard = std::move(get);
+        applyKeyboard = std::move(set);
+    }
 
     // The pads' notes come from the scale chosen on SCALE (its page and root), like the SCALE
     // screen's own pads, when the app provides them: `note(pad)` and the root to mark. Without
@@ -123,6 +131,8 @@ public:
         td.soundParams = snapshotSaved;
         if (!snapshotArp.empty() && snapshotTrack < (int) data.arps.size())
             data.arps[(size_t) snapshotTrack] = snapshotArp;
+        if (getKeyboard && keyboardSet)
+            data.keyboard = snapshotKeyboard;
         td.sampleName.clear();
         if (snapshotType == EngineType::Sampler || snapshotType == EngineType::Wavetable)
         {
@@ -356,6 +366,70 @@ public:
         return true;
     }
 
+    // The name the Mac's box offers for the preset SV has just saved as `savedName`: the name of
+    // the user preset this track's sound was last loaded from or saved as (typing nothing then
+    // saves over it), else `savedName`.
+    juce::String suggestedName(const juce::String& savedName) const
+    {
+        auto it = trackPresetName.find(savedTrack);
+        if (it != trackPresetName.end() && presetManager.findUserPreset(it->second) >= 0)
+            return it->second;
+        return savedName;
+    }
+
+    // The box was answered with a name: the preset saved as `from` gets it. A user preset that
+    // already has that name is replaced (saving over it); a built-in preset's name is refused.
+    // False = nothing changed. Call holding ScreenManager::getLock().
+    bool nameSavedPreset(const juce::String& from, const juce::String& typed)
+    {
+        const auto name = PresetManager::cleanName(typed);
+        if (name.isEmpty() || presetManager.findUserPreset(from) < 0)
+            return false;
+        if (name != from)
+        {
+            int other = -1;
+            for (int i = 0; i < presetManager.getPresetCount(); ++i)
+                if (presetManager.getPreset(i).name.equalsIgnoreCase(name))
+                {
+                    if (presetManager.getPreset(i).isFactory)
+                        return false;
+                    other = i;
+                }
+            if (other >= 0)
+            {
+                // The highlight and the audition, if on the old one, move to its replacement.
+                const auto oldKey = keyOf(presetManager.getPreset(other));
+                const auto newKey = keyOf(presetManager.getPreset(presetManager.findUserPreset(from)));
+                const auto highlighted = highlightedKey();
+                presetManager.removePreset(other);
+                rebuildFilteredList();
+                selectByKey(highlighted == oldKey ? newKey : highlighted);
+                if (shownKey == oldKey) shownKey = newKey;
+                if (heardKey == oldKey) heardKey = newKey;
+            }
+            if (!renameUserPreset(from, name))
+                return false;
+        }
+        trackPresetName[savedTrack] = name;
+        return true;
+    }
+
+    // The box was cancelled: the preset SV saved as `name` is taken away again.
+    bool cancelSavedPreset(const juce::String& name)
+    {
+        const int index = presetManager.findUserPreset(name);
+        if (index < 0)
+            return false;
+        const auto key = keyOf(presetManager.getPreset(index));
+        const auto highlighted = highlightedKey();
+        presetManager.removePreset(index);
+        rebuildFilteredList();
+        if (highlighted != key) selectByKey(highlighted);
+        if (shownKey == key) shownKey = highlightedKey();
+        if (onUserPresetsChanged) onUserPresetsChanged();
+        return true;
+    }
+
     void onPadPress(int padIndex, int velocity) override
     {
         if (padIndex < 0 || padIndex >= 16) return;
@@ -514,6 +588,8 @@ private:
         snapshotArp.clear();
         if (auto* arp = arpOf(snapshotTrack))
             snapshotArp = ProjectBridge::captureArp(*arp);
+        snapshotKeyboard = getKeyboard ? getKeyboard() : KeyboardSetup();
+        keyboardSet = false;
         ownEngine = nullptr;
         parkedEngine.reset();               // (a kept preset: the sound it replaced is gone)
         if (audioEngine)
@@ -667,6 +743,8 @@ private:
             applyTrackLevelValues(snapshotTrack, snapshotSaved);
             audioEngine->setPressureRouter(snapshotTrack, snapshotRoutes);
             setArp(snapshotTrack, snapshotArp);
+            ownKeyboardFollowsHand();
+            setKeyboard(snapshotKeyboard);
             ownEngine = audioEngine->getEngine(snapshotTrack);
         }
         else
@@ -677,6 +755,30 @@ private:
         if (engineChanged && loadCallback)
             loadCallback(snapshotTrack, snapshotType);
         rebuildFilteredList();
+    }
+
+    // An octave button or the split gesture used while a preset is heard: what the player set by
+    // hand is their keyboard from then on, and nothing puts the earlier one back.
+    void ownKeyboardFollowsHand()
+    {
+        if (!getKeyboard || !keyboardSet) return;
+        const auto now = getKeyboard();
+        if (now.split != lastKeyboard.split)
+            snapshotKeyboard.split = now.split;
+        if (now.octave != lastKeyboard.octave && now.octave != KeyboardSetup::UNKNOWN && lastKeyboard.octave != KeyboardSetup::UNKNOWN)
+            snapshotKeyboard.octave = now.octave;
+        lastKeyboard = now;
+    }
+
+    void setKeyboard(const KeyboardSetup& k)
+    {
+        if (!applyKeyboard) return;
+        applyKeyboard(k);
+        if (getKeyboard)
+        {
+            lastKeyboard = getKeyboard();
+            keyboardSet = true;
+        }
     }
 
     // While a preset of another engine is auditioned, "this track's engine" is still the engine
@@ -733,13 +835,20 @@ private:
         ParamMap trackLevel = snapshotSaved;
         // The preset's values, its sample found by name (its place in the bank may have moved).
         const ParamMap sound = PresetManager::soundOf(preset);
-        // A preset saved with its effects replaces the track's insert chain and everything set on
-        // it; one without (the factory presets, user presets from before 2026-11-14) plays through
-        // the track's own effects.
-        if (sound.count(ProjectBridge::INSERT_TYPE_BASE) != 0)
+        // A preset is the whole of a track's sound: its effects take the place of the track's.
+        // One that stores none (the built-in presets, user presets from before 2026-11-14) leaves
+        // the track without insert effects and with the DIRT / TALK / MODFX blocks as they come.
+        // The mixer (volume, pan, sends) is the track's and stays unless the preset stores it.
+        eraseInsertValues(trackLevel);
+        eraseInsertValues(stored);
+        if (sound.count(ProjectBridge::INSERT_TYPE_BASE) == 0)
         {
-            eraseInsertValues(trackLevel);
-            eraseInsertValues(stored);
+            const TrackFx defaults;
+            for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
+            {
+                trackLevel[id] = defaults.get(id);
+                stored.erase(id);
+            }
         }
         for (auto& [id, value] : sound)
         {
@@ -767,6 +876,10 @@ private:
         applyTrackLevelValues(trackIdx, trackLevel);
         // The preset's arpeggiator, or (a preset without one) the track's own again.
         setArp(trackIdx, preset.arp.empty() ? snapshotArp : preset.arp);
+        // The preset's keyboard; what it does not store is the keyboard from before the audition.
+        ownKeyboardFollowsHand();
+        setKeyboard({ preset.keyboard.split >= 0 ? preset.keyboard.split : snapshotKeyboard.split,
+                      preset.keyboard.octave != KeyboardSetup::UNKNOWN ? preset.keyboard.octave : snapshotKeyboard.octave });
         // Back on the remembered sound's engine type: its pressure routes, not the type's defaults.
         if (!sameType && preset.engineType == snapshotType)
             audioEngine->setPressureRouter(trackIdx, snapshotRoutes);
@@ -783,8 +896,10 @@ private:
         const auto key = highlightedKey();
         if (key.isEmpty())
             return false;
+        const auto& kept = presetManager.getPreset(filteredIndices[(size_t) selectedIndex]);
         if (!(auditioned && heardKey == key))
-            applyPreset(presetManager.getPreset(filteredIndices[(size_t) selectedIndex]));
+            applyPreset(kept);
+        trackPresetName[sequencer.getSelectedTrack()] = kept.name;
         takeSnapshot();
         rebuildFilteredList();
         selectByKey(key);
@@ -848,7 +963,14 @@ private:
                 preset.soundParams[ProjectBridge::INSERT_TYPE_BASE] = 0.0f;
             preset.sampleName = PresetManager::sampleNameOf(preset.engineType, preset.soundParams);
         }
+        // The keyboard as it is, or (a preset is being heard and may have moved it) as it was.
+        if (getKeyboard)
+        {
+            ownKeyboardFollowsHand();
+            preset.keyboard = (auditioned && !snapshotIsStale()) ? snapshotKeyboard : getKeyboard();
+        }
         presetManager.addPreset(preset);
+        savedTrack = trackIdx;
         rebuildFilteredList();
         if (onUserPresetsChanged) onUserPresetsChanged();
         if (onPresetSaved) onPresetSaved(name);
@@ -876,6 +998,8 @@ private:
     bool anyEngine = false;
     bool audition = true;               // AU: on unless switched off
     bool auditioned = false;            // a preset is being heard for listening only
+    std::map<int, juce::String> trackPresetName;    // per track: the preset its sound was loaded from or saved as
+    int savedTrack = -1;                // the track SV last saved
     juce::String shownKey;              // the preset the highlight was on when last looked at
     juce::String heardKey;              // the preset being heard
     // The remembered sound of `snapshotTrack`.
@@ -888,7 +1012,12 @@ private:
     const EngineBase* ownEngine = nullptr;      // the track's engine as this screen last left it
     std::shared_ptr<EngineBase> parkedEngine;   // the track's own engine while a preset is heard
     std::vector<float> snapshotArp;             // the track's own arpeggiator
+    KeyboardSetup snapshotKeyboard;             // the keyboard when the sound was remembered
+    KeyboardSetup lastKeyboard;                 // the keyboard as an audition last left it
+    bool keyboardSet = false;                   // an audition has set the keyboard since the snapshot
     std::function<Arpeggiator*(int)> arpForTrack;
+    std::function<KeyboardSetup()> getKeyboard;
+    std::function<void(const KeyboardSetup&)> applyKeyboard;
     TurnConfirm confirm;
     std::function<juce::int64()> clock;
     NoteCallback noteCallback;

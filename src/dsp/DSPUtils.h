@@ -27,9 +27,20 @@ inline float dbToLinear(float db)
 
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
 
+// A phase kept in [0, 1) whatever it is given: an infinite or not-a-number phase (a pitch gone
+// wrong) is 0, never an index outside a table or a loop that does not end.
+// `now` moved towards `target` by at most `step`: what a value that is set under a sounding note
+// is heard through, so that it is never jumped to (a jump is a click).
+inline float towards(float now, float target, float step)
+{
+    const float d = target - now;
+    return std::abs(d) <= step ? target : now + (d > 0.0f ? step : -step);
+}
+
 inline double wrapPhase(double p)
 {
-    return p - std::floor(p);
+    p -= std::floor(p);
+    return (p >= 0.0 && p < 1.0) ? p : 0.0;
 }
 
 inline double midiNoteToHz(int note)
@@ -88,7 +99,10 @@ inline float xorshiftFloat(uint32_t& state)
 struct Declick
 {
     void setSampleRate(double sr) { length = sr > 0.0 ? (int) (sr * 0.002) : 96; if (length < 1) length = 1; }
-    void arm() { pending = true; }
+    void arm() { pending = true; tail = false; }
+    // For a sound whose new note may start on a value of its own (a drum's knock): the old sound
+    // is carried down UNDER the new note, whose first sample is left exactly as it is.
+    void armTail() { pending = true; tail = true; }
     void reset() { last = 0.0f; before = 0.0f; offset = 0.0f; remaining = 0; pending = false; }
 
     float process(float x)
@@ -100,7 +114,7 @@ struct Declick
             // moving smoothly (so that arming on a sound that does not jump changes nothing).
             const float slope = last - before;
             const bool smooth = std::abs(slope - lastSlope) <= 0.5f * std::abs(slope);
-            offset = last + (smooth ? slope : 0.0f) - x;
+            offset = last + (smooth ? slope : 0.0f) - (tail ? 0.0f : x);
             remaining = length;
         }
         if (remaining > 0)
@@ -117,7 +131,78 @@ struct Declick
 
     float last = 0.0f, before = 0.0f, lastSlope = 0.0f, offset = 0.0f;
     int length = 96, remaining = 0;
-    bool pending = false;
+    bool pending = false, tail = false;
+};
+
+// The same for a signal that is handled a block at a time (a track, the master output), at no cost
+// while nothing happens: it remembers how each block ended and, when armed, carries the jump
+// between that and the next block's first sample off over about 2 ms. For what cuts or swaps a
+// sound between two blocks: an engine replaced, an effect taken out, every note stopped at once.
+struct BlockDeclick
+{
+    void setSampleRate(double sr) { length = sr > 0.0 ? (int) (sr * 0.002) : 96; if (length < 1) length = 1; }
+    // arm: the sound goes on, changed - the next block is joined to this one.
+    // armTail: the sound was stopped - it is carried down under whatever starts in the next block
+    // (a new note's first sample is its own, and is not joined to anything).
+    void arm() { pending = true; tail = false; }
+    void armTail() { pending = true; tail = true; }
+    void reset() { last = 0.0f; before = 0.0f; lastSlope = 0.0f; offset = 0.0f; remaining = 0; pending = false; }
+
+    void process(float* x, int numSamples)
+    {
+        if (numSamples <= 0)
+            return;
+        if (pending)
+        {
+            pending = false;
+            const float slope = last - before;
+            const bool smooth = std::abs(slope - lastSlope) <= 0.5f * std::abs(slope);
+            offset = held = last + (smooth ? slope : 0.0f);
+            remaining = length;
+        }
+        for (int i = 0; i < numSamples && remaining > 0; ++i, --remaining)
+        {
+            // tail: the old sound's last value dies away under the new. Otherwise a crossfade from
+            // it to the new sound (which may need a moment to settle: a filter that starts empty).
+            const float t = (float) remaining / (float) length;
+            const float w = t * t * (3.0f - 2.0f * t);
+            x[i] = tail ? x[i] + offset * w : x[i] + (held - x[i]) * w;
+        }
+        for (int i = numSamples > 3 ? numSamples - 3 : 0; i < numSamples; ++i)
+        {
+            lastSlope = last - before;
+            before = last;
+            last = x[i];
+        }
+    }
+
+    float last = 0.0f, before = 0.0f, lastSlope = 0.0f, offset = 0.0f, held = 0.0f;
+    int length = 96, remaining = 0;
+    bool pending = false, tail = false;
+};
+
+// A gain (a level, a pan) moved by an LFO may not jump: a ramp, square or random shape steps it,
+// and a step in gain is a click on whatever is sounding. The value follows its target at no more
+// than a range of 2 (a level's 0..2, a pan's -1..1) in 4 ms. No continuous shape at LFO rates
+// moves that fast, so those pass through exactly; a jump becomes a ramp of at most 4 ms.
+struct GainSlew
+{
+    void setSampleRate(double sr) { maxStep = sr > 0.0 ? (float) (2.0 / (0.004 * sr)) : 0.01f; }
+    void snap() { fresh = true; }       // the next value is taken as it is (a voice starting from silence)
+
+    float process(float target)
+    {
+        const float d = target - value;
+        if (fresh || std::abs(d) <= maxStep)
+            value = target;
+        else
+            value += d > 0.0f ? maxStep : -maxStep;
+        fresh = false;
+        return value;
+    }
+
+    float value = 0.0f, maxStep = 0.01f;
+    bool fresh = true;
 };
 
 } // namespace dsp

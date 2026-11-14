@@ -3,6 +3,7 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_core/juce_core.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include "ParamSpec.h"
@@ -149,7 +150,19 @@ public:
 
     virtual float getCpuLoad() const { return 0.0f; }
 
+    // What the engine did to its sound between two blocks that would be heard as a click, since the
+    // last call (0 = nothing): the track it plays on carries the jump off over 2 ms (AudioEngine).
+    enum { NoJump = 0, SoundCut, SoundSwapped };
+    int takeJump() { return jump.exchange(NoJump, std::memory_order_relaxed); }
+
 protected:
+    // Every voice was stopped at once: what was sounding is carried down (a note that starts in
+    // the same block is not touched).
+    void soundCut() { jump.store(SoundCut, std::memory_order_relaxed); }
+    // A selector changed how the notes that are sounding are made (another table, filter type,
+    // algorithm ...): the jump from the old sound to the new is carried off.
+    void soundSwapped() { if (jump.load(std::memory_order_relaxed) != SoundCut) jump.store(SoundSwapped, std::memory_order_relaxed); }
+
     const AftertouchRouter* aftertouchRouter = nullptr;
 
     // The strip arrives in 7-bit steps; an engine that routes it to something heard at that
@@ -165,5 +178,6 @@ protected:
 
 private:
     float modWheelPosition = 0.0f;
+    std::atomic<int> jump { NoJump };
 
 };

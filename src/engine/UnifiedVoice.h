@@ -201,6 +201,13 @@ public:
         filterSlot.setSampleRate(sr);
         envChain.setSampleRate(sr);
         lfoBank.setSampleRate(sr);
+        lfoAmpSlew.setSampleRate(sr);
+        lfoPanSlew.setSampleRate(sr);
+        declick.setSampleRate(sr);
+        gainDeclick.setSampleRate(sr);
+        lfoStep = (float) (2.0 / (0.004 * sr));         // an LFO's whole swing in 4 ms
+        levelStep = (float) (1.0 / (0.004 * sr));       // a level's whole range in 4 ms
+        octaveRatio = (float) std::exp2(8.0 / (0.004 * sr));   // 8 octaves in 4 ms
     }
 
     // ---- Destinations that are page cells ------------------------------------------------------
@@ -400,6 +407,18 @@ public:
 
     void noteOn()
     {
+        if (! active)
+        {
+            lfoAmpSlew.snap();      // from silence: nothing to step from
+            lfoPanSlew.snap();
+        }
+        else
+        {
+            declick.arm();          // struck again while sounding: new phases, a new velocity
+            gainDeclick.arm();
+        }
+        finishLfoClosings();        // a new note takes every destination as it stands
+        struck = true;              // ... and every glided value (glide)
         // Per-note component spread: pitch, cutoff and envelope times are each a little different
         // on every note, as on a polysynth whose voices are never identical.
         noteSlopSemis = 0.0f;
@@ -469,11 +488,12 @@ public:
     void processModulation(float& pitchOffsetSemitones, float& cutoffMod,
                            float& resonanceMod, float& oscMixMod, float& ampMod)
     {
-        // Feed LFO outputs into ModMatrix sources
+        // Feed LFO outputs into ModMatrix sources (on their leads: a matrix route to a level or
+        // the cutoff may not jump either)
         int lfoCount = lfoBank.getActiveCount();
         for (int i = 0; i < lfoCount && i < 5; ++i)
             modMatrix.setSourceValue(static_cast<ModSource>(static_cast<int>(ModSource::LFO1) + i),
-                                     lfoBank.getOutput(i));
+                                     i < LFOBank::MAX_LFOS ? lfoHeard[(size_t) i] : lfoBank.getOutput(i));
 
         // Feed envelope chain output
         float envOutput = envChain.getLastOutput();
@@ -506,6 +526,7 @@ public:
         lfoPan = 0.0f;
         lfoOscGain.fill(1.0f);
         std::array<float, LFOBank::MAX_LFOS> rateMod {}, depthMod {};
+        float routedAmp = 0.0f;
         auto route = [&](LfoDest d, float v)
         {
             switch (d)
@@ -528,18 +549,31 @@ public:
                 case LfoDest::Cutoff:     lfoCutoffOct += v * 4.0f; break;
                 case LfoDest::Resonance:  resonanceMod += v * 0.5f; break;
                 case LfoDest::OscMix:     oscMixMod += v * 0.5f; break;
-                case LfoDest::Amp:        ampMod += v; break;
+                case LfoDest::Amp:        routedAmp += v; break;
                 case LfoDest::PulseWidth: lfoPwMod += v * 0.4f; break;
                 case LfoDest::CrossMod:   lfoXmodMod += v; break;
                 default: break;          // off, or a page cell (applyParamRoutes)
             }
         };
-        for (int i = 0; i < lfoCount && i < LFOBank::MAX_LFOS; ++i)
-            route(lfoDest[(size_t) i], lfoBank.getOutput(i));
+        // Pitch and the other LFOs' rate and depth take an LFO's output as it is (a pitch step is no
+        // click); everything else takes it on a lead that does not jump (lfoHeard, see glide).
+        for (int i = 0; i < LFOBank::MAX_LFOS; ++i)
+        {
+            const LfoDest d = lfoDest[(size_t) i];
+            const bool asItIs = d == LfoDest::Pitch || d == LfoDest::Osc2Pitch
+                                || ((int) d >= (int) LfoDest::Lfo1Rate && (int) d <= (int) LfoDest::Lfo4Depth);
+            if (asItIs ? i < lfoCount : lfoHeard[(size_t) i] != 0.0f)
+                route(d, asItIs ? lfoBank.getOutput(i) : lfoHeard[(size_t) i]);
+        }
+        // A ramp, square or random LFO may not step the level or the pan (dsp::GainSlew); the
+        // envelopes' own share of the level is left as it is.
+        ampMod += lfoAmpSlew.process(routedAmp);
+        routedAmp = 0.0f;
         // The extra envelopes sent to one of the LFOs' destinations.
         if (envDest != LfoDest::Off && envChain.getStageCount() > 0)
             route(envDest, envOutput * envChain.getDepth());
-        lfoPan = std::clamp(lfoPan, -1.0f, 1.0f);
+        ampMod += routedAmp;
+        lfoPan = std::clamp(lfoPanSlew.process(lfoPan), -1.0f, 1.0f);
 
         // LFOs modulating LFOs take effect on the next sample.
         for (int i = 0; i < LFOBank::MAX_LFOS; ++i)
@@ -564,6 +598,7 @@ public:
 
         // Process LFO bank
         lfoBank.processAll();
+        glide();
 
         // Process envelope chain (needed for mod matrix feed)
         float chainMod = envChain.process();
@@ -636,9 +671,9 @@ public:
         // Poly-mod: the filter envelope bends oscillator 2 (its value from the previous sample).
         const float polyModSemis = polyMod * lastFilterEnv * 24.0f + lfoOsc2Semis;
 
-        const float pwMod = lfoPwMod + atTimbre * 0.4f;
-        const float xmodNow = std::clamp(crossMod + lfoXmodMod + atFm, 0.0f, 1.0f);
-        modOscMixOffset += atWavePos * 0.5f;
+        const float pwMod = lfoPwMod + atTimbreNow * 0.4f + pwLag;
+        const float xmodNow = std::clamp(crossModNow + lfoXmodMod + atFmNow, 0.0f, 1.0f);
+        modOscMixOffset += atWavePosNow * 0.5f;
 
         // Cross-modulation is through-zero linear FM: oscillator 2 moves oscillator 1's FREQUENCY in
         // proportion to that frequency, and far enough the phase runs backwards. Its effect on the
@@ -659,17 +694,19 @@ public:
         float oscMix = 0.0f;
         for (int i = 0; i < MAX_OSCS; ++i)
         {
-            if (!oscs[i].enabled)
+            // (An oscillator that has just been taken out of the mix is heard until it has faded.)
+            const float setLevel = oscLevelNow[(size_t) i];
+            if (!oscs[i].enabled && setLevel <= 0.0f)
                 continue;
 
             // Apply osc mix modulation: scale level of osc 1 up / osc 0 down (or vice versa)
-            float levelScale = oscs[i].level;
+            float levelScale = setLevel;
             if (MAX_OSCS >= 2 && modOscMixOffset != 0.0f)
             {
                 if (i == 0)
-                    levelScale = std::clamp(oscs[i].level - modOscMixOffset, 0.0f, 2.0f);
+                    levelScale = std::clamp(setLevel - modOscMixOffset, 0.0f, 2.0f);
                 else if (i == 1)
-                    levelScale = std::clamp(oscs[i].level + modOscMixOffset, 0.0f, 2.0f);
+                    levelScale = std::clamp(setLevel + modOscMixOffset, 0.0f, 2.0f);
             }
             levelScale *= lfoOscGain[(size_t) i];
 
@@ -681,9 +718,9 @@ public:
                 double freq = baseFrequency * std::exp2((oscs[i].detune + driftSemitones
                                                          + (i == 1 ? polyModSemis : 0.0f)) / 12.0);
                 double phaseInc = freq / sampleRate;
-                oscs[i].phase += phaseInc;
-                if (oscs[i].phase >= 1.0)
-                    oscs[i].phase -= 1.0;
+                // (wrapped for any step: one subtraction let the phase run away once a pitch passed
+                // the sample rate - a high key with PMOD or TUNE and BEND up - and the level with it)
+                oscs[i].phase = dsp::wrapPhase(oscs[i].phase + phaseInc);
 
                 OscState shaped = oscs[i];
                 shaped.pulseWidth = std::clamp(shaped.pulseWidth + pwMod, 0.05f, 0.95f);
@@ -719,9 +756,7 @@ public:
                         (oscs[i].detune + driftSemitones + voiceDetune + (i == 1 ? polyModSemis : 0.0f)) / 12.0);
                     double phaseInc = freq / sampleRate;
 
-                    stackPhases[i][v] += phaseInc;
-                    if (stackPhases[i][v] >= 1.0)
-                        stackPhases[i][v] -= 1.0;
+                    stackPhases[i][v] = dsp::wrapPhase(stackPhases[i][v] + phaseInc);
 
                     // Create a temporary OscState for generation with the stacked phase
                     OscState tempOsc = oscs[i];
@@ -744,17 +779,17 @@ public:
         }
 
         // Noise source and mixer drive (soft saturation before the filter).
-        if (noiseLevel > 0.0f)
+        if (noiseLevelNow > 0.0f)
         {
             // Colour: a one-pole low-pass on the noise, white at 0 and dark at 1.
             float n = dsp::xorshiftNoise(noiseSeed);
             noiseState += noiseCoeff * (n - noiseState);
-            oscMix += noiseState * noiseLevel * noiseMakeup * lfoNoiseGain;
+            oscMix += noiseState * noiseLevelNow * noiseMakeup * lfoNoiseGain;
         }
 
-        if (mixDrive > 0.0f)
+        if (mixDriveNow > 0.0f)
         {
-            const float g = 1.0f + mixDrive * 5.0f;
+            const float g = 1.0f + mixDriveNow * 5.0f;
             oscMix = dsp::fastTanh(oscMix * g) / dsp::fastTanh(g) ;
         }
 
@@ -764,15 +799,15 @@ public:
         lastFilterEnv = filterEnvVal;
         const float filterFmNow = lfoFilterFmMod != 0.0f ? std::clamp(filterFm + lfoFilterFmMod, 0.0f, 1.0f) : filterFm;
         float cutoffOct = filterFmNow * lastOsc2 * 2.0f     // audio-rate cutoff modulation from oscillator 2
-                        + filterEnvVal * filterEnvAmount * FILTER_ENV_OCTAVES
+                        + filterEnvVal * filterEnvAmountNow * FILTER_ENV_OCTAVES
                         + filterKeyTrack * (currentPitch - 60.0f) / 12.0f
                         + filterVelAmount * currentVelocity * 4.0f
                         + lfoCutoffOct
-                        + atCutoff * 4.0f
+                        + atCutoffNow * 4.0f
                         + noteFilterOct;
-        float cutoff = filterBaseCutoff * (cutoffOct != 0.0f ? std::exp2(cutoffOct) : 1.0f) + modCutoffOffset;
+        float cutoff = filterCutoffNow * (cutoffOct != 0.0f ? std::exp2(cutoffOct) : 1.0f) + modCutoffOffset;
         // Filter B follows that modulation fully, partly or not at all.
-        float cutoffB = filterBaseCutoff * (cutoffOct != 0.0f ? std::exp2(cutoffOct * filterBTrack) : 1.0f)
+        float cutoffB = filterCutoffNow * (cutoffOct != 0.0f ? std::exp2(cutoffOct * filterBTrack) : 1.0f)
                         * filterBRatio + modCutoffOffset * filterBTrack;
         if (lfoCutoffBOct != 0.0f)
             cutoffB *= std::exp2(lfoCutoffBOct);
@@ -790,18 +825,18 @@ public:
         // values back when it stops).
         if (modResonanceOffset != 0.0f)
         {
-            filterSlot.setResonance(0, std::clamp(filterBaseResonance + modResonanceOffset, 0.0f, 1.0f));
-            filterSlot.setResonance(1, std::clamp(filterResonanceB + modResonanceOffset, 0.0f, 1.0f));
+            filterSlot.setResonance(0, std::clamp(resonanceNow + modResonanceOffset, 0.0f, 1.0f));
+            filterSlot.setResonance(1, std::clamp(resonanceBNow + modResonanceOffset, 0.0f, 1.0f));
             resonanceModulated = true;
         }
-        else if (resonanceModulated)
+        else if (resonanceModulated || resonanceGlides)
         {
-            filterSlot.setResonance(0, filterBaseResonance);
-            filterSlot.setResonance(1, filterResonanceB);
+            filterSlot.setResonance(0, resonanceNow);
+            filterSlot.setResonance(1, resonanceBNow);
             resonanceModulated = false;
         }
 
-        float filtered = filterSlot.process(oscMix);
+        float filtered = filterSlot.process(declick.process(oscMix));
 
         float ampVal = ampEnv.process();
 
@@ -813,13 +848,14 @@ public:
             active = false;
 
         // Apply amp modulation (mod matrix, LFOs, pressure) AFTER filter
-        float ampScale = std::clamp(1.0f + modAmpOffset + atVolume, 0.0f, 2.0f);
+        float ampScale = std::clamp(1.0f + modAmpOffset + atVolumeNow, 0.0f, 2.0f);
 
-        // Velocity sensitivity: 0 = every note at full level, 1 = level follows velocity.
-        float velGain = 1.0f - velSensitivity + velSensitivity * currentVelocity;
-
-        return filtered * ampVal * velGain * ampScale;
+        // Velocity sensitivity: 0 = every note at full level, 1 = level follows velocity (velGainNow).
+        return gainDeclick.process(filtered * ampVal * velGainNow * ampScale * levelNow);
     }
+
+    // The engine's LEVL (each voice applies it, so that a note takes it whole).
+    void setLevel(float l) { level = l; }
 
     void reset()
     {
@@ -828,6 +864,9 @@ public:
         filterSlot.reset();
         envChain.reset();
         lfoBank.resetAll();
+        declick.reset();
+        gainDeclick.reset();
+        finishLfoClosings();
         active = false;
         for (auto& osc : oscs)
             osc.phase = 0.0;
@@ -909,10 +948,32 @@ public:
             ? 1.0f - std::exp(-3.0f / (glideTime * (float) sampleRate))
             : 1.0f;
     }
+    // An LFO taken off a destination under a sounding note lets go of it first: its output glides
+    // to zero over a few milliseconds, and only then does it move (a snap back would be a click).
     void setLfoDest(int lfoIndex, LfoDest d)
     {
-        if (lfoIndex >= 0 && lfoIndex < LFOBank::MAX_LFOS)
-            lfoDest[(size_t) lfoIndex] = d;
+        if (lfoIndex < 0 || lfoIndex >= LFOBank::MAX_LFOS)
+            return;
+        const auto i = (size_t) lfoIndex;
+        if (lfoClosing[i])
+        {
+            if (d == lfoDest[i])        // back where it was: it stays
+            {
+                lfoClosing[i] = false;
+                routePending[i] = false;
+                lfoCatchUp[i] = true;
+            }
+            else
+                pendingDest[i] = d;
+        }
+        else if (active && d != lfoDest[i] && lfoHeard[i] != 0.0f)
+        {
+            pendingDest[i] = d;
+            lfoClosing[i] = true;
+            routePending[i] = false;
+        }
+        else
+            lfoDest[i] = d;
     }
     // The extra envelopes as a source for one of the LFOs' destinations (Off: their own AMP / CUT
     // / PTCH target applies, EnvelopeChain::Target).
@@ -931,6 +992,17 @@ public:
     {
         if (source < 0 || source >= NUM_MOD_SOURCES)
             return;
+        if (source < LFOBank::MAX_LFOS && lfoClosing[(size_t) source])
+        {
+            // The LFO is still letting go of where it was: its new cell waits with its destination.
+            ParamRoute p;
+            p.id = id; p.base = base; p.lo = lo; p.hi = hi;
+            p.log = log && lo > 0.0f && hi > lo;
+            p.span = p.log ? 0.5f * std::log2(hi / lo) : (span > 0.0f ? span : hi - lo);
+            pendingRoute[(size_t) source] = p;
+            routePending[(size_t) source] = true;
+            return;
+        }
         auto& r = paramRoutes[(size_t) source];
         r.id = id;
         r.base = base;
@@ -950,6 +1022,9 @@ public:
     void setParamRouteBase(int id, float base)
     {
         for (auto& r : paramRoutes)
+            if (r.id == id)
+                r.base = base;
+        for (auto& r : pendingRoute)
             if (r.id == id)
                 r.base = base;
     }
@@ -1049,16 +1124,17 @@ public:
     static constexpr float FILTER_ENV_OCTAVES = 7.0f;
 
     // Sets both filters; setFilterResonanceB then gives filter B its own.
-    void setFilterResonance(float q) { filterBaseResonance = q; filterResonanceB = q; filterSlot.setResonance(q); }
-    void setFilterResonanceA(float q) { filterBaseResonance = q; filterSlot.setResonance(0, q); }
-    void setFilterResonanceB(float q) { filterResonanceB = q; filterSlot.setResonance(1, q); }
+    // (Under a sounding note the resonances and the balance are moved to, not jumped to: glide.)
+    void setFilterResonance(float q) { filterBaseResonance = q; filterResonanceB = q; if (! active) filterSlot.setResonance(q); }
+    void setFilterResonanceA(float q) { filterBaseResonance = q; if (! active) filterSlot.setResonance(0, q); }
+    void setFilterResonanceB(float q) { filterResonanceB = q; if (! active) filterSlot.setResonance(1, q); }
     void setFilterModel(int slot, FilterModel model)
     {
         filterSlot.setModel(slot, model);
     }
     void setFilterMode(int slot, int mode) { filterSlot.setMode(slot, mode); }
     void setFilterRouting(FilterRouting r) { filterSlot.setRouting(r); }
-    void setFilterBalance(float b) { filterSlot.setBalance(b); }
+    void setFilterBalance(float b) { filterBalance = b; if (! active) filterSlot.setBalance(b); }
     void setFilterDrive(float d) { filterSlot.setDrive(d); }
     void setFilterDrive(int slot, float d) { filterSlot.setDrive(slot, d); }
     void setFilterFM(float amount) { filterFm = std::clamp(amount, 0.0f, 1.0f); }
@@ -1071,9 +1147,8 @@ private:
     void applyParamRoutes(float envValue)
     {
         std::array<float, NUM_MOD_SOURCES> amount {};
-        const int lfoCount = lfoBank.getActiveCount();
-        for (int s = 0; s < LFOBank::MAX_LFOS && s < lfoCount; ++s)
-            amount[(size_t) s] = lfoBank.getOutput(s);
+        for (int s = 0; s < LFOBank::MAX_LFOS; ++s)
+            amount[(size_t) s] = lfoHeard[(size_t) s];
         amount[ENV_SOURCE] = envChain.getStageCount() > 0 ? envValue * envChain.getDepth() : 0.0f;
 
         for (int s = 0; s < NUM_MOD_SOURCES; ++s)
@@ -1094,6 +1169,147 @@ private:
             const float moved = r.log ? r.base * std::exp2(total * r.span) : r.base + total * r.span;
             setParam(r.id, std::clamp(moved, r.lo, r.hi));
         }
+    }
+
+    // The shapes that jump: at the turn of the cycle, or (the two decays) when it starts again.
+    static bool hasEdge(LFO::Shape s)
+    {
+        return s != LFO::Shape::Sine && s != LFO::Shape::Triangle && s != LFO::Shape::SmoothRandom;
+    }
+
+    // The LFOs that were letting go of a destination take their new one now.
+    void finishLfoClosings()
+    {
+        for (int i = 0; i < LFOBank::MAX_LFOS; ++i)
+            if (lfoClosing[(size_t) i])
+                finishLfoClosing(i);
+    }
+
+    void finishLfoClosing(int i)
+    {
+        const auto s = (size_t) i;
+        lfoClosing[s] = false;
+        lfoHeard[s] = 0.0f;
+        lfoCatchUp[s] = true;
+        lfoDest[s] = pendingDest[s];
+        if (routePending[s])
+        {
+            routePending[s] = false;
+            // The cell it was moving goes back to its set value, unless another source still moves it.
+            const ParamRoute old = paramRoutes[s];
+            paramRoutes[s] = pendingRoute[s];
+            bool held = false;
+            for (auto& r : paramRoutes)
+                held = held || (old.id >= 0 && r.id == old.id);
+            if (old.id >= 0 && ! held)
+                setParam(old.id, old.base);
+            anyParamRoute = false;
+            for (auto& r : paramRoutes)
+                anyParamRoute = anyParamRoute || r.id >= 0;
+        }
+    }
+
+    // Once per sample, after the LFOs have run. Nothing that jumps under a sounding note is heard
+    // as a jump (a click), except what the player asked to be one:
+    //   - an LFO's output reaches every destination but pitch on a lead (lfoHeard): it follows
+    //     exactly while it moves smoothly, and at no more than the whole swing in 4 ms where it
+    //     jumps - at the edge of a square, ramp, random or decay shape, where its depth or shape
+    //     was changed (a knob, the strip, pressure, another LFO), and while it lets go of a
+    //     destination. The sound still changes abruptly to the ear;
+    //   - what is set from outside between two blocks (a step lock, a knob, pad pressure): the
+    //     oscillator and noise levels, cross-mod, pulse width, the cutoff, the filter envelope's
+    //     amount, velocity's share and the LEVL cell are moved to over a few milliseconds.
+    // Envelopes are not touched: an attack is as fast as it was set. The first sample of a note
+    // takes everything as it stands.
+    void glide()
+    {
+        const int lfoCount = lfoBank.getActiveCount();
+        for (int i = 0; i < LFOBank::MAX_LFOS; ++i)
+        {
+            const auto s = (size_t) i;
+            if (lfoClosing[s] && lfoHeard[s] == 0.0f)
+                finishLfoClosing(i);
+            auto& lfo = lfoBank.getLFO(i);
+            const bool on = i < lfoCount;
+            const float depth = on ? lfo.getEffectiveDepth() : 0.0f;
+            const LFO::Shape shape = lfo.getShape();
+            if (depth != lfoDepthSeen[s] || shape != lfoShapeSeen[s])
+            {
+                lfoDepthSeen[s] = depth;
+                lfoShapeSeen[s] = shape;
+                lfoCatchUp[s] = true;
+            }
+            const float raw = on && ! lfoClosing[s] ? lfoBank.getOutput(i) : 0.0f;
+            const float d = raw - lfoHeard[s];
+            if (struck || std::abs(d) <= lfoStep || ! (hasEdge(shape) || lfoCatchUp[s] || lfoClosing[s]))
+            {
+                lfoHeard[s] = raw;
+                lfoCatchUp[s] = false;
+            }
+            else
+                lfoHeard[s] += d > 0.0f ? lfoStep : -lfoStep;
+        }
+
+        const float velGain = 1.0f - velSensitivity + velSensitivity * currentVelocity;
+        if (struck)
+        {
+            struck = false;
+            for (int i = 0; i < MAX_OSCS; ++i)
+                oscLevelNow[(size_t) i] = oscs[i].enabled ? oscs[i].level : 0.0f;
+            noiseLevelNow = noiseLevel;
+            mixDriveNow = mixDrive;
+            resonanceGlides = resonanceNow != filterBaseResonance || resonanceBNow != filterResonanceB;
+            resonanceNow = filterBaseResonance;
+            resonanceBNow = filterResonanceB;
+            if (balanceNow != filterBalance)
+            {
+                balanceNow = filterBalance;
+                filterSlot.setBalance(balanceNow);
+            }
+            crossModNow = crossMod;
+            pulseWidthNow = oscs[0].pulseWidth;
+            filterCutoffNow = filterBaseCutoff;
+            filterEnvAmountNow = filterEnvAmount;
+            velGainNow = velGain;
+            levelNow = level;
+            atVolumeNow = atVolume; atCutoffNow = atCutoff; atTimbreNow = atTimbre; atWavePosNow = atWavePos; atFmNow = atFm;
+        }
+        else
+        {
+            for (int i = 0; i < MAX_OSCS; ++i)
+            {
+                const float target = oscs[i].enabled ? oscs[i].level : 0.0f;
+                if (oscLevelNow[(size_t) i] != target)
+                    oscLevelNow[(size_t) i] = dsp::towards(oscLevelNow[(size_t) i], target, levelStep);
+            }
+            if (noiseLevelNow != noiseLevel)            noiseLevelNow = dsp::towards(noiseLevelNow, noiseLevel, levelStep);
+            if (mixDriveNow != mixDrive)                mixDriveNow = dsp::towards(mixDriveNow, mixDrive, levelStep);
+            resonanceGlides = resonanceNow != filterBaseResonance || resonanceBNow != filterResonanceB;
+            if (resonanceGlides)
+            {
+                resonanceNow = dsp::towards(resonanceNow, filterBaseResonance, levelStep);
+                resonanceBNow = dsp::towards(resonanceBNow, filterResonanceB, levelStep);
+            }
+            if (balanceNow != filterBalance)
+            {
+                balanceNow = dsp::towards(balanceNow, filterBalance, levelStep);
+                filterSlot.setBalance(balanceNow);
+            }
+            if (crossModNow != crossMod)                crossModNow = dsp::towards(crossModNow, crossMod, levelStep);
+            if (pulseWidthNow != oscs[0].pulseWidth)    pulseWidthNow = dsp::towards(pulseWidthNow, oscs[0].pulseWidth, levelStep);
+            if (filterCutoffNow != filterBaseCutoff)
+                filterCutoffNow = filterCutoffNow < filterBaseCutoff ? std::min(filterBaseCutoff, filterCutoffNow * octaveRatio)
+                                                                     : std::max(filterBaseCutoff, filterCutoffNow / octaveRatio);
+            if (filterEnvAmountNow != filterEnvAmount)  filterEnvAmountNow = dsp::towards(filterEnvAmountNow, filterEnvAmount, levelStep);
+            if (velGainNow != velGain)                  velGainNow = dsp::towards(velGainNow, velGain, levelStep);
+            if (levelNow != level)                      levelNow = dsp::towards(levelNow, level, levelStep);
+            if (atVolumeNow != atVolume)                atVolumeNow = dsp::towards(atVolumeNow, atVolume, levelStep);
+            if (atCutoffNow != atCutoff)                atCutoffNow = dsp::towards(atCutoffNow, atCutoff, 2.0f * levelStep);
+            if (atTimbreNow != atTimbre)                atTimbreNow = dsp::towards(atTimbreNow, atTimbre, levelStep);
+            if (atWavePosNow != atWavePos)              atWavePosNow = dsp::towards(atWavePosNow, atWavePos, levelStep);
+            if (atFmNow != atFm)                        atFmNow = dsp::towards(atFmNow, atFm, levelStep);
+        }
+        pwLag = pulseWidthNow - oscs[0].pulseWidth;
     }
 
     static Envelope::Params scaledEnvelope(Envelope::Params p, float scale)
@@ -1326,7 +1542,26 @@ private:
     float lfoOsc2Semis = 0.0f;
     float lfoNoiseGain = 1.0f;
     float lfoPan = 0.0f;
+    dsp::GainSlew lfoAmpSlew, lfoPanSlew;
     std::array<float, MAX_OSCS> lfoOscGain { 1.0f, 1.0f, 1.0f };
+
+    // What is heard (see glide): the LFOs on their leads, the set values on theirs.
+    bool struck = true;
+    float lfoStep = 0.01f, levelStep = 0.005f, octaveRatio = 1.03f;
+    std::array<float, LFOBank::MAX_LFOS> lfoHeard {}, lfoDepthSeen {};
+    std::array<LFO::Shape, LFOBank::MAX_LFOS> lfoShapeSeen {};
+    std::array<bool, LFOBank::MAX_LFOS> lfoCatchUp {}, lfoClosing {}, routePending {};
+    std::array<LfoDest, LFOBank::MAX_LFOS> pendingDest { LfoDest::Off, LfoDest::Off, LfoDest::Off, LfoDest::Off };
+    std::array<ParamRoute, LFOBank::MAX_LFOS> pendingRoute {};
+    std::array<float, MAX_OSCS> oscLevelNow {};
+    float noiseLevelNow = 0.0f, crossModNow = 0.0f, pulseWidthNow = 0.5f, pwLag = 0.0f, mixDriveNow = 0.0f;
+    float resonanceNow = 0.0f, resonanceBNow = 0.0f, filterBalance = 0.5f, balanceNow = 0.5f;
+    bool resonanceGlides = false;
+    float filterCutoffNow = 20000.0f, filterEnvAmountNow = 0.0f, velGainNow = 1.0f;
+    float level = 0.8f, levelNow = 0.8f;
+    float atVolumeNow = 0.0f, atCutoffNow = 0.0f, atTimbreNow = 0.0f, atWavePosNow = 0.0f, atFmNow = 0.0f;
+    dsp::Declick declick;       // on the mixer's output, before the filter (whose state smears a jump)
+    dsp::Declick gainDeclick;   // on the voice's output
 
     // Pressure contributions
     float atVolume = 0.0f, atCutoff = 0.0f, atVibrato = 0.0f, atTimbre = 0.0f, atWavePos = 0.0f, atFm = 0.0f;

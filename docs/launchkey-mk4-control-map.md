@@ -1,6 +1,6 @@
 # Controls Specification — Neptune Groovebox
 
-Hardware messages below are for Neptune firmware **NPD** and **NPE**, the running build (the same messages; measured on NPD; source: `docs/launchkey-mk4-firmware-map.md` section 0.7).
+Hardware messages below are for Neptune firmware **NPD**, **NPE** and **NPF**, the running build (the same messages, except that NPF also sends encoder turns while Shift is held; measured on NPD; source: `docs/launchkey-mk4-firmware-map.md` section 0.7).
 What every control does is the last section, **CONTROL GRAMMAR**; what each screen's knobs and pads are is the table
 in the owner's manual (`docs/Neptune-Groovebox-Manual.pdf`). The sections before the grammar are protocol and implementation facts only.
 
@@ -66,6 +66,9 @@ Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 
 - At connect the app sends, in order (`main.cpp`): `enableFeatureControls()`, `setPadMode(PAD_MODE_DAW)` (0x1D = 2), `disableFirmwareArp()` (0x49 = 0), `disableFirmwareScale()` (0x4A = 0), `setEncoderMode(ENCODER_MODE_PLUGIN)` (0x1E = 2), `configureNeptuneFirmware()` (0x64 = 0 keys on channel 1, 0x6C = 2 polyphonic pad aftertouch, 0x6E = 0 device MIDI clock output off, 0x45 = 127 relative encoders)
 - 0x45 is volatile and must be sent on every connect; 0x64, 0x6C and 0x6E are non-volatile
 - **MIDI clock:** the device's "MIDI Clock Out" setting (0x6E) is on by default; it then sends `F8` on the MIDI port all the time (24 a beat at its own tempo, 120 BPM), app or no app. The app switches it off. The controller's ports are never a clock or transport source for the app: `LaunchkeyController` drops system messages (`F1`–`FF`) from them, and clock from a MIDI input goes through `MIDIClock::handleMidiMessageFromPort`, which refuses a Launchkey port in every CLK mode (nothing calls it yet: the app opens no MIDI input but the controller, so CLK = EXT / AUTO has no clock source). The app's own clock goes to the first MIDI output that is not a Launchkey port. Play is CC 115; in DAW mode the device sends no Start / Stop
+- **Clock in:** the app makes a virtual MIDI input, "Neptune Clock In". With CLK = EXT or AUTO the sequencer follows clock sent there (Start / Stop, tempo, position). No physical MIDI input is opened for clock, and the Launchkey's ports never count as one
+- **Button lights:** after the connect messages the app lights Up, Down, > and Func white: the debug SysEx on the MIDI port calling the firmware's `led_set(id, 0x3F3F3F)` for ids 0x22, 0x23, 0x10, 0x11 *(not yet seen on the device)*
+- **Octave and split:** the app reads the firmware's octave every 2 s while idle (debug SysEx) and writes it, with the split, when a preset or project that stores the keyboard is loaded (`KeyboardSplit.h`)
 - Full list of registered feature controls: `docs/launchkey-mk4-firmware-map.md` section 0.9 and the Programmer's Reference
 
 ## ENCODER VALUE CONVENTION
@@ -83,7 +86,7 @@ Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 
 - Bottom row pads: notes 112–119 (`PAD_BOTTOM_ROW_START + 0..7`)
 
 ## PARAMETER ID SPACE
-Parameter id ranges in use (engine ids 0–149, 158–189 and 400–527, send types 150–157, mixer 190–199, insert effects
+Parameter id ranges in use (engine ids 0–149, 158–189 and 400–655, send types 150–157, mixer 190–199, insert effects
 200–239, track effect blocks 240–263, arp locks 270–272, insert ON / WET / SYNC / division 280–311, screen-only cells
 900–909, pressure ranges 1000+ / 2000+). Do not add a range that collides with them.
 
@@ -129,7 +132,7 @@ CURV cell, CURV still bends all three stages and each stage's own curve adds to 
 
 **Buttons.** Arp: opens the ARP screen; pressed again on that screen it switches the selected track's arp on / off
 (an ARP tag in the name bar shows it is on). Shift + Arp: latch — the arp's latch when the arp is on, the key latch
-when it is off; LATCH tag in the name bar on every screen. Scale: scale lock (keys on pitched tracks play the
+when it is off; LATCH tag in the name bar on every screen (and ROLL, letter O, while pad rolls are on with ROL2's LTCH). Scale: scale lock (keys on pitched tracks play the
 nearest note of the active scale page, arps stay in it); the name bar says "SCALE LOCK ON C MAJOR" / "SCALE LOCK
 OFF" for 2 s (shortened to fit: "SCALE ON C MAJOR", "SCALE ON") and a SCALE tag stays while it is on; Shift + Scale:
 SCALE screen. Play: start / stop; Shift + Play: stop and return to the start (when already stopped: reset the

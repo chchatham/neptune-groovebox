@@ -44,6 +44,7 @@
 #endif
 #include "project/ProjectManager.h"
 #include "sync/MIDIClock.h"
+#include "sync/MIDIRouter.h"
 #include "sync/AbletonLink.h"
 
 class MainWindow : public juce::DocumentWindow
@@ -378,7 +379,8 @@ class NeptuneApplication : public juce::JUCEApplication
 public:
     const juce::String getApplicationName() override    { return "Neptune Groovebox"; }
     const juce::String getApplicationVersion() override { return "0.1.0"; }
-    bool moreThanOneInstanceAllowed() override           { return false; }
+    // (A screen dump for the manual runs beside the app that is being played: see dumpFolder.)
+    bool moreThanOneInstanceAllowed() override           { return dumpFolder().isNotEmpty(); }
 
     void initialise(const juce::String& /*commandLine*/) override
     {
@@ -537,6 +539,10 @@ public:
         midiClock = std::make_unique<MIDIClock>();
         midiClock->setTempo(sequencer->getTempo());
         audioEngine->setMIDIClock(midiClock.get());
+
+        midiRouter = std::make_unique<MIDIRouter>();
+        if (dumpFolder().isEmpty())
+            midiRouter->open(midiClock.get());
 
         abletonLink = std::make_unique<AbletonLink>();
         abletonLink->setTempoCallback([this](double newTempo)
@@ -754,6 +760,8 @@ public:
             presetScreen->setNoteCallback([this](int note, int velocity) { notePadDown(note, velocity); });
             // ... on the notes of the scale chosen on SCALE (page and root), like SCALE's own pads.
             presetScreen->setArpProvider([this](int t) { return (t >= 0 && t < (int) arps.size()) ? arps[(size_t) t].get() : nullptr; });
+            presetScreen->setKeyboardProvider([this] { return keyboardSplit.getSetup(); },
+                                              [this](const KeyboardSetup& k) { keyboardSplit.apply(k); });
             presetScreen->setPadScale([this](int pad) { return scaleManager ? scaleManager->getNoteForPad(pad) : -1; },
                                       [this] { return scaleManager ? scaleManager->getRootNote() : 0; });
             presetScreen->setNoteOffCallback([this](int note) { notePadUp(note); });
@@ -996,7 +1004,8 @@ public:
             auto midiOutputs = juce::MidiOutput::getAvailableDevices();
             for (auto& d : midiOutputs)
             {
-                if (!d.name.containsIgnoreCase("Launchkey"))
+                // (Not the app's own clock input: its clock would come straight back in.)
+                if (!d.name.containsIgnoreCase("Launchkey") && !d.name.startsWith("Neptune "))
                 {
                     midiOutputDevice = juce::MidiOutput::openDevice(d.identifier);
                     if (midiOutputDevice)
@@ -1009,7 +1018,7 @@ public:
             }
         }
 
-        if (controller->scanAndConnect())
+        if (dumpFolder().isEmpty() && controller->scanAndConnect())
         {
             juce::Logger::writeToLog("Launchkey found, entering DAW mode...");
             controller->enterDawMode();
@@ -1019,6 +1028,7 @@ public:
             controller->disableFirmwareScale();
             controller->setEncoderMode(LaunchkeyController::ENCODER_MODE_PLUGIN);
             controller->configureNeptuneFirmware();
+            controller->illuminateNavigationButtons();
 
             screenManager->configureEncoderDisplays();
 
@@ -1096,14 +1106,6 @@ public:
                 return;
             }
 
-            // NEPTUNE_DUMP_SCREENS=<folder>: write every screen and page as a PBM image, then quit
-            // (documentation and review; nothing is loaded so the pictures show the defaults).
-            if (auto dumpDir = juce::SystemStats::getEnvironmentVariable("NEPTUNE_DUMP_SCREENS", {}); dumpDir.isNotEmpty())
-            {
-                juce::Timer::callAfterDelay(4500, [this, dumpDir] { dumpScreens(juce::File(dumpDir)); quit(); });
-                return;
-            }
-
             // Pick up where the last session left off: reopen the project last saved or loaded.
             {
                 const int last = lastProjectFile().loadFileAsString().trim().getIntValue() - 1;
@@ -1124,8 +1126,9 @@ public:
             panelPadTimer->startTimerHz(30);
             if (auditFolder().isNotEmpty())
                 juce::Timer::callAfterDelay(500, [this] { startScreenAudit(false); });     // drawing checks only
-            else if (juce::SystemStats::getEnvironmentVariable("NEPTUNE_DUMP_SCREENS", {}).isEmpty()
-                     && juce::SystemStats::getEnvironmentVariable("NEPTUNE_SNAPSHOT_CONTROLLER", {}).isEmpty())
+            else if (dumpFolder().isNotEmpty())
+                juce::Timer::callAfterDelay(1500, [this] { dumpScreens(juce::File(dumpFolder())); quit(); });
+            else if (juce::SystemStats::getEnvironmentVariable("NEPTUNE_SNAPSHOT_CONTROLLER", {}).isEmpty())
                 restoreSession();
         }
     }
@@ -1148,6 +1151,7 @@ public:
             deviceManager->removeAudioCallback(audioEngine.get());
         deviceManager.reset();
         midiOutputDevice.reset();
+        midiRouter.reset();
         abletonLink.reset();
         midiClock.reset();
         TurnNotice::setSink({});
@@ -1189,37 +1193,50 @@ private:
     std::unique_ptr<DrumPadScreen> drumPadScreen;
     PresetScreen* presetScreenRef = nullptr;     // owned by screenManager
 
-    // The preset is already saved as `savedName`; this offers to rename it. Return renames,
-    // Escape keeps the name. The controller goes on working while the box is open.
+    // The preset is already saved as `savedName` (SV never waits for the Mac); this asks for its
+    // name, offering the name of the preset the sound came from. Return saves under the name
+    // (over a user preset that has it), Escape takes the save back. The controller goes on working
+    // while the box is open.
     void askPresetName(const juce::String& savedName)
     {
         if (mainWindow == nullptr)
             return;
-        auto* box = new juce::AlertWindow("Name the preset",
-                                          "Saved as \"" + savedName + "\". Type a name (up to "
-                                              + juce::String(PresetManager::MAX_NAME_LENGTH) + " characters) and press Return.",
+        juce::String offered = savedName;
+        {
+            const juce::ScopedLock ui(screenManager->getLock());
+            offered = presetScreenRef->suggestedName(savedName);
+        }
+        auto* box = new juce::AlertWindow("Save preset",
+                                          "Name (up to " + juce::String(PresetManager::MAX_NAME_LENGTH)
+                                              + " characters). Return saves; a name one of your presets has saves over it."
+                                              " Escape cancels: nothing is saved.",
                                           juce::MessageBoxIconType::NoIcon, mainWindow.get());
-        box->addTextEditor("name", savedName);
+        box->addTextEditor("name", offered);
         if (auto* editor = box->getTextEditor("name"))
         {
             editor->setInputRestrictions(PresetManager::MAX_NAME_LENGTH);
             editor->selectAll();
         }
-        box->addButton("Rename", 1, juce::KeyPress(juce::KeyPress::returnKey));
-        box->addButton("Keep " + savedName, 0, juce::KeyPress(juce::KeyPress::escapeKey));
+        box->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        box->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
         juce::Component::SafePointer<juce::AlertWindow> safeBox(box);
         box->enterModalState(true, juce::ModalCallbackFunction::create([this, safeBox, savedName](int result)
         {
-            if (result != 1 || safeBox == nullptr || screenManager == nullptr || presetScreenRef == nullptr)
-                return;
-            const auto typed = safeBox->getTextEditorContents("name");
-            const auto name = PresetManager::cleanName(typed);
-            if (name.isEmpty() || name == savedName)
+            if (safeBox == nullptr || screenManager == nullptr || presetScreenRef == nullptr)
                 return;
             const juce::ScopedLock ui(screenManager->getLock());
-            const bool ok = presetScreenRef->renameUserPreset(savedName, typed);
-            screenManager->showStatus(ok ? "NAMED" : "NAME IN USE");
-            juce::Logger::writeToLog("[Preset] " + savedName + (ok ? " renamed to " : " not renamed to ") + typed);
+            if (result != 1)
+            {
+                presetScreenRef->cancelSavedPreset(savedName);
+                screenManager->showStatus("NOT SAVED");
+                juce::Logger::writeToLog("[Preset] save cancelled (" + savedName + " removed)");
+                return;
+            }
+            const auto typed = safeBox->getTextEditorContents("name");
+            // An empty name, or a built-in preset's: it stays saved under the name it was given.
+            const bool ok = presetScreenRef->nameSavedPreset(savedName, typed);
+            screenManager->showStatus(ok ? "SAVED" : "NAME IN USE");
+            juce::Logger::writeToLog("[Preset] " + savedName + (ok ? " saved as " : " kept, not named ") + typed);
         }), true);
         juce::Process::makeForegroundProcess();
         box->toFront(true);
@@ -1237,6 +1254,7 @@ private:
     std::unique_ptr<SongMode> songMode;
     std::unique_ptr<ProjectManager> projectManager;
     std::unique_ptr<MIDIClock> midiClock;
+    std::unique_ptr<MIDIRouter> midiRouter;
     std::unique_ptr<AbletonLink> abletonLink;
     std::unique_ptr<juce::MidiOutput> midiOutputDevice;
     MainContentComponent* mainContent = nullptr;
@@ -1315,7 +1333,9 @@ private:
     {
         return { *sequencer, *audioEngine, songMode.get(), scaleManager.get(), nullptr,
                  [this](int t) { return (t >= 0 && t < (int) arps.size()) ? arps[(size_t) t].get() : nullptr; },
-                 chordPads.get() };
+                 chordPads.get(),
+                 [this] { return keyboardSplit.getSetup(); },
+                 [this](const KeyboardSetup& k) { keyboardSplit.apply(k); } };
     }
 
     // Projects are numbered slots: ~/Music/Neptune/Projects/P01 ... P32.
@@ -1327,6 +1347,10 @@ private:
     }
 
     static juce::String auditFolder() { return juce::SystemStats::getEnvironmentVariable("NEPTUNE_AUDIT_SCREENS", {}); }
+    // NEPTUNE_DUMP_SCREENS=<folder>: write every screen and page as a PBM image, then quit (for the
+    // manual; nothing is loaded so the pictures show the defaults). The controller is left alone
+    // and no MIDI port is made, so it can run while the app proper is being played.
+    static juce::String dumpFolder() { return juce::SystemStats::getEnvironmentVariable("NEPTUNE_DUMP_SCREENS", {}); }
 
     // The screen audit runs on a thread of its own and sends the same messages the controller
     // does. Nothing is loaded before it and autosave is off, so no project is touched.

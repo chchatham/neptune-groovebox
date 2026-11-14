@@ -54,13 +54,22 @@ public:
         processBlock(left, right, numSamples);
     }
 
-    void setEnabled(bool e) { enabled = e; }
-    bool isEnabled() const { return enabled; }
+    // Switched on or off. In an EffectChain the effect is faded in or out over a few milliseconds
+    // (it goes on running until it has faded: `enabled`, which the effects themselves read, is
+    // then the chain's to set, from the audio thread).
+    void setEnabled(bool e) { wanted = e; if (! chained) enabled = e; }
+    bool isEnabled() const { return wanted; }
+    void setChained() { chained = true; enabled = wanted; }
+    void hold(bool running) { enabled = running; }      // the chain, audio thread
 
     void setMix(float m) { mix = std::clamp(m, 0.0f, 1.0f); }
     float getMix() const { return mix; }
 
-    bool isBypassed() const { return !enabled; }
+    bool isBypassed() const { return !wanted; }
+
+    // How much of the effect is heard, 0..1: an effect switched off or on under sound is faded
+    // out or in over a few milliseconds by its chain (EffectChain), never cut. Audio thread.
+    float presence = -1.0f;     // below 0: not heard yet (it starts as it is set)
 
     virtual void setParameter(int /*id*/, float /*value*/) {}
     virtual float getParameter(int /*id*/) const { return 0.0f; }
@@ -123,7 +132,9 @@ public:
 
 protected:
     double sampleRate = 44100.0;
-    bool enabled = true;
+    bool enabled = true;        // running (what process() looks at)
+    bool wanted = true;         // switched on
+    bool chained = false;
     float mix = 1.0f;
 
     static float lerp(float a, float b, float t) { return a + t * (b - a); }

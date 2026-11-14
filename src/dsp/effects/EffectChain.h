@@ -63,6 +63,7 @@ public:
         if (currentSampleRate > 0.0 && currentBlockSize > 0)
             fx->prepare(currentSampleRate, currentBlockSize);
 
+        fx->setChained();
         effects.push_back(std::move(fx));
     }
 
@@ -73,6 +74,7 @@ public:
             return;
         if (currentSampleRate > 0.0 && currentBlockSize > 0)
             fx->prepare(currentSampleRate, currentBlockSize);
+        fx->setChained();
         effects[(size_t) index] = std::move(fx);
     }
 
@@ -112,8 +114,31 @@ private:
     {
         for (auto& fx : effects)
         {
-            if (!fx->isBypassed())
-                fx->processStereo(left, right, numSamples);
+            // Switched off or on under sound: the effect is faded out or in over 3 ms (a cut
+            // from the effect's output to its input, or back, is a click).
+            const float target = fx->isBypassed() ? 0.0f : 1.0f;
+            float presence = fx->presence < 0.0f ? target : fx->presence;
+            if (presence == target || (int) scratchL.size() < numSamples || currentSampleRate <= 0.0)
+            {
+                fx->presence = target;
+                fx->hold(target > 0.0f);
+                if (target > 0.0f)
+                    fx->processStereo(left, right, numSamples);
+                continue;
+            }
+            fx->hold(true);         // it runs on while it fades
+            std::memcpy(scratchL.data(), left, sizeof(float) * (size_t) numSamples);
+            std::memcpy(scratchR.data(), right, sizeof(float) * (size_t) numSamples);
+            fx->processStereo(scratchL.data(), scratchR.data(), numSamples);
+            const float step = (float) (1.0 / (0.003 * currentSampleRate));
+            for (int i = 0; i < numSamples; ++i)
+            {
+                const float d = target - presence;
+                presence = std::abs(d) <= step ? target : presence + (d > 0.0f ? step : -step);
+                left[i] += presence * (scratchL[(size_t) i] - left[i]);
+                right[i] += presence * (scratchR[(size_t) i] - right[i]);
+            }
+            fx->presence = presence;
         }
     }
 
@@ -127,6 +152,7 @@ private:
 
         for (auto& fx : effects)
         {
+            fx->hold(! fx->isBypassed());
             if (fx->isBypassed())
                 continue;
 
@@ -162,6 +188,7 @@ private:
             return;
 
         // First effect processes in series (in place)
+        effects[0]->hold(! effects[0]->isBypassed());
         if (!effects[0]->isBypassed())
             effects[0]->processStereo(left, right, numSamples);
 
@@ -176,6 +203,7 @@ private:
 
         for (size_t idx = 1; idx < effects.size(); ++idx)
         {
+            effects[idx]->hold(! effects[idx]->isBypassed());
             if (effects[idx]->isBypassed())
                 continue;
 

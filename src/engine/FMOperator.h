@@ -8,7 +8,7 @@
 class FMOperator
 {
 public:
-    void setSampleRate(double sr) { sampleRate = sr; env.setSampleRate(sr); }
+    void setSampleRate(double sr) { sampleRate = sr; env.setSampleRate(sr); levelStep = (float) (1.0 / (0.004 * sr)); }
 
     void setRatio(float r) { ratio = r; }
     void setLevel(float l) { level = l; }
@@ -42,6 +42,7 @@ public:
         prevOutput = 0.0f;
         env.noteOn();
         active = true;
+        struck = true;
     }
 
     void noteOff()
@@ -60,7 +61,9 @@ public:
             freq *= (double) lfoPitchMul;
         double phaseInc = freq / sampleRate;
 
-        float fbMod = prevOutput * (lfoFeedback != 0.0f ? std::clamp(feedback + lfoFeedback, 0.0f, 1.0f) : feedback);
+        if (feedbackNow != feedback)    // (set under a sounding note: moved to, like the level below)
+            feedbackNow = struck ? feedback : dsp::towards(feedbackNow, feedback, levelStep);
+        float fbMod = prevOutput * (lfoFeedback != 0.0f ? std::clamp(feedbackNow + lfoFeedback, 0.0f, 1.0f) : feedbackNow);
         float totalMod = modulation * modSensitivity * lfoIndexMul + fbMod;
 
         float sample = std::sin((float)(phase * dsp::TWO_PI_D) + totalMod);
@@ -70,7 +73,17 @@ public:
         if (!env.isActive())
             active = false;
 
-        float output = sample * envVal * level * currentVelocity;
+        // A level set under a sounding note is moved to over at most 4 ms, never jumped to (a
+        // carrier's level is the sound's, a modulator's its brightness: either jump is a click).
+        // The first sample of a note takes it as it stands.
+        if (levelNow != level)
+        {
+            const float d = level - levelNow;
+            levelNow = struck || std::abs(d) <= levelStep ? level : levelNow + (d > 0.0f ? levelStep : -levelStep);
+        }
+        struck = false;
+
+        float output = sample * envVal * levelNow * currentVelocity;
         prevOutput = output;
         return output;
     }
@@ -95,11 +108,13 @@ private:
 
     float ratio = 1.0f;
     float level = 1.0f;
+    float levelNow = 1.0f, levelStep = 0.005f;
+    bool struck = true;
     float detuneCents = 0.0f;
     float detuneMul = 1.0f;
     float pitchMul = 1.0f;
     float modSensitivity = 1.0f;
-    float feedback = 0.0f;
+    float feedback = 0.0f, feedbackNow = 0.0f;
     bool fixedFreq = false;
     float fixedHz = 440.0f;
     float prevOutput = 0.0f;

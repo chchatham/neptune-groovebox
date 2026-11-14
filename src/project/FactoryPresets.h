@@ -1,11 +1,15 @@
 #pragma once
 
 #include "Preset.h"
+#include "CymbalPresets.h"
 #include "../dsp/filters/FilterSlot.h"
 #include "../engine/DrumVoice.h"
 #include "../engine/ArchitecturePreset.h"
 #include "../engine/SampleBank.h"
 #include "../engine/WavetableEngine.h"
+#include "../engine/FMEngine.h"
+#include "../engine/MacroOscEngine.h"
+#include "../engine/SamplerEngine.h"
 #include <cmath>
 #include <vector>
 
@@ -38,7 +42,8 @@ namespace FactoryPresets
     //  DrumSynthType values:
     //    FMKick=0, AnalogKick=1, ModCyclesKick=2, NoiseSnare=3, FMSnare=4,
     //    Clap=5, ClosedHat=6, OpenHat=7, Cymbal=8, Tom=9, Rim=10,
-    //    Shaker=11, Clave=12, SubBass=13
+    //    Shaker=11, Clave=12, SubBass=13, KickSynth=14 (its page: 400 + voice * 8 + n),
+    //    CymbalSynth=15 (its page: 528 + voice * 8 + n, see CymbalPresets.h)
     //
     //  MacroOsc parameter IDs (from MacroOscEngine.h):
     //    0 = Model (0=VA, 1=FM2Op, 2=WaveFold, 3=Formant, 4=Harmonic,
@@ -437,6 +442,28 @@ namespace FactoryPresets
             {W::Level, 0.65f},
         });
 
+        // VOWL - a voice that says four words while a key is held: "I, you, we, yeah". The scan
+        // runs there and back across the vowels, 0.9 s each way: A to I is "I" (ah-eh-ee), I to U is
+        // "you" (ee-oh-oo); on the way back U to I is "we" and I to A is "yeah". LFO 1 (ramp down,
+        // one cycle per word, started with the key) leans on the start of each word and lets it
+        // fall away, which is what parts the words; LFO 2 lets the pitch fall over the four words
+        // as a spoken sentence does. One octave down: the table is a 110 Hz voice, and that is the
+        // A in the middle of the keys. (Written by Claude, asked for a preset that speaks for it.)
+        {
+            constexpr int L1 = EngineLfoSection::BASE, L2 = L1 + EngineLfoSection::PER_LFO;
+            using O = EngineLfoSection::Offset;
+            add("I You We Yeah", "LEAD", "VOWL", {
+                {W::Octave, -1.0f}, {W::Position, 0.0f}, {W::Glide, 0.04f},
+                {W::ScanMode, (float) (int) WavetableScanMode::Ping}, {W::ScanSync, 0.0f}, {W::ScanTime, 0.9f},
+                {L1 + O::Rate, 2.0f / 0.9f}, {L1 + O::Depth, 0.5f}, {L1 + O::Shape, (float) (int) LFO::Shape::RampDown},
+                {L1 + O::Trigger, (float) (int) LFO::TriggerMode::KeySync}, {L1 + O::Dest, (float) WavetableVoice::LfoAmp},
+                {L2 + O::Rate, 1.0f / 3.6f}, {L2 + O::Depth, 0.3f}, {L2 + O::Shape, (float) (int) LFO::Shape::RampDown},
+                {L2 + O::Trigger, (float) (int) LFO::TriggerMode::KeySync}, {L2 + O::Dest, (float) WavetableVoice::LfoPitch},
+                {W::AmpAttack, 0.03f}, {W::AmpDecay, 0.3f}, {W::AmpSustain, 0.9f}, {W::AmpRelease, 0.25f},
+                {W::Level, 0.8f},
+            });
+        }
+
         // SYNC - the classic sync sweep: the envelope pulls the restarted sine up and lets it fall.
         add("Sync Sweep Lead", "LEAD", "SYNC", {
             {W::Position, 0.12f}, {W::EnvToPosition, 0.55f}, {W::UnisonSpread, 0.2f},
@@ -737,6 +764,33 @@ namespace FactoryPresets
             {60, 4.0f},            // Algorithm 4
             {61, 0.6f},            // Master level
         }));
+
+        // Anthem Bell - the struck tubular bell of 1980s film themes, the way a six-operator FM
+        // synth of that time made it (owner's request, 2026-11-14): three pairs side by side.
+        // Two are the bell itself, a carrier with a modulator at 3.5 times its pitch, one pair
+        // tuned a little flat and one a little sharp so the tone beats slowly as it rings out
+        // over many seconds. The third is the strike: a pair at an unrelated pitch with
+        // feedback on its modulator, gone in a third of a second. Nothing sustains: it is hit
+        // and left to ring, held or not.
+        {
+            using F = FMEngine::Param;
+            presets.push_back(make("Anthem Bell", "KEYS", EngineType::FM, {
+                {F::AlgorithmParam, 2.0f},                                   // [2>1] [4>3] [6>5]
+                {F::Op1Ratio, 1.0f},  {F::Op1Level, 0.8f},  {F::Op1Detune, -4.0f},
+                {F::Op1Attack, 0.001f}, {F::Op1Decay, 6.0f}, {F::Op1Sustain, 0.0f}, {F::Op1Release, 5.0f},
+                {F::Op2Ratio, 3.5f},  {F::Op2Level, 0.55f}, {F::Op2Detune, 3.0f},
+                {F::Op2Attack, 0.001f}, {F::Op2Decay, 3.5f}, {F::Op2Sustain, 0.0f}, {F::Op2Release, 3.0f},
+                {F::Op3Ratio, 1.0f},  {F::Op3Level, 0.8f},  {F::Op3Detune, 4.0f},
+                {F::Op3Attack, 0.001f}, {F::Op3Decay, 7.0f}, {F::Op3Sustain, 0.0f}, {F::Op3Release, 5.5f},
+                {F::Op4Ratio, 3.5f},  {F::Op4Level, 0.5f},  {F::Op4Detune, -2.0f},
+                {F::Op4Attack, 0.001f}, {F::Op4Decay, 4.5f}, {F::Op4Sustain, 0.0f}, {F::Op4Release, 3.5f},
+                {F::Op5Ratio, 1.24f}, {F::Op5Level, 0.45f},
+                {F::Op5Attack, 0.001f}, {F::Op5Decay, 0.35f}, {F::Op5Sustain, 0.0f}, {F::Op5Release, 0.35f},
+                {F::Op6Ratio, 2.0f},  {F::Op6Level, 0.7f},  {F::Op6Feedback, 0.5f},
+                {F::Op6Attack, 0.001f}, {F::Op6Decay, 0.25f}, {F::Op6Sustain, 0.0f}, {F::Op6Release, 0.25f},
+                {F::MasterLevel, 0.6f},
+            }));
+        }
 
         // Dark Pad - square + saw, very low cutoff
         presets.push_back(make("Dark Pad", "PAD", EngineType::UnifiedVoice, {
@@ -1174,6 +1228,103 @@ namespace FactoryPresets
             {14, 1.0f},           // Amp Release
         }));
 
+        // Four for each model but the bowed string, across the categories (owner's request, 2026-11-14:
+        // presets to explore the macro oscillator from). Each comment says which cells make the sound.
+        {
+            using M = MacroOscEngine::Param;
+            using D = MacroOscVoice::LfoDest;
+            using S = LFO::Shape;
+            using O = EngineLfoSection::Offset;
+            using V = VoiceFilterSection::Offset;
+            constexpr int L1b = EngineLfoSection::BASE, L2b = L1b + EngineLfoSection::PER_LFO, Fb = M::FilterBase;
+            using Cells = std::vector<std::pair<int, float>>;
+            auto T = [](int semitones) { return Cells { { M::TuneParam, (float) semitones } }; };
+            auto A = [](float a, float d, float s, float r)
+                { return Cells { { M::AmpAttack, a }, { M::AmpDecay, d }, { M::AmpSustain, s }, { M::AmpRelease, r } }; };
+            // The low-pass: cutoff in Hz, resonance, how far its envelope opens it, the envelope's decay.
+            auto F = [](float hz, float reso, float env, float decay)
+                { return Cells { { Fb + V::Cutoff, hz }, { Fb + V::Resonance, reso }, { Fb + V::EnvAmount, env },
+                                 { Fb + V::Attack, 0.002f }, { Fb + V::Decay, decay }, { Fb + V::Sustain, 0.0f } }; };
+            auto lfo = [](int base, float hz, float depth, S shape, int dest)
+                { return Cells { { base + O::Rate, hz }, { base + O::Depth, depth }, { base + O::Shape, (float) (int) shape },
+                                 { base + O::Dest, (float) dest } }; };
+            auto L1 = [&](float hz, float depth, S shape, int dest) { return lfo(L1b, hz, depth, shape, dest); };
+            auto L2 = [&](float hz, float depth, S shape, int dest) { return lfo(L2b, hz, depth, shape, dest); };
+            auto Lv = [](float level) { return Cells { { M::LevelParam, level } }; };     // LEVL, set by ear of the meter:
+                                                                                          // a chord of each is about as loud
+            auto K1 = [] { return Cells { { L1b + O::Trigger, (float) (int) LFO::TriggerMode::KeySync } }; };   // LFO 1 starts with the key
+            auto FD1 = [](float seconds) { return Cells { { L1b + O::Fade, seconds } }; };                      // LFO 1 fades in
+            auto add = [&presets](const char* name, const char* category, int model, float timbre, float color,
+                                  float harmonics, float morph, std::initializer_list<Cells> more)
+            {
+                ParamMap p { { M::ModelParam, (float) model }, { M::TimbreParam, timbre }, { M::ColorParam, color },
+                             { M::HarmonicsParam, harmonics }, { M::MorphParam, morph }, { M::LevelParam, 0.8f } };
+                for (auto& cells : more)
+                    for (auto& [id, value] : cells)
+                        p[id] = value;
+                presets.push_back(make(name, category, EngineType::MacroOsc, std::move(p)));
+            };
+
+            // VA: seven saws spread wide, a little of the octave above
+            add("Super Saw Lead", "LEAD", 0, 1.0f, 0.55f, 0.6f, 0.0f, { A(0.005f,0.4f,0.8f,0.3f), F(9000,0.15f,0.2f,0.5f), Lv(0.53f) });
+            // VA: one saw turned into a square, the filter plucks it
+            add("Hollow Sq Bass", "BASS", 0, 0.0f, 0.0f, 0.5f, 1.0f, { T(-12), A(0.002f,0.3f,0.6f,0.12f), F(500,0.3f,0.45f,0.25f), Lv(0.67f) });
+            // VA: five saws faded almost to sines; LFO 1 lets some edge in and out
+            add("Soft Sine Pad", "PAD", 0, 0.7f, 0.4f, 0.12f, 0.0f, { A(1.2f,2.0f,0.85f,2.5f), L1(0.1f,0.15f,S::Sine,D::LfoHarmonics) });
+            // VA: six saws with the octave mixed in: a string section
+            add("Octave Strings", "PAD", 0, 0.85f, 0.7f, 0.85f, 0.0f, { A(0.5f,1.5f,0.9f,1.5f), F(3500,0.1f,0.0f,0.5f), Lv(0.61f) });
+            // FM: modulator four times the carrier, modest index: glassy, struck
+            add("FM Glass Keys", "KEYS", 1, 0.35f, 0.4286f, 0.5f, 0.0f, { A(0.002f,1.2f,0.0f,0.8f), Lv(0.53f) });
+            // FM: modulator at the carrier's pitch with feedback: a growl
+            add("FM Growl Bass", "BASS", 1, 0.6f, 0.0f, 0.5f, 0.35f, { T(-12), A(0.002f,0.4f,0.5f,0.15f), F(1800,0.2f,0.4f,0.3f), Lv(0.63f) });
+            // FM: ratio 3.5 and the modulator detuned (DETN): the sidebands beat, a chime
+            add("Detuned Chime", "KEYS", 1, 0.45f, 0.3571f, 0.62f, 0.0f, { A(0.001f,2.5f,0.0f,2.0f), Lv(0.52f) });
+            // FM: feedback (FDBK) far up, towards noise; LFO 1 shakes the index
+            add("Feedback Scream", "LEAD", 1, 0.7f, 0.1429f, 0.5f, 0.75f, { A(0.01f,0.3f,0.8f,0.2f), L1(5.5f,0.1f,S::Sine,D::LfoTimbre), Lv(0.53f) });
+            // FOLD: a sine folded four times over; LFO 1 moves the fold amount
+            add("Fold Lead", "LEAD", 2, 0.45f, 0.0f, 0.5f, 0.0f, { A(0.01f,0.3f,0.8f,0.25f), L1(0.3f,0.25f,S::Triangle,D::LfoTimbre), Lv(0.57f) });
+            // FOLD: a triangle into the folder, off-centre (BIAS) for even harmonics
+            add("West Coast Bass", "BASS", 2, 0.3f, 1.0f, 0.6f, 0.2f, { T(-12), A(0.002f,0.35f,0.4f,0.12f), F(2500,0.15f,0.3f,0.25f), Lv(0.50f) });
+            // FOLD: hardly folded, mostly the second and third harmonic (CHEB): an organ stop
+            add("Cheby Organ", "KEYS", 2, 0.08f, 0.0f, 0.5f, 0.7f, { A(0.005f,0.1f,1.0f,0.08f), Lv(0.61f) });
+            // FOLD: the fold amount swept slowly by LFO 1, LFO 2 moves it between the speakers
+            add("Fold Sweep Pad", "PAD", 2, 0.55f, 0.5f, 0.42f, 0.15f, { A(1.5f,2.0f,0.9f,3.0f), F(5000,0.1f,0.0f,0.5f), L1(0.08f,0.4f,S::Sine,D::LfoTimbre), L2(0.2f,0.5f,S::Sine,D::LfoPan), Lv(0.52f) });
+            // FORM: the vowel ah, drifting a little towards eh
+            add("Choir Aah", "PAD", 3, 0.0f, 0.5f, 0.35f, 0.0f, { A(0.6f,1.0f,0.9f,1.5f), L1(0.12f,0.12f,S::Sine,D::LfoTimbre), Lv(0.31f) });
+            // FORM: LFO 1 runs through the vowels with every key: it talks
+            add("Talking Lead", "LEAD", 3, 0.25f, 0.55f, 0.6f, 0.0f, { A(0.01f,0.3f,0.8f,0.2f), L1(2.0f,0.5f,S::Triangle,D::LfoTimbre), K1(), Lv(0.35f) });
+            // FORM: noise instead of a voice (MORP), narrow resonances wandering: wind
+            add("Whisper Wind", "FX", 3, 0.5f, 0.6f, 0.8f, 1.0f, { A(1.5f,2.0f,1.0f,3.0f), L1(0.07f,0.5f,S::SmoothRandom,D::LfoTimbre), L2(0.11f,0.3f,S::SmoothRandom,D::LfoColor) });
+            // FORM: the vowel oh with its formants moved down
+            add("Vox Bass", "BASS", 3, 0.75f, 0.3f, 0.5f, 0.0f, { T(-12), A(0.003f,0.4f,0.6f,0.15f), Lv(0.52f) });
+            // HARM: eight harmonics, falling away gently: a flute organ
+            add("Pure Organ", "KEYS", 4, 0.35f, 1.0f, 0.25f, 0.0f, { A(0.005f,0.1f,1.0f,0.06f), Lv(0.53f) });
+            // HARM: sixteen partials stretched like a bar's (STRC): a bell
+            add("Stiff Bell", "KEYS", 4, 0.6f, 1.0f, 0.5f, 1.0f, { A(0.001f,3.0f,0.0f,2.5f), Lv(0.65f) });
+            // HARM: odd harmonics only (EVOD at 0): a hollow reed, vibrato fading in
+            add("Clarinet Tone", "LEAD", 4, 0.55f, 0.0f, 0.4f, 0.0f, { A(0.04f,0.3f,0.85f,0.15f), L1(5.0f,0.12f,S::Sine,D::LfoPitch), FD1(0.4f), Lv(0.56f) });
+            // HARM: even harmonics, a little stretch: glassy, never quite in tune with itself
+            add("Glass Harmonics", "PAD", 4, 0.75f, 0.5f, 0.8f, 0.35f, { A(1.0f,2.0f,0.85f,3.0f), L1(0.09f,0.2f,S::Sine,D::LfoTimbre) });
+            // PLCK: a dull string picked a quarter along
+            add("Nylon Guitar", "KEYS", 5, 0.55f, 0.25f, 0.7f, 0.0f, { A(0.001f,2.0f,0.0f,0.6f), Lv(1.00f) });
+            // PLCK: a damped string an octave down
+            add("Pluck Bass", "BASS", 5, 0.7f, 0.15f, 0.5f, 0.0f, { T(-12), A(0.001f,1.0f,0.0f,0.2f), Lv(1.00f) });
+            // PLCK: bright, picked near the middle, long sustain
+            add("Koto Snap", "KEYS", 5, 0.2f, 0.45f, 0.9f, 0.0f, { A(0.001f,3.0f,0.0f,1.5f), Lv(1.00f) });
+            // PLCK: MORP at full turns the string into a drum: the pitch dissolves
+            add("String Drum", "PERC", 5, 0.5f, 0.0f, 0.3f, 1.0f, { T(-12), A(0.001f,0.5f,0.0f,0.3f), Lv(1.00f) });
+            // DUST: sparse clicks, a little colour: a record's surface
+            add("Vinyl Crackle", "FX", 6, 0.15f, 0.2f, 0.5f, 0.3f, { A(0.3f,1.0f,1.0f,1.0f), Lv(1.00f) });
+            // DUST: particles through a resonator at the key's pitch (RING up): tuned rain
+            add("Pitched Rain", "FX", 6, 0.55f, 0.5f, 0.95f, 1.0f, { A(0.2f,1.0f,1.0f,2.5f), Lv(1.00f) });
+            // DUST: hiss through the high-pass (RING down), rising over three seconds; the strip thickens it
+            add("Hiss Riser", "FX", 6, 0.6f, 0.6f, 0.2f, 0.4f, { A(3.0f,1.0f,1.0f,0.5f), L1(0.1f,0.3f,S::Saw,D::LfoHarmonics), Lv(1.00f) });
+            // DUST: a 60 ms burst of dense dust: a hi-hat; the strip makes it denser and brighter
+            add("Dust Hat", "PERC", 6, 0.55f, 0.1f, 0.1f, 0.15f, { A(0.001f,0.06f,0.0f,0.05f), Lv(1.00f) });
+            // (None for BOW yet: the bowed-string model does not settle on the key's pitch and
+            // rests on a constant offset; presets wait for the model.)
+        }
+
         // ===================== WAVETABLE (3) =====================
 
         // Digital Choir - formant wavetable, slow morph, pad envelope
@@ -1333,6 +1484,45 @@ namespace FactoryPresets
             {17, 0.6f},           // FilterCutoff: darkened top end
         }));
 
+        // Abyss Drone - a dark ambient drone made of grains (owner's request, 2026-11-14: a
+        // granular preset to learn from). The sampler in GRAN mode reads the built-in cymbal two
+        // octaves down: a cymbal is hundreds of unrelated partials, and slowed that far it is a
+        // deep metallic wash with no pitch of its own. What each setting is for:
+        //   SIZE 0.35 s, DENS 30: long grains, about ten sounding at once - a continuous body, no
+        //     audible grain rate. Shorter or sparser and it turns into rain.
+        //   SCAN 0.05: the read position creeps through the cymbal's ring (STRT .. END leave out
+        //     its strike and its faint end) - the drone never repeats, and never plays the hit.
+        //   SPRY 0.7: every grain starts somewhere else around that position, which smears the
+        //     cymbal's own decay into a steady level.
+        //   RVRS 0.5: half the grains backwards - no attack survives. SPRD 0.9: each grain at its
+        //     own place between the speakers. PJIT a touch: grains slightly off each other's pitch.
+        //   LFO 1 moves where grains are taken from, once in 20 s; LFO 2 drifts the low-pass
+        //     (CUT about 600 Hz, some resonance and drive) at random: the slow breathing.
+        //   ATK 3 s, REL 5 s: it rises and leaves slowly. Keys play it at other depths.
+        {
+            using S = SamplerEngine::Param;
+            constexpr int L1 = EngineLfoSection::BASE, L2 = L1 + EngineLfoSection::PER_LFO;
+            using O = EngineLfoSection::Offset;
+            const int cymbal = juce::jmax(0, SampleBank::get().indexOf("CYMB"));
+            auto drone = make("Abyss Drone", "PAD", EngineType::Sampler, {
+                {S::SampleSelect, (float) cymbal}, {S::Mode, (float) SamplerEngine::Granular}, {S::Normalize, 1.0f},
+                {S::StartPoint, 0.08f}, {S::EndPoint, 0.7f}, {S::PitchSemi, -24.0f},
+                {S::GrainSize, 0.35f}, {S::GrainDensity, 30.0f}, {S::GrainScan, 0.05f}, {S::GrainSpray, 0.7f},
+                {S::GrainPitchJit, 0.04f}, {S::GrainSpread, 0.9f}, {S::GrainShape, (float) SamplerEngine::WindowHann},
+                {S::GrainReverse, 0.5f},
+                {S::FilterCutoff, 0.5f}, {S::FilterReso, 0.3f}, {S::FilterDrive, 0.2f},
+                {S::Attack, 3.0f}, {S::Decay, 1.0f}, {S::Sustain, 1.0f}, {S::Release, 5.0f}, {S::VelSens, 0.2f},
+                {S::Volume, 0.9f},
+                {L1 + O::Rate, 0.05f}, {L1 + O::Depth, 0.5f}, {L1 + O::Shape, (float) (int) LFO::Shape::Sine},
+                {L1 + O::Dest, (float) SamplerEngine::LfoGrainPos},
+                {L2 + O::Rate, 0.07f}, {L2 + O::Depth, 0.15f}, {L2 + O::Shape, (float) (int) LFO::Shape::SmoothRandom},
+                {L2 + O::Dest, (float) SamplerEngine::LfoCutoff},
+            });
+            // (No sample name: the built-in samples never change places, and a name on a factory
+            // preset means one of the drum breaks.)
+            presets.push_back(std::move(drone));
+        }
+
         // Granular Pad - looped sample with slow attack, filtered
         presets.push_back(make("Granular Pad", "PAD", EngineType::Sampler, {
             {6, 4.0f},            // Mode: Loop
@@ -1408,6 +1598,34 @@ namespace FactoryPresets
 
         // ===================== WAVETABLE: THE NEWER TABLES (16) AND THE CLSC READ-OUT (3) =====================
         appendWavetableTablePresets(presets);
+
+        // ===================== THE CYMBAL MACHINE (2) =====================
+        // (CymbalPresets.h: the ten ready-made cymbal-machine sounds and where these kits put them.)
+
+        // Cymbal Works - the ten sounds on ten pads; the rest is the starting kit.
+        {
+            ParamMap p;
+            CymbalPresets::works(p);
+            presets.push_back(make(CymbalPresets::worksName, "KIT", EngineType::Drum, std::move(p)));
+        }
+
+        // House Kit - kick machine, snare, clap, hats; crash, house ride and ride bell beside the
+        // kick, an analog cymbal and a splash at the right of the top row.
+        {
+            ParamMap p;
+            setDrumVoice(p, 8,  48.0f, 0.45f, 0.7f, 0.2f, 0.7f, 0.9f, 0.5f,
+                         (int)DrumSynthType::KickSynth);
+            setDrumVoice(p, 12, 200.0f, 0.2f, 0.5f, 0.3f, 0.6f, 0.8f, 0.5f,
+                         (int)DrumSynthType::NoiseSnare);
+            setDrumVoice(p, 13, 1200.0f, 0.3f, 0.6f, 0.5f, 0.5f, 0.7f, 0.55f,
+                         (int)DrumSynthType::Clap);
+            setDrumVoice(p, 14, 8500.0f, 0.04f, 0.5f, 0.0f, 0.5f, 0.55f, 0.6f,
+                         (int)DrumSynthType::ClosedHat);
+            setDrumVoice(p, 15, 8000.0f, 0.4f, 0.5f, 0.0f, 0.5f, 0.5f, 0.6f,
+                         (int)DrumSynthType::OpenHat);
+            CymbalPresets::houseCymbals(p);
+            presets.push_back(make(CymbalPresets::houseName, "KIT", EngineType::Drum, std::move(p)));
+        }
 
         // ===================== SAVED FROM THE APP (1) =====================
 

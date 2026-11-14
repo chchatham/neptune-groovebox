@@ -49,6 +49,7 @@ namespace GrammarHooks
         h.setArpEnabled = [eng](int t, bool on) { if (auto* a = eng->getTrackArpeggiator(t)) a->setEnabled(on); };
         h.arpLatch = [eng](int t) { auto* a = eng->getTrackArpeggiator(t); return a != nullptr && a->getLatch(); };
         h.setArpLatch = [eng](int t, bool on) { if (auto* a = eng->getTrackArpeggiator(t)) a->setLatch(on); };
+        h.rollLatched = [eng] { auto& r = eng->getPadRatchet(); return r.isEnabled() && r.isLatch(); };
 
         h.captureSound = [seq, eng](int t)
         {

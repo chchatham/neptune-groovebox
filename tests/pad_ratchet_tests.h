@@ -127,7 +127,10 @@ public:
             expect(! r.isEnabled());
             expect(r.getMode() == PadRatchet::Mode::Quantized);
             expectEquals(r.getBaseDivision(), (int) PadRatchet::Div1_8);
-            expectEquals(r.getMaxDivision(), (int) PadRatchet::Div1_32);
+            expectEquals(r.getMaxDivision(), (int) PadRatchet::Div1_128);
+            expect(! r.isLatch(), "the roll latch is off to begin with");
+            expectEquals(juce::String(PadRatchet::getDivisionName(PadRatchet::Div1_128)), juce::String("1/128"));
+            expectWithinAbsoluteError(PadRatchet::getDivisionBeats(PadRatchet::Div1_128), 1.0 / 32.0, 1.0e-12);
 
             r.setGate(0.0f);
             expectWithinAbsoluteError(r.getGate(), 0.05f, 1.0e-6f);
@@ -272,6 +275,42 @@ public:
             rig.r.setPressure(0, 1.0f);
             rig.run(48100, 64);
             expectEquals(rig.numOns(), 5);
+        }
+
+        beginTest("As it comes: the harder the pad is pressed, the faster the roll, through every rate from 1/8 to 1/128");
+        {
+            // Nine rates from BASE to MAX, each with its own share of the pressure, lightest first.
+            const int first = PadRatchet::Div1_8, last = PadRatchet::Div1_128, bands = last - first + 1;
+            expectEquals(bands, 9);
+            double previous = 1.0e12;
+            for (int band = 0; band < bands; ++band)
+            {
+                Rig rig;
+                rig.r.setEnabled(true);                    // nothing else is set: the defaults
+                rig.r.padDown(0, 60, 1.0f);
+                rig.r.setPressure(0, ((float) band + 0.5f) / (float) bands);
+                rig.run(48000, 16);
+                auto ons = rig.ons();
+                expect(ons.size() >= 3);
+                if (ons.size() < 3) continue;
+                const double gap = (double) (ons[2].time - ons[1].time);
+                expectWithinAbsoluteError(gap, PadRatchet::getDivisionBeats(first + band) * 24000.0, 17.0,
+                                          juce::String(PadRatchet::getDivisionName(first + band)));
+                expect(gap < previous, "faster than with less pressure");
+                previous = gap;
+            }
+            // Let go: it stops (no latch).
+            Rig rig;
+            rig.r.setEnabled(true);
+            rig.r.padDown(0, 60, 1.0f);
+            rig.r.setPressure(0, 1.0f);
+            rig.run(24000, 16);
+            rig.r.padUp(0);
+            rig.run(64, 16);
+            const int hits = rig.numOns();
+            rig.run(48000, 16);
+            expectEquals(rig.numOns(), hits, "nothing after the pad is released");
+            expect(rig.balanced());
         }
 
         beginTest("Quantized: a rate change waits for the next hit");

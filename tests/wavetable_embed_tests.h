@@ -205,6 +205,7 @@ public:
     {
         static const std::vector<Expected> list = {
             { "Vowel Lead", "VOWL", "LEAD", false },      { "Vowel Choir", "VOWL", "PAD", false },
+            { "I You We Yeah", "VOWL", "LEAD", false },
             { "Sync Sweep Lead", "SYNC", "LEAD", false }, { "Fold Bass", "FOLD", "BASS", false },
             { "FM Table Keys", "FM1", "KEYS", false },    { "Glass Pluck", "FM3", "KEYS", false },
             { "Struck Bar", "BELL", "KEYS", false },      { "Drawbar Organ", "ORGN", "KEYS", false },

@@ -585,6 +585,33 @@ public:
             expect(rms(out, s.sr, 0.21, 0.29) > 0.05f);
         }
 
+        beginTest("Voice: a square LFO on the level or the pan does not step it (no click at its edges)");
+        for (auto dest : { UnifiedVoice::LfoDest::Amp, UnifiedVoice::LfoDest::Pan })
+        {
+            // A sine with the LFO's edges every 3675 samples (each at a different point of the wave): the largest step from one sample to the
+            // next in the 10 ms around the edges against the largest anywhere else.
+            Synth s;
+            s.engine.setParameter(UnifiedParam::WAVE1, (float) (int) UnifiedVoice::OscWaveform::Sine);
+            s.squareTremolo(6.0f, 0.8f);
+            s.lfo(ModParam::LFO_DEST, (float) (int) dest);
+            s.engine.noteOn(69, 1.0f, -1);
+            std::vector<float> left, right;
+            s.render(1.05, left, &right);
+            for (auto* ch : { &left, &right })
+            {
+                float atEdges = 0.0f, elsewhere = 0.0f, peak = 0.0f;
+                for (size_t i = 2205; i < ch->size(); ++i)
+                {
+                    float& worst = (i + 220) % 3675 < 441 ? atEdges : elsewhere;
+                    worst = std::max(worst, std::abs((*ch)[i] - (*ch)[i - 1]));
+                    peak = std::max(peak, std::abs((*ch)[i]));
+                }
+                expect(peak > 0.01f);
+                expect(atEdges <= elsewhere + 0.1f * peak, juce::String(dest == UnifiedVoice::LfoDest::Amp ? "AMP: " : "PAN: ") + juce::String(atEdges, 4)
+                       + " at the edges, " + juce::String(elsewhere, 4) + " elsewhere, peak " + juce::String(peak, 4));
+            }
+        }
+
         beginTest("Voice: ONE with a decay shape is a one-off sweep that ends, every note");
         {
             Synth s;

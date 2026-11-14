@@ -28,14 +28,24 @@ struct Track
             steps.resize(length);
     }
 
+    // A step for ANY index: wrapped into the track's length, which is held to the steps there are
+    // (length and steps are separate fields; a length set by hand, a negative index or a length
+    // of 0 once read outside the vector or divided by zero).
+    int stepIndex(int index) const
+    {
+        const int n = juce::jmax(1, juce::jmin(length, (int) steps.size()));
+        const int i = index % n;
+        return i < 0 ? i + n : i;
+    }
+
     Step& getStep(int index)
     {
-        return steps[index % length];
+        return steps[(size_t) stepIndex(index)];
     }
 
     const Step& getStep(int index) const
     {
-        return steps[index % length];
+        return steps[(size_t) stepIndex(index)];
     }
 
     void clearAllSteps()
@@ -49,8 +59,7 @@ struct Track
         buffer.clear();
         for (int i = 0; i < count; ++i)
         {
-            int idx = (fromStart + i) % length;
-            buffer.push_back(steps[(size_t) idx]);
+            buffer.push_back(steps[(size_t) stepIndex(fromStart + i)]);
         }
     }
 
@@ -58,8 +67,7 @@ struct Track
     {
         for (int i = 0; i < (int) buffer.size(); ++i)
         {
-            int idx = (toStart + i) % length;
-            steps[(size_t) idx] = buffer[(size_t) i];
+            steps[(size_t) stepIndex(toStart + i)] = buffer[(size_t) i];
         }
     }
 };
