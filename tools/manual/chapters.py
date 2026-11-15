@@ -579,12 +579,12 @@ strike, at an unrelated ratio with feedback, gone in a third of a second.</p>"""
 <p>One oscillator that can be eight different things. {{MODL}} chooses the model, and knobs 2 to 5 are renamed to
 suit it.</p>""") + table(["Model", "What it is", "Knobs 2–5"],
                           [(f"<code>{m}</code>", d, " ".join(f"<code>{x}</code>" for x in k.split())) for m, d, k in ctx["macro_models"]])
-        + fmt("""<p>Four built-in presets for each model but the last show where its knobs lead (on {{PRESET}} set {{EN}} to this engine):
+        + fmt("""<p>Four built-in presets for each model show where its knobs lead (on {{PRESET}} set {{EN}} to this engine):
 VA - Super Saw Lead, Hollow Sq Bass, Soft Sine Pad, Octave Strings. FM - FM Glass Keys, FM Growl Bass, Detuned
 Chime, Feedback Scream. FOLD - Fold Lead, West Coast Bass, Cheby Organ, Fold Sweep Pad. FORM - Choir Aah, Talking
 Lead, Whisper Wind, Vox Bass. HARM - Pure Organ, Stiff Bell, Clarinet Tone, Glass Harmonics. PLCK - Nylon Guitar,
 Pluck Bass, Koto Snap, String Drum (and Resonator Pluck). DUST - Vinyl Crackle, Pitched Rain, Hiss Riser, Dust Hat
-(and Grain Cloud). BOW has none yet. Load one, look at knobs 2 to 5 on the first
+(and Grain Cloud). BOW - Solo Cello, Glass Bow, Scrape FX, Bowed Bass. Load one, look at knobs 2 to 5 on the first
 page, and turn them: each preset sits at one corner of its model.</p>""")
         + page_list(params, "Macro Oscillator")))
     eng.append(("Wavetable", fmt("""
@@ -1074,7 +1074,11 @@ controller, the screens nor your project yet.</p>""")),
         ("The arpeggiator", fmt("""
 <p>Every track has its own. [[Arp]] opens the screen; pressed again there, it switches the selected track's arp on.
 [[Shift]] + [[Arp]] latches it so it carries on after you let go (with the arp off, the same gesture latches the
-keys themselves). Arps follow the transport, the scale lock and the tempo.</p>""")
+keys themselves). Arps follow the transport, the scale lock and the tempo.</p>
+<p><b>Transposing a latched arp:</b> latch a chord, let go, then press a pad that plays a single note (the
+<code>SCALE</code>, <code>PRESET</code> and <code>AT ROUTE</code> pads). The arpeggio carries on without restarting,
+moved so that its lowest note is the pad's note. Mutations and a frozen loop move with it. A key, or a chord pad,
+still starts a new chord.</p>""")
             + table(["Page", "Knobs 1–4", "Knobs 5–8", "For"], [
                 ("<code>ARP</code>", "MODE RATE OCT GATE", "RPT SWNG GLID LTCH", "The basics"),
                 ("<code>PLAY</code>", "STRM TIME DIR VEL", "RTCH RDEC HUMN FREZ", "Strumming, ratchets, humanize, freeze"),
@@ -1252,10 +1256,18 @@ leaving puts your own split and octave back - unless you pressed [[Oct−]] / [[
 in the meantime: what you set by hand stays. The app learns of an octave press within two seconds (the buttons
 send nothing), so give it that long before saving.</p>
 <p><b>The save box:</b> {{SV}} saves at once as User 1, User 2 and so on, so nothing waits for the Mac. The Mac
-then shows a box with a name in it: the name of the preset of yours this track's sound was last loaded from or
-saved as, or else the User name. Return (Save) saves under the name shown or typed, up to 15 characters; if one
-of your presets already has that name, it is saved over. Escape (Cancel) takes the save back: nothing is kept. A
-built-in preset's name is refused (the name bar says NAME IN USE) and the preset stays under its User name.</p>""")),
+then puts a small window in front of everything, "Save the sound of track N as a preset", with a name in it,
+selected, so that typing replaces it. The name is that of the preset the track's sound came from: the one you last
+kept with {{LD}} or last saved under. It is remembered for each track, with the project and across restarts. A
+sound that came from a built-in preset is offered under that name with a number (Deep Bass 2), since a built-in
+preset cannot be saved over; a track whose sound came from no preset, or whose engine you have changed since, is
+offered the User name. The line under the name says what Return will do: keep it as a new preset, or replace
+your preset of that name. Return, or the Save button, does it; names have up to 15 characters. Escape, the
+Cancel button or closing the window takes the save back: no preset, no file, and the list and the track are as
+they were before {{SV}} (the name bar says NOT SAVED). A built-in preset's name cannot be typed in either: the
+line says so and Save is off until the name is another one. If you save again before answering, the earlier save
+stays under its User name and the window asks about the new one; so does a save whose window is still open when
+you quit.</p>""")),
         ("Keyboard split", fmt("""
 <p>[[Shift]] + [[Oct−]] drops the lowest twelve keys by one further octave, then two, then three, then back to
 normal; [[Shift]] + [[Oct+]] steps the other way. The name bar shows {{SPLIT -1 OCT}}. Plain [[Oct−]] / [[Oct+]]

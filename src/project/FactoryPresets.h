@@ -1228,7 +1228,7 @@ namespace FactoryPresets
             {14, 1.0f},           // Amp Release
         }));
 
-        // Four for each model but the bowed string, across the categories (owner's request, 2026-11-14:
+        // Four for each of the eight models, across the categories (owner's request, 2026-11-14:
         // presets to explore the macro oscillator from). Each comment says which cells make the sound.
         {
             using M = MacroOscEngine::Param;
@@ -1321,8 +1321,14 @@ namespace FactoryPresets
             add("Hiss Riser", "FX", 6, 0.6f, 0.6f, 0.2f, 0.4f, { A(3.0f,1.0f,1.0f,0.5f), L1(0.1f,0.3f,S::Saw,D::LfoHarmonics), Lv(1.00f) });
             // DUST: a 60 ms burst of dense dust: a hi-hat; the strip makes it denser and brighter
             add("Dust Hat", "PERC", 6, 0.55f, 0.1f, 0.1f, 0.15f, { A(0.001f,0.06f,0.0f,0.05f), Lv(1.00f) });
-            // (None for BOW yet: the bowed-string model does not settle on the key's pitch and
-            // rests on a constant offset; presets wait for the model.)
+            // BOW: middle pressure and speed, vibrato fading in
+            add("Solo Cello", "LEAD", 7, 0.5f, 0.25f, 0.5f, 0.55f, { T(-12), A(0.12f,0.3f,0.9f,0.3f), L1(5.2f,0.12f,S::Sine,D::LfoPitch), FD1(0.5f), Lv(0.8f) });
+            // BOW: a light bow far from the bridge: glassy
+            add("Glass Bow", "PAD", 7, 0.15f, 0.6f, 0.3f, 0.4f, { A(0.8f,1.0f,0.9f,2.0f), Lv(0.8f) });
+            // BOW: pressed hard near the bridge, fast, the pressure never still: a scrape
+            add("Scrape FX", "FX", 7, 0.8f, 0.12f, 0.6f, 0.9f, { A(0.05f,0.5f,0.9f,0.4f), L1(3.0f,0.3f,S::SmoothRandom,D::LfoTimbre), Lv(0.62f) });
+            // BOW: two octaves down, a double bass
+            add("Bowed Bass", "BASS", 7, 0.6f, 0.15f, 0.65f, 0.5f, { T(-24), A(0.08f,0.3f,0.9f,0.25f), Lv(0.8f) });
         }
 
         // ===================== WAVETABLE (3) =====================

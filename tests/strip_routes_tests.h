@@ -98,6 +98,8 @@ public:
             { "Pitched Rain", 0.113f, 226, 226, 1.8f },
             { "Hiss Riser", 0.111f, 6262, 5182, 0.3f },
             { "Dust Hat", 0.106f, 7713, 7548, 1.2f },
+            { "Solo Cello", 0.178f, 272, 277, 3.9f },        { "Glass Bow", 0.326f, 516, 486, 5.5f },
+            { "Scrape FX", 0.311f, 704, 419, 6.6f },         { "Bowed Bass", 0.182f, 214, 209, 5.1f },
             { "FM Pluck", 0.171f, 216, 289, 0.6f },         { "Electric Piano", 0.119f, 202, 248, -0.0f },
             { "Rhodes", 0.089f, 200, 211, 0.2f },           { "FM Metallic", 0.125f, 288, 292, -0.1f },
             { "808 Kit 2", 0.355f, 55, 162, -0.5f },        { "FM Kit", 0.357f, 94, 229, -0.6f },
@@ -145,7 +147,8 @@ public:
             { "model 0", 0.335f, 536, 305, -0.6f },          { "model 1", 0.654f, 2221, 2850, -0.3f },
             { "model 2", 0.406f, 672, 925, 0.5f },          { "model 3", 0.367f, 601, 1027, -4.7f },
             { "model 4", 0.373f, 201, 215, -2.6f },         { "model 5", 0.452f, 1291, 4554, -8.3f },
-            { "model 6", 0.119f, 7586, 5587, 0.2f },        { "model 7", 0.376f, 23, 23, 11.9f },
+            { "model 6", 0.119f, 7586, 5587, 0.2f },        { "model 7", 0.370f, 797, 545, 10.5f },     // (re-measured 2026-11-14: the bowed string now sounds;
+                                                             //  the earlier 23 Hz was its constant offset)
             { "mode 0", 0.653f, 347, 495, 4.0f },           { "mode 1", 0.640f, 275, 420, 2.9f },
             { "mode 2", 0.654f, 322, 463, 3.9f },           { "mode 3", 0.653f, 347, 495, 4.0f },
             { "mode 4", 0.653f, 347, 495, 4.0f },           { "mode 5", 0.653f, 347, 495, 4.0f },
@@ -172,10 +175,10 @@ public:
 
     static Measured measureStrip(EngineType type, const ParamMap* sound = nullptr)
     {
-        const auto rest = W::render(*W::makeEngine(type, sound), 0.0f);
-        const auto up = W::render(*W::makeEngine(type, sound), 1.0f);
-        const auto a = W::measure(rest), b = W::measure(up);
-        return { W::difference(rest, up), a.centroid, b.centroid, W::dB(b.rms / std::max(a.rms, 1.0e-9f)) };
+        // The "Mod Wheel" suite's measurement of the same sound (strip at rest, strip up), taken
+        // from that suite when it has run in this process, made here when it has not.
+        const auto r = W::compare(type, sound, false);
+        return { r.diff, r.at0.centroid, r.at127.centroid, W::dB(r.at127.rms / std::max(r.at0.rms, 1.0e-9f)) };
     }
 
     void checkAgainstReference(const juce::String& name, const Measured& m)
@@ -361,10 +364,11 @@ public:
                     continue;
                 for (auto& [id, value] : preset.soundParams)
                     expect(! S::ownsStrip(id), preset.name + " sets a STRIP cell (the reference is for the defaults)");
+                expect(refFor(preset.name) != nullptr, preset.name + ": no reference measurement");
                 checkAgainstReference(preset.name, measureStrip(preset.engineType, &preset.soundParams));
                 ++checked;
             }
-            expectEquals(checked, 95, "the factory presets of the six engines (59, two for each of the eight drum breaks, 20 for the newer wavetables)");
+            expectEquals(checked, 99, "the factory presets of the six engines (63, two for each of the eight drum breaks, 20 for the newer wavetables)");
         }
 
         beginTest("Defaults: the macro oscillator's models and the sampler's play modes");

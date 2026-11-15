@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fast_measure.h"
 #include "../src/engine/DrumEngine.h"
 #include "../src/engine/AudioEngine.h"
 #include "../src/sequencer/SequencerCore.h"
@@ -20,33 +21,8 @@
 // measures of the older CYMB type are taken beside them: they are what was wrong with it.
 namespace cymbaltest
 {
-    inline void fft(std::vector<std::complex<double>>& a)
-    {
-        const size_t n = a.size();
-        for (size_t i = 1, j = 0; i < n; ++i)
-        {
-            size_t bit = n >> 1;
-            for (; j & bit; bit >>= 1) j ^= bit;
-            j ^= bit;
-            if (i < j) std::swap(a[i], a[j]);
-        }
-        for (size_t len = 2; len <= n; len <<= 1)
-        {
-            const double angle = -2.0 * 3.14159265358979323846 / (double) len;
-            const std::complex<double> wl(std::cos(angle), std::sin(angle));
-            for (size_t i = 0; i < n; i += len)
-            {
-                std::complex<double> w(1.0);
-                for (size_t j = 0; j < len / 2; ++j)
-                {
-                    const auto u = a[i + j], v = a[i + j + len / 2] * w;
-                    a[i + j] = u + v;
-                    a[i + j + len / 2] = u - v;
-                    w *= wl;
-                }
-            }
-        }
-    }
+    // (In fast_measure.cpp, compiled with optimisation: the transform was most of this suite's time.)
+    inline void fft(std::vector<std::complex<double>>& a) { fastmeasure::fft(a); }
 
     // Power spectrum of n samples from `start` (Hann window); bin i is i * sr / n Hz.
     inline std::vector<double> spectrum(const std::vector<float>& x, size_t start, size_t n)

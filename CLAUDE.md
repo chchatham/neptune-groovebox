@@ -81,6 +81,7 @@ src/
 │   ├── FilterCurve.h       — the filter picture, measured from the real filters
 │   ├── EnvelopeCurve.h     — the envelope picture, drawn from the real Envelope class
 │   ├── ScreenAudit.h       — turns every knob on every page, holds every help key, checks the display
+│   ├── SavePresetBox.h     — the Mac's window that asks for a saved preset's name (Save / Cancel)
 │   ├── TurnNotice.h        — a knob with nothing to act on says why in the name bar
 │   ├── UiClock.h           — the screens' clock (the audit can move it on)
 │   ├── screens/            — Home (TRACKS), StepView, ParamPage (PARAM, and `ParamCellScreen`, the base it shares
@@ -95,6 +96,7 @@ src/
 │   ├── Project.h, ProjectManager.h, ProjectBridge.h — project files; capture / apply of the whole live state
 │   ├── Preset.h, PresetManager.h, FactoryPresets.h — sound presets
 │   ├── CymbalPresets.h     — the cymbal machine's ten ready-made sounds and the two factory kits made of them
+│   ├── TrackPresetNames.h  — the preset each track's sound came from (what the save box offers); stored with the track
 │   ├── UndoHistory.h       — 15 levels of undo / redo; ScreenManager fills and applies it
 │   └── DrumKit.h, KitPreset.h, SamplePool.h — KitPreset, SamplePool not used by the app yet
 ├── sync/                   — MIDIClock.h (clock out; external clock measured, followed by `AudioEngine::followExternalClock`);
@@ -169,7 +171,8 @@ Arpeggiator settings live in the per-track `Arpeggiator` objects, insert chains 
 - **Platform:** macOS (Apple Silicon + Intel)
 - **Controller:** Novation Launchkey Mini 25 MK4, USB-C, bus powered, running Neptune firmware NPF
 - **Build:** `cmake --build build` is Debug, for the tests. The app runs from the optimised build: `cmake --build build-release` → `build-release/NeptuneGroovebox_artefacts/Release/Neptune Groovebox.app`
-- **Test commands:** `cmake --build build --target NeptuneTests && (cd build && ctest)` (binary `build/NeptuneTests_artefacts/Debug/NeptuneTests`)
+- **Test commands:** `cmake --build build --target NeptuneTests && (cd build && ctest -j 12)` (about 90 s: one binary,
+  `build/NeptuneTests_artefacts/Debug/NeptuneTests`, run as eleven tests side by side). One suite: `NEPTUNE_TEST_ONLY="<part of its name>"` on the binary
 - **Everything else** (lag pass, manual build, screen dump, bench): `.ralph/progress.md` → How to run
 - **Screen audit:** `python3 tools/screen_audit.py [--photos]` (device connected, app not running) → `.ralph/screen-audit/report.txt`
 - **Reference docs:** Novation MK4 Programmer's Reference Guide (`.ralph/launchkey_mk4_programmers_reference.pdf`: Novation's, git-ignored; download it from Novation)

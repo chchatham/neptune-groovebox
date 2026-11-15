@@ -523,6 +523,56 @@ public:
         // Task 8: Freeze
         // ================================================================
 
+        beginTest("Latch: a pad moves the latched arpeggio, which carries on from where it is");
+        {
+            Arpeggiator arp;
+            arp.setEnabled(true);
+            arp.setMode(Arpeggiator::Mode::Up);
+            arp.setRate(Arpeggiator::Rate::Sixteenth);
+            std::vector<int> played;
+            arp.onNoteOn = [&](int pitch, float) { played.push_back(pitch); };
+
+            expect(!arp.transposeLatched(60), "nothing to move without latched notes");
+            arp.noteOn(60, 0.8f);
+            arp.noteOn(64, 0.8f);
+            arp.noteOn(67, 0.8f);
+            expect(!arp.transposeLatched(62), "not latched: nothing moves");
+            arp.setLatch(true);
+            expect(!arp.transposeLatched(62), "keys still down: a pad is one more note, not a move");
+            arp.noteOff(60); arp.noteOff(64); arp.noteOff(67);
+            expect(arp.isHoldingLatchedNotes());
+
+            for (int i = 0; i < 40; ++i) arp.processBlock(512, 44100.0, 120.0);
+            const int stepBefore = arp.getCurrentStep();
+            const size_t countBefore = played.size();
+            expect(countBefore > 0);
+
+            expect(arp.transposeLatched(65));          // up a fourth: F A C
+            expectEquals(arp.getCurrentStep(), stepBefore, "the pattern is not restarted");
+            expectEquals(arp.getInputNoteCount(), 3);
+            expectEquals(arp.getInputPitch(0), 65);
+            expectEquals(arp.getInputPitch(1), 69);
+            expectEquals(arp.getInputPitch(2), 72);
+            for (int i = 0; i < 80; ++i) arp.processBlock(512, 44100.0, 120.0);
+            expect(played.size() > countBefore + 3);
+            for (size_t i = countBefore; i < played.size(); ++i)
+                expect(played[i] == 65 || played[i] == 69 || played[i] == 72, "only the moved chord plays");
+
+            expect(!arp.transposeLatched(124), "a move that would leave the MIDI range is refused");
+            expectEquals(arp.getInputPitch(0), 65);
+
+            // A key still starts a new chord.
+            arp.noteOn(48, 0.8f);
+            expectEquals(arp.getInputNoteCount(), 1);
+            expectEquals(arp.getInputPitch(0), 48);
+
+            // A frozen loop moves too.
+            arp.noteOff(48);
+            arp.setFrozen(true);
+            expect(arp.transposeLatched(50));
+            expectEquals(arp.getFrozenSequencePitch(0), 50);
+        }
+
         beginTest("Freeze: default off");
         {
             Arpeggiator arp;

@@ -1,4 +1,5 @@
 #pragma once
+#include "fast_measure.h"
 #include "../src/engine/SamplerEngine.h"
 #include <juce_core/juce_core.h>
 #include <juce_audio_basics/juce_audio_basics.h>
@@ -109,17 +110,10 @@ public:
     }
 
     // --- measurements ---
+    // (The loop is in fast_measure.cpp, compiled with optimisation.)
     static double goertzel(const std::vector<float>& x, size_t from, size_t n, double hz)
     {
-        const double w = 2.0 * 3.141592653589793 * hz / SR, c = 2.0 * std::cos(w);
-        double s1 = 0.0, s2 = 0.0;
-        for (size_t i = 0; i < n; ++i)
-        {
-            const double win = 0.5 - 0.5 * std::cos(2.0 * 3.141592653589793 * (double) i / (double) n);
-            const double s0 = win * x[from + i] + c * s1 - s2;
-            s2 = s1; s1 = s0;
-        }
-        return s1 * s1 + s2 * s2 - c * s1 * s2;
+        return fastmeasure::goertzel(x, from, n, hz, SR);
     }
 
     struct Spectrum { double peakHz = 0.0, centroid = 0.0, width = 0.0; };

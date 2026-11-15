@@ -5,6 +5,7 @@
 #include <vector>
 #include "control_grammar_tests.h"
 #include "../src/ui/screens/PresetScreen.h"
+#include "../src/ui/SavePresetBox.h"
 #include "../src/engine/UnifiedVoiceEngine.h"
 #include "../src/ui/screens/ParamPageScreen.h"
 #include "../src/project/PresetManager.h"
@@ -1280,6 +1281,349 @@ public:
             rig.screen->onDeactivate();
         }
 
+        beginTest("The save box: a built-in preset's sound is offered under a free name of its own");
+        {
+            Rig rig;
+            auto last = [&] { return rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).name; };
+            rig.screen->onActivate();
+            for (int i = 0; i < 400 && (rig.highlighted() == nullptr || ! rig.highlighted()->isFactory); ++i)
+                rig.turn(0);
+            const auto builtIn = rig.highlighted()->name;
+            rig.confirm(4);                                     // LD
+            expectEquals(rig.screen->getTrackPresets().get(0).name, builtIn);
+            rig.set(0, MixParam::PAN, 0.5f);
+            rig.confirm(5);                                     // SV
+            const auto first = last();
+            const auto offered = rig.screen->suggestedName(first);
+            expectEquals(offered, rig.screen->freeVariation(builtIn));
+            expect(offered.startsWith(builtIn.substring(0, 5)) && offered.endsWith(" 2"), offered);
+            expect(offered.length() <= PresetManager::MAX_NAME_LENGTH);
+            expect(rig.screen->nameUse(first, builtIn) == PresetScreen::NameUse::BuiltIn, "its own name cannot be saved over");
+            expect(rig.screen->nameUse(first, offered) == PresetScreen::NameUse::New);
+            expect(rig.screen->nameSavedPreset(first, offered));
+            expectEquals(last(), offered);
+
+            // From then on the track's sound is that preset of the player's: saved over.
+            rig.confirm(5);
+            const auto second = last();
+            expectEquals(rig.screen->suggestedName(second), offered);
+            expect(rig.screen->nameUse(second, offered) == PresetScreen::NameUse::Replaces);
+            expect(rig.screen->nameSavedPreset(second, offered));
+            int withName = 0;
+            for (int i = 0; i < rig.mgr.getPresetCount(); ++i)
+                if (rig.mgr.getPreset(i).name == offered) ++withName;
+            expectEquals(withName, 1);
+            // The next free number, and a long name is cut to make room for it.
+            expect(rig.screen->freeVariation(builtIn).endsWith(" 3"), rig.screen->freeVariation(builtIn));
+            expectEquals(rig.screen->freeVariation("Abcdefghijklmno"), juce::String("Abcdefghijklm 2"));
+            rig.screen->onDeactivate();
+        }
+
+        beginTest("The save box: one name per track; another engine or a deleted preset");
+        {
+            Rig rig;
+            auto last = [&] { return rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).name; };
+            auto named = [&](const juce::String& n) { int c = 0; for (int i = 0; i < rig.mgr.getPresetCount(); ++i) if (rig.mgr.getPreset(i).name == n) ++c; return c; };
+            rig.screen->onActivate();
+            rig.confirm(5);
+            expect(rig.screen->nameSavedPreset(last(), "Zero"));
+            rig.seq.setSelectedTrack(1);
+            rig.confirm(5);
+            expectEquals(rig.screen->getSavedTrack(), 1);
+            expectEquals(rig.screen->suggestedName(last()), last(), "track 2 never had a preset: the name it was saved under");
+            expect(rig.screen->nameSavedPreset(last(), "One"));
+            expectEquals(rig.screen->getTrackPresets().get(0).name, juce::String("Zero"));
+            expectEquals(rig.screen->getTrackPresets().get(1).name, juce::String("One"));
+            rig.confirm(5);
+            expectEquals(rig.screen->suggestedName(last()), juce::String("One"));
+            expect(rig.screen->cancelSavedPreset(last()));
+            rig.seq.setSelectedTrack(0);
+            rig.confirm(5);
+            expectEquals(rig.screen->suggestedName(last()), juce::String("Zero"));
+            expect(rig.screen->cancelSavedPreset(last()));
+
+            // The preset was deleted meanwhile: its name is still what the sound is called, and free.
+            rig.mgr.removePreset(rig.mgr.findUserPreset("Zero"));
+            rig.confirm(5);
+            const auto again = last();
+            expectEquals(rig.screen->suggestedName(again), juce::String("Zero"));
+            expect(rig.screen->nameUse(again, "Zero") == PresetScreen::NameUse::New);
+            expect(rig.screen->nameSavedPreset(again, "Zero"));
+            expectEquals(named("Zero"), 1);
+            rig.screen->onDeactivate();
+
+            // Another engine on the track since: the sound is no longer that preset's.
+            rig.audio.setEngineType(0, EngineType::FM, true);
+            rig.seq.getPattern().getTrack(0).engineType = EngineType::FM;
+            rig.screen->onActivate();
+            rig.confirm(5);
+            expectEquals(rig.screen->suggestedName(last()), last());
+            expect(last().startsWith("User "), last());
+            rig.screen->onDeactivate();
+        }
+
+        beginTest("The save box: Cancel leaves no trace (list, folder, highlight, the track's name)");
+        {
+            Rig rig;
+            auto last = [&] { return rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).name; };
+            const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                                    .getChildFile("neptune-save-box-test-" + juce::String(juce::Time::getMillisecondCounter()));
+            auto files = [&]
+            {
+                juce::StringArray names;
+                for (auto& f : folder.findChildFiles(juce::File::findFiles, false, "*.json"))
+                    names.add(f.getFileName() + ":" + juce::String(f.loadFileAsString().hashCode64()));
+                names.sort(false);
+                return names.joinIntoString("|");
+            };
+            auto users = [&]
+            {
+                juce::StringArray names;
+                for (int i = 0; i < rig.mgr.getPresetCount(); ++i)
+                    if (! rig.mgr.getPreset(i).isFactory) names.add(rig.mgr.getPreset(i).name);
+                return names.joinIntoString("|");
+            };
+            rig.screen->onUserPresetsChanged = [&]      // (as the app does it)
+            {
+                for (auto& f : folder.findChildFiles(juce::File::findFiles, false, "*.json"))
+                    f.deleteFile();
+                rig.mgr.saveUserPresetsToDirectory(folder);
+            };
+            rig.screen->onActivate();
+            rig.confirm(5);
+            expect(rig.screen->nameSavedPreset(last(), "Keeper"));
+            for (int i = 0; i < 400 && (rig.highlighted() == nullptr || rig.highlighted()->name != "Keeper"); ++i)
+                rig.turn(0);
+            rig.confirm(4);                                     // LD: the track's sound is "Keeper"
+            rig.set(0, MixParam::PAN, 0.75f);                   // ... edited
+
+            const auto listBefore = users(), filesBefore = files(), highlightBefore = rig.highlighted()->name;
+            const auto originBefore = rig.screen->getTrackPresets().get(0).name;
+            const int indexBefore = rig.screen->getSelectedIndex(), sizeBefore = rig.screen->getListSize();
+            expectEquals(originBefore, juce::String("Keeper"));
+            expect(filesBefore.contains("Keeper.json"));
+
+            rig.confirm(5);                                     // SV
+            const auto saved = last();
+            expect(files() != filesBefore, "SV has written the preset");
+            expectEquals(rig.screen->suggestedName(saved), juce::String("Keeper"));
+            expect(rig.screen->cancelSavedPreset(saved));
+            expectEquals(users(), listBefore);
+            expectEquals(files(), filesBefore);
+            expect(rig.highlighted() != nullptr && rig.highlighted()->name == highlightBefore);
+            expectEquals(rig.screen->getSelectedIndex(), indexBefore);
+            expectEquals(rig.screen->getListSize(), sizeBefore);
+            expectEquals(rig.screen->getTrackPresets().get(0).name, originBefore);
+            expectEquals(rig.audio.getTrackParameter(0, MixParam::PAN), 0.75f, "and the sound is still the edited one");
+
+            // Save over the offered name: that preset is replaced, there is one of it, with the new sound.
+            rig.confirm(5);
+            expect(rig.screen->nameSavedPreset(last(), rig.screen->suggestedName(last())));
+            expectEquals(users(), listBefore);
+            expectEquals(rig.mgr.getPreset(rig.mgr.findUserPreset("Keeper")).soundParams.at(MixParam::PAN), 0.75f);
+            expect(files() != filesBefore && files().contains("Keeper.json") && ! files().contains("User"));
+            rig.screen->onDeactivate();
+            folder.deleteRecursively();
+        }
+
+        beginTest("The save box: the track's preset name is in the project and the session (restart, project load)");
+        {
+            Rig rig;
+            auto last = [](Rig& r) { return r.mgr.getPreset(r.mgr.getPresetCount() - 1).name; };
+            rig.screen->onActivate();
+            rig.confirm(5);
+            expect(rig.screen->nameSavedPreset(last(rig), "Bells"));
+            const auto bells = rig.mgr.getPreset(rig.mgr.findUserPreset("Bells"));
+            rig.seq.setSelectedTrack(1);
+            rig.confirm(5);
+            expect(rig.screen->nameSavedPreset(last(rig), "Second"));
+            const auto second = rig.mgr.getPreset(rig.mgr.findUserPreset("Second"));
+            rig.seq.setSelectedTrack(0);
+            rig.turn(0);                                        // (a preset is being listened to while it is saved)
+            expect(rig.screen->isAuditioning());
+
+            ProjectBridge::Live live { rig.seq, rig.audio };
+            live.presetNames = &rig.screen->getTrackPresets();
+            auto data = ProjectBridge::capture(live, "S");
+            rig.screen->keepOriginalInSave(data);
+            const auto json = data.toJSON();
+            expect(json.contains("\"preset\": \"Bells\"") || json.contains("\"preset\":\"Bells\""), "stored with the track");
+            rig.screen->onDeactivate();
+
+            // A new run of the app: the user presets come from their folder, the state from the session.
+            auto restart = [&](Rig& fresh, const ProjectData& stored)
+            {
+                fresh.mgr.addPreset(bells);
+                fresh.mgr.addPreset(second);
+                ProjectBridge::Live into { fresh.seq, fresh.audio };
+                into.presetNames = &fresh.screen->getTrackPresets();
+                ProjectBridge::apply(stored, into);
+            };
+            {
+                Rig fresh;
+                restart(fresh, ProjectData::fromJSON(json));
+                expectEquals(fresh.screen->getTrackPresets().get(0).name, juce::String("Bells"));
+                expectEquals(fresh.screen->getTrackPresets().get(1).name, juce::String("Second"));
+                fresh.seq.setSelectedTrack(0);
+                fresh.screen->onActivate();
+                fresh.confirm(5);
+                expectEquals(fresh.screen->suggestedName(last(fresh)), juce::String("Bells"));
+                expect(fresh.screen->cancelSavedPreset(last(fresh)));
+                fresh.seq.setSelectedTrack(1);
+                fresh.confirm(5);
+                expectEquals(fresh.screen->suggestedName(last(fresh)), juce::String("Second"));
+                fresh.screen->onDeactivate();
+
+                // A project from before the names were stored: the tracks have none (not the old ones).
+                auto old = ProjectData::fromJSON(json);
+                for (auto& pattern : old.patterns)
+                    for (auto& track : pattern.tracks)
+                        track.presetName.clear();
+                expect(! old.toJSON().contains("\"preset\""));
+                ProjectBridge::Live into { fresh.seq, fresh.audio };
+                into.presetNames = &fresh.screen->getTrackPresets();
+                ProjectBridge::apply(ProjectData::fromJSON(old.toJSON()), into);
+                expect(fresh.screen->getTrackPresets().get(0).name.isEmpty());
+                expect(fresh.screen->getTrackPresets().get(1).name.isEmpty());
+                fresh.seq.setSelectedTrack(0);
+                fresh.screen->onActivate();
+                fresh.confirm(5);
+                expectEquals(fresh.screen->suggestedName(last(fresh)), last(fresh));
+                fresh.screen->onDeactivate();
+            }
+            // A name in a file is held to what a preset's name can be.
+            {
+                auto damaged = ProjectData::fromJSON(json);
+                damaged.patterns[(size_t) damaged.activePattern].tracks[0].presetName = juce::String("  A name that is far too long\n ");
+                const auto read = ProjectData::fromJSON(damaged.toJSON());
+                expectEquals(read.patterns[(size_t) read.activePattern].tracks[0].presetName, juce::String("A name that is"));
+            }
+        }
+
+        beginTest("The save box itself: the name selected in a field, Save on Return, Cancel on Escape, all in sight");
+        {
+            const juce::ScopedJuceInitialiser_GUI gui;
+            Rig rig;
+            auto last = [&] { return rig.mgr.getPreset(rig.mgr.getPresetCount() - 1).name; };
+            auto named = [&](const juce::String& n) { int c = 0; for (int i = 0; i < rig.mgr.getPresetCount(); ++i) if (rig.mgr.getPreset(i).name == n) ++c; return c; };
+            rig.screen->onActivate();
+            rig.confirm(5);
+            expect(rig.screen->nameSavedPreset(last(), "Unknown Soldier"));
+            rig.confirm(5);
+            const auto saved = last();
+
+            // Built as the app builds it (main.cpp, askPresetName).
+            auto make = [&](const juce::String& from)
+            {
+                auto box = std::make_unique<SavePresetBox>("Save the sound of track " + juce::String(rig.screen->getSavedTrack() + 1) + " as a preset",
+                                                           rig.screen->suggestedName(from), PresetManager::MAX_NAME_LENGTH);
+                box->nameUse = [&rig, from](const juce::String& typed)
+                {
+                    switch (rig.screen->nameUse(from, typed))
+                    {
+                        case PresetScreen::NameUse::Empty:    return SavePresetBox::NameUse::Empty;
+                        case PresetScreen::NameUse::BuiltIn:  return SavePresetBox::NameUse::BuiltIn;
+                        case PresetScreen::NameUse::Replaces: return SavePresetBox::NameUse::Replaces;
+                        case PresetScreen::NameUse::New:      break;
+                    }
+                    return SavePresetBox::NameUse::New;
+                };
+                box->onSave = [&rig, from](const juce::String& typed) { return rig.screen->nameSavedPreset(from, typed); };
+                box->onCancel = [&rig, from] { rig.screen->cancelSavedPreset(from); };
+                box->refresh();
+                return box;
+            };
+            auto box = make(saved);
+            auto& editor = box->getNameEditor();
+            expectEquals(box->getHeading(), juce::String("Save the sound of track 1 as a preset"));
+            expectEquals(editor.getText(), juce::String("Unknown Soldier"));
+            expectEquals(editor.getHighlightedText(), juce::String("Unknown Soldier"), "selected: typing replaces it");
+            expect(editor.isVisible() && box->getLocalBounds().contains(editor.getBounds()));
+            for (auto* b : { &box->getSaveButton(), &box->getCancelButton() })
+            {
+                expect(b->isVisible() && b->getWidth() >= 80 && b->getHeight() >= 28, b->getButtonText());
+                expect(box->getLocalBounds().reduced(8).contains(b->getBounds()), b->getButtonText() + " is inside the box");
+                expect(! b->getBounds().intersects(editor.getBounds()));
+            }
+            expect(! box->getSaveButton().getBounds().intersects(box->getCancelButton().getBounds()));
+            expectEquals(box->getSaveButton().getButtonText(), juce::String("Save"));
+            expectEquals(box->getCancelButton().getButtonText(), juce::String("Cancel"));
+            expect(box->getSaveButton().isRegisteredForShortcut(juce::KeyPress(juce::KeyPress::returnKey)));
+            expect(box->getCancelButton().isRegisteredForShortcut(juce::KeyPress(juce::KeyPress::escapeKey)));
+            expect(box->getSaveButton().isEnabled());
+            expect(box->getHint().contains("replaces your preset \"Unknown Soldier\""), box->getHint());
+            expect(box->getCancelHint().contains("Cancel") && box->getCancelHint().contains("nothing is saved"));
+
+            // The picture: written for looking at, and not an empty one (the buttons and the field are drawn).
+            {
+                auto file = juce::File(juce::SystemStats::getEnvironmentVariable("NEPTUNE_SAVE_BOX_PNG", {}));
+                if (file.getFullPathName().isEmpty())
+                    file = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("neptune-save-box.png");
+                expect(box->writePng(file), "the picture is written to " + file.getFullPathName());
+                const auto image = box->createComponentSnapshot(box->getLocalBounds(), true, 1.0f);
+                auto differs = [&](juce::Rectangle<int> area)
+                {
+                    const auto background = image.getPixelAt(2, 2);
+                    int n = 0;
+                    for (int y = area.getY(); y < area.getBottom(); ++y)
+                        for (int x = area.getX(); x < area.getRight(); ++x)
+                            if (image.getPixelAt(x, y) != background) ++n;
+                    return n;
+                };
+                expect(differs(box->getSaveButton().getBounds()) > 500, "the Save button is drawn");
+                expect(differs(box->getCancelButton().getBounds()) > 100, "the Cancel button is drawn");
+                expect(differs(editor.getBounds()) > 500, "the name field is drawn");
+            }
+
+            // A built-in preset's name, or none: said under the field, and Return does nothing.
+            int saves = 0;
+            const auto appSave = box->onSave;
+            box->onSave = [&](const juce::String& typed) { ++saves; return appSave(typed); };
+            editor.setText(rig.mgr.getPreset(0).name, true);
+            box->refresh();
+            expect(! box->getSaveButton().isEnabled());
+            expect(box->getHint().contains("built-in"), box->getHint());
+            expect(box->keyPressed(juce::KeyPress(juce::KeyPress::returnKey)));
+            editor.setText("  ", true);
+            box->refresh();
+            expect(! box->getSaveButton().isEnabled());
+            box->save();
+            expectEquals(saves, 0);
+            expect(! box->isAnswered());
+            editor.setText("Brand New", true);
+            box->refresh();
+            expect(box->getHint().contains("new preset \"Brand New\""), box->getHint());
+
+            // Return on the offered name: saved over that preset; exactly one of it; the box is done.
+            editor.setText("Unknown Soldier", true);
+            box->refresh();
+            int done = 0;
+            box->onDone = [&] { ++done; };
+            expect(box->keyPressed(juce::KeyPress(juce::KeyPress::returnKey)));
+            expectEquals(saves, 1);
+            expectEquals(done, 1);
+            expect(box->isAnswered());
+            expectEquals(named("Unknown Soldier"), 1);
+            expectEquals(named(saved), 0);
+            box->cancel();                                      // (answered once: nothing more happens)
+            expectEquals(named("Unknown Soldier"), 1);
+
+            // Escape: the save is taken back.
+            rig.confirm(5);
+            const auto third = last();
+            const int countBefore = rig.mgr.getPresetCount() - 1;
+            auto box2 = make(third);
+            expectEquals(box2->getNameEditor().getText(), juce::String("Unknown Soldier"));
+            expect(box2->keyPressed(juce::KeyPress(juce::KeyPress::escapeKey)));
+            expect(box2->isAnswered());
+            expectEquals(rig.mgr.getPresetCount(), countBefore);
+            expectEquals(named(third), 0);
+            expectEquals(named("Unknown Soldier"), 1);
+            box2->save();
+            expectEquals(rig.mgr.getPresetCount(), countBefore);
+            rig.screen->onDeactivate();
+        }
+
         beginTest("Notes held across an audition do not hang");
         {
             Rig rig;
@@ -1320,6 +1664,7 @@ public:
                 rig.audio.prepare(48000.0, 64);
                 rig.screen->onActivate();
                 const int count = rig.screen->getListSize();
+                // Down the whole list and back up it, every preset compared with a fresh load.
                 for (int i = 0; i < 2 * count; ++i)
                 {
                     if (i < count) rig.screen->onPadPageNext(); else rig.screen->onPadPagePrev();
@@ -1350,6 +1695,7 @@ public:
                 }
                 rig.screen->onDeactivate();
             }
+            logMessage(juce::String(checked) + " auditions compared with a fresh load");
             expect(checked > 50);
         }
     }

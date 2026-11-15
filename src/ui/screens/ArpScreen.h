@@ -113,7 +113,7 @@ public:
             cell(onOff("STRM"),
                  [this] { return arp().isStrumEnabled() ? 1.0f : 0.0f; },
                  [this](float v) { arp().setStrumEnabled(v > 0.5f); }),
-            cell({ "TIME", 0, 0, 100, 20, L, "ms" },
+            cell({ "TIME", 0, 0, Arpeggiator::MAX_STRUM_MS, 20, L, "ms" },
                  [this] { return arp().getStrumTime(); },
                  [this](float v) { arp().setStrumTime(v); }),
             cell({ "DIR", 0, 0, 2, 0, C, "", strumDirs, 3 },

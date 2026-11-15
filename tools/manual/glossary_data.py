@@ -500,7 +500,7 @@ DESC = {
     "STER": [(None, "Stereo", "Offsets left and right so the tremolo moves across the stereo field.")],
     "TIME": [
         ('Wavetable/', 'Scan time', 'Time one pass through the table takes, while SYNC is off.'),
-        ("ARP/", "Strum time", "Time between the notes of a strummed chord."),
+        ("ARP/", "Strum time", "Time from the first note of a strummed chord to its last (up to 1 second)."),
         (None, "Delay time", "Time between echoes. With SYNC on it picks a tempo division."),
     ],
     "DCAY": [
@@ -646,7 +646,7 @@ EXTRA = [
     ("RPT", "Repeats", "ARP", "ARP", "1–8", "Times each note is repeated before moving on."),
     ("LTCH", "Latch", "ARP", "ARP / ROL2", "OFF / ON", "ARP: the arp keeps playing after the keys are released (also Shift + Arp). ROL2: a pad press starts a roll that runs until pressed again; this one is off after every start and every project load."),
     ("STRM", "Strum", "ARP", "PLAY", "OFF / ON", "Plays held notes as a strummed chord."),
-    ("TIME", "Strum time", "ARP", "PLAY", "0–100 ms", "Gap between strummed notes."),
+    ("TIME", "Strum time", "ARP", "PLAY", "0–1000 ms", "Time from the first note of a strummed chord to its last. A note whose turn has not come when the step ends is not played: a long strum wants a slow RATE."),
     ("DIR", "Strum direction", "ARP", "PLAY", "UP DOWN ALT", "Direction of the strum."),
     ("VEL", "Strum velocity", "ARP", "PLAY", "0–100", "Velocity change across the strum."),
     ("RTCH", "Ratchet", "ARP", "PLAY", "1–4", "Repeats inside each arp step."),

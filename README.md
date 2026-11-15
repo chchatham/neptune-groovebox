@@ -101,7 +101,7 @@ cmake --build build-release
 open "build-release/NeptuneGroovebox_artefacts/Release/Neptune Groovebox.app"
 
 # tests (Debug build)
-cmake -S . -B build && cmake --build build --target NeptuneTests && (cd build && ctest)
+cmake -S . -B build && cmake --build build --target NeptuneTests && (cd build && ctest -j 12)
 ```
 
 The app expects a Launchkey Mini 25 MK4 running the Neptune firmware build. Without one it starts but has

@@ -214,6 +214,7 @@ juce_add_console_app(NeptuneTests
 
 target_sources(NeptuneTests PRIVATE
     tests/main_test.cpp
+    tests/fast_measure.cpp
     src/engine/VoiceAllocator.cpp
     src/sequencer/SequencerCore.cpp
     src/controller/DisplayRenderer.cpp
@@ -225,6 +226,10 @@ target_sources(NeptuneTests PRIVATE
 target_include_directories(NeptuneTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+# The tests' measuring arithmetic (FFTs over what was rendered) is optimised in every build type:
+# in the Debug build it was most of the suite's time. The instrument is compiled as the build type says.
+set_source_files_properties(tests/fast_measure.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 target_link_libraries(NeptuneTests PRIVATE
     juce::juce_core
@@ -249,4 +254,38 @@ if(TARGET NeptuneBreakData)
     target_link_libraries(NeptuneTests PRIVATE NeptuneBreakData)
 endif()
 
-add_test(NAME NeptuneTests COMMAND NeptuneTests_artefacts/Debug/NeptuneTests)
+# The suite is one binary, run as several tests so that `ctest -j 8` runs them side by side (about a
+# minute; one after the other they take about five). Each slow suite is named in one group; the last
+# test runs every suite that no group names, so a new suite runs without being added here. Rules:
+#   - a suite is named in one group only (names are matched as parts of suite names, see main() in
+#     tests/main_test.cpp), and a group stays under about 30 s (time them with NEPTUNE_TEST_ONLY);
+#   - "Mod Wheel" and "Strip Routes" stay together: the second reuses the first one's renders;
+#   - only suites that render sound and touch no file, folder or MIDI port may be named: everything
+#     that writes projects, presets or the recent list, or opens a port, stays in the last test, where
+#     the suites run one after the other.
+set(NEPTUNE_TEST_GROUPS
+    "Click Audit"
+    "Dead Controls"
+    "Mod Wheel|Strip Routes"
+    "Send Reverb|Engine LFOs"
+    "Sampler Stretch|Macro Osc Extended"
+    "Preset Audition|Cymbal Machine"
+    "LFO Destinations|Wavetable Embed|Sampler Release"
+    "Undo History|Effects More|Sampler Grain|Wavetable Keyframes|Wavetable Scan"
+)
+set(NEPTUNE_TEST_NAMED "Robustness")
+foreach(group IN LISTS NEPTUNE_TEST_GROUPS)
+    string(REGEX REPLACE "[ |]+" "-" label "${group}")
+    add_test(NAME "NeptuneTests-${label}" COMMAND NeptuneTests)
+    set_tests_properties("NeptuneTests-${label}" PROPERTIES ENVIRONMENT "NEPTUNE_TEST_ONLY=${group}")
+    string(APPEND NEPTUNE_TEST_NAMED "|${group}")
+endforeach()
+# "Robustness" in two halves (its parts 1-9: NEPTUNE_ROBUST_ONLY in tests/robustness_tests.h).
+add_test(NAME "NeptuneTests-Robustness-1235" COMMAND NeptuneTests)
+set_tests_properties("NeptuneTests-Robustness-1235" PROPERTIES
+    ENVIRONMENT "NEPTUNE_TEST_ONLY=Robustness;NEPTUNE_ROBUST_ONLY=1235")
+add_test(NAME "NeptuneTests-Robustness-46789" COMMAND NeptuneTests)
+set_tests_properties("NeptuneTests-Robustness-46789" PROPERTIES
+    ENVIRONMENT "NEPTUNE_TEST_ONLY=Robustness;NEPTUNE_ROBUST_ONLY=46789")
+add_test(NAME "NeptuneTests-everything-else" COMMAND NeptuneTests)
+set_tests_properties("NeptuneTests-everything-else" PROPERTIES ENVIRONMENT "NEPTUNE_TEST_EXCEPT=${NEPTUNE_TEST_NAMED}")

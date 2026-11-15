@@ -1,4 +1,5 @@
 #pragma once
+#include "fast_measure.h"
 #include "../src/engine/SamplerEngine.h"
 #include <juce_core/juce_core.h>
 #include <juce_audio_basics/juce_audio_basics.h>
@@ -236,17 +237,10 @@ public:
                 return (double) i / SR;
         return 0.0;
     }
+    // (The loop is in fast_measure.cpp, compiled with optimisation.)
     static double goertzel(const std::vector<float>& x, size_t from, size_t n, double hz)
     {
-        const double w = 2.0 * PI * hz / SR, c = 2.0 * std::cos(w);
-        double s1 = 0.0, s2 = 0.0;
-        for (size_t i = 0; i < n && from + i < x.size(); ++i)
-        {
-            const double win = 0.5 - 0.5 * std::cos(2.0 * PI * (double) i / (double) n);
-            const double s0 = win * x[from + i] + c * s1 - s2;
-            s2 = s1; s1 = s0;
-        }
-        return s1 * s1 + s2 * s2 - c * s1 * s2;
+        return fastmeasure::goertzel(x, from, n, hz, SR);
     }
     // The strongest frequency between lo and hi in x[fromSec, fromSec + lenSec).
     static double peakHz(const std::vector<float>& x, double fromSec, double lenSec, double lo = 150.0, double hi = 2000.0)

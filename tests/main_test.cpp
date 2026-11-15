@@ -9945,11 +9945,33 @@ int main(int argc, char** argv)
             ours.add(t);
     }
 
-    // NEPTUNE_TEST_ONLY=<text>: only the suites whose name contains it (the whole suite takes minutes).
+    // NEPTUNE_TEST_ONLY=<text>: only the suites whose name contains it; several texts separated by '|'
+    // ("Mod Wheel|Strip Routes") run the suites that contain any of them.
+    // NEPTUNE_TEST_EXCEPT=<text>|<text>: every suite but those. CMakeLists.txt uses the two to run the
+    // suite as several tests side by side (ctest -j): the slow suites by name, and one test with
+    // everything that is not named, so a new suite runs without being added to any list.
+    auto named = [](const juce::UnitTest& test, const juce::String& list)
+    {
+        for (auto& text : juce::StringArray::fromTokens(list, "|", ""))
+            if (text.trim().isNotEmpty() && test.getName().containsIgnoreCase(text.trim()))
+                return true;
+        return false;
+    };
     if (const auto only = juce::SystemStats::getEnvironmentVariable("NEPTUNE_TEST_ONLY", {}); only.isNotEmpty())
         for (int i = ours.size(); --i >= 0;)
-            if (! ours[i]->getName().containsIgnoreCase(only))
+            if (! named(*ours[i], only))
                 ours.remove(i);
+    if (const auto except = juce::SystemStats::getEnvironmentVariable("NEPTUNE_TEST_EXCEPT", {}); except.isNotEmpty())
+        for (int i = ours.size(); --i >= 0;)
+            if (named(*ours[i], except))
+                ours.remove(i);
+
+    // A list that names nothing must not pass for a run (a misspelt name in the test list would).
+    if (ours.isEmpty())
+    {
+        std::cout << "FAILED: no test suite matches NEPTUNE_TEST_ONLY / NEPTUNE_TEST_EXCEPT." << std::endl;
+        return 1;
+    }
 
     runner.runTests(ours);
 

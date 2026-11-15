@@ -1183,17 +1183,19 @@ public:
 
     void runTest() override
     {
-        // NEPTUNE_ROBUST_ONLY=<1..9>: one part only (while looking for the cause of a report).
-        const int only = juce::SystemStats::getEnvironmentVariable("NEPTUNE_ROBUST_ONLY", {}).getIntValue();
-        if (only == 0 || only == 1) enginesAtTheirEnds();
-        if (only == 0 || only == 2) absurdTrackParameters();
-        if (only == 0 || only == 3) effectsAtTheirEnds();
-        if (only == 0 || only == 4) wholeInstrumentAtTheEnds();
-        if (only == 0 || only == 5) tinySamples();
-        if (only == 0 || only == 6) hostileProjects();
-        if (only == 0 || only == 7) hostilePresets();
-        if (only == 0 || only == 8) generatorsAtTheirEnds();
-        if (only == 0 || only == 9) randomControllerInput();
+        // NEPTUNE_ROBUST_ONLY=<1..9>: one part only (while looking for the cause of a report); several
+        // digits run those parts ("1235": the test list in CMakeLists.txt runs the suite as two halves).
+        const auto only = juce::SystemStats::getEnvironmentVariable("NEPTUNE_ROBUST_ONLY", {});
+        auto wanted = [&only](char part) { return only.isEmpty() || only.containsChar(part); };
+        if (wanted('1')) enginesAtTheirEnds();
+        if (wanted('2')) absurdTrackParameters();
+        if (wanted('3')) effectsAtTheirEnds();
+        if (wanted('4')) wholeInstrumentAtTheEnds();
+        if (wanted('5')) tinySamples();
+        if (wanted('6')) hostileProjects();
+        if (wanted('7')) hostilePresets();
+        if (wanted('8')) generatorsAtTheirEnds();
+        if (wanted('9')) randomControllerInput();
     }
 };
 

@@ -71,23 +71,24 @@ public:
     static Row measureOnce(const juce::String& where, const Setup& setup, const ParamSpec& spec)
     {
         Row row { where, spec.label };
-        std::vector<std::vector<float>> renders;
-        int i = 0;
-        for (float n : { 0.0f, 0.5f, 1.0f })
+        std::vector<float> renders[3];
+        auto renderAt = [&](int i)
         {
             Plan plan;
             setup(plan);
-            plan.engine->setParameter(spec.id, spec.fromNorm(n));
-            renders.push_back(L::render(plan));
+            plan.engine->setParameter(spec.id, spec.fromNorm(0.5f * (float) i));
+            renders[i] = L::render(plan);
             double sq = 0.0;
-            for (float s : renders.back())
+            for (float s : renders[i])
             {
                 row.finite = row.finite && std::isfinite(s);
                 row.peak = std::max(row.peak, std::abs(s));
                 sq += (double) s * s;
             }
-            row.rms[i++] = (float) std::sqrt(sq / (double) renders.back().size());
-        }
+            row.rms[i] = (float) std::sqrt(sq / (double) renders[i].size());
+        };
+        for (int i = 0; i < 3; ++i)
+            renderAt(i);
         row.range = std::max({ W::difference(renders[0], renders[1]), W::difference(renders[1], renders[2]),
                                W::difference(renders[0], renders[2]) });
         return row;

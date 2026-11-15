@@ -133,6 +133,7 @@ public:
             data.arps[(size_t) snapshotTrack] = snapshotArp;
         if (getKeyboard && keyboardSet)
             data.keyboard = snapshotKeyboard;
+        td.presetName = trackPresets.nameFor(snapshotTrack, snapshotType);
         td.sampleName.clear();
         if (snapshotType == EngineType::Sampler || snapshotType == EngineType::Wavetable)
         {
@@ -366,15 +367,59 @@ public:
         return true;
     }
 
-    // The name the Mac's box offers for the preset SV has just saved as `savedName`: the name of
-    // the user preset this track's sound was last loaded from or saved as (typing nothing then
-    // saves over it), else `savedName`.
+    // The preset each track's sound came from (LD, a named save, a loaded project or session).
+    TrackPresetNames& getTrackPresets() { return trackPresets; }
+    // The track SV last saved (-1 before any save).
+    int getSavedTrack() const { return savedTrack; }
+
+    // The name the Mac's box offers for the preset SV has just saved as `savedName`:
+    // - the name of the preset this track's sound came from (Return then saves over that preset;
+    //   if it has been deleted since, it is made again);
+    // - a built-in preset cannot be saved over: its name with the first free number ("Deep Bass 2");
+    // - a track whose sound came from no preset, or whose engine is another one since: `savedName`.
     juce::String suggestedName(const juce::String& savedName) const
     {
-        auto it = trackPresetName.find(savedTrack);
-        if (it != trackPresetName.end() && presetManager.findUserPreset(it->second) >= 0)
-            return it->second;
-        return savedName;
+        const int saved = presetManager.findUserPreset(savedName);
+        const auto origin = trackPresets.get(savedTrack);
+        if (origin.name.isEmpty() || saved < 0 || presetManager.getPreset(saved).engineType != origin.engine)
+            return savedName;
+        for (int i = 0; i < presetManager.getPresetCount(); ++i)
+            if (presetManager.getPreset(i).isFactory && presetManager.getPreset(i).name.equalsIgnoreCase(origin.name))
+                return freeVariation(origin.name);
+        return origin.name;
+    }
+
+    // `name` with the first number from 2 that makes a name no preset has, within the name length.
+    juce::String freeVariation(const juce::String& name) const
+    {
+        for (int n = 2; n < 1000; ++n)
+        {
+            const auto tail = " " + juce::String(n);
+            const auto candidate = name.substring(0, PresetManager::MAX_NAME_LENGTH - tail.length()).trimEnd() + tail;
+            if (!presetManager.isNameTaken(candidate))
+                return candidate;
+        }
+        return name;
+    }
+
+    // What Return would do with `typed` in the box for the preset saved as `from`.
+    enum class NameUse { Empty, BuiltIn, Replaces, New };
+    NameUse nameUse(const juce::String& from, const juce::String& typed) const
+    {
+        const auto name = PresetManager::cleanName(typed);
+        if (name.isEmpty())
+            return NameUse::Empty;
+        if (name.equalsIgnoreCase(from))
+            return NameUse::New;
+        NameUse use = NameUse::New;
+        for (int i = 0; i < presetManager.getPresetCount(); ++i)
+            if (presetManager.getPreset(i).name.equalsIgnoreCase(name))
+            {
+                if (presetManager.getPreset(i).isFactory)
+                    return NameUse::BuiltIn;
+                use = NameUse::Replaces;
+            }
+        return use;
     }
 
     // The box was answered with a name: the preset saved as `from` gets it. A user preset that
@@ -385,7 +430,8 @@ public:
         const auto name = PresetManager::cleanName(typed);
         if (name.isEmpty() || presetManager.findUserPreset(from) < 0)
             return false;
-        if (name != from)
+        const bool same = name.equalsIgnoreCase(from);      // (the name it has, in whatever letters: kept)
+        if (!same)
         {
             int other = -1;
             for (int i = 0; i < presetManager.getPresetCount(); ++i)
@@ -410,7 +456,8 @@ public:
             if (!renameUserPreset(from, name))
                 return false;
         }
-        trackPresetName[savedTrack] = name;
+        const auto& named = presetManager.getPreset(presetManager.findUserPreset(same ? from : name));
+        trackPresets.set(savedTrack, named.name, named.engineType);
         return true;
     }
 
@@ -899,7 +946,7 @@ private:
         const auto& kept = presetManager.getPreset(filteredIndices[(size_t) selectedIndex]);
         if (!(auditioned && heardKey == key))
             applyPreset(kept);
-        trackPresetName[sequencer.getSelectedTrack()] = kept.name;
+        trackPresets.set(sequencer.getSelectedTrack(), kept.name, kept.engineType);
         takeSnapshot();
         rebuildFilteredList();
         selectByKey(key);
@@ -998,7 +1045,7 @@ private:
     bool anyEngine = false;
     bool audition = true;               // AU: on unless switched off
     bool auditioned = false;            // a preset is being heard for listening only
-    std::map<int, juce::String> trackPresetName;    // per track: the preset its sound was loaded from or saved as
+    TrackPresetNames trackPresets;      // per track: the preset its sound was loaded from or saved as
     int savedTrack = -1;                // the track SV last saved
     juce::String shownKey;              // the preset the highlight was on when last looked at
     juce::String heardKey;              // the preset being heard

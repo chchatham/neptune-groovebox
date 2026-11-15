@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Project.h"
+#include "TrackPresetNames.h"
 #include "../sequencer/SequencerCore.h"
 #include "../engine/AudioEngine.h"
 #include "../arpeggiator/Arpeggiator.h"
@@ -37,6 +38,7 @@ namespace ProjectBridge
         ChordPads* chords = nullptr;              // the CHORD screen's pads
         std::function<KeyboardSetup()> getKeyboard;               // the keys' split and octave
         std::function<void(const KeyboardSetup&)> setKeyboard;
+        TrackPresetNames* presetNames = nullptr;  // the preset each track's sound came from
     };
 
     // Arpeggiator settings as a flat list; the order is the file format. Nothing can be appended
@@ -276,6 +278,10 @@ namespace ProjectBridge
         for (int t = 0; t < (int) activeTracks.size(); ++t)
             if (auto* engine = live.audio.getEngine(t))
                 activeTracks[(size_t) t].engineType = engine->getType();
+        // The preset each sound came from (not that of an engine the track no longer has).
+        if (live.presetNames != nullptr)
+            for (int t = 0; t < (int) activeTracks.size(); ++t)
+                activeTracks[(size_t) t].presetName = live.presetNames->nameFor(t, activeTracks[(size_t) t].engineType);
 
         for (int b = 0; b < live.audio.getSendCount(); ++b)
         {
@@ -546,6 +552,12 @@ namespace ProjectBridge
 
         if (live.setKeyboard)
             live.setKeyboard(data.keyboard);
+
+        // The preset each track's sound came from; none in a project stored without them.
+        if (live.presetNames != nullptr)
+            for (int t = 0; t < juce::jmax(trackCount, (int) AudioEngine::MAX_TRACKS); ++t)
+                live.presetNames->set(t, t < trackCount && t < (int) soundTracks.size() ? soundTracks[(size_t) t].presetName : juce::String(),
+                                      t < trackCount ? live.sequencer.getPattern(active).getTrack(t).engineType : EngineType::UnifiedVoice);
 
         // Pad-pressure routes. A project with per-track lists: each track gets its own. An older
         // project with one list: every track whose engine uses a router gets that list (it never

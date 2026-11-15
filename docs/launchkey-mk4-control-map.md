@@ -132,7 +132,7 @@ CURV cell, CURV still bends all three stages and each stage's own curve adds to 
 
 **Buttons.** Arp: opens the ARP screen; pressed again on that screen it switches the selected track's arp on / off
 (an ARP tag in the name bar shows it is on). Shift + Arp: latch — the arp's latch when the arp is on, the key latch
-when it is off; LATCH tag in the name bar on every screen (and ROLL, letter O, while pad rolls are on with ROL2's LTCH). Scale: scale lock (keys on pitched tracks play the
+when it is off. A latched arp with no key down is transposed by the single-note pads (SCALE, PRESET, AT ROUTE): its lowest note becomes the pad's note, the pattern carries on (`Arpeggiator::transposeLatched`); keys and chord pads start a new chord. LATCH tag in the name bar on every screen (and ROLL, letter O, while pad rolls are on with ROL2's LTCH). Scale: scale lock (keys on pitched tracks play the
 nearest note of the active scale page, arps stay in it); the name bar says "SCALE LOCK ON C MAJOR" / "SCALE LOCK
 OFF" for 2 s (shortened to fit: "SCALE ON C MAJOR", "SCALE ON") and a SCALE tag stays while it is on; Shift + Scale:
 SCALE screen. Play: start / stop; Shift + Play: stop and return to the start (when already stopped: reset the

@@ -687,38 +687,61 @@ private:
     // ===================================================================
     float processBowedString()
     {
-        const float delaySamples = stringDelay(sampleRate, baseFrequency, (int) delayLine.size());
+        // A string in two parts, from the bow to the nut and from the bow to the bridge, each a
+        // delay that ends in an inverting reflection; the bow sits between them and lets the
+        // string go when it moves too differently from the bow (stick and slip). The two parts
+        // share the line, one in the even slots and one in the odd, so each has half of it: the
+        // lowest pitch is an octave above the plucked string's (0.96 Hz), and is held there below.
+        const int pairs = (int) delayLine.size() / 2;
+        if (delayWritePos >= pairs)                     // (the model was changed under a sounding note)
+            delayWritePos = 0;
+        const float dampCoeff = 0.03f + harmonics * harmonics * 0.88f;     // the bridge's low-pass
+        // One period is both parts and what the low-pass holds back.
+        const float period = stringDelay(sampleRate, baseFrequency, pairs) - dampCoeff / (1.0f - dampCoeff);
+        const float total = juce::jlimit(2.0f, (float) (pairs - 2), period);
+        const float bowPos = 0.05f + color * 0.45f;                        // 5 % .. 50 % from the bridge
+        const float bridgeLen = juce::jmax(1.0f, total * bowPos);
+        const float neckLen = juce::jmax(1.0f, total - bridgeLen);
 
-        float delayOut = readString(delaySamples);
+        bowFilterState = bowFilterState * dampCoeff + readBow(1, bridgeLen) * (1.0f - dampCoeff);
+        const float fromBridge = -BOW_BRIDGE_GAIN * bowFilterState;
+        const float fromNut = -readBow(0, neckLen);
+        const float stringVelocity = fromBridge + fromNut;
 
-        // Bow velocity (from morph parameter — represents bow speed)
-        float bowVelocity = 0.2f + morph * 0.6f;
+        // The bow: its speed (SPD) against the string's. Friction falls off steeply once they
+        // differ; more pressure (PRES) holds on over a wider difference.
+        const float bowVelocity = BOW_SPEED_MIN + morph * BOW_SPEED_RANGE;
+        const float difference = bowVelocity - stringVelocity;
+        const float slope = 5.0f - 4.0f * timbre;
+        const float x = std::abs(difference * slope) + 0.75f;
+        const float grip = juce::jlimit(0.01f, 0.98f, 1.0f / (x * x * x * x));
+        const float pushed = difference * grip;
 
-        // Velocity difference between bow and string
-        float vDiff = bowVelocity - delayOut;
+        const size_t at = (size_t) (2 * delayWritePos);
+        delayLine[at] = fromBridge + pushed;            // towards the nut
+        delayLine[at + 1] = fromNut + pushed;           // towards the bridge
+        if ((int) at + 2 > delayDirty)
+            delayDirty = (int) at + 2;
+        if (++delayWritePos >= pairs)
+            delayWritePos = 0;
 
-        // Bow friction curve: f(v) = v * exp(-a * v^2) — stick-slip model. The pressure sets how
-        // steep it is, over a range wide enough to be heard at the speeds the string moves at.
-        float bowPressure = BOW_PRESSURE_MIN * std::pow(BOW_PRESSURE_RANGE, timbre);
-        float friction = vDiff * std::exp(-bowPressure * vDiff * vDiff);
+        return fromBridge * BOW_OUTPUT_GAIN;
+    }
 
-        // Apply friction force
-        float excitation = friction * 0.5f;
-
-        // Bow position comb filter (similar to pick position in KS)
-        float bowPos = 0.05f + color * 0.45f; // 5%-50% along string
-        int bowDelay = juce::jlimit(1, juce::jmax(1, (int)delaySamples / 2),
-                                     (int)(bowPos * delaySamples));
-        float bowReflection = (delayOut + delayLine[tapIndex(bowDelay)]) * 0.5f;
-
-        // One-pole damping filter in the loop
-        float dampCoeff = 0.03f + harmonics * harmonics * 0.88f;     // 0.25 at the middle, as before
-        bowFilterState = bowFilterState * dampCoeff + (bowReflection + excitation) * (1.0f - dampCoeff);
-
-        // Write back to delay line
-        writeString(bowFilterState * 0.995f); // slight loss
-
-        return delayOut;
+    // One of the bowed string's two parts (0 = to the nut, 1 = to the bridge), `length` samples
+    // ago, between two slots. Always inside the line.
+    float readBow(int part, float length) const
+    {
+        const int pairs = (int) delayLine.size() / 2;
+        const int whole = (int) length;
+        const float frac = length - (float) whole;
+        auto slot = [&](int back)
+        {
+            int i = delayWritePos - juce::jlimit(1, pairs - 1, back);
+            if (i < 0) i += pairs;
+            return delayLine[(size_t) (2 * i + part)];
+        };
+        return slot(whole) * (1.0f - frac) + slot(whole + 1) * frac;
     }
 
     // --- The string's line (both string models) ---
@@ -814,6 +837,7 @@ private:
     void initBowedString()
     {
         clearString();
+        delayWritePos = 0;
         bowFilterState = 0.0f;
         bowForce = 0.0f;
     }
@@ -844,8 +868,9 @@ private:
     static constexpr float FORMANT_GAIN = 14.0f;
     static constexpr float HARM_STRETCH = 0.012f;       // stiffness B at the top of the macro
     static constexpr float RING_MAX_GAIN = 8.0f;
-    static constexpr float BOW_PRESSURE_MIN = 0.3f;
-    static constexpr float BOW_PRESSURE_RANGE = 200.0f;
+    static constexpr float BOW_BRIDGE_GAIN = 0.95f;      // what the bridge gives back
+    static constexpr float BOW_SPEED_MIN = 0.05f, BOW_SPEED_RANGE = 0.2f;
+    static constexpr float BOW_OUTPUT_GAIN = 2.0f;       // the string moves little: up to the other models' level
 
     // --- State ---
     double sampleRate = 44100.0;

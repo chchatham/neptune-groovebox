@@ -215,6 +215,9 @@ struct TrackData
     // The same for the samples of a wavetable track's key frames (SMP1-8): eight names, empty for a
     // key that is OFF. Not present in older projects (there are no key frames in them).
     juce::StringArray keySamples;
+    // The name of the preset the track's sound came from (kept with LD, or the name it was saved
+    // under): what the save box offers. Empty = none, and in older projects.
+    juce::String presetName;
 
     // Per-track arpeggiator settings
     ArpData arpSettings;
@@ -388,6 +391,8 @@ struct TrackData
                 names.add(n);
             obj->setProperty("keySamples", names);
         }
+        if (presetName.isNotEmpty())
+            obj->setProperty("preset", presetName);
 
         // Sound params
         juce::Array<juce::var> paramsArr;
@@ -424,6 +429,14 @@ struct TrackData
             t.muted = (bool) obj->getProperty("muted");
             t.soloed = (bool) obj->getProperty("soloed");
             t.sampleName = obj->getProperty("sample").toString();
+            {
+                // (a name as a preset can have it: printable, 15 characters; see PresetManager::cleanName)
+                juce::String name;
+                for (auto c : obj->getProperty("preset").toString())
+                    if (c >= 32 && c <= 126)
+                        name += juce::String::charToString(c);
+                t.presetName = name.trim().substring(0, 15).trim();
+            }
             if (auto* names = obj->getProperty("keySamples").getArray())
                 for (auto& n : *names)
                     t.keySamples.add(n.toString());

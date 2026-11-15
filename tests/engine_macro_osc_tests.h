@@ -3,6 +3,7 @@
 // Add to test filter: || name == "Macro Osc Extended"
 #pragma once
 
+#include "fast_measure.h"
 #include "../src/engine/MacroOscEngine.h"
 #include "../src/project/FactoryPresets.h"
 #include "../src/dsp/EnvelopeChain.h"
@@ -17,7 +18,7 @@ public:
 
     void runTest() override
     {
-        beginTest("Every factory preset of the macro oscillator sounds, at a level like the others', without clipping; four or more per model but the bowed string");
+        beginTest("Every factory preset of the macro oscillator sounds, at a level like the others', without clipping; four or more per model");
         {
             int perModel[8] = {};
             static const auto all = FactoryPresets::getAll();
@@ -60,7 +61,7 @@ public:
                 expect(dB > -30.0 && dB < -4.0, preset.name + ": loudest 100 ms at " + juce::String(dB, 1) + " dB");
                 expect(peak < 1.5f, preset.name + ": peak " + juce::String(peak, 2));
             }
-            for (int m = 0; m < 7; ++m)          // (the bowed string, model 7, has none yet)
+            for (int m = 0; m < 8; ++m)
                 expect(perModel[m] >= 4, "model " + juce::String(m) + " has " + juce::String(perModel[m]));
         }
 
@@ -335,31 +336,10 @@ public:
 
         // The lag at which x repeats best (normalised correlation), searched from 0.6 to 1.4 of the
         // expected period, and how well it repeats there (1 = exactly).
+        // (The search is in fast_measure.cpp, compiled with optimisation.)
         auto measurePeriod = [](const std::vector<float>& x, int start, double expected, double& correlation)
         {
-            const int lo = (int) (expected * 0.6), hi = (int) (expected * 1.4), points = 1500;
-            const int span = (int) x.size() - start - hi - 1;
-            int best = 0;
-            correlation = -1.0;
-            if (span < points)
-                return 0;
-            const int stride = span / points;
-            double mean = 0.0;                      // the bowed string sits off centre
-            for (size_t i = (size_t) start; i < x.size(); ++i)
-                mean += x[i];
-            mean /= (double) (x.size() - (size_t) start);
-            for (int lag = lo; lag <= hi; ++lag)
-            {
-                double ab = 0.0, aa = 0.0, bb = 0.0;
-                for (int k = 0; k < points; ++k)
-                {
-                    const double a = x[(size_t) (start + k * stride)] - mean, b = x[(size_t) (start + k * stride + lag)] - mean;
-                    ab += a * b; aa += a * a; bb += b * b;
-                }
-                const double c = ab / std::sqrt(std::max(aa * bb, 1.0e-30));
-                if (c > correlation) { correlation = c; best = lag; }
-            }
-            return best;
+            return fastmeasure::bestLag(x, start, expected, correlation);
         };
 
         // A string held open: bright, sustaining, no pick or bow comb worth the name.
@@ -425,15 +405,24 @@ public:
                 }
                 else
                 {
-                    // The bowed string settles on a pitch of its own (bow position and pressure
-                    // move it), so the loop is measured directly: the string is still until the
-                    // bow's first push has travelled its length once.
-                    expect(render(*e, (int) (period * 1.5) + 4000, &x), what + ": not a number");
-                    int first = 0;
-                    while (first < (int) x.size() && std::abs(x[(size_t) first]) < 1.0e-7f)
-                        ++first;
-                    expect(std::abs(first - period) <= 2.0,
-                           what + ": the first sound after " + juce::String(first) + " samples, expected " + juce::String(period, 1));
+                    const double asked = period;
+                    // The bow needs some periods to find the string's swing; then it repeats at the key's
+                    // period. Its two parts share the line, so its longest string is half the plucked
+                    // one's (0.96 Hz): below that the pitch is held there.
+                    const double longest = (double) MacroOscVoice::delayLineLength(k.sr) / 2.0 - 2.0;
+                    const double period = std::min(asked, longest);
+                    expect(render(*e, (int) (period * 14.0) + 8000, &x), what + ": not a number");
+                    double c = 0.0;
+                    const int lag = measurePeriod(x, (int) (period * 9.0), period, c);
+                    expect(std::abs(lag - period) <= std::max(2.0, period * 0.01),
+                           what + ": period " + juce::String(lag) + " samples, expected " + juce::String(period, 1));
+                    expect(c > 0.7, what + ": repeats with correlation " + juce::String(c, 2));
+                    // And it swings about zero: nothing constant is left on the output.
+                    double mean = 0.0, peak = 0.0;
+                    const size_t from = (size_t) (period * 9.0);
+                    for (size_t n = from; n < x.size(); ++n) { mean += x[n]; peak = std::max(peak, (double) std::abs(x[n])); }
+                    mean /= (double) (x.size() - from);
+                    expect(peak > 0.01 && std::abs(mean) < 0.1 * peak, what + ": mean " + juce::String(mean, 4) + " of a peak of " + juce::String(peak, 3));
                 }
             }
         }

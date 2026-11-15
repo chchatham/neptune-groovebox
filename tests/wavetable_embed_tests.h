@@ -1,4 +1,5 @@
 #pragma once
+#include "fast_measure.h"
 #include <numeric>
 #include <juce_core/juce_core.h>
 #include <juce_audio_basics/juce_audio_basics.h>
@@ -114,16 +115,10 @@ public:
 
     // ---- measuring ----------------------------------------------------------------------------
 
+    // (The projection is in fast_measure.cpp, compiled with optimisation.)
     static double harmonic(const std::vector<float>& x, double hz, int h)
     {
-        double c = 0.0, s = 0.0;
-        for (size_t n = 0; n < x.size(); ++n)
-        {
-            const double a = 2.0 * 3.14159265358979323846 * hz * (double) h * (double) n / SR;
-            c += x[n] * std::cos(a);
-            s += x[n] * std::sin(a);
-        }
-        return 2.0 * std::sqrt(c * c + s * s) / (double) x.size();
+        return fastmeasure::harmonic(x, hz, h, SR);
     }
     static double rms(const std::vector<float>& x)
     {
@@ -394,10 +389,12 @@ public:
             expectEquals(juce::String(FilterSlot::modelNames()[FILTER_OFF]), juce::String("OFF"));
             double worst = 0.0;
             juce::String where;
+            int compared = 0;
             for (int t = 0; t < total(); ++t)
                 for (float position : { 0.0f, 0.37f, 1.0f })
                     for (int note : { 57, 81 })
                     {
+                        ++compared;
                         const double hz = note == 57 ? 220.0 : 880.0;
                         const auto slot = renderSlot(t, position, note, 72000, [](U& e) { e.setParameter(UnifiedParam::MODEL_A, (float) FILTER_OFF); });
                         const auto engine = renderEngine(t, position, note, 72000, false);
@@ -413,7 +410,7 @@ public:
                         }
                         expect(d < TOLERANCE, name + ": harmonics differ by " + juce::String(d, 5));
                     }
-            logMessage("slot v. wavetable engine, 23 tables x 3 positions x 2 pitches: largest harmonic difference "
+            logMessage("slot v. wavetable engine, " + juce::String(compared) + " of 23 tables x 3 positions x 2 pitches: largest harmonic difference "
                        + juce::String(worst, 6) + " (" + where + "), tolerance " + juce::String(TOLERANCE, 3));
         }
 
@@ -603,7 +600,7 @@ public:
             expectEquals(all.back().name, juce::String("Narptune"), "the saved sound stays the last factory preset");
         }
 
-        beginTest("Factory presets for the newer tables: audible, as loud as the older wavetable presets, and the strip moves them");
+        beginTest("Factory presets for the newer tables: audible and as loud as the older wavetable presets");
         {
             const auto all = FactoryPresets::getAll();
             auto level = [&](const Preset& p) { return loudest(MW::render(*MW::makeEngine(p.engineType, &p.soundParams), 0.0f)); };
@@ -626,18 +623,19 @@ public:
                 for (auto& p : all)
                     if (p.name == x.name)
                     {
+                        // "The strip moves them" is not measured here any more: this test rendered
+                        // each preset twice at rest and once with the strip up and asserted what
+                        // "Mod Wheel" ("Every factory preset answers to the mod strip") asserts of
+                        // the same three renders of the same presets, with the same two limits, and
+                        // "Strip Routes" pins the strip's effect on each to its reference row. What
+                        // is this test's own is the level, and that needs the render at rest alone.
                         const auto rest = MW::render(*MW::makeEngine(p.engineType, &p.soundParams), 0.0f);
-                        const auto again = MW::render(*MW::makeEngine(p.engineType, &p.soundParams), 0.0f);
-                        const auto up = MW::render(*MW::makeEngine(p.engineType, &p.soundParams), 1.0f);
-                        const float dB = loudest(rest), strip = MW::difference(rest, up);
+                        const float dB = loudest(rest);
                         logMessage(p.name.paddedRight(' ', 18) + " " + juce::String(x.table).paddedRight(' ', 5) + juce::String(x.category).paddedRight(' ', 5)
-                                   + " loudest 100 ms " + juce::String(dB, 1) + " dB (" + juce::String(dB - older, 1) + " from the older ones)"
-                                   + "  strip " + juce::String(strip, 3));
-                        expect(finite(rest) && finite(up), p.name);
+                                   + " loudest 100 ms " + juce::String(dB, 1) + " dB (" + juce::String(dB - older, 1) + " from the older ones)");
+                        expect(finite(rest), p.name);
                         expect(MW::measure(rest).rms > 0.003f, p.name + ": hardly audible");
                         expectWithinAbsoluteError(dB, older, LEVEL_WINDOW_DB, p.name + ": level");
-                        expect(MW::difference(rest, again) <= MW::MAX_REST_DIFFERENCE, p.name + ": two renders at rest differ");
-                        expect(strip >= MW::MIN_DIFFERENCE, p.name + ": the strip changes the sound by only " + juce::String(strip, 3));
                     }
         }
 

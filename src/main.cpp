@@ -42,6 +42,7 @@
  #include "ui/screens/TrackFxScreen.h"
  #define NEPTUNE_HAS_TRACK_FX_SCREEN 1
 #endif
+#include "ui/SavePresetBox.h"
 #include "project/ProjectManager.h"
 #include "sync/MIDIClock.h"
 #include "sync/MIDIRouter.h"
@@ -380,7 +381,7 @@ public:
     const juce::String getApplicationName() override    { return "Neptune Groovebox"; }
     const juce::String getApplicationVersion() override { return "0.1.0"; }
     // (A screen dump for the manual runs beside the app that is being played: see dumpFolder.)
-    bool moreThanOneInstanceAllowed() override           { return dumpFolder().isNotEmpty(); }
+    bool moreThanOneInstanceAllowed() override           { return standsAside(); }
 
     void initialise(const juce::String& /*commandLine*/) override
     {
@@ -541,7 +542,7 @@ public:
         audioEngine->setMIDIClock(midiClock.get());
 
         midiRouter = std::make_unique<MIDIRouter>();
-        if (dumpFolder().isEmpty())
+        if (!standsAside())
             midiRouter->open(midiClock.get());
 
         abletonLink = std::make_unique<AbletonLink>();
@@ -776,6 +777,8 @@ public:
             presetScreen->onUserPresetsChanged = [this]
             {
                 // The folder mirrors the user presets in memory: rewrite it whole so deletions stick.
+                if (saveBoxShot().isNotEmpty())     // (the snapshot of the save box writes nothing)
+                    return;
                 for (auto& f : userPresetDir().findChildFiles(juce::File::findFiles, false, "*.json"))
                     f.deleteFile();
                 presetManager->saveUserPresetsToDirectory(userPresetDir());
@@ -958,7 +961,7 @@ public:
                         held.push_back({ arp->getInputPitch(i), arp->getInputVelocity(i) });
                 return held;
             });
-            chordScreen->setNoteCallback([this](int note, int velocity) { notePadDown(note, velocity); });
+            chordScreen->setNoteCallback([this](int note, int velocity) { notePadDown(note, velocity, false); });
             chordScreen->setNoteOffCallback([this](int note) { notePadUp(note); });
             chordScreen->setAftertouchCallback([this](int note, int pressure)
             {
@@ -1018,7 +1021,7 @@ public:
             }
         }
 
-        if (dumpFolder().isEmpty() && controller->scanAndConnect())
+        if (!standsAside() && controller->scanAndConnect())
         {
             juce::Logger::writeToLog("Launchkey found, entering DAW mode...");
             controller->enterDawMode();
@@ -1128,6 +1131,8 @@ public:
                 juce::Timer::callAfterDelay(500, [this] { startScreenAudit(false); });     // drawing checks only
             else if (dumpFolder().isNotEmpty())
                 juce::Timer::callAfterDelay(1500, [this] { dumpScreens(juce::File(dumpFolder())); quit(); });
+            else if (saveBoxShot().isNotEmpty())
+                juce::Timer::callAfterDelay(800, [this] { snapshotSaveBox(); });
             else if (juce::SystemStats::getEnvironmentVariable("NEPTUNE_SNAPSHOT_CONTROLLER", {}).isEmpty())
                 restoreSession();
         }
@@ -1135,6 +1140,7 @@ public:
 
     void shutdown() override
     {
+        saveBox.reset();                     // an unanswered save box: the save stays under the name it has
         saveSession();                       // the next start begins where this one ends
         sessionTimer.reset();
         keyboardSplit.restore();             // the keys go back to the firmware's own notes
@@ -1194,53 +1200,112 @@ private:
     PresetScreen* presetScreenRef = nullptr;     // owned by screenManager
 
     // The preset is already saved as `savedName` (SV never waits for the Mac); this asks for its
-    // name, offering the name of the preset the sound came from. Return saves under the name
-    // (over a user preset that has it), Escape takes the save back. The controller goes on working
-    // while the box is open.
+    // name in the save box (ui/SavePresetBox.h), offering the name of the preset the track's sound
+    // came from. Save names it (over a preset of the player's that has the name); Cancel, Escape or
+    // closing the box takes the save back, leaving no trace. The controller goes on working while
+    // the box is open. One box at a time: a save made while a box is open keeps the earlier save
+    // under the name it has and the box asks about the new one. Quitting with the box open keeps
+    // the save too (it was made; only the player takes it back).
     void askPresetName(const juce::String& savedName)
     {
-        if (mainWindow == nullptr)
+        if (mainWindow == nullptr || presetScreenRef == nullptr)
             return;
+        if (saveBox != nullptr && !saveBox->getBox().isAnswered())
+            juce::Logger::writeToLog("[Preset] " + saveBoxFor + " kept under that name (saved again before the box was answered)");
+        saveBox.reset();
+
         juce::String offered = savedName;
+        int track = 0;
         {
             const juce::ScopedLock ui(screenManager->getLock());
             offered = presetScreenRef->suggestedName(savedName);
+            track = presetScreenRef->getSavedTrack();
         }
-        auto* box = new juce::AlertWindow("Save preset",
-                                          "Name (up to " + juce::String(PresetManager::MAX_NAME_LENGTH)
-                                              + " characters). Return saves; a name one of your presets has saves over it."
-                                              " Escape cancels: nothing is saved.",
-                                          juce::MessageBoxIconType::NoIcon, mainWindow.get());
-        box->addTextEditor("name", offered);
-        if (auto* editor = box->getTextEditor("name"))
+        saveBoxFor = savedName;
+        saveBox = std::make_unique<SavePresetWindow>("Save the sound of track " + juce::String(track + 1) + " as a preset",
+                                                     offered, PresetManager::MAX_NAME_LENGTH);
+        auto& box = saveBox->getBox();
+        box.nameUse = [this, savedName](const juce::String& typed)
         {
-            editor->setInputRestrictions(PresetManager::MAX_NAME_LENGTH);
-            editor->selectAll();
-        }
-        box->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
-        box->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-        juce::Component::SafePointer<juce::AlertWindow> safeBox(box);
-        box->enterModalState(true, juce::ModalCallbackFunction::create([this, safeBox, savedName](int result)
-        {
-            if (safeBox == nullptr || screenManager == nullptr || presetScreenRef == nullptr)
-                return;
             const juce::ScopedLock ui(screenManager->getLock());
-            if (result != 1)
+            switch (presetScreenRef->nameUse(savedName, typed))
             {
-                presetScreenRef->cancelSavedPreset(savedName);
-                screenManager->showStatus("NOT SAVED");
-                juce::Logger::writeToLog("[Preset] save cancelled (" + savedName + " removed)");
-                return;
+                case PresetScreen::NameUse::Empty:    return SavePresetBox::NameUse::Empty;
+                case PresetScreen::NameUse::BuiltIn:  return SavePresetBox::NameUse::BuiltIn;
+                case PresetScreen::NameUse::Replaces: return SavePresetBox::NameUse::Replaces;
+                case PresetScreen::NameUse::New:      break;
             }
-            const auto typed = safeBox->getTextEditorContents("name");
-            // An empty name, or a built-in preset's: it stays saved under the name it was given.
+            return SavePresetBox::NameUse::New;
+        };
+        box.onSave = [this, savedName](const juce::String& typed)
+        {
+            const juce::ScopedLock ui(screenManager->getLock());
             const bool ok = presetScreenRef->nameSavedPreset(savedName, typed);
             screenManager->showStatus(ok ? "SAVED" : "NAME IN USE");
-            juce::Logger::writeToLog("[Preset] " + savedName + (ok ? " saved as " : " kept, not named ") + typed);
-        }), true);
-        juce::Process::makeForegroundProcess();
-        box->toFront(true);
+            juce::Logger::writeToLog("[Preset] " + savedName + (ok ? " saved as " : " not named ") + typed);
+            return ok;
+        };
+        box.onCancel = [this, savedName]
+        {
+            const juce::ScopedLock ui(screenManager->getLock());
+            presetScreenRef->cancelSavedPreset(savedName);
+            screenManager->showStatus("NOT SAVED");
+            juce::Logger::writeToLog("[Preset] save cancelled (" + savedName + " removed)");
+        };
+        // (the box is inside its own button's click here: it is taken away afterwards)
+        box.onDone = [this, made = saveBox.get()]
+        {
+            made->setVisible(false);
+            juce::MessageManager::callAsync([this, made] { if (saveBox.get() == made) saveBox.reset(); });
+        };
+        box.refresh();
+        saveBox->showOver(mainWindow.get());
     }
+    std::unique_ptr<SavePresetWindow> saveBox;
+    juce::String saveBoxFor;                     // the name the save the box asks about has now
+
+    // NEPTUNE_SNAPSHOT_SAVE_BOX: the box as the app shows it, with a sample name and answers that do
+    // nothing; its picture, and where it is and what has the keyboard, then quit.
+    void snapshotSaveBox()
+    {
+        saveBox = std::make_unique<SavePresetWindow>("Save the sound of track 3 as a preset", "Unknown Soldier",
+                                                     PresetManager::MAX_NAME_LENGTH);
+        saveBox->getBox().nameUse = [](const juce::String& typed)
+        {
+            return typed == "Unknown Soldier" ? SavePresetBox::NameUse::Replaces
+                 : typed == "Deep Bass"       ? SavePresetBox::NameUse::BuiltIn : SavePresetBox::NameUse::New;
+        };
+        saveBox->getBox().refresh();
+        saveBox->showOver(mainWindow.get());
+        juce::Timer::callAfterDelay(1200, [this]
+        {
+            auto& box = saveBox->getBox();
+            const bool wrote = box.writePng(juce::File::getCurrentWorkingDirectory().getChildFile(saveBoxShot()));
+            auto* focused = juce::Component::getCurrentlyFocusedComponent();
+            const auto screen = juce::Desktop::getInstance().getDisplays().getDisplayForRect(saveBox->getScreenBounds());
+            std::cout << "[SaveBox] picture " << (wrote ? "written" : "NOT written")
+                      << "; window " << saveBox->getScreenBounds().toString() << " over main window " << mainWindow->getScreenBounds().toString()
+                      << (screen != nullptr && screen->userArea.contains(saveBox->getScreenBounds()) ? ", whole on the screen" : ", NOT whole on the screen")
+                      << "; showing " << (int) saveBox->isShowing() << ", always on top " << (int) saveBox->isAlwaysOnTop()
+                      << ", app in front " << (int) juce::Process::isForegroundProcess()
+                      << ", window has the keyboard " << (int) (saveBox->getPeer() != nullptr && saveBox->getPeer()->isFocused())
+                      << ", keyboard in the name field " << (int) (focused == &box.getNameEditor() || box.getNameEditor().isParentOf(focused))
+                      << ", selected \"" << box.getNameEditor().getHighlightedText() << "\"" << std::endl;
+            // Return and Escape as the keyboard sends them, through the window to whatever has the focus.
+            int saves = 0, cancels = 0;
+            box.onSave = [&saves](const juce::String&) { ++saves; return false; };
+            box.onCancel = [&cancels] { ++cancels; };
+            if (auto* peer = saveBox->getPeer())
+            {
+                peer->handleKeyPress(juce::KeyPress(juce::KeyPress::returnKey));
+                peer->handleKeyPress(juce::KeyPress(juce::KeyPress::escapeKey));
+            }
+            std::cout << "[SaveBox] Return saved " << saves << " time(s), Escape cancelled " << cancels << " time(s)" << std::endl;
+            saveBox.reset();
+            quit();
+        });
+    }
+
     std::unique_ptr<juce::AudioDeviceManager> deviceManager;
     std::vector<std::unique_ptr<Arpeggiator>> arps;
 
@@ -1335,7 +1400,8 @@ private:
                  [this](int t) { return (t >= 0 && t < (int) arps.size()) ? arps[(size_t) t].get() : nullptr; },
                  chordPads.get(),
                  [this] { return keyboardSplit.getSetup(); },
-                 [this](const KeyboardSetup& k) { keyboardSplit.apply(k); } };
+                 [this](const KeyboardSetup& k) { keyboardSplit.apply(k); },
+                 presetScreenRef != nullptr ? &presetScreenRef->getTrackPresets() : nullptr };
     }
 
     // Projects are numbered slots: ~/Music/Neptune/Projects/P01 ... P32.
@@ -1351,6 +1417,11 @@ private:
     // manual; nothing is loaded so the pictures show the defaults). The controller is left alone
     // and no MIDI port is made, so it can run while the app proper is being played.
     static juce::String dumpFolder() { return juce::SystemStats::getEnvironmentVariable("NEPTUNE_DUMP_SCREENS", {}); }
+    // NEPTUNE_SNAPSHOT_SAVE_BOX=<file.png>: show the save box as the app shows it (over the window, with
+    // a sample name), write its picture to that file and what it is to the log, then quit. Like the
+    // screen dump it leaves the controller, the MIDI ports, the session and the presets alone.
+    static juce::String saveBoxShot() { return juce::SystemStats::getEnvironmentVariable("NEPTUNE_SNAPSHOT_SAVE_BOX", {}); }
+    static bool standsAside() { return dumpFolder().isNotEmpty() || saveBoxShot().isNotEmpty(); }
 
     // The screen audit runs on a thread of its own and sends the same messages the controller
     // does. Nothing is loaded before it and autosave is off, so no project is touched.
@@ -1569,12 +1640,19 @@ private:
     bool padSlotBusy[PadRatchet::kNumPads] = {};
     bool notePadViaKeys[128] = {};
 
-    void notePadDown(int note, int velocity)
+    // `transposes`: a pad that plays one note moves a latched arpeggio to that note instead of
+    // starting a new chord (the chord pads pass false: a chord pad is a new chord).
+    void notePadDown(int note, int velocity, bool transposes = true)
     {
         if (note < 0 || note > 127) return;
         auto* arp = currentArp();
         if (arp != nullptr && arp->isEnabled())
         {
+            if (transposes && arp->isHoldingLatchedNotes())
+            {
+                arp->transposeLatched(note);
+                return;                 // nothing was pressed into the arp, so the release does nothing
+            }
             notePadViaKeys[note] = true;
             keyboardToEngine.keyboardNoteOn(note, velocity);
             return;

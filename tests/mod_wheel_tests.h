@@ -4,9 +4,13 @@
 #include "../src/engine/ModStripFollower.h"
 #include "../src/sequencer/SequencerCore.h"
 #include "../src/project/FactoryPresets.h"
+#include "fast_measure.h"
 #include <juce_core/juce_core.h>
 #include <complex>
 #include <functional>
+#include <map>
+#include <set>
+#include <string>
 #include <vector>
 
 // -----------------------------------------------------------------------------
@@ -110,86 +114,27 @@ public:
 
     // ---- measuring ---------------------------------------------------------------------------
 
-    static void fft(std::vector<std::complex<float>>& a)
-    {
-        const size_t n = a.size();
-        for (size_t i = 1, j = 0; i < n; ++i)
-        {
-            size_t bit = n >> 1;
-            for (; j & bit; bit >>= 1) j ^= bit;
-            j ^= bit;
-            if (i < j) std::swap(a[i], a[j]);
-        }
-        for (size_t len = 2; len <= n; len <<= 1)
-        {
-            const float ang = -2.0f * juce::MathConstants<float>::pi / (float) len;
-            const std::complex<float> wl(std::cos(ang), std::sin(ang));
-            for (size_t i = 0; i < n; i += len)
-            {
-                std::complex<float> w(1.0f, 0.0f);
-                for (size_t k = 0; k < len / 2; ++k)
-                {
-                    const auto u = a[i + k], v = a[i + k + len / 2] * w;
-                    a[i + k] = u + v;
-                    a[i + k + len / 2] = u - v;
-                    w *= wl;
-                }
-            }
-        }
-    }
-
     static constexpr int FFT_SIZE = 2048;
+
+    // The arithmetic is in fast_measure.cpp (compiled with optimisation; it was most of this
+    // suite's time, and of the three suites that measure with it).
 
     // Magnitude frames (square root of the magnitude, so that quiet parts of a sound - a tail,
     // high harmonics - count as the ear counts them), Hann window, hop of half a frame.
     static std::vector<std::vector<float>> frames(const std::vector<float>& x)
     {
-        std::vector<std::vector<float>> out;
-        std::vector<std::complex<float>> buf((size_t) FFT_SIZE);
-        for (size_t start = 0; start + (size_t) FFT_SIZE <= x.size(); start += (size_t) FFT_SIZE / 2)
-        {
-            for (int i = 0; i < FFT_SIZE; ++i)
-            {
-                const float w = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * (float) i / (float) FFT_SIZE);
-                buf[(size_t) i] = { x[start + (size_t) i] * w, 0.0f };
-            }
-            fft(buf);
-            std::vector<float> mag((size_t) FFT_SIZE / 2);
-            for (int i = 0; i < FFT_SIZE / 2; ++i)
-                mag[(size_t) i] = std::sqrt(std::abs(buf[(size_t) i]));
-            out.push_back(std::move(mag));
-        }
-        return out;
+        return fastmeasure::frames(x, FFT_SIZE);
     }
 
     static float difference(const std::vector<float>& a, const std::vector<float>& b)
     {
-        const auto fa = frames(a), fb = frames(b);
-        double diff = 0.0, sum = 0.0;
-        for (size_t f = 0; f < std::min(fa.size(), fb.size()); ++f)
-            for (size_t i = 0; i < fa[f].size(); ++i)
-            {
-                diff += std::abs(fa[f][i] - fb[f][i]);
-                sum += fa[f][i] + fb[f][i];
-            }
-        return sum > 0.0 ? (float) (diff / sum) : 0.0f;
+        return fastmeasure::difference(a, b, FFT_SIZE);
     }
 
     static Measure measure(const std::vector<float>& x)
     {
         Measure m;
-        double sq = 0.0;
-        for (float s : x) sq += (double) s * s;
-        m.rms = x.empty() ? 0.0f : (float) std::sqrt(sq / (double) x.size());
-        double num = 0.0, den = 0.0;
-        for (auto& frame : frames(x))
-            for (size_t i = 1; i < frame.size(); ++i)
-            {
-                const double p = std::pow((double) frame[i], 4.0);     // back to power
-                num += p * (double) i * SR / FFT_SIZE;
-                den += p;
-            }
-        m.centroid = den > 0.0 ? (float) (num / den) : 0.0f;
+        fastmeasure::rmsAndCentroid(x, FFT_SIZE, SR, m.rms, m.centroid);
         return m;
     }
 
@@ -206,14 +151,30 @@ public:
 
     struct Result { float diff = 0.0f, rest = 0.0f; Measure at0, at127; bool finite = true; float peak = 0.0f; };
 
-    static Result compare(EngineType type, const ParamMap* sound = nullptr)
+    // The measurement of one sound is kept for the run: "Strip Routes" pins the very same renders
+    // (strip at rest, strip up) of every engine default, model, play mode and preset against its
+    // reference table, and used to render them all a second time. `restTwice` adds the second
+    // render at rest (r.rest); a kept measurement without it is made again when it is asked for.
+    static Result compare(EngineType type, const ParamMap* sound = nullptr, bool restTwice = true)
     {
+        struct Kept { Result result; bool restMeasured = false; };
+        static std::map<std::string, Kept> kept;
+        std::string key = std::to_string((int) type);
+        if (sound != nullptr)
+            for (auto& [id, value] : *sound)
+            {
+                key += ' ' + std::to_string(id) + '=';
+                key.append(reinterpret_cast<const char*>(&value), sizeof(value));
+            }
+        if (auto it = kept.find(key); it != kept.end() && (it->second.restMeasured || ! restTwice))
+            return it->second.result;
+
         Result r;
         const auto a = render(*makeEngine(type, sound), 0.0f);
-        const auto a2 = render(*makeEngine(type, sound), 0.0f);
         const auto b = render(*makeEngine(type, sound), 1.0f);
         r.diff = difference(a, b);
-        r.rest = difference(a, a2);
+        if (restTwice)
+            r.rest = difference(a, render(*makeEngine(type, sound), 0.0f));
         r.at0 = measure(a);
         r.at127 = measure(b);
         for (float s : b)
@@ -221,6 +182,7 @@ public:
             r.finite = r.finite && std::isfinite(s);
             r.peak = std::max(r.peak, std::abs(s));
         }
+        kept[key] = { r, restTwice };
         return r;
     }
 

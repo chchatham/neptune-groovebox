@@ -215,7 +215,10 @@ public:
     void setStrumEnabled(bool e) { strumEnabled = e; }
     bool isStrumEnabled() const { return strumEnabled; }
 
-    void setStrumTime(float ms) { strumTime = juce::jlimit(0.0f, 100.0f, ms); }
+    // The time from the first note of a strummed chord to its last. A note whose turn has not come
+    // when the step ends is not played, so a long strum wants a slow rate.
+    static constexpr float MAX_STRUM_MS = 1000.0f;
+    void setStrumTime(float ms) { strumTime = juce::jlimit(0.0f, MAX_STRUM_MS, ms); }
     float getStrumTime() const { return strumTime; }
 
     // 0 = up, 1 = down, 2 = alternating (up, down, up, ...)
@@ -957,6 +960,38 @@ public:
 
         if (!frozen)
             rebuildSequence();
+    }
+
+    // True when the arp is playing notes that only its latch is keeping (no key is down).
+    bool isHoldingLatchedNotes() const { return latch && inputNoteCount > 0 && physicalNoteCount == 0; }
+
+    // Moves a latched arpeggio so that its lowest note becomes `newLowest`. The pattern carries on
+    // from where it is: position, mutations and a frozen loop are kept, only the pitches move.
+    // Returns false (and changes nothing) if there is nothing latched or a note would leave 0..127.
+    bool transposeLatched(int newLowest)
+    {
+        if (!isHoldingLatchedNotes())
+            return false;
+        int lowest = 127, highest = 0;
+        for (int i = 0; i < inputNoteCount; ++i)
+        {
+            lowest = juce::jmin(lowest, inputNotes[i].pitch);
+            highest = juce::jmax(highest, inputNotes[i].pitch);
+        }
+        const int delta = newLowest - lowest;
+        if (newLowest < 0 || highest + delta > 127)
+            return false;
+        if (delta == 0)
+            return true;
+        for (int i = 0; i < inputNoteCount; ++i)
+            inputNotes[i].pitch += delta;
+        for (int i = 0; i < playLogCount; ++i)
+            playLog[i].pitch += delta;
+        for (int i = 0; i < sequenceLength; ++i)
+            sequence[i].pitch = foldPitch(sequence[i].pitch + delta);
+        for (int i = 0; i < frozenSequenceLength; ++i)
+            frozenSequence[i].pitch = foldPitch(frozenSequence[i].pitch + delta);
+        return true;
     }
 
     void noteOff(int pitch)
