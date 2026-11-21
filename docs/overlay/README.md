@@ -106,7 +106,7 @@ another rings knobs 5–8 and runs into the bottom row: on grid screens knobs 1�
 5–8 the bottom row. Over each top pad, in amber: the screen Shift + that pad opens. The line along the pads
 marks the beats of the sixteen steps (1, 5; on F2: 9, 13).
 
-**F2 — bottom pads.** Under each bottom pad, in amber: the screen Shift + that pad opens (pads 7 and 8 open
+**F2 — bottom pads.** Under each bottom pad, in amber: the screen Shift + that pad opens (pad 8 opens
 nothing).
 
 **R — right margin.** ‹ › beside the two small buttons: KNOB PAGE back / on; with Func: JUMP (a section, or
@@ -143,6 +143,7 @@ Whole words, except these everyday short forms:
 | TRACK FX | track effects | TRK FX |
 | AT ROUTE | aftertouch routing (pad pressure) | AT ROUTE |
 | CHORDS | chord pads | CHORD |
+| PERF FX | performance effects (effects played from the pads) | PERF |
 
 (Shift + bottom pad 3 was ARP until 2026-11-14; the arpeggiator is on the Arp button, which carries its own cap.)
 

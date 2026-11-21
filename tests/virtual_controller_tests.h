@@ -404,7 +404,7 @@ public:
             const juce::ScopedJuceInitialiser_GUI gui;
             const auto words = VirtualControllerComponent::overlayWords();
             // counted on the printed sheets by the overlay itself ("Words on the six pieces")
-            expectEquals(words.size(), 42);
+            expectEquals(words.size(), 44);     // (42 until PERF FX went under bottom pad 7)
             for (const auto& w : words)
                 expect(html.contains("'" + w + "'") || html.contains("'" + w + " ") || html.contains(" " + w + "'"), w);
             for (const char* w : { "PARAMS", "TRACK", "FX", "WAVEFORM", "FILTER", "NEPTUNE", "KNOB", "PAGE", "JUMP", "PATTERN", "PASTE",

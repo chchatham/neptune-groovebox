@@ -234,14 +234,15 @@ private:
         static constexpr Pair WORD[] = {
             { "PARAM", "PARAMS" }, { "TRACKS", "TRACKS" }, { "TRK FX", "TRACK FX" }, { "STEP", "STEP" },
             { "PRESET", "PRESET" }, { "SONG", "SONG" }, { "SETTINGS", "SETTINGS" }, { "AT ROUTE", "AT ROUTE" },
-            { "DRUMS", "DRUMS" }, { "ARP", "ARP" }, { "CHORD", "CHORDS" }, { "SCALE", "SCALE" }, { "WAVE", "WAVEFORM" }, { "FLTR", "FILTER" } };
+            { "DRUMS", "DRUMS" }, { "ARP", "ARP" }, { "CHORD", "CHORDS" }, { "SCALE", "SCALE" }, { "WAVE", "WAVEFORM" }, { "FLTR", "FILTER" },
+            { "PERF", "PERF FX" } };
         for (const auto& w : WORD)
             if (juce::String(w.key) == name)
                 return w.value;
         return name;
     }
     static constexpr const char* SHIFT_TOP[8] = { "PARAM", "TRACKS", "TRK FX", "STEP", "PRESET", "SONG", "SETTINGS", "AT ROUTE" };
-    static constexpr const char* SHIFT_BOT[8] = { "STEP", "DRUMS", "CHORD", "SCALE", "WAVE", "FLTR", nullptr, nullptr };
+    static constexpr const char* SHIFT_BOT[8] = { "STEP", "DRUMS", "CHORD", "SCALE", "WAVE", "FLTR", "PERF", nullptr };
 
     void padName(double x, double yMid, const char* name) { word(x, yMid + 1.17, screenWord(name), SHIFT, BIG, Anchor::Middle, 0.2); }
 

@@ -44,11 +44,11 @@ in the owner's manual (`docs/Neptune-Groovebox-Manual.pdf`). The sections before
 | 4 | Transport | STEP | Chord Map | SCALE |
 | 5 | Custom 1 | PRESET | Custom 1 | WAVE |
 | 6 | Custom 2 | SONG | Custom 2 | FLTR |
-| 7 | Custom 3 | SETTINGS | Custom 3 | — |
+| 7 | Custom 3 | SETTINGS | Custom 3 | PERF |
 | 8 | Custom 4 | AT ROUTE | Custom 4 | — |
 
 Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 4 PRESET, 5 SETTINGS, 6 FLTR, 7 ARP,
-8 SCALE, 9 SONG, 10 AT ROUTE, 11 WAVE, 12 TRK FX, 13 CHORD. ARP is reached by the Arp button only.
+8 SCALE, 9 SONG, 10 AT ROUTE, 11 WAVE, 12 TRK FX, 13 CHORD, 14 PERF. ARP is reached by the Arp button only.
 
 ## ARP, SCALE AND LATCH (app side)
 - Internally the app still identifies the Arp and Scale buttons as (channel 7, CC 0x49) and (channel 7, CC 0x4A); the Mac window's keyboard shortcuts and the tests use that identity. `ScreenManager::controlChangeReceived` translates the hardware messages CC 109 / CC 110 (ch1) to it and opens SETTINGS on CC 108.
@@ -269,9 +269,77 @@ cards). The screen audit holds every key on every screen (`ScreenAudit::auditHel
 latched, the arp's notes) + a pad: the pad takes that chord, replacing what it had (undo step "STORE CHORD PAD n");
 nothing is played by the press. A pad pressed with no key held plays its chord on the selected track through the
 note-pad path (`notePadDown`, one pad slot per note: recording, arp, rolls), pad velocity scaling the chord and pad
-pressure going to every note. Four banks of sixteen (BK, Up / Down), TR / OC move all pads, VL = stored levels or
-the pad's velocity, CL (four clicks) clears the bank. Pinnable. Saved in the project (`chordPads`,
-`ChordPads::toFlat`). Not built: strum, copy / clear / paste of one pad.
+pressure going to every note. Four banks of sixteen (BK, Up / Down), TR / OC move all pads, VL = PAD (all notes at the pad's
+velocity) / BALANCE (loudest note at the pad's velocity, the rest in the keys' proportion; the default) / AS KEYS
+(each note exactly its key's velocity), CL (four clicks) clears the bank. Pinnable. Saved in the project (`chordPads`,
+`ChordPads::toFlat`). Second knob page STRUM (bank buttons), one setting for all pads, saved with them: TM 0-1000 ms
+from first note to last (0 = together), DR up / down / alternate, HU uneven timing (stroke length +-30 %, unequal
+gaps), VR changing pattern (a stroke reversed, neighbours swapped; no note dropped), FL later notes softer
+(`ChordPads::strum`). The later notes are started by `ChordPadScreen::serviceStrum`, called every millisecond by a
+timer in `main.cpp` under the screen lock; a pad released early cancels the rest of its stroke. With the track's arp
+on the notes go to the arp together (the arp has its own strum). Key latch on (arp off): a released pad sounds on and its stroke is played out; the next pad pressed with
+no other pad down ends the latched ones, a pad pressed while another is down is added; latch off, a new chord on
+the keys or transport stop ends them (`ScreenManager::getLatchReleaseCount`, seen by `serviceStrum`). A note two pads
+share is counted (`NotePadSlots`): it ends with the last pad. Not built: copy / clear / paste of one pad.
+
+**PERF (effects played from the pads).** Shift + bottom pad 7. `src/engine/PerfFx.h` (the pads, their press logic
+and audio), `src/dsp/effects/PerfEffects.h` (the pads' own effects), `src/ui/screens/PerfFxScreen.h`.
+- *A pad* holds up to four effects, layers A - D, that one press plays together. A layer is FX (the effect), TRK
+  (what it acts on), MODE, WET and the effect's own four values. An empty pad says `EMPTY: TURN FX`. The pad
+  touched last is the one on the knobs and is lit a little brighter; holding it and turning changes it while it is
+  heard. **Up / Down choose the layer on the knobs** (round and round); the strip at the bottom left shows the four
+  (a letter where a layer holds an effect, a dash where it is empty, the shown one inverted). Touching another pad
+  shows its first effect. The name bar on the FX page says what the shown layer does (`DUB>T2`, `B EMPTY`).
+  Pinnable.
+- *What the press and the pressure control.* Each of a layer's five values (its four and its WET) has two
+  amounts, -100 .. +100 of the value's range: how far the **press** moves it for as long as the pad is down, and
+  how far full **pressure** moves it. They add up. So one pad can move any number of values on any of its
+  effects at once, each its own way (one finger closing a filter on track 1 while it opens the echo's feedback
+  on the mix). The amounts are on two knob pages laid out like the FX page: knob 4 is WET, knobs 5 - 8 the
+  effect's four, so an amount sits under the knob of the value it moves. The press is followed over 8 ms, the
+  pressure over 15 ms; neither is written into the pad's own values.
+- *TRK* (per layer): SEL = the track selected at the press (it stays on that track while it rings), MSTR = the
+  whole mix, or T1 .. Tn. A track's layers act after its fader, pan and sends (a tail outlives a fader pulled
+  down, a mute or a stopped sequencer; it does not reach the track's sends). MSTR's act on the sum before the
+  master EQ, compressor and limiter, and are in a master resample. Layers on one target run in pad order, then
+  layer order.
+- *MODE* (per layer): PNCH = the effect in place of the sound while the pad is down (in over 4 ms, out over
+  25 ms). THRW = the sound is fed to the effect only while the pad is down, the effect's wet part is added, and
+  it rings on after the release until it has been quiet for 2.5 s (longer than any echo time; then the layer rests
+  and costs nothing). DUB and FRZ are
+  throws only, RPT and STOP punches only, echoes and reverbs of the insert list both, every other insert type a
+  punch (the knob says `THROW ONLY` / `PUNCH ONLY`).
+- *FX*: nothing, the pads' own four, then the insert types (all but DUCK). Turning FX gives the layer that
+  effect's starting values, its usual MODE and a starting pressure amount (one undo step for a turn through the
+  list). Turning it to `--` empties the layer.
+  - DUB: echo with a band filter and saturation in its loop. TIME, FDBK (the top feeds on itself, held by the
+    saturation), TONE (where the band sits, 150 Hz - 5 kHz), DRIV. Starts in time (1/8D) with pressure on FDBK.
+  - FRZ: catches the sound for GRAB after the press, then holds it for as long as the pad is down; let go, it
+    dies away in DEC. SHIM = octave-up feedback while held (pressure to start with), SPRL = octave-up feedback
+    after the release: the held sound climbs away.
+  - RPT: beat repeat. The first slice is the sound itself, then it comes round again. DIV 1/4 - 1/64 (read at the
+    start of each repeat; pressure to start with, towards 1/64), DCAY each repeat quieter, PTCH each repeat that
+    many semitones from the last, GATE how much of a slice sounds.
+  - STOP: tape stop over TIME, CURV the way it slows; letting go brings the live sound back.
+- *Knob pages* (bank buttons): **FX** = TRK FX MODE WET and the four values (a value in time with the tempo
+  shows and turns its division). **PRESS** = LTCH (a press switches the pad on, the next off), QNT (OFF 1/16 1/8
+  1/4 BAR: while the sequencer plays a press takes hold on the next of these, to the sample; stopped, at once),
+  then the press amounts for WET and the four values. **PRES** (name bar: PRESSURE) = CURV (LIN / SOFT / HARD)
+  and the pressure amounts for WET and the four values. **MORE** = SYNC + DIV (the layer's TIME or RATE as a
+  division of the tempo; `NO TIME CELL` where the effect has none), CLR (four clicks: empties the pad, all
+  layers). LTCH, QNT and CURV belong to the pad; everything else to the shown layer. A knob with nothing drawn
+  over it does nothing.
+- *Edits*: Func + Record / Play / > copy, clear and paste the shown pad (all layers, targets and all); FX, CLR,
+  clear and paste are undo steps. Shift + Play's silence lets go of every pad, latched ones too, and empties
+  their effects.
+- *Lights*: the colour of the pad's first effect (echoes amber, reverbs blue, FRZ violet, RPT green, STOP red,
+  movement cyan, filters yellow, dirt magenta); dim = waiting, full = down, half = let go and ringing.
+- *Saved* in the project and the session (`perfPads`, `PerfFxRack::toFlat`: version 2, banks, pads, layers per
+  pad, fields per pad, fields per layer).
+  A project without them gets the starting layout (`AudioEngine::loadFactoryPerfPads`): DUB FRZ RPT STOP FLT PHS
+  RED HALL on the whole mix (top row) and again on the selected track (bottom row), one layer each.
+- Not built: recording pad moves into the pattern, more than one bank, more than four layers, a send bus as a
+  target, pad velocity as a source, copy / paste of one layer.
 
 **Presets.** SV saves the track's own sound read from the engine, mixer and effects (`ProjectBridge::captureTrackSound`,
 with the insert chain's types); while a preset is auditioned, the remembered sound. A preset that has the insert
@@ -287,6 +355,12 @@ track, until that track's sound is replaced by a preset, a project or another en
 **Session.** The app starts in the state it was last running in: every sound, pattern and setting a project holds
 is written to `~/Music/Neptune/Projects/session.json` when the app quits and every 15 s while it runs, and put back
 at the next start on top of the project last saved or loaded (SAVE on SETTINGS still writes that project's slot).
+
+**Project names.** SVAS (and SAVE of a project that has no slot yet) saves at once; the Mac then shows the save
+box (`ui/SaveBox.h`, the one PRESET's SV uses) with the project's name. Save names it (13 printable characters);
+Cancel takes the save back (`ProjectManager::takeBackSaveAs`: the slot holds what it held, the project is the one
+it was). Another save-as, SAVE, LOAD, NEW, a preset's box or quitting leaves the save as it is. PROJ's strip:
+`P05 EMPTY NOW P03`, `P05 USED NOW P03` (no name), `P07 Other Song`, `P05 NOW Night Drive` (the current slot).
 
 **Stop and latch.** When the transport stops (Play, or Shift + Play, which also cuts effect tails), notes that only
 a latch is holding are let go: the key latch's and those of every track's latched arp. The latch stays on for the

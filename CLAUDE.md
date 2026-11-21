@@ -65,11 +65,14 @@ src/
 │   │                         STRIP page, shared by the non-unified engines
 │   ├── AftertouchRouter.h  — pad-pressure routes, one set per track
 │   ├── ModStripFollower.h  — every track keeps the value the mod strip last gave it
+│   ├── PerfFx.h            — PERF: effects played from the pads (what each pad holds, press / pressure / latch,
+│   │                         the audio: per-track after the fader, MSTR before the master chain)
 │   └── SendBusManager.h — not used by the app yet
 ├── dsp/
 │   ├── filters/            — SVF, SEM, ladder, diode, comb; FilterSlot.h offers them by type and mode
 │   ├── effects/            — EffectBase.h, EffectChain.h, TrackFx.h (DIRT / TALK / MODFX blocks), FxBlocks.h (shared
-│   │                         building blocks), one header per effect
+│   │                         building blocks), one header per effect; PerfEffects.h = the PERF pads' own (dub echo, freeze,
+│   │                         beat repeat, tape stop: not insert types)
 │   ├── WaveTables.h, WaveMorph.h — the wavetable engine's built-in tables; key-frame morph algorithms and their FFT
 │   └── Envelope.h, EnvelopeChain.h, LFO.h, ModMatrix.h, DSPUtils.h
 ├── arpeggiator/            — Arpeggiator.h (one per track), VariationMacros.h, MutateSystem.h, RhythmCapture.h
@@ -81,12 +84,12 @@ src/
 │   ├── FilterCurve.h       — the filter picture, measured from the real filters
 │   ├── EnvelopeCurve.h     — the envelope picture, drawn from the real Envelope class
 │   ├── ScreenAudit.h       — turns every knob on every page, holds every help key, checks the display
-│   ├── SavePresetBox.h     — the Mac's window that asks for a saved preset's name (Save / Cancel)
+│   ├── SaveBox.h           — the Mac's window that asks for a saved preset's or project's name (Save / Cancel)
 │   ├── TurnNotice.h        — a knob with nothing to act on says why in the name bar
 │   ├── UiClock.h           — the screens' clock (the audit can move it on)
 │   ├── screens/            — Home (TRACKS), StepView, ParamPage (PARAM, and `ParamCellScreen`, the base it shares
 │   │                         with TrackFx and FilterView), TrackFx (TRK FX), DrumPad, Preset, Settings, FilterView
-│   │                         (FLTR), Arp, CustomScale, ChordPad (CHORD), Song, Aftertouch (AT ROUTE), Waveform (WAVE);
+│   │                         (FLTR), Arp, CustomScale, ChordPad (CHORD), PerfFx (PERF), Song, Aftertouch (AT ROUTE), Waveform (WAVE);
 │   │                         Mixer and SubParamOverlay are unused
 │   ├── ScreenLayout.h, BitmapFont.h, Icons.h, NoteUtils.h, ParamConstants.h, PadLEDFeedback.h, StartupAnimation.h
 │   └── OLEDMirrorComponent.h, VirtualControllerComponent.h, MainContentComponent.h — the Mac window
@@ -162,8 +165,8 @@ Track {
   soloed: bool
 }
 ```
-Arpeggiator settings live in the per-track `Arpeggiator` objects, insert chains and send buses in `AudioEngine`;
-`ProjectBridge` saves them with the project.
+Arpeggiator settings live in the per-track `Arpeggiator` objects, insert chains, send buses and the PERF pads
+(`PerfFxRack`) in `AudioEngine`; `ProjectBridge` saves them with the project.
 
 ## Environment
 - **Language:** C++17

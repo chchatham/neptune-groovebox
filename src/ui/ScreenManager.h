@@ -69,7 +69,14 @@ public:
     // shows the same answer; while it returns true onCopy / onClear / onPaste must act.
     // `step` is the step of the selected track they change (so that exactly that step is kept for
     // the undo); -1 = the screen does not say, and the whole track's steps are kept.
-    struct EditScope { juce::StringArray names; bool canPaste = true; int step = -1; };
+    struct EditScope
+    {
+        juce::StringArray names; bool canPaste = true; int step = -1;
+        // What a clear or paste changes when it is neither a step nor a track's steps (PERF's pads):
+        // the undo step keeps and puts back exactly this.
+        std::function<std::vector<float>()> capture;
+        std::function<void(const std::vector<float>&)> apply;
+    };
     virtual bool getEditScope(EditScope& scope) const { juce::ignoreUnused(scope); return false; }
 
     // ---- Undo: a screen's own one-click destructive actions --------------------------------------
@@ -174,6 +181,8 @@ public:
     virtual void onShiftChanged(bool held) { juce::ignoreUnused(held); }
     // A screen that lays steps out on the pads shows the page that holds this step (after recording).
     virtual void showStep(int stepIndex) { juce::ignoreUnused(stepIndex); }
+    // The first step the step pads stand for (STEP's step page): what their lights must show.
+    virtual int getStepPadOffset() const { return 0; }
 
     virtual bool usesEncoderBar() const { return true; }
 
@@ -449,10 +458,15 @@ public:
     bool isRecordArmed() const { return sequencer != nullptr ? sequencer->isRecording() : recordLocal; }
     bool isTransportRunning() const { return sequencer != nullptr ? sequencer->isRunning() : playLocal; }     // (a count-in is running too)
     int getRecordLightPad() const;
+    // The first of the 16 steps the pads show in step mode (the active screen's step page).
+    int getStepPadOffset() const { return activeScreen != nullptr ? activeScreen->getStepPadOffset() : 0; }
     bool isFuncHeld() const { return funcHeld; }
     bool isPatternKeyHeld() const { return patternKeyHeld; }
     bool isTrackLayerHeld() const { return trackKeysHeld != 0; }
     bool isKeyLatchOn() const { return holdActive; }
+    // Counts every time the notes a latch was holding are let go (latch off, a new chord on the
+    // keys, transport stop): whoever else holds notes for the latch (the chord pads) lets go too.
+    int getLatchReleaseCount() const { return latchReleases; }
     // The keys that count as held now: physically down, or kept by the key latch. Each as the note
     // it sounds (scale lock) with the velocity it was played at. For the chord pads.
     std::vector<std::pair<int, int>> getHeldKeys() const;
@@ -748,6 +762,7 @@ private:
 
     // Latch: keys stay down after their release until the next chord starts or latch goes off.
     bool holdActive = false;
+    int latchReleases = 0;
     static constexpr int MAX_HELD_NOTES = 16;
     int heldNotes[MAX_HELD_NOTES] = {};
     int heldNoteCount = 0;

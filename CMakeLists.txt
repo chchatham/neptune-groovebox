@@ -272,6 +272,7 @@ set(NEPTUNE_TEST_GROUPS
     "Preset Audition|Cymbal Machine"
     "LFO Destinations|Wavetable Embed|Sampler Release"
     "Undo History|Effects More|Sampler Grain|Wavetable Keyframes|Wavetable Scan"
+    "Perf FX"
 )
 set(NEPTUNE_TEST_NAMED "Robustness")
 foreach(group IN LISTS NEPTUNE_TEST_GROUPS)

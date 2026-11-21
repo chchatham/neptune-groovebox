@@ -1,8 +1,11 @@
 #pragma once
 #include <juce_core/juce_core.h>
+#include <algorithm>
+#include <limits>
 #include <memory>
 #include <vector>
 #include "../src/controller/ChordPads.h"
+#include "../src/controller/NotePadSlots.h"
 #include "../src/ui/screens/ChordPadScreen.h"
 #include "../src/ui/ScreenManager.h"
 #include "../src/ui/GrammarHooks.h"
@@ -60,6 +63,7 @@ public:
             screen->setNoteCallback([this](int n, int v) { played.add("on" + juce::String(n) + ":" + juce::String(v)); });
             screen->setNoteOffCallback([this](int n) { played.add("off" + juce::String(n)); });
             screen->setAftertouchCallback([this](int n, int p) { played.add("at" + juce::String(n) + ":" + juce::String(p)); });
+            screen->setLatchState([this] { return mgr.isKeyLatchOn(); }, [this] { return mgr.getLatchReleaseCount(); });
             mgr.addScreen(std::move(s));
             mgr.setShiftPadScreen(10, 1);           // Shift + bottom pad 3
             mgr.setPinnable(1, true);
@@ -151,6 +155,7 @@ public:
             r.played.clear();
             r.padOn(4, 90); r.padOff(4);
             expect(r.played[0] == "on60:90" && r.played[1] == "on64:90" && r.played[2] == "on67:90", r.played.joinIntoString(" "));
+            r.turn(3, 1);
 
             // An empty pad says what to do and plays nothing.
             r.played.clear();
@@ -186,6 +191,29 @@ public:
             r.keyOff(62); r.keyOff(65); r.keyOff(69);           // hands off the keys: the latch holds them
             r.padOn(3); r.padOff(3);
             expectEquals(r.name(3), juce::String("Dm"));
+        }
+
+        beginTest("No physical keys held: a pad plays its chord, not stores; arp latch does not count as held keys");
+        {
+            Rig r;
+            // Store a Cmaj on pad 0 with real keys.
+            r.keyOn(60); r.keyOn(64); r.keyOn(67);
+            r.padOn(0); r.padOff(0);
+            r.keyOff(60); r.keyOff(64); r.keyOff(67);
+            expectEquals(r.name(0), juce::String("C"));
+            // Store a Dm on pad 1.
+            r.keyOn(62); r.keyOn(65); r.keyOn(69);
+            r.padOn(1); r.padOff(1);
+            r.keyOff(62); r.keyOff(65); r.keyOff(69);
+            expectEquals(r.name(1), juce::String("Dm"));
+            // Press pad 0 (plays C), then press pad 1 with no keys held: pad 1 must still be Dm.
+            r.played.clear();
+            r.padOn(0);
+            expect(r.played.size() > 0, "pad 0 should sound");
+            r.padOn(1);
+            expect(!r.screen->getSounding(1).empty(), "pad 1 should sound");
+            expectEquals(r.name(1), juce::String("Dm"), "pad 1 must not be overwritten");
+            r.padOff(0); r.padOff(1);
         }
 
         beginTest("TR and OC move every pad; BK and Up / Down change the bank; CL empties it after four clicks");
@@ -289,6 +317,328 @@ public:
             none.chordPads.clear();
             ProjectBridge::apply(none, into);
             expect(!other.anyStored(), "a project saved before chord pads: every pad empty");
+        }
+
+        beginTest("VL: every key's own velocity is on the pad - exactly (KEYS), or as a balance under the pad's velocity");
+        {
+            Rig r;
+            r.keyOn(60, 3); r.keyOn(64, 40); r.keyOn(67, 80);
+            r.padOn(0); r.padOff(0);
+            r.keyOff(60); r.keyOff(64); r.keyOff(67);
+            expectWithinAbsoluteError(r.chords.get(0).notes[0].velocity, 3.0f / 127.0f, 1.0e-6f, "the softest key is kept as it was");
+
+            expectEquals(r.chords.velocityMode, (int) ChordPads::VEL_BALANCE);
+            r.padOn(0, 127); r.padOff(0);
+            expect(r.played[0] == "on60:5" && r.played[1] == "on64:64" && r.played[2] == "on67:127",
+                   "the loudest key at the pad's velocity, the others in proportion: " + r.played.joinIntoString(" "));
+
+            r.turn(3, 1);
+            expectEquals(r.chords.velocityMode, (int) ChordPads::VEL_KEYS);
+            for (int padVelocity : { 20, 127 })
+            {
+                r.played.clear();
+                r.padOn(0, padVelocity); r.padOff(0);
+                expect(r.played[0] == "on60:3" && r.played[1] == "on64:40" && r.played[2] == "on67:80",
+                       "exactly as the keys were played: " + r.played.joinIntoString(" "));
+            }
+            r.turn(3, 1);
+            expectEquals(r.chords.velocityMode, (int) ChordPads::VEL_KEYS, "the end of the list");
+
+            ChordPads other;
+            other.fromFlat(r.chords.toFlat());
+            expectEquals(other.velocityMode, (int) ChordPads::VEL_KEYS);
+        }
+
+        beginTest("Two pads that share a note: no slot is lost, the note ends with the last pad, a later pad still plays");
+        {
+            NotePadSlots slots;
+            juce::StringArray log;
+            slots.slotOn = [&log](int slot, int note, float) { log.add("on" + juce::String(note) + "@" + juce::String(slot)); };
+            slots.slotOff = [&log](int slot) { log.add("off@" + juce::String(slot)); };
+            slots.slotPressure = [&log](int slot, float) { log.add("at@" + juce::String(slot)); };
+            slots.keyOn = [&log](int note, int) { log.add("key" + juce::String(note)); };
+            slots.keyOff = [&log](int note) { log.add("keyoff" + juce::String(note)); };
+
+            const std::vector<int> a { 55, 62, 67, 70 }, b { 55, 62, 69 };
+            // The owner's playing: one chord pressed before the last is let go, over and over.
+            for (int round = 0; round < 20; ++round)
+            {
+                for (int n : a) expect(slots.down(n, 100, false));
+                for (int n : b) expect(slots.down(n, 100, false));
+                expectEquals(slots.slotsInUse(), 5, "seven presses, five different notes");
+                for (int n : a) slots.up(n);
+                expect(slots.isHeld(55) && slots.isHeld(62), "the second pad still holds the notes they share");
+                expect(!slots.isHeld(67) && !slots.isHeld(70));
+                for (int n : b) slots.up(n);
+                expectEquals(slots.slotsInUse(), 0, "everything given back, round " + juce::String(round));
+            }
+            log.clear();
+            for (int n : a) slots.down(n, 100, false);
+            expect(slots.down(31, 100, false), "a pad pressed second is played");
+            expect(log.contains("on31@4"), log.joinIntoString(" "));
+            slots.pressure(31, 60);
+            expect(log.contains("at@4"));
+
+            // The same note again strikes it again where it is; it ends once.
+            log.clear();
+            slots.down(31, 90, false);
+            expectEquals(log.joinIntoString(" "), juce::String("on31@4"));
+            slots.up(31);
+            expect(!log.contains("off@4"), "still held once");
+            slots.up(31);
+            expect(log.contains("off@4"));
+            slots.up(31);                                       // one release too many changes nothing
+            for (int n : a) slots.up(n);
+            expectEquals(slots.slotsInUse(), 0);
+
+            // Sixteen notes at most; the seventeenth says so, and is free to play once one is let go.
+            for (int n = 40; n < 56; ++n) expect(slots.down(n, 100, false));
+            expect(!slots.down(60, 100, false), "no slot left");
+            slots.up(60);
+            slots.up(40);
+            expect(slots.down(60, 100, false));
+            for (int n = 40; n < 61; ++n) slots.up(n);
+            expectEquals(slots.slotsInUse(), 0);
+
+            // With the arp on the notes go the keys' way, counted the same.
+            log.clear();
+            slots.down(55, 100, true); slots.down(55, 100, true);
+            slots.up(55);
+            expect(!log.contains("keyoff55"));
+            slots.up(55);
+            expectEquals(log.joinIntoString(" "), juce::String("key55 key55 keyoff55"));
+            expectEquals(slots.slotsInUse(), 0);
+        }
+
+        beginTest("Key latch: a pad let go sounds on until the next pad, the latch going off, or stop; a stroke is played out");
+        {
+            Rig r;
+            r.chords.store(0, { { 60, 1.0f }, { 64, 1.0f }, { 67, 1.0f } });
+            r.chords.store(1, { { 62, 1.0f }, { 65, 1.0f } });
+            r.chords.store(2, { { 48, 1.0f } });
+            auto offs = [&r] { int n = 0; for (auto& e : r.played) n += e.startsWith("off") ? 1 : 0; return n; };
+
+            r.shift(true); r.tap(109); r.shift(false);          // key latch on
+            expect(r.mgr.isKeyLatchOn());
+            r.padOn(0); r.padOff(0);
+            expectEquals(offs(), 0, "let go, and it sounds on");
+            expect(r.screen->getSounding(0).size() == 3 && r.screen->strumIsWaiting());
+            r.screen->serviceStrum();
+            expectEquals(offs(), 0, "nothing has let go of the latch");
+
+            r.padOn(1);                                         // a new chord: the old one ends
+            expect(r.played.contains("off60") && r.played.contains("off64") && r.played.contains("off67"));
+            expect(r.played.contains("on62:100"));
+            r.padOn(2);                                         // pressed while pad 2 is down: added
+            r.padOff(1); r.padOff(2);
+            expect(!r.played.contains("off62") && !r.played.contains("off48"), "both are kept");
+
+            r.shift(true); r.tap(109); r.shift(false);          // latch off
+            r.screen->serviceStrum();
+            expect(r.played.contains("off62") && r.played.contains("off65") && r.played.contains("off48"), r.played.joinIntoString(" "));
+            expect(!r.screen->strumIsWaiting());
+
+            // Without the latch a pad ends with the finger, as before.
+            r.played.clear();
+            r.padOn(0); r.padOff(0);
+            expectEquals(offs(), 3);
+
+            // Stop lets go of what the latch holds; the latch stays on.
+            r.shift(true); r.tap(109); r.shift(false);
+            r.played.clear();
+            r.padOn(0); r.padOff(0);
+            r.tap(115);                                         // Play: start
+            r.tap(115);                                         // Play: stop
+            r.screen->serviceStrum();
+            expectEquals(offs(), 3, "stop is quiet: " + r.played.joinIntoString(" "));
+            expect(r.mgr.isKeyLatchOn());
+
+            // A stroke is played out after the pad is let go.
+            r.chords.strumMs = 200.0f;
+            r.played.clear();
+            r.padOn(0); r.padOff(0);
+            expectEquals(r.played.size(), 1);
+            UiClock::advance(250); r.screen->serviceStrum();
+            expect(r.played.size() == 3 && offs() == 0, r.played.joinIntoString(" "));
+            r.padOn(1);
+            expectEquals(offs(), 3);
+            r.padOff(1);
+        }
+
+        beginTest("STRUM page: a pad's notes start one after the other over TM; a pad let go early leaves the rest unplayed");
+        {
+            Rig r;
+            r.keyOn(60); r.keyOn(64); r.keyOn(67);
+            r.padOn(0); r.padOff(0);
+            r.keyOff(60); r.keyOff(64); r.keyOff(67);
+            auto pass = [&r](int ms) { UiClock::advance(ms); r.screen->serviceStrum(); };
+            r.chords.velocityMode = ChordPads::VEL_PAD;                   // every note at the pad's level
+            UiClock::advance(2000);                             // (the "PAD 1 = C" message has gone)
+
+            expectEquals(r.screen->getPageCount(), 2);
+            r.tap(52);                                          // bank button: the STRUM page
+            expectEquals(r.screen->getPageIndex(), 1);
+            expectEquals(r.screen->getEncoderName(0), juce::String("TM"));
+            expectEquals(r.screen->getSubPage(), juce::String("STRUM OFF"));
+            r.turn(0, 1);
+            expectEquals(r.chords.strumMs, 10.0f, "one click is 10 ms");
+            r.turn(0, -1);
+            expectEquals(r.chords.strumMs, 0.0f);
+            r.turn(7, 1); r.turn(7, 1); r.turn(7, 1); r.turn(7, 1);
+            expectEquals(r.name(0), juce::String("C"), "knob 8 clears nothing on this page");
+            r.chords.strumMs = 300.0f;
+            expectEquals(r.screen->getSubPage(), juce::String("STRUM 300"));
+
+            r.played.clear();
+            r.padOn(0, 100);
+            expectEquals(r.played.joinIntoString(" "), juce::String("on60:100"), "the first note at once, alone");
+            expect(r.screen->strumIsWaiting());
+            pass(149);
+            expectEquals(r.played.size(), 1, "not before its time");
+            pass(2);
+            expect(r.played.size() == 2 && r.played[1] == "on64:100", r.played.joinIntoString(" "));
+            pass(150);
+            expect(r.played.size() == 3 && r.played[2] == "on67:100", r.played.joinIntoString(" "));
+            expect(!r.screen->strumIsWaiting());
+            r.padPressure(0, 50);
+            expect(r.played.contains("at67:50"), "pressure reaches the notes of the stroke");
+            r.padOff(0);
+            expect(r.played.contains("off60") && r.played.contains("off64") && r.played.contains("off67"));
+
+            r.played.clear();
+            r.padOn(0, 100);
+            pass(160);
+            r.padOff(0);
+            pass(500);
+            expectEquals(r.played.joinIntoString(" "), juce::String("on60:100 on64:100 off60 off64"), "the last note never starts");
+            expect(!r.screen->strumIsWaiting());
+
+            // Down, and one then the other.
+            r.tap(51);                                          // back to the pads' page and to STRUM again
+            expectEquals(r.screen->getEncoderName(0), juce::String("BK"));
+            r.tap(51);
+            r.turn(1, 1);
+            expectEquals(r.chords.strumDir, (int) ChordPads::STRUM_DOWN);
+            r.played.clear();
+            r.padOn(0, 100); pass(400); r.padOff(0);
+            expect(r.played[0] == "on67:100" && r.played[2] == "on60:100", r.played.joinIntoString(" "));
+            r.turn(1, 1);
+            expectEquals(r.chords.strumDir, (int) ChordPads::STRUM_ALT);
+            juce::String firsts;
+            for (int i = 0; i < 4; ++i)
+            {
+                r.played.clear();
+                r.padOn(0, 100); pass(400); r.padOff(0);
+                firsts += r.played[0].substring(2, 4) + " ";
+            }
+            expect(firsts == "60 67 60 67 " || firsts == "67 60 67 60 ", firsts);
+
+            // FL: the later, the softer.
+            r.chords.strumDir = ChordPads::STRUM_UP;
+            r.chords.strumFall = 1.0f;
+            r.played.clear();
+            r.padOn(0, 100); pass(400); r.padOff(0);
+            expect(r.played[0] == "on60:100" && r.played[1] == "on64:70" && r.played[2] == "on67:40", r.played.joinIntoString(" "));
+
+            // The arp on (the app says so through setStrumAllowed): the notes go together.
+            r.screen->setStrumAllowed([] { return false; });
+            r.played.clear();
+            r.padOn(0, 100);
+            expectEquals(r.played.size(), 3);
+            expect(!r.screen->strumIsWaiting());
+            r.padOff(0);
+        }
+
+        beginTest("HU makes the timing uneven and VR the pattern; every note is still played once, inside the stroke");
+        {
+            ChordPads c;
+            c.store(0, { { 48, 1.0f }, { 55, 1.0f }, { 60, 1.0f }, { 64, 1.0f }, { 67, 1.0f } });
+            c.strumMs = 200.0f;
+            juce::Random random(7);
+            bool alt = false;
+
+            auto plain = c.strum(0, 1.0f, random, alt);
+            expectEquals((int) plain.size(), 5);
+            for (int i = 0; i < 5; ++i)
+                expectWithinAbsoluteError(plain[(size_t) i].delayMs, 50.0f * (float) i, 0.01f);
+            expectEquals(plain[4].pitch, 67);
+
+            c.strumHuman = 1.0f;
+            float shortest = 1.0e9f, longest = 0.0f;
+            bool uneven = false;
+            for (int press = 0; press < 200; ++press)
+            {
+                const auto s = c.strum(0, 1.0f, random, alt);
+                expectEquals(s[0].delayMs, 0.0f);
+                for (size_t i = 1; i < s.size(); ++i)
+                {
+                    expect(s[i].delayMs > s[i - 1].delayMs, "in order of time");
+                    expect(s[i].pitch > s[i - 1].pitch, "HU leaves the pattern alone");
+                }
+                shortest = juce::jmin(shortest, s[4].delayMs);
+                longest = juce::jmax(longest, s[4].delayMs);
+                uneven = uneven || std::abs((s[1].delayMs - s[0].delayMs) - (s[2].delayMs - s[1].delayMs)) > 10.0f;
+            }
+            expect(shortest >= 139.9f && shortest < 160.0f, "the quickest stroke: " + juce::String(shortest));
+            expect(longest <= 260.1f && longest > 240.0f, "the slowest stroke: " + juce::String(longest));
+            expect(uneven, "the gaps differ");
+
+            c.strumHuman = 0.0f;
+            c.strumVary = 1.0f;
+            int downward = 0, shuffled = 0;
+            for (int press = 0; press < 200; ++press)
+            {
+                const auto s = c.strum(0, 1.0f, random, alt);
+                std::vector<int> pitches;
+                for (auto& n : s) pitches.push_back(n.pitch);
+                expectWithinAbsoluteError(s[4].delayMs, 200.0f, 0.01f, "VR leaves the timing alone");
+                if (pitches[0] > pitches[4]) ++downward;
+                auto sorted = pitches;
+                std::sort(sorted.begin(), sorted.end());
+                if (pitches != sorted && pitches != std::vector<int>(sorted.rbegin(), sorted.rend())) ++shuffled;
+                expect(sorted == (std::vector<int> { 48, 55, 60, 64, 67 }), "every note, once");
+            }
+            expect(downward > 60 && downward < 140, "about half the strokes go the other way: " + juce::String(downward));
+            expect(shuffled > 100, "neighbours change places: " + juce::String(shuffled));
+
+            c.strumVary = 0.0f;
+            c.strumMs = 0.0f;
+            for (auto& n : c.strum(0, 1.0f, random, alt))
+                expectEquals(n.delayMs, 0.0f, "no strum time: together");
+        }
+
+        beginTest("The strum is kept with the chords; a list from before it reads as no strum");
+        {
+            Rig r;
+            r.chords.strumMs = 420.0f;
+            r.chords.strumDir = ChordPads::STRUM_ALT;
+            r.chords.strumHuman = 0.25f;
+            r.chords.strumVary = 0.5f;
+            r.chords.strumFall = 0.75f;
+
+            ProjectBridge::Live live { r.seq, r.audio, nullptr, nullptr, nullptr, nullptr, &r.chords };
+            const auto back = ProjectData::fromJSON(ProjectBridge::capture(live, "T").toJSON());
+            expect(!back.chordPads.empty(), "a strum with no chord stored is still saved");
+            ChordPads other;
+            ProjectBridge::Live into { r.seq, r.audio, nullptr, nullptr, nullptr, nullptr, &other };
+            ProjectBridge::apply(back, into);
+            expectEquals(other.strumMs, 420.0f);
+            expectEquals(other.strumDir, (int) ChordPads::STRUM_ALT);
+            expectEquals(other.strumHuman, 0.25f);
+            expectEquals(other.strumVary, 0.5f);
+            expectEquals(other.strumFall, 0.75f);
+
+            r.chords.store(3, { { 60, 1.0f }, { 64, 1.0f } });
+            auto old = r.chords.toFlat();
+            old.resize(old.size() - 5);                         // as written before the strum existed
+            other.fromFlat(old);
+            expectEquals(other.get(0, 3).count, 2);
+            expectEquals(other.strumMs, 0.0f);
+            old.insert(old.end(), { 1.0e9f, 9.0f, -4.0f, std::numeric_limits<float>::quiet_NaN(), 7.0f });
+            other.fromFlat(old);
+            expectEquals(other.strumMs, ChordPads::MAX_STRUM_MS, "values from a file are brought into range");
+            expectEquals(other.strumDir, (int) ChordPads::STRUM_ALT);
+            expect(other.strumHuman == 0.0f && other.strumVary == 0.0f && other.strumFall == 1.0f);
         }
     }
 };

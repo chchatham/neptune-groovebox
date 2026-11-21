@@ -39,6 +39,7 @@ public:
         std::function<float(int)> getMaster;        std::function<void(int, float)> setMaster;
         // PROJ
         std::function<bool(int)> slotUsed;          // slot is 0-based
+        std::function<juce::String(int)> slotTitle; // the name of the project in a used slot
         std::function<int()> currentSlot;           // -1 = the current project has never been saved
         std::function<bool(int)> loadSlot;
         std::function<bool(int)> saveToSlot;        // save as
@@ -122,15 +123,30 @@ protected:
             GridScreen::drawStrip(display);
     }
 
+public:
+    static juce::String slotName(int slot) { return "P" + juce::String(slot + 1).paddedLeft('0', 2); }
+
+    // A project nobody has named: no name, "Untitled", or a slot's own name (what a save used to
+    // call it).
+    static bool isUnnamed(const juce::String& name)
+    {
+        const bool slotLike = name.length() == 3 && name[0] == 'P' && name.substring(1).containsOnly("0123456789");
+        return name.trim().isEmpty() || name == "Untitled" || slotLike;
+    }
+
 private:
     enum Action { Load = 0, Save, SaveAs, New, NumActions };
 
-    static juce::String slotName(int slot) { return "P" + juce::String(slot + 1).paddedLeft('0', 2); }
-
+    // "P05 EMPTY NOW P03", "P05 USED NOW P03" (a project without a name), "P05 My Song" and, on
+    // the slot the current project is in, "P05 NOW My Song": 21 characters at most.
     juce::String statusLine() const
     {
-        juce::String s = slotName(selectedSlot) + (hooks.slotUsed && hooks.slotUsed(selectedSlot) ? " USED" : " EMPTY");
+        const bool used = hooks.slotUsed && hooks.slotUsed(selectedSlot);
         int current = hooks.currentSlot ? hooks.currentSlot() : -1;
+        const auto title = used && hooks.slotTitle ? hooks.slotTitle(selectedSlot) : juce::String();
+        if (!isUnnamed(title))
+            return (slotName(selectedSlot) + (current == selectedSlot ? " NOW " : " ") + title).substring(0, 21);
+        juce::String s = slotName(selectedSlot) + (used ? " USED" : " EMPTY");
         s += " NOW " + (current >= 0 ? slotName(current) : juce::String("UNSAVED"));     // 21 characters at most
         return s;
     }

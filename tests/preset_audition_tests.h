@@ -5,7 +5,7 @@
 #include <vector>
 #include "control_grammar_tests.h"
 #include "../src/ui/screens/PresetScreen.h"
-#include "../src/ui/SavePresetBox.h"
+#include "../src/ui/SaveBox.h"
 #include "../src/engine/UnifiedVoiceEngine.h"
 #include "../src/ui/screens/ParamPageScreen.h"
 #include "../src/project/PresetManager.h"
@@ -1515,18 +1515,18 @@ public:
             // Built as the app builds it (main.cpp, askPresetName).
             auto make = [&](const juce::String& from)
             {
-                auto box = std::make_unique<SavePresetBox>("Save the sound of track " + juce::String(rig.screen->getSavedTrack() + 1) + " as a preset",
+                auto box = std::make_unique<SaveBox>("Save the sound of track " + juce::String(rig.screen->getSavedTrack() + 1) + " as a preset",
                                                            rig.screen->suggestedName(from), PresetManager::MAX_NAME_LENGTH);
                 box->nameUse = [&rig, from](const juce::String& typed)
                 {
                     switch (rig.screen->nameUse(from, typed))
                     {
-                        case PresetScreen::NameUse::Empty:    return SavePresetBox::NameUse::Empty;
-                        case PresetScreen::NameUse::BuiltIn:  return SavePresetBox::NameUse::BuiltIn;
-                        case PresetScreen::NameUse::Replaces: return SavePresetBox::NameUse::Replaces;
+                        case PresetScreen::NameUse::Empty:    return SaveBox::NameUse::Empty;
+                        case PresetScreen::NameUse::BuiltIn:  return SaveBox::NameUse::BuiltIn;
+                        case PresetScreen::NameUse::Replaces: return SaveBox::NameUse::Replaces;
                         case PresetScreen::NameUse::New:      break;
                     }
-                    return SavePresetBox::NameUse::New;
+                    return SaveBox::NameUse::New;
                 };
                 box->onSave = [&rig, from](const juce::String& typed) { return rig.screen->nameSavedPreset(from, typed); };
                 box->onCancel = [&rig, from] { rig.screen->cancelSavedPreset(from); };
@@ -1622,6 +1622,42 @@ public:
             box2->save();
             expectEquals(rig.mgr.getPresetCount(), countBefore);
             rig.screen->onDeactivate();
+        }
+
+        beginTest("The same box for a project: its own words, any name but an empty one");
+        {
+            const juce::ScopedJuceInitialiser_GUI gui;
+            // Built as the app builds it (main.cpp, askProjectName).
+            SaveBox box("Save the project in P05", "Untitled", 13);
+            box.nameUse = [](const juce::String& typed) { return typed.trim().isEmpty() ? SaveBox::NameUse::Empty : SaveBox::NameUse::New; };
+            box.hintFor = [](SaveBox::NameUse use, const juce::String& typed)
+            {
+                return use == SaveBox::NameUse::New ? "Return or Save: P05 holds this project as \"" + typed + "\"." : juce::String();
+            };
+            box.setCancelHint("Escape or Cancel: P05 keeps the project it held.");
+            box.refresh();
+            expectEquals(box.getNameEditor().getHighlightedText(), juce::String("Untitled"));
+            expectEquals(box.getHint(), juce::String("Return or Save: P05 holds this project as \"Untitled\"."));
+            expect(box.getCancelHint().contains("keeps the project it held"));
+            expect(box.getSaveButton().isEnabled());
+            box.getNameEditor().setText(" ", true);
+            box.refresh();
+            expectEquals(box.getHint(), juce::String("Type a name."), "the shared words where the owner has none");
+            expect(!box.getSaveButton().isEnabled());
+            box.getNameEditor().setText("Night Drive", true);
+            box.refresh();
+            juce::String savedAs;
+            int cancels = 0;
+            box.onSave = [&](const juce::String& typed) { savedAs = typed; return true; };
+            box.onCancel = [&] { ++cancels; };
+            auto file = juce::File(juce::SystemStats::getEnvironmentVariable("NEPTUNE_PROJECT_BOX_PNG", {}));
+            if (file.getFullPathName().isEmpty())
+                file = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("neptune-project-box.png");
+            expect(box.writePng(file), "the picture is written to " + file.getFullPathName());
+            expect(box.keyPressed(juce::KeyPress(juce::KeyPress::returnKey)));
+            expectEquals(savedAs, juce::String("Night Drive"));
+            expect(box.keyPressed(juce::KeyPress(juce::KeyPress::escapeKey)));
+            expectEquals(cancels, 0, "answered once");
         }
 
         beginTest("Notes held across an audition do not hang");

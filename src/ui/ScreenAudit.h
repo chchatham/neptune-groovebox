@@ -66,6 +66,7 @@ public:
         juce::String name;
         bool perEngine = false;     // repeat for every engine on the selected track
         bool withHeldStep = false;  // repeat once more with a step pad held (parameter locks)
+        std::function<void()> before, after;    // a state the page needs (a drum pad of some type), and back
     };
 
     // (The audit holds every help key right after turning knobs: the "in the middle of something"
@@ -111,6 +112,7 @@ public:
 
         for (auto& target : targets)
         {
+            if (target.before) { const juce::ScopedLock ui(screens.getLock()); target.before(); }
             const int engines = (target.perEngine && setEngine) ? engineNames.size() : 1;
             for (int e = 0; e < engines; ++e)
             {
@@ -126,6 +128,7 @@ public:
             }
             // The other screens are audited on the default engine.
             if (target.perEngine && setEngine) { const juce::ScopedLock ui(screens.getLock()); setEngine(0); }
+            if (target.after) { const juce::ScopedLock ui(screens.getLock()); target.after(); }
         }
         if (setEngine) { const juce::ScopedLock ui(screens.getLock()); setEngine(0); }
 

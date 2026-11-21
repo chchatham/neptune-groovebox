@@ -569,6 +569,7 @@ struct ProjectData
     // Custom scale pages
     std::vector<ScalePage> customScalePages;
     std::vector<float> chordPads;           // ChordPads::toFlat(); empty = no chord stored
+    std::vector<float> perfPads;            // PerfFxRack::toFlat(); empty = the starting layout
 
     // Aftertouch routing. Per track (index = track); `aftertouchRouting` is the single list of
     // older projects, applied to every track when a project has no per-track lists.
@@ -655,6 +656,13 @@ struct ProjectData
                 chordArr.add((double) v);
             root->setProperty("chordPads", chordArr);
         }
+        if (!perfPads.empty())
+        {
+            juce::Array<juce::var> perfArr;
+            for (float v : perfPads)
+                perfArr.add((double) v);
+            root->setProperty("perfPads", perfArr);
+        }
 
         // Custom scale pages
         if (!customScalePages.empty())
@@ -737,6 +745,9 @@ struct ProjectData
             if (auto* chordArr = obj->getProperty("chordPads").getArray())
                 for (auto& cv : *chordArr)
                     proj.chordPads.push_back((float) (double) cv);
+            if (auto* perfArr = obj->getProperty("perfPads").getArray())
+                for (auto& pv : *perfArr)
+                    proj.perfPads.push_back((float) (double) pv);
 
             // Custom scale pages
             if (auto* scaleArr = obj->getProperty("scalePages").getArray())
@@ -861,6 +872,8 @@ public:
 
     bool hasFile() const { return currentFile.isDirectory(); }
     juce::File getCurrentFile() const { return currentFile; }
+    void setCurrentFile(const juce::File& f) { currentFile = f; }      // (a Save As taken back)
+    void setRecentProjects(std::vector<juce::String> paths) { recentPaths = std::move(paths); }
     juce::String getProjectName() const { return data.name; }
 
     // --- Autosave -----------------------------------------------------------

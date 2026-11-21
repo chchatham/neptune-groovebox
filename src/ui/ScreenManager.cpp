@@ -1291,7 +1291,19 @@ void ScreenManager::performEdit(Edit edit, const EditPlan& plan)
     point.names = plan.names;
     switch (plan.kind)
     {
-        case Kind::ScreenOwn:   point.scope = plan.step >= 0 ? Screen::UndoPoint::Scope::Step : Screen::UndoPoint::Scope::TrackSteps; break;
+        case Kind::ScreenOwn:
+        {
+            Screen::EditScope own;
+            if (mods(activeScreen)->getEditScope(own) && own.capture && own.apply)
+            {
+                point.scope = Screen::UndoPoint::Scope::Custom;
+                point.capture = own.capture;
+                point.apply = own.apply;
+            }
+            else
+                point.scope = plan.step >= 0 ? Screen::UndoPoint::Scope::Step : Screen::UndoPoint::Scope::TrackSteps;
+            break;
+        }
         case Kind::Steps:       point.scope = Screen::UndoPoint::Scope::TrackSteps; break;
         case Kind::Pattern:     point.scope = Screen::UndoPoint::Scope::Pattern; break;
         default:                point.scope = Screen::UndoPoint::Scope::Sound; break;
@@ -1412,6 +1424,14 @@ void ScreenManager::undoEnd()
             // The same control again within a moment: one step, from where it began to where it is now.
             target->after = std::move(pendingEntry.after);
             target->typeAfter = pendingEntry.typeAfter;
+            target->touchedMs = now;
+            history.redos().clear();
+            lastPushedSerial = target->serial;
+        }
+        else if (target != nullptr && target->scope == UndoEntry::Scope::Custom && pendingEntry.scope == UndoEntry::Scope::Custom)
+        {
+            // The same again for a screen's own state (PERF's FX list turned on through): the step
+            // already holds what was there before the first click.
             target->touchedMs = now;
             history.redos().clear();
             lastPushedSerial = target->serial;
@@ -2007,6 +2027,7 @@ bool ScreenManager::isLatchedNote(int note) const
 // Lets go of every latched note whose key is not down right now.
 void ScreenManager::releaseHeldNotes()
 {
+    ++latchReleases;
     const int count = heldNoteCount;
     heldNoteCount = 0;
     for (int i = 0; i < count; ++i)

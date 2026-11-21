@@ -45,6 +45,7 @@
 #include "../dsp/effects/LCRDelay.h"
 #include "../dsp/effects/MultiTapInsert.h"
 #include "../dsp/effects/SidechainInsert.h"
+#include "PerfFx.h"
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <array>
 #include <atomic>
@@ -149,6 +150,7 @@ public:
         // down 7 dB within 20 ms of its onset, which was heard as a click on every loud note.
         masterComp.setThreshold(0.0f);
         masterComp.setRatio(1.0f);
+        perfFx.setCreator(&AudioEngine::createPerfEffect, &AudioEngine::perfWays, &structureMutex);
         sendBuses.resize(DEFAULT_NUM_SENDS);
         sendBusTypes.resize(DEFAULT_NUM_SENDS, EffectType::ReverbEffect);
 
@@ -246,6 +248,118 @@ public:
         }
         return "---";
     }
+
+    // ---- PERF: effects played from the pads (PerfFx.h) -----------------------------------------
+    // A pad's effect: one of the insert types (kind = type + 1), or one of the pads' own.
+    static std::unique_ptr<EffectBase> createPerfEffect(int kind)
+    {
+        switch (kind)
+        {
+            case PerfFx::DUB:  return std::make_unique<DubDelay>();
+            case PerfFx::FRZ:  return std::make_unique<FreezeReverb>();
+            case PerfFx::RPT:  return std::make_unique<BeatRepeat>();
+            case PerfFx::STOP: return std::make_unique<TapeStop>();
+            default: break;
+        }
+        const int type = kind - PerfFx::INSERT_BASE;
+        // (DUCK listens to another track: it has no place on a pad.)
+        if (type < 0 || type >= (int) EffectType::NumEffectTypes || type == (int) EffectType::SidechainEffect)
+            return nullptr;
+        return createEffect((EffectType) type);
+    }
+
+    static const char* perfKindName(int kind)
+    {
+        switch (kind)
+        {
+            case PerfFx::NONE: return "--";
+            case PerfFx::DUB:  return "DUB";
+            case PerfFx::FRZ:  return "FRZ";
+            case PerfFx::RPT:  return "RPT";
+            case PerfFx::STOP: return "STOP";
+            default: break;
+        }
+        const int type = kind - PerfFx::INSERT_BASE;
+        return (type >= 0 && type < (int) EffectType::NumEffectTypes) ? effectTypeName((EffectType) type) : "--";
+    }
+
+    // The pads' own effects are made for one way of pressing. Of the insert types, those with a
+    // tail (echoes and reverbs: all mix dry and wet as dry (1 - mix) + wet mix) can be thrown too.
+    static PerfFx::Ways perfWays(int kind)
+    {
+        switch (kind)
+        {
+            case PerfFx::DUB: case PerfFx::FRZ:   return { false, true };
+            case PerfFx::RPT: case PerfFx::STOP:  return { true, false };
+            default: break;
+        }
+        switch ((EffectType) (kind - PerfFx::INSERT_BASE))
+        {
+            case EffectType::DelayEffect: case EffectType::ReverbEffect: case EffectType::HallReverbEffect:
+            case EffectType::SpringReverbEffect: case EffectType::ShimmerReverbEffect: case EffectType::ReverseDelayEffect:
+            case EffectType::TapeDelayEffect: case EffectType::LCRDelayEffect: case EffectType::MultiTapEffect:
+                return { true, true };
+            default: break;
+        }
+        return { true, false };
+    }
+
+    // The kinds in the order the FX knob offers them: nothing, the pads' own, then the insert types.
+    static const std::vector<int>& perfKinds()
+    {
+        static const std::vector<int> kinds = []
+        {
+            std::vector<int> k { PerfFx::NONE, PerfFx::DUB, PerfFx::FRZ, PerfFx::RPT, PerfFx::STOP };
+            for (int t = 0; t < (int) EffectType::NumEffectTypes; ++t)
+                if (t != (int) EffectType::SidechainEffect)
+                    k.push_back(PerfFx::INSERT_BASE + t);
+            return k;
+        }();
+        return kinds;
+    }
+
+    PerfFxRack& getPerfFx() { return perfFx; }
+
+    // The pads as a new project has them, so that PERF plays at the first touch: the same eight
+    // moves twice, on the whole mix (top row) and on the selected track (bottom row).
+    void loadFactoryPerfPads()
+    {
+        using namespace PerfFx;
+        auto insert = [](EffectType t) { return INSERT_BASE + (int) t; };
+        const int kinds[8] = { DUB, FRZ, RPT, STOP, insert(EffectType::FilterEffectType), insert(EffectType::PhaserEffect),
+                               insert(EffectType::RateReducerEffect), insert(EffectType::HallReverbEffect) };
+        perfFx.silence();
+        for (int pad = 0; pad < PADS; ++pad)
+        {
+            const int kind = kinds[pad % 8];
+            perfFx.clear(pad);
+            perfFx.setKind(pad, 0, kind);
+            Setting s = perfFx.get(pad);
+            Layer& p = s.layer[0];
+            p.target = pad < 8 ? (int) MASTER : (int) SEL;
+            if (kind == RPT)
+                s.quantize = Q_16;
+            if (kind == insert(EffectType::FilterEffectType))
+            {
+                // Open at rest; pressing harder closes it.
+                p.cell[0] = 12000.0f;
+                p.cell[1] = 0.45f;
+                p.pressure[0] = -0.7f;
+            }
+            if (kind == insert(EffectType::PhaserEffect))
+            {
+                p.cell[1] = 0.2f;
+                p.pressure[1] = 0.8f;
+            }
+            if (kind == insert(EffectType::RateReducerEffect))
+            {
+                p.cell[0] = 0.25f;
+                p.pressure[0] = 0.6f;
+            }
+            perfFx.set(pad, s);
+        }
+    }
+    const PerfFxRack& getPerfFx() const { return perfFx; }
 
     // ---- Structure lock -----------------------------------------------------------------------
     // Anything that builds or destroys objects the audio thread uses (effects, engines, the whole
@@ -1166,6 +1280,7 @@ public:
             if (e) e->prepareToPlay(currentSampleRate, currentBlockSize);
 
         scratchL.resize((size_t) currentBlockSize, 0.0f);
+        trackMidi.ensureSize(2048);
         resampler.prepare(currentSampleRate);
         metronome.prepare(currentSampleRate);
         trackTapL.assign((size_t) MAX_TRACKS, std::vector<float>((size_t) currentBlockSize, 0.0f));
@@ -1180,6 +1295,10 @@ public:
 
         for (auto& bus : sendBuses)
             bus.prepare(currentSampleRate, currentBlockSize);
+        {
+            const StructureLock lock(structureMutex);
+            perfFx.prepare(currentSampleRate, currentBlockSize);
+        }
 
         masterEQ.setSampleRate(currentSampleRate);
         masterComp.setSampleRate(currentSampleRate);
@@ -1317,6 +1436,7 @@ public:
                                       / (currentSampleRate > 0.0 ? currentSampleRate : 44100.0);
 
         processGenerators(numSamples);
+        perfFx.beginBlock({ sequencer != nullptr ? sequencer->getTempo() : 120.0f, beatAtStart, beatsPerSample, seqPlaying }, numSamples);
 
         if (midiClock)
             midiClock->processBlock(numSamples, currentSampleRate);
@@ -1352,7 +1472,6 @@ public:
         for (auto& bus : sendBuses)
             bus.clearBuffer();
 
-        juce::MidiBuffer trackMidi;
         for (int t = 0; t < (int) engines.size(); ++t)
         {
             auto& e = engines[(size_t) t];
@@ -1480,6 +1599,9 @@ public:
                 }
             }
 
+            // The PERF pads that act on this track: after its fader and its sends.
+            perfFx.process(t, scratchL.data(), scratchR.data(), numSamples);
+
             juce::FloatVectorOperations::add(mainL, scratchL.data(), numSamples);
             juce::FloatVectorOperations::add(mainR, scratchR.data(), numSamples);
         }
@@ -1489,6 +1611,9 @@ public:
             bus.process();
             bus.mixInto(mainL, mainR, numSamples);
         }
+
+        // The PERF pads that act on the whole mix: before the master EQ, compressor and limiter.
+        perfFx.process(PerfFx::ON_MASTER, mainL, mainR, numSamples);
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -1758,6 +1883,8 @@ private:
     }
 
     std::array<std::unique_ptr<TrackFx>, MAX_TRACKS> trackFx;
+    PerfFxRack perfFx;
+    juce::MidiBuffer trackMidi;         // a MIDI track's messages for one block (kept: no allocation in the callback)
     std::array<Arpeggiator*, MAX_TRACKS> trackArps {};
     PadRatchet padRatchet;
     std::array<int, PadRatchet::kNumPads> padTrack {};
@@ -1872,6 +1999,7 @@ private:
             chain.reset();
         for (auto& bus : sendBuses)
             bus.getChain().reset();
+        perfFx.silence();
     }
 public:
     // Stop everything that sounds: notes are released and effect tails cut at the next block.
@@ -1880,7 +2008,7 @@ public:
     int getSkippedBlocks() const { return skippedBlocks.load(); }     // blocks silenced by a rebuild
     // Blocks dropped because an engine, an insert chain or the sum held a number that is not finite.
     // It stays 0 while everything is right: the robustness tests fail on any other value.
-    int getNonFiniteBlocks() const { return nonFiniteBlocks.load(std::memory_order_relaxed); }
+    int getNonFiniteBlocks() const { return nonFiniteBlocks.load(std::memory_order_relaxed) + perfFx.getNonFiniteCount(); }
     // Where the last one came from: a track's engine (the track), its insert effects (1000 + the
     // track), or -1.
     int getNonFiniteTrack() const { return nonFiniteTrack.load(std::memory_order_relaxed); }

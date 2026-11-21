@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_core/juce_core.h>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <vector>
 
@@ -13,6 +14,7 @@ public:
     static constexpr int NUM_BANKS = 4;
     static constexpr int PADS = 16;
     static constexpr int MAX_NOTES = 10;
+    static constexpr float MIN_VELOCITY = 1.0f / 127.0f;       // the softest key there is
 
     struct Note
     {
@@ -54,7 +56,7 @@ public:
             if (n.pitch < 0 || n.pitch > 127) continue;
             if (c.count > 0 && c.notes[(size_t) c.count - 1].pitch == n.pitch) continue;
             if (c.count >= MAX_NOTES) break;
-            c.notes[(size_t) c.count++] = { n.pitch, juce::jlimit(0.05f, 1.0f, n.velocity) };
+            c.notes[(size_t) c.count++] = { n.pitch, juce::jlimit(MIN_VELOCITY, 1.0f, n.velocity) };
         }
         chords[(size_t) bankIndex][(size_t) pad] = c;
     }
@@ -68,21 +70,105 @@ public:
     // ---- how they play ---------------------------------------------------------------------------
     int transpose = 0;              // semitones, -24..24, every pad
     int octave = 0;                 // -3..3
-    bool playedVelocity = true;     // each note at the level it was stored with (scaled by the pad's);
-                                    // off: every note at the pad's velocity
+    // VL, how hard each note of a pad is played:
+    //   VEL_PAD      every note at the pad's velocity
+    //   VEL_BALANCE  the chord's loudest note at the pad's velocity, the others below it in the
+    //                proportion the keys were played in
+    //   VEL_KEYS     every note exactly as its key was played; how hard the pad is hit changes nothing
+    enum VelocityMode { VEL_PAD = 0, VEL_BALANCE, VEL_KEYS, NUM_VELOCITY_MODES };
+    int velocityMode = VEL_BALANCE;
 
     // The notes a pad sounds now (transposed; a note pushed out of the MIDI range folds back by octaves).
     std::vector<Note> sounding(int pad, float padVelocity) const
     {
         std::vector<Note> out;
         const auto& c = get(pad);
+        float loudest = MIN_VELOCITY;
+        for (int i = 0; i < c.count; ++i)
+            loudest = std::max(loudest, c.notes[(size_t) i].velocity);
         for (int i = 0; i < c.count; ++i)
         {
             int pitch = c.notes[(size_t) i].pitch + transpose + octave * 12;
             while (pitch > 127) pitch -= 12;
             while (pitch < 0) pitch += 12;
-            const float v = playedVelocity ? padVelocity * (0.4f + 0.6f * c.notes[(size_t) i].velocity) : padVelocity;
-            out.push_back({ pitch, juce::jlimit(0.02f, 1.0f, v) });
+            const float stored = c.notes[(size_t) i].velocity;
+            const float v = velocityMode == VEL_KEYS ? stored
+                          : velocityMode == VEL_BALANCE ? padVelocity * stored / loudest : padVelocity;
+            out.push_back({ pitch, juce::jlimit(MIN_VELOCITY, 1.0f, v) });
+        }
+        return out;
+    }
+
+    // ---- strum: one setting for every pad -----------------------------------------------------------
+    static constexpr float MAX_STRUM_MS = 1000.0f;
+    enum StrumDir { STRUM_UP = 0, STRUM_DOWN, STRUM_ALT, NUM_STRUM_DIRS };
+    float strumMs = 0.0f;           // the time from the chord's first note to its last; 0 = all together
+    int strumDir = STRUM_UP;        // lowest note first, highest first, or one then the other
+    float strumHuman = 0.0f;        // 0..1: the timing is uneven - the whole stroke faster or slower, the gaps unequal
+    float strumVary = 0.0f;         // 0..1: the pattern changes - a stroke the other way, neighbouring notes changing places
+    float strumFall = 0.0f;         // 0..1: later notes of a stroke are softer
+
+    struct Stroke
+    {
+        int pitch = 60;
+        float velocity = 1.0f;
+        float delayMs = 0.0f;       // after the pad was pressed
+    };
+
+    // The notes a pad sounds now and when each one starts, in the order they start. `altDown` is
+    // the caller's memory of the last stroke's direction (STRUM_ALT). No note is ever left out, and
+    // without a strum time every note starts at once.
+    std::vector<Stroke> strum(int pad, float padVelocity, juce::Random& random, bool& altDown) const
+    {
+        const auto notes = sounding(pad, padVelocity);
+        const int n = (int) notes.size();
+        std::vector<Stroke> out;
+        if (n == 0)
+            return out;
+        if (strumMs <= 0.0f || n < 2)
+        {
+            for (auto& note : notes)
+                out.push_back({ note.pitch, note.velocity, 0.0f });
+            return out;
+        }
+
+        // The pattern: which note comes when.
+        bool down = strumDir == STRUM_DOWN || (strumDir == STRUM_ALT && altDown);
+        if (strumDir == STRUM_ALT)
+            altDown = !altDown;
+        const float vary = juce::jlimit(0.0f, 1.0f, strumVary);
+        if (random.nextFloat() < vary * 0.5f)
+            down = !down;
+        std::vector<int> order((size_t) n);
+        for (int i = 0; i < n; ++i)
+            order[(size_t) i] = down ? n - 1 - i : i;
+        for (int i = 0; i + 1 < n; ++i)
+            if (random.nextFloat() < vary * 0.35f)
+            {
+                std::swap(order[(size_t) i], order[(size_t) i + 1]);
+                ++i;                // (a note moves one place at most)
+            }
+
+        // The timing: the stroke's length, and how it is shared among the gaps between the notes.
+        const float human = juce::jlimit(0.0f, 1.0f, strumHuman);
+        auto either = [&random] { return random.nextFloat() * 2.0f - 1.0f; };
+        const float total = strumMs * (1.0f + human * 0.3f * either());
+        std::vector<float> gap((size_t) n - 1);
+        float sum = 0.0f;
+        for (auto& g : gap)
+        {
+            g = juce::jmax(0.1f, 1.0f + human * 0.9f * either());
+            sum += g;
+        }
+        const float fall = juce::jlimit(0.0f, 1.0f, strumFall);
+        float at = 0.0f;
+        for (int k = 0; k < n; ++k)
+        {
+            const auto& note = notes[(size_t) order[(size_t) k]];
+            const float level = 1.0f - fall * 0.6f * (float) k / (float) (n - 1);
+            out.push_back({ note.pitch, juce::jlimit(MIN_VELOCITY, 1.0f, note.velocity * level), at });
+            if (k < n - 1)
+                at += total * gap[(size_t) k] / sum;
         }
         return out;
     }
@@ -169,10 +255,11 @@ public:
     }
 
     // ---- as numbers: the project file and the undo history (append only) --------------------------
-    // [version 1, bank, transpose, octave, playedVelocity, then for every bank and pad: count, (pitch, velocity) x count]
+    // [version 1, bank, transpose, octave, velocity mode, then for every bank and pad: count, (pitch, velocity) x count,
+    //  then the strum: time in ms, direction, humanize, vary, fall (absent in a list from before the strum)]
     std::vector<float> toFlat() const
     {
-        std::vector<float> v { 1.0f, (float) bank, (float) transpose, (float) octave, playedVelocity ? 1.0f : 0.0f };
+        std::vector<float> v { 1.0f, (float) bank, (float) transpose, (float) octave, (float) velocityMode };
         for (auto& b : chords)
             for (auto& c : b)
             {
@@ -183,6 +270,7 @@ public:
                     v.push_back(c.notes[(size_t) i].velocity);
                 }
             }
+        v.insert(v.end(), { strumMs, (float) strumDir, strumHuman, strumVary, strumFall });
         return v;
     }
 
@@ -195,7 +283,7 @@ public:
         setBank((int) std::lround(v[1]));
         transpose = juce::jlimit(-24, 24, (int) std::lround(v[2]));
         octave = juce::jlimit(-3, 3, (int) std::lround(v[3]));
-        playedVelocity = v[4] > 0.5f;
+        velocityMode = std::isfinite(v[4]) ? juce::jlimit(0, NUM_VELOCITY_MODES - 1, (int) std::lround(v[4])) : VEL_BALANCE;
         size_t at = 5;
         for (auto& b : chords)
             for (auto& c : b)
@@ -204,11 +292,20 @@ public:
                 const int count = juce::jlimit(0, MAX_NOTES, (int) std::lround(v[at++]));
                 for (int i = 0; i < count && at + 1 < v.size() + 0; ++i)
                 {
-                    c.notes[(size_t) i] = { juce::jlimit(0, 127, (int) std::lround(v[at])), juce::jlimit(0.05f, 1.0f, v[at + 1]) };
+                    c.notes[(size_t) i] = { juce::jlimit(0, 127, (int) std::lround(v[at])), juce::jlimit(MIN_VELOCITY, 1.0f, v[at + 1]) };
                     c.count = i + 1;
                     at += 2;
                 }
             }
+        if (at + 5 <= v.size())
+        {
+            auto unit = [](float x) { return std::isfinite(x) ? juce::jlimit(0.0f, 1.0f, x) : 0.0f; };
+            strumMs = std::isfinite(v[at]) ? juce::jlimit(0.0f, MAX_STRUM_MS, v[at]) : 0.0f;
+            strumDir = std::isfinite(v[at + 1]) ? juce::jlimit(0, NUM_STRUM_DIRS - 1, (int) std::lround(v[at + 1])) : STRUM_UP;
+            strumHuman = unit(v[at + 2]);
+            strumVary = unit(v[at + 3]);
+            strumFall = unit(v[at + 4]);
+        }
     }
 
     bool anyStored() const
@@ -218,6 +315,8 @@ public:
                 if (!c.empty()) return true;
         return false;
     }
+    // Something a project has to keep: a chord, or a strum that was set.
+    bool hasContent() const { return anyStored() || strumMs > 0.0f; }
 
 private:
     std::array<std::array<Chord, PADS>, NUM_BANKS> chords {};

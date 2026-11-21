@@ -4,7 +4,8 @@
 #include <functional>
 
 // -----------------------------------------------------------------------------
-// The save box: the Mac's window that asks for the name of the preset SV has just saved.
+// The save box: the Mac's window that asks for the name of what the controller has just saved -
+// a preset (PRESET -> SV) or a project (SETTINGS -> PROJ -> SVAS). Shown here with a preset:
 //
 //   Save the sound of track 3 as a preset
 //   [ Unknown Soldier ]                       <- the offered name, selected: typing replaces it
@@ -12,12 +13,13 @@
 //   Escape or Cancel: nothing is saved.
 //                                   [ Cancel ]  [ Save ]
 //
-// SavePresetBox is the content (what the tests build and look at); SavePresetWindow puts it in a
+// The words are the preset's unless the owner sets `hintFor` and `setCancelHint` (the project does).
+// SaveBox is the content (what the tests build and look at); SaveBoxWindow puts it in a
 // window that stays above the main window, comes to the front and takes the keyboard.
 // Return = Save, Escape = Cancel, closing the window = Cancel. The line under the name says what
 // Return will do with the name as typed; a name that cannot be used switches Save off.
 // -----------------------------------------------------------------------------
-class SavePresetBox : public juce::Component
+class SaveBox : public juce::Component
 {
 public:
     enum class NameUse { Empty, BuiltIn, Replaces, New };
@@ -26,13 +28,15 @@ public:
 
     // What Return would do with the name as typed (asked on every change of the text).
     std::function<NameUse(const juce::String& typed)> nameUse;
+    // The line under the name, if not the preset's words (empty answer = the preset's words).
+    std::function<juce::String(NameUse, const juce::String& typed)> hintFor;
     // Save: true = done (the box can go), false = the name was not taken (the box stays).
     std::function<bool(const juce::String& typed)> onSave;
     std::function<void()> onCancel;
     // After Save succeeded or Cancel: the owner takes the window away.
     std::function<void()> onDone;
 
-    SavePresetBox(const juce::String& heading, const juce::String& offeredName, int maxNameLength)
+    SaveBox(const juce::String& heading, const juce::String& offeredName, int maxNameLength)
     {
         setName("Save preset");
         setOpaque(true);
@@ -88,6 +92,7 @@ public:
     juce::String getHeading() const       { return title.getText(); }
     juce::String getHint() const          { return hint.getText(); }
     juce::String getCancelHint() const    { return cancelHint.getText(); }
+    void setCancelHint(const juce::String& text) { cancelHint.setText(text, juce::dontSendNotification); }
     bool isAnswered() const               { return answered; }
 
     // The line under the name and the Save button follow the text (also after `nameUse` is set).
@@ -95,8 +100,8 @@ public:
     {
         const auto typed = name.getText().trim();
         const auto use = typed.isEmpty() ? NameUse::Empty : (nameUse ? nameUse(typed) : NameUse::New);
-        juce::String text;
-        switch (use)
+        juce::String text = hintFor ? hintFor(use, typed) : juce::String();
+        if (text.isEmpty()) switch (use)
         {
             case NameUse::Empty:    text = "Type a name."; break;
             case NameUse::BuiltIn:  text = "\"" + typed + "\" is a built-in preset: choose another name."; break;
@@ -181,11 +186,12 @@ private:
 
 // The box in its window: above the main window (and everything else, so it cannot open behind
 // something), with the system's title bar; its close button is Cancel.
-class SavePresetWindow : public juce::DocumentWindow
+class SaveBoxWindow : public juce::DocumentWindow
 {
 public:
-    SavePresetWindow(const juce::String& heading, const juce::String& offeredName, int maxNameLength)
-        : DocumentWindow("Save preset", juce::Colour(0xFF263238), DocumentWindow::closeButton),
+    SaveBoxWindow(const juce::String& heading, const juce::String& offeredName, int maxNameLength,
+                  const juce::String& windowTitle = "Save preset")
+        : DocumentWindow(windowTitle, juce::Colour(0xFF263238), DocumentWindow::closeButton),
           box(heading, offeredName, maxNameLength)
     {
         setUsingNativeTitleBar(true);
@@ -194,7 +200,7 @@ public:
         setAlwaysOnTop(true);
     }
 
-    SavePresetBox& getBox() { return box; }
+    SaveBox& getBox() { return box; }
 
     // Shown over `over` (the main window), in front, with the keyboard in the name. The app is
     // brought to the front as well: SV comes from the controller while any app may be in front.
@@ -205,7 +211,7 @@ public:
         takeKeyboard();
         // Once more when the window is really up (a window that has just been made may not be
         // the key window yet when the focus is first asked for).
-        juce::Component::SafePointer<SavePresetWindow> safe(this);
+        juce::Component::SafePointer<SaveBoxWindow> safe(this);
         juce::Timer::callAfterDelay(150, [safe]
         {
             if (safe != nullptr && !safe->box.isAnswered() && !safe->box.getNameEditor().hasKeyboardFocus(true))
@@ -223,5 +229,5 @@ private:
         box.focusName();
     }
 
-    SavePresetBox box;
+    SaveBox box;
 };

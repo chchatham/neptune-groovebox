@@ -297,8 +297,9 @@ namespace ProjectBridge
             data.song.loop = live.song->getLoopMode();
         }
 
-        if (live.chords != nullptr && live.chords->anyStored())
+        if (live.chords != nullptr && live.chords->hasContent())
             data.chordPads = live.chords->toFlat();
+        data.perfPads = live.audio.getPerfFx().toFlat();
 
         if (live.scales != nullptr)
         {
@@ -496,6 +497,9 @@ namespace ProjectBridge
 
         if (live.chords != nullptr)
             live.chords->fromFlat(data.chordPads);      // (a project without chords: every pad empty)
+        // PERF's pads; a project from before they existed gets the starting layout.
+        if (! live.audio.getPerfFx().fromFlat(data.perfPads))
+            live.audio.loadFactoryPerfPads();
 
         if (live.scales != nullptr)
         {

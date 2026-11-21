@@ -62,6 +62,8 @@ public:
     void setChained() { chained = true; enabled = wanted; }
     void hold(bool running) { enabled = running; }      // the chain, audio thread
 
+    // (PERF's throw takes the dry share back out of an effect's output: it relies on the mix being
+    // applied as dry (1 - mix) + wet mix, unsmoothed.)
     void setMix(float m) { mix = std::clamp(m, 0.0f, 1.0f); }
     float getMix() const { return mix; }
 
@@ -114,7 +116,7 @@ public:
     int getSyncDivision() const { return syncDivision; }
     void setTempo(float bpm)
     {
-        if (bpm == tempoBpm || bpm <= 0.0f) return;
+        if (! (bpm > 0.0f) || bpm == tempoBpm) return;
         tempoBpm = bpm;
         applySync();
     }
@@ -138,6 +140,7 @@ protected:
     float mix = 1.0f;
 
     static float lerp(float a, float b, float t) { return a + t * (b - a); }
+    float getTempo() const { return tempoBpm; }
 
 private:
     void applySync()

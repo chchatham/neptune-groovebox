@@ -19,6 +19,7 @@
 #include "../src/ui/screens/WaveformScreen.h"
 #include "../src/ui/screens/TrackFxScreen.h"
 #include "../src/ui/screens/ChordPadScreen.h"
+#include "../src/ui/screens/PerfFxScreen.h"
 #include "../src/controller/DisplayRenderer.h"
 #include "../src/controller/LaunchkeyController.h"
 #include "../src/controller/PadManager.h"
@@ -38,11 +39,11 @@ namespace helptest
     using Edit = ScreenManager::Edit;
     using Card = ScreenManager::HelpCard;
 
-    enum { TRACKS = 0, STEP, PARAM, DRUMS, PRESET, SETTINGS, FLTR, ARP, SCALE, SONG, ATROUTE, WAVE, TRKFX, CHORD, NUM_SCREENS };
+    enum { TRACKS = 0, STEP, PARAM, DRUMS, PRESET, SETTINGS, FLTR, ARP, SCALE, SONG, ATROUTE, WAVE, TRKFX, CHORD, PERF, NUM_SCREENS };
     static const char* const screenNames[NUM_SCREENS] = { "TRACKS", "STEP", "PARAM", "DRUMS", "PRESET", "SETTINGS", "FLTR", "ARP",
-                                                          "SCALE", "SONG", "AT ROUTE", "WAVE", "TRK FX", "CHORD" };
+                                                          "SCALE", "SONG", "AT ROUTE", "WAVE", "TRK FX", "CHORD", "PERF" };
     static const char* const mapNames[NUM_SCREENS] = { "TRKS", "STEP", "PARM", "DRUM", "PRST", "SETT", "FLTR", "ARP",
-                                                       "SCAL", "SONG", "ATRT", "WAVE", "TKFX", "CHRD" };
+                                                       "SCAL", "SONG", "ATRT", "WAVE", "TKFX", "CHRD", "PERF" };
     enum : int { BANK_UP = 51, BANK_DOWN = 52, PATTERN_KEY = 104, UP = 106, DOWN = 107, SETTINGS_BUTTON = 108,
                  PLAY = 115, RECORD = 117 };
 
@@ -102,9 +103,10 @@ namespace helptest
             add(new WaveformScreen(seq, &audio));
             add(new TrackFxScreen(seq, &audio));
             add(new ChordPadScreen(chordPads));
+            add(new PerfFxScreen(audio, [this] { return seq.getSelectedTrack(); }, [this] { return seq.getPattern().getTrackCount(); }));
 
             static constexpr int map[16] = { PARAM, TRACKS, TRKFX, STEP, PRESET, SONG, SETTINGS, ATROUTE,
-                                             STEP, DRUMS, CHORD, SCALE, WAVE, FLTR, -1, -1 };
+                                             STEP, DRUMS, CHORD, SCALE, WAVE, FLTR, PERF, -1 };
             for (int pad = 0; pad < 16; ++pad)
                 mgr.setShiftPadScreen(pad, map[pad]);
             mgr.setButtonScreens(SETTINGS, ARP, SCALE);
@@ -112,6 +114,7 @@ namespace helptest
             mgr.setPinnable(DRUMS, true);
             mgr.setPinnable(SCALE, true);
             mgr.setPinnable(CHORD, true);
+            mgr.setPinnable(PERF, true);
             mgr.setScreenContext(STEP, ScreenManager::CopyContext::Steps);
             mgr.setScreenContext(TRACKS, ScreenManager::CopyContext::Pattern);
             mgr.setScreenContext(PARAM, ScreenManager::CopyContext::Sound);
@@ -147,6 +150,7 @@ namespace helptest
             track(0).getStep(3).trig = true;
             track(0).getStep(3).paramLocks[moved.id] = movedDefault;
             track(2).getStep(5).trig = true;
+            audio.getPerfFx().setKind(0, 0, PerfFx::DUB);      // PERF's first pad holds an effect
         }
 
         Track& track(int t) { return seq.getPattern().getTrack(t); }
@@ -212,7 +216,11 @@ namespace helptest
             juce::String out;
             for (int t = 0; t < seq.getPattern().getTrackCount(); ++t)
                 out << "T" << t << ": " << stepsText(t) << "| ";
-            return out + soundText();
+            // (PERF's pads between the steps and the sound.)
+            out << "PERF:";
+            for (float v : audio.getPerfFx().toFlat())
+                out << " " << juce::String(v, 3);
+            return out + "| " + soundText();
         }
     };
 
@@ -588,7 +596,7 @@ public:
             for (auto& l : card.padRows[0].labels) top.add(l.text);
             for (auto& l : card.padRows[1].labels) bottom.add(l.text);
             expectEquals(top.joinIntoString(" "), juce::String("PARM TRKS TKFX STEP PRST SONG SETT ATRT"));
-            expectEquals(bottom.joinIntoString(" ").trim(), juce::String("STEP DRUM CHRD SCAL WAVE FLTR"));
+            expectEquals(bottom.joinIntoString(" ").trim(), juce::String("STEP DRUM CHRD SCAL WAVE FLTR PERF"));
             expectEquals(card.lines[5].text, juce::String("COPY CLEAR PASTE:FUNC"));
             expect(card.lines[4].text.isEmpty(), "TRACKS cannot be pinned");
 
@@ -749,7 +757,7 @@ public:
             expectEquals(names.joinIntoString(" ").trim(), juce::String("TRCK ARPL DIRT TALK MDFX FX"));
         }
 
-        beginTest("FUNC: EDIT says what copy / clear / paste act on, and that is what they then do (13 screens, with and without a held step)");
+        beginTest("FUNC: EDIT says what copy / clear / paste act on, and that is what they then do (every screen, with and without a held step)");
         {
             // What the PLAY line must name on each screen: no step held / pad 1 held.
             static const char* const expected[NUM_SCREENS][2] = {
@@ -759,7 +767,9 @@ public:
                 { "", "" }, { "", "" }, { "", "" },             // DRUMS PRESET SETTINGS
                 { "RESET T1 ENGINE", "CLEAR S1 LOCKS" },        // FLTR: as PARAM
                 { "", "" }, { "", "" }, { "", "" }, { "", "" }, { "", "" },     // ARP SCALE SONG AT ROUTE WAVE
-                { "CLEAR T1 FX",     "CLEAR S1 LOCKS" } };      // TRK FX: the track's effects
+                { "CLEAR T1 FX",     "CLEAR S1 LOCKS" },        // TRK FX: the track's effects
+                { "", "" },                                     // CHORD
+                { "CLEAR PERF PAD 1", "CLEAR PERF PAD 1" } };   // PERF: the pad on the knobs
 
             for (int screen = 0; screen < NUM_SCREENS; ++screen)
             {
@@ -894,6 +904,11 @@ public:
                         {
                             expectEquals(r.stepText(0, 0), juce::String("0t0 "), where + ": the locks go, the trig stays");
                             expectEquals(r.stepText(0, 3), juce::String("3t1 "), where);
+                        }
+                        else if (name == "PERF PAD 1")
+                        {
+                            expect(r.audio.getPerfFx().get(0).empty(), where + ": the pad is empty");
+                            expect(original.startsWith("T0: " + r.stepsText(0)) && original.endsWith(r.soundText()), where + ": steps and sound stay");
                         }
                         else
                             expect(false, where + ": a scope this test does not know: " + name);

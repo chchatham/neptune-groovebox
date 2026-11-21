@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EffectBase.h"
+#include "FxBlocks.h"
 #include "../DSPUtils.h"
 #include <array>
 #include <cmath>
@@ -196,32 +197,7 @@ private:
             cachedLpCoeff = 1.0f - std::exp(-dsp::TWO_PI_F * 10000.0f / (float)sampleRate);
     }
 
-    struct AllpassStage
-    {
-        std::array<float, MAX_AP_SIZE> buf {};
-        int writeIdx = 0;
-
-        void clear()
-        {
-            buf.fill(0.0f);
-            writeIdx = 0;
-        }
-
-        float process(float in, int delaySamples, float coeff)
-        {
-            delaySamples = std::clamp(delaySamples, 1, MAX_AP_SIZE - 1);
-            int readIdx = writeIdx - delaySamples;
-            if (readIdx < 0) readIdx += MAX_AP_SIZE;
-            float delayed = buf[(size_t)readIdx];
-            // Schroeder allpass: v = x + g v[n-D], y = v[n-D] - g v. (The output once used x in place
-            // of v, which is a comb with gain above 1: the plate's tank fed on itself and never died.)
-            const float v = in + delayed * coeff;
-            float out = delayed - v * coeff;
-            buf[(size_t)writeIdx] = v;
-            writeIdx = (writeIdx + 1) % MAX_AP_SIZE;
-            return out;
-        }
-    };
+    using AllpassStage = fxb::FixedAllpass<MAX_AP_SIZE>;
 
     struct FDNDelayLine
     {

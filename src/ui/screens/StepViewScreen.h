@@ -503,6 +503,7 @@ public:
     // Up / Down = which 16 steps the pads show.
     void onPadPagePrev() override { if (currentPage > 0) --currentPage; }
     void onPadPageNext() override { if (currentPage < getStepPageCount() - 1) ++currentPage; }
+    int getStepPadOffset() const override { return currentPage * 16; }
     void showStep(int stepIndex) override { currentPage = juce::jlimit(0, getStepPageCount() - 1, stepIndex / 16); }
 
     void onActivate() override
@@ -783,7 +784,7 @@ private:
             case 0:
             {
                 const ParamSpec spec { "LEN", 0, 1, 64, 16, ParamKind::Int };
-                track.setLength((int) spec.turned((float) track.length, clicks, turnStep()));
+                lengthTurn.turn(track, (int) spec.turned((float) track.length, clicks, turnStep()), now());
                 currentPage = juce::jmin(currentPage, (track.length - 1) / 16);
                 break;
             }
@@ -993,6 +994,7 @@ private:
     SequencerCore& sequencer;
     PadManager& padManager;
     [[maybe_unused]] PadLEDFeedback& ledFeedback;
+    LengthTurn lengthTurn;       // LN made longer: the track loops through the new steps
     int currentPage = 0;         // step page: which 16 steps the pads show
     ParamPageScreen* lockPages = nullptr;
     AudioEngine* audioEngine = nullptr;

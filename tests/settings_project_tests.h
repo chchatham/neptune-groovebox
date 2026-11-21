@@ -105,6 +105,29 @@ public:
             expect(screen.getStatusLine().contains("P05 USED"));
             expect(screen.getStatusLine().contains("NOW P05"));
 
+            // A slot whose project has a name shows it; one nobody named says USED as before.
+            juce::String titles[SettingsScreen::NUM_SLOTS];
+            auto h = fake.hooks();
+            h.slotTitle = [&titles](int s) { return titles[s]; };
+            screen.setHooks(h);
+            for (auto* unnamed : { "", "Untitled", "P05", "P31" })
+            {
+                titles[4] = unnamed;
+                expectEquals(screen.getStatusLine(), juce::String("P05 USED NOW P05"), unnamed);
+            }
+            titles[4] = "Night Drive 13";                         // 13 characters: the longest a name is
+            expectEquals(screen.getStatusLine(), juce::String("P05 NOW Night Drive 1"));
+            expect(screen.getStatusLine().length() <= 21);
+            fake.used[6] = true;
+            titles[6] = "Other Song";
+            screen.setSelectedSlot(6);
+            expectEquals(screen.getStatusLine(), juce::String("P07 Other Song"));
+            titles[7] = "Ghost";                                  // (an empty slot has no name to show)
+            screen.setSelectedSlot(7);
+            expectEquals(screen.getStatusLine(), juce::String("P08 EMPTY NOW P05"));
+            screen.setSelectedSlot(4);
+            expect(SettingsScreen::isUnnamed("P05") && !SettingsScreen::isUnnamed("P5") && !SettingsScreen::isUnnamed("Pop"));
+
             // SAVE now writes the current project without asking for a slot.
             for (int i = 0; i < SettingsScreen::ACTION_STEPS; ++i)
                 screen.onEncoderChange(2, 1);

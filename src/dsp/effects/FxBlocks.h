@@ -6,6 +6,7 @@
 
 #include "../DSPUtils.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -239,6 +240,70 @@ private:
     int mask = 0;
     int w = 0;
     float maxDelay = 1.0f;
+};
+
+// Fixed-size circular line read at a whole number of samples (the reverbs' tank and FDN-style lines).
+template <int N>
+struct FixedDelay
+{
+    std::array<float, N> buf {};
+    int writeIdx = 0;
+
+    void clear()
+    {
+        buf.fill(0.0f);
+        writeIdx = 0;
+    }
+
+    void write(float sample)
+    {
+        buf[(size_t)writeIdx] = sample;
+        writeIdx = (writeIdx + 1) % N;
+    }
+
+    float read(int delaySamples) const
+    {
+        delaySamples = std::clamp(delaySamples, 1, N - 1);
+        int readIdx = writeIdx - delaySamples;
+        if (readIdx < 0) readIdx += N;
+        return buf[(size_t)readIdx];
+    }
+};
+
+// Schroeder allpass on a fixed-size line: v = x + g v[n-D], y = v[n-D] - g v. (The output once used
+// x in place of v, which is a comb with gain above 1: the plate's tank fed on itself and never died.)
+template <int N>
+struct FixedAllpass
+{
+    std::array<float, N> buf {};
+    int writeIdx = 0;
+
+    void clear()
+    {
+        buf.fill(0.0f);
+        writeIdx = 0;
+    }
+
+    float process(float in, int delaySamples, float coeff)
+    {
+        delaySamples = std::clamp(delaySamples, 1, N - 1);
+        int readIdx = writeIdx - delaySamples;
+        if (readIdx < 0) readIdx += N;
+        float delayed = buf[(size_t)readIdx];
+        const float v = in + delayed * coeff;
+        float out = delayed - v * coeff;
+        buf[(size_t)writeIdx] = v;
+        writeIdx = (writeIdx + 1) % N;
+        return out;
+    }
+
+    float readAt(int delaySamples) const
+    {
+        delaySamples = std::clamp(delaySamples, 1, N - 1);
+        int readIdx = writeIdx - delaySamples;
+        if (readIdx < 0) readIdx += N;
+        return buf[(size_t)readIdx];
+    }
 };
 
 } // namespace fxb

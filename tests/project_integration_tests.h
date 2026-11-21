@@ -231,6 +231,89 @@ public:
             tempDir1.deleteRecursively();
             tempDir2.deleteRecursively();
         }
+
+        // -------------------------------------------------------------------
+        beginTest("Save As that the save box names or takes back");
+        {
+            const auto root = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("neptune_test_save_as");
+            root.deleteRecursively();
+            const auto p1 = root.getChildFile("P01"), p2 = root.getChildFile("P02");
+            auto bpmIn = [](const juce::File& dir)
+            {
+                return ProjectData::fromJSON(dir.getChildFile("project.json").loadFileAsString()).bpm;
+            };
+
+            ProjectManager pm;
+            pm.onCapture = [&]() { return pm.getData(); };
+            pm.newProject();
+            pm.getData().bpm = 100.0f;
+
+            // Into an empty slot: saved at once, under the name it had; named by the box.
+            expect(pm.saveProjectAsPending(p1));
+            expect(pm.saveAsPending());
+            expect(pm.getCurrentFile() == p1);
+            expectEquals(ProjectManager::nameIn(p1), juce::String("Untitled"));
+            expect(!pm.nameSaveAs("   "), "no name: not taken");
+            expect(pm.saveAsPending());
+            expect(pm.nameSaveAs("  First Song with a long name "));
+            expect(!pm.saveAsPending());
+            expectEquals(ProjectManager::nameIn(p1), juce::String("First Song wi"), "13 characters, as the display shows");
+            expectEquals(pm.getProjectName(), juce::String("First Song wi"));
+            expect(!ProjectManager::keptIn(p1).exists());
+            expect(!pm.takeBackSaveAs(), "named: nothing left to take back");
+            expectEquals(bpmIn(p1), 100.0f);
+
+            // Into another empty slot, taken back: the slot is gone, the project is P01's again.
+            pm.getData().bpm = 110.0f;
+            expect(pm.saveProjectAsPending(p2));
+            expect(pm.getCurrentFile() == p2);
+            expect(pm.takeBackSaveAs());
+            expect(!p2.exists());
+            expect(pm.getCurrentFile() == p1);
+            expectEquals(pm.getProjectName(), juce::String("First Song wi"));
+            expectEquals(pm.getData().bpm, 110.0f, "what is playing is not touched");
+
+            // Over a slot that holds a project (with a sample beside it), taken back: it holds what it held.
+            p1.getChildFile("samples").getChildFile("kick.wav").replaceWithText("x");
+            expect(pm.saveProjectAsPending(p1));
+            expectEquals(bpmIn(p1), 110.0f);
+            expect(ProjectManager::keptIn(p1).existsAsFile());
+            expect(pm.takeBackSaveAs());
+            expectEquals(bpmIn(p1), 100.0f);
+            expectEquals(ProjectManager::nameIn(p1), juce::String("First Song wi"));
+            expect(p1.getChildFile("samples").getChildFile("kick.wav").existsAsFile());
+            expect(!ProjectManager::keptIn(p1).exists());
+            expect(pm.getCurrentFile() == p1);
+
+            // Over it again and named: the new one, and nothing kept beside it.
+            expect(pm.saveProjectAsPending(p1));
+            pm.getData().bpm = 150.0f;                      // turned after the save: not in it
+            expect(pm.nameSaveAs("Second"));
+            expectEquals(bpmIn(p1), 110.0f);
+            expectEquals(ProjectManager::nameIn(p1), juce::String("Second"));
+            expect(!ProjectManager::keptIn(p1).exists());
+
+            // A second save-as, a save, a load or a new project settles an unanswered one as it stands.
+            expect(pm.saveProjectAsPending(p2));
+            expect(pm.saveProjectAsPending(p1));
+            expect(pm.pendingSaveDir() == p1);
+            expect(p2.getChildFile("project.json").existsAsFile());
+            expect(pm.saveProject());
+            expect(!pm.saveAsPending());
+            expect(!ProjectManager::keptIn(p1).exists());
+            expectEquals(bpmIn(p1), 150.0f);
+            expect(pm.saveProjectAsPending(p2));
+            expect(pm.loadProject(p1));
+            expect(!pm.saveAsPending() && !pm.takeBackSaveAs());
+            expect(p2.getChildFile("project.json").existsAsFile());
+            expect(pm.saveProjectAsPending(p2));
+            pm.newProject();
+            expect(!pm.saveAsPending());
+            expect(!pm.hasFile());
+
+            expectEquals(ProjectManager::nameIn(root.getChildFile("P09")), juce::String());
+            root.deleteRecursively();
+        }
     }
 };
 

@@ -192,7 +192,8 @@ and {{LP}} (knob 5) on, then press [[Play]]: the song plays pattern 1 twice, pat
         + '<div class="shots">' + S.svg("SONG", 1, "SONG") + "</div>"))
     a.append(step(10, "Save", fmt("""
 <p>[[Settings]], then the {{PROJ}} page. Choose a {{SLOT}} with knob 1 and turn {{SVAS}} (knob 4) four clicks
-clockwise. The display answers OK. Next time the app starts it reopens this project.</p>""")))
+clockwise. The display answers OK, and the Mac asks for a name: type one and press Return (Escape takes the save
+back). Next time the app starts it reopens this project.</p>""")))
     qs.append(("Ten steps to a song", "".join(a)))
 
     qs.append(("Where to go next", fmt("""
@@ -281,7 +282,7 @@ moment says why there for a second instead of doing nothing: {{SAMPLER ONLY}}, {
                 ("4", fmt("{{STEP}} — the step sequencer"), fmt("{{SCALE}} — scale pads")),
                 ("5", fmt("{{PRESET}} — sound presets"), fmt("{{WAVE}} — waveform and resampling")),
                 ("6", fmt("{{SONG}} — song rows"), fmt("{{FLTR}} — the filter picture")),
-                ("7", fmt("{{SETTINGS}} (also the [[Settings]] button)"), "—"),
+                ("7", fmt("{{SETTINGS}} (also the [[Settings]] button)"), fmt("{{PERF}} — effects played from the pads")),
                 ("8", fmt("{{AT ROUTE}} — pad pressure routing"), "—")])),
         ("The grammar: one gesture, one meaning", fmt("""
 <p>These hold on every screen. Learn this table and you know the instrument.</p>""")
@@ -371,7 +372,7 @@ pattern needs its button held for half a second, and whatever the edit combinati
 <p>On screens with several pages, [[Func]] + a top-row pad jumps straight to a page (on {{PARAM}}, to a section; the
 same pad again steps within it).</p>
 <h3>Pinning the playing pads</h3>
-<p>On {{DRUMS}}, {{CHORD}} or {{SCALE}}, hold [[Shift]] and hold that screen's own bottom pad for half a second. {{PIN}} appears
+<p>On {{DRUMS}}, {{CHORD}}, {{SCALE}} or {{PERF}}, hold [[Shift]] and hold that screen's own bottom pad for half a second. {{PIN}} appears
 in the name bar and those pads keep playing, with pressure, on every other screen, so you can play pads with one hand
 and turn sound knobs with the other. The same gesture unpins.</p>""")),
     ]))
@@ -393,6 +394,11 @@ as pending and nothing changes yet. Tap that track's top pad (lit amber) to comm
 Changing engine replaces the track's sound in every pattern.</p>""")
     screen("STEP — the step sequencer", [("STEP", 1, "STEP")], """
 <p><b>Knobs:</b> {{LN}} track length, {{SP}} track speed, {{QN}} playback quantize, and the tempo on knob 8.</p>
+<p><b>A longer track loops what it had:</b> turn {{LN}} up and the track's steps repeat through the new ones, notes
+and locks included: 16 steps turned up to 64 are the 16 four times, ready to be varied. One turn of the knob (clicks
+no more than a second and a half apart) repeats the track as it was when the turn began. The one exception: a track
+that was longer before and still holds steps beyond its length gets those back as they were, not written over. The
+length on {{TRK FX}} does the same.</p>
 <p><b>Pads:</b> sixteen steps. A tap adds a step; a quick tap on a lit step removes it; a held step is never
 removed. [[▲]] / [[▼]] move to the next sixteen steps of a longer track. Hold a step and press a key to set its note
 (several keys for a chord).</p>
@@ -476,9 +482,22 @@ latch count as held, so you can latch a chord and use the same hand for the pad.
 names the chord (<code>Cm7 &gt; PAD</code>) and the empty pads light up; afterwards it says where the chord went
 (<code>PAD 5 = Cm7</code>).</p>
 <p><b>Playing:</b> press a pad with no key held. It plays its chord on the selected track; the harder you hit, the
-louder the chord, and pressure reaches every note. Chord pads record into steps, feed the arp when it is on, and
+louder the chord, and pressure reaches every note. {{VL}} decides what becomes of the velocities the keys were
+played with: <code>BALANCE</code> (as the screen starts) keeps their proportions under the pad's velocity,
+<code>AS KEYS</code> plays every note exactly as hard as its key was played, however the pad is hit, and
+<code>PAD</code> plays them all at the pad's velocity. With the key latch on, a pad you let go keeps sounding (and finishes its strum) until you press the next pad;
+a pad pressed while another is still down is added to it. Switching the latch off, or stopping the transport,
+ends it. Chord pads record into steps, feed the arp when it is on, and
 roll, like every other playing pad. They can be pinned (below), so a progression stays under your fingers while
 you edit the sound.</p>
+<p><b>Strum:</b> the bank buttons turn to the screen's second knob page, <code>STRUM</code>; its five knobs are one
+setting for every pad. {{TM}} is the time from a chord's first note to its last, up to a second; at 0 the notes
+start together. {{DR}} strokes upward from the lowest note, downward from the highest, or one then the other.
+{{HU}} loosens the timing: each stroke a little quicker or slower than the last, its notes unevenly spaced.
+{{VR}} loosens the pattern: now and then a stroke goes the other way, or two neighbouring notes change places.
+No note is ever left out. {{FL}} makes the later notes of a stroke softer. A pad let go before its stroke is over
+leaves the rest unplayed, so hold the pad for a long strum. This strum is the pads' own and needs no arp; while
+the track's arp is on, a pad hands its notes to the arp together and the arp's own {{STRM}} applies instead.</p>
 <p><b>Display:</b> the sixteen pads as two rows of eight, each with the chord's root over its kind: <code>M</code>
 major, <code>m</code> minor, <code>7</code>, <code>M7</code>, <code>m7</code>, <code>o</code> diminished,
 <code>h7</code> half-diminished, <code>+</code> augmented, <code>s2</code> / <code>s4</code> suspended,
@@ -488,6 +507,58 @@ root, neighbours on the circle of fifths in neighbouring colours, so a progressi
 <p><b>Knobs:</b> {{BK}} bank (four banks of sixteen; also [[▲]] / [[▼]]), {{TR}} transpose and {{OC}} octave for
 every pad, {{VL}} whether each note keeps the level it was stored with, {{CL}} clear the bank (four clicks). Chords
 are saved with the project.</p>""")
+    screen("PERF — effects played from the pads", [("PERF", 1, "FX: the layer's effect"), ("PERF", 2, "PRESS: what a press moves"), ("PERF", 3, "PRESSURE: what pressure moves")], """
+<p>[[Shift]] + bottom pad 7. Each of the sixteen pads holds an effect move, and pressing the pad plays it: an echo
+thrown onto one snare hit, a chord frozen and left to climb away, a bar that stutters, the whole mix grinding to a
+stop. Pads for different tracks sit side by side, so one hand can work the effects of the whole pattern. A new
+project starts with the same eight moves twice: on the whole mix along the top row, and on the selected track
+along the bottom row. Every one of them is yours to change: which effects a pad holds, what they act on, and what
+your press and your pressure do to them.</p>
+<p><b>Pads:</b> press to play. The lights show the kind of effect (echoes amber, reverbs blue, the freeze violet,
+repeats green, the stop red, phasers and their kin cyan, filters yellow, distortion magenta): dim while waiting,
+full under your finger, half while a tail is still ringing. The pad you touched last is the one on the knobs, a
+little brighter than the rest: hold it and turn, and you hear what you change. The pads can be pinned, so they
+stay under your fingers on every other screen.</p>
+<p><b>Layers:</b> a pad holds up to four effects, <code>A</code> to <code>D</code>, and one press plays them all.
+[[▲]] / [[▼]] choose which layer the knobs show; the bottom left of the display shows the four, a letter for each
+layer that holds an effect, the shown one inverted. To add an effect to a pad, step to an empty layer and turn
+{{FX}}; to remove one, turn its {{FX}} back to <code>--</code>. Each layer has its own target, so one pad can
+filter the bass, throw the snare into an echo and crush the whole mix at once.</p>
+<p><b>Knob page FX</b> (the name bar says what the layer does, <code>DUB&gt;T2</code>: the dub echo, on track 2):
+{{TRK}} is what the layer acts on: <code>SEL</code>, the track that is selected when you press;
+<code>MSTR</code>, everything; or one track by number. {{FX}} chooses the effect: the pads' own four (below), then
+every insert effect of {{TRK FX}}. {{MODE}} is the way a press brings it in. <code>PNCH</code> (punch): the effect
+replaces the sound while the pad is down. <code>THRW</code> (throw): the sound is sent into the effect only while
+the pad is down, and what the effect makes of it is added and rings on after you let go. Echoes and reverbs can
+do both; the knob says so where an effect can do only one. {{WET}} is how much of the effect you get. Knobs 5 to
+8 are the effect's own four values.</p>
+<p><b>What your press and your pressure do.</b> The next two knob pages have the same layout as the first:
+knob 4 belongs to {{WET}} and knobs 5 to 8 to the effect's four values. On <code>PRESS</code> each of those knobs
+sets how far the press itself moves that value for as long as the pad is down; on <code>PRESSURE</code>, how far
+leaning on the pad moves it. An amount runs from −100 to +100 of the value's range, and 0 leaves the value alone.
+Set as many as you like, on every layer: a single finger can open an echo's feedback, darken its tone, and close a
+filter on another track, all by different amounts, and the press and the pressure add up on a value that has
+both. Nothing you play is written into the pad: let go and every value is back where its knob put it.
+<code>PRESS</code> also holds the pad's {{LTCH}} (a press switches the pad on, the next switches it off) and
+{{QNT}} (a press waits for the next sixteenth, eighth, beat or bar while the sequencer plays, so a repeat or a
+stop lands on the grid); <code>PRESSURE</code> holds {{CURV}}, whether pressure answers early
+(<code>SOFT</code>) or late (<code>HARD</code>).</p>
+<p><b>The pads' own effects.</b> <code>DUB</code> is a dub echo: every repeat passes a band filter ({{TONE}}
+places it) and a saturator ({{DRIV}}); at the top of {{FDBK}} it goes on by itself until you ease off, which is
+why it starts with pressure on {{FDBK}}. <code>FRZ</code> catches the sound for a moment ({{GRAB}}) and holds it
+for as long as the pad is down. Let go and it dies away over {{DEC}}; with {{SPRL}} up it spirals away, climbing
+octave on octave as it goes. {{SHIM}} is the same climb while you hold, and starts on pressure.
+<code>RPT</code> repeats the last slice of the beat ({{DIV}}); it starts with pressure shortening the slices, down
+to 1/64, and {{DCAY}} and {{PTCH}} make each repeat quieter or step it up or down in pitch. <code>STOP</code>
+is a tape stopping over {{TIME}}; let go and the sound is back.</p>
+<p><b>Knob page MORE:</b> {{SYNC}} locks the layer's time or rate to the tempo and {{DIV}} chooses the division;
+the effect's own time knob then shows the division too. {{CLR}}, four clicks, empties the pad, all its
+layers.</p>
+<p><b>Good to know:</b> a layer on a track acts after that track's fader, so an echo you threw keeps ringing when
+you pull the fader down or mute the track, and one on <code>MSTR</code> sits before the master limiter, which
+catches a feedback that got away. [[Shift]] + [[Play]] silences everything, latched pads included.
+[[Func]] + [[Record]] / [[Play]] / [[&gt;]] copy, clear and paste the pad on the knobs, with all its layers. The
+pads are saved with the project. What you play on them is not recorded into the pattern.</p>""")
     screen("SONG", [("SONG", 1, "SONG")], """
 <p><b>Knobs:</b> {{PA}} pattern, {{RP}} repeats, {{TR}} transpose, {{RW}} row, {{LP}} loop, {{SG}} song on / off,
 {{IN}} insert a row, {{DL}} delete the row (four clicks).</p>
@@ -1226,7 +1297,15 @@ to its markers.</p>""") + '<div class="shots">' + S.svg("WAVE", 2, "WAVE, REC pa
 effects, sends, master section, song, scale pages, pressure routes and ranges, and arp settings. There are 32 slots
 (<i>Music / Neptune / Projects</i>, P01 to P32).</p>
 <p>{{SETTINGS}} → {{PROJ}}: {{SLOT}} chooses, {{LOAD}}, {{SAVE}}, {{SVAS}} (save as, to the chosen slot) and {{NEW}}
-each need four clicks and answer OK or FAIL. {{AUTO}} keeps saving to the current slot as you work. The app reopens
+each need four clicks and answer OK or FAIL.</p>
+<p><b>Naming a project:</b> {{SVAS}} saves at once, so nothing waits for the Mac. The Mac then puts the save box in
+front of everything, "Save the project in P05", with the project's name selected so that typing replaces it (13
+characters at most). Return or Save names the project. Escape or Cancel takes the save back: the slot keeps the
+project it held, or stays empty, and your project is the one it was before. Left unanswered, the save stays as it
+is. {{SAVE}} writes the current slot again without asking. The line under the cells shows the chosen slot's name:
+"P05 Night Drive", with NOW before the name on the slot your project is in; a project nobody has named reads
+"P05 USED".</p>
+<p>{{AUTO}} keeps saving to the current slot as you work. The app reopens
 the last project when it starts, and on top of it everything exactly as it was when the app was last running, saved
 or not (the app notes its state when it quits and every 15 seconds). {{SAVE}} is still what writes a project slot;
 {{NEW}} or {{LOAD}} is the way to a different starting point.</p>

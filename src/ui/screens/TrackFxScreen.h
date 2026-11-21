@@ -174,7 +174,7 @@ protected:
                 if (auto* fx = effectOf(trackIdx)) fx->setMix(value);
                 return true;
             case TRACK_LENGTH:
-                track.setLength(iv);
+                lengthTurn.turn(track, iv, UiClock::nowMs());
                 return true;
             case TRACK_SPEED:
                 track.speedMultiplier = speedFromIndex(iv);
@@ -348,4 +348,5 @@ private:
     }
 
     int fxSelectedSlot = 0;
+    LengthTurn lengthTurn;       // LEN made longer: the track loops through the new steps
 };
