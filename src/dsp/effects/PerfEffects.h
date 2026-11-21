@@ -31,14 +31,25 @@ inline float ceiling(float x)
 }
 
 // -------------------------------------------------------------------------------------------
-// DUB: the echo of a dub mixing desk. A tape-style line (the structure of TapeDelay.h: Hermite
-// read at a gliding position, so a moved TIME bends the pitch of what is in the loop) whose
-// repeats pass a band filter and a saturator each time round.
+// DUB: the echo of a dub mixing desk: a tape echo with its feedback ridden by hand. A tape-style
+// line (the structure of TapeDelay.h: Hermite read at a gliding position, so a moved TIME bends
+// the pitch of what is in the loop, with the transport's wow and flutter on top) whose repeats
+// pass a band filter and the tape each time round.
+//
+// The tape (record()) is the usual model of a recording stage, three things a plain saturator
+// does not do:
+//  - record pre-emphasis, saturation, playback de-emphasis: flat while the level is low, but the
+//    top of the spectrum reaches the saturation first, so a hot repeat comes back duller and
+//    squashed and the next one more so (tape's level-dependent treble loss);
+//  - a bias offset inside the saturator: the two halves of the wave bend differently, which adds
+//    the even harmonics (the octave) that make a driven repeat thicken instead of only fuzz;
+//  - the saturation bounds the loop, so FDBK at the top howls at a held level and never runs away.
 //
 // TIME  echo time
-// FDBK  0..1 -> loop gain 0..1.15: the top of the range feeds on itself, held by the saturation
+// FDBK  0..1 -> loop gain 0..1.15: the top of the range feeds on itself, held by the tape
 // TONE  where the loop's band sits, 150 Hz .. 5 kHz: every repeat is narrowed towards it
-// DRIV  how hard the loop is driven into the saturation
+// DRIV  how hard the tape is hit: more squash, more harmonics, more treble lost per repeat, and
+//       a less steady transport
 // -------------------------------------------------------------------------------------------
 class DubDelay : public EffectBase
 {
@@ -95,6 +106,8 @@ public:
         toneSmooth.setTime(sr, 20.0f);
         fbSmooth.setTime(sr, 10.0f);
         driveSmooth.setTime(sr, 10.0f);
+        for (auto* f : { &preL, &preR }) f->setCutoff(sr, EMPHASIS_HZ);
+        for (auto* f : { &deL, &deR })   f->setCutoff(sr, EMPHASIS_HZ / (1.0f + EMPHASIS));
         appliedTone = -1.0f;
         reset();
     }
@@ -103,13 +116,14 @@ public:
     {
         lineL.clear();
         lineR.clear();
-        for (auto* f : { &lpL, &lpR, &hpL, &hpR })
+        for (auto* f : { &lpL, &lpR, &hpL, &hpR, &preL, &preR, &deL, &deR })
             f->reset();
         timeSmooth.snap(timeSec);
         toneSmooth.snap(tone);
         fbSmooth.snap(feedback);
         driveSmooth.snap(driveAmt);
         toneCount = 0;
+        wowPhase = flutterPhase = 0.0f;
     }
 
     void process(float& left, float& right) override
@@ -128,16 +142,24 @@ public:
             }
         }
 
-        const float d = timeSmooth.next(timeSec) * (float) sampleRate;
+        const float driven = driveSmooth.next(driveAmt);
+        const float drive = 1.0f + 7.0f * driven;
+
+        // The transport: slow wow and faster flutter move the head a little, more when driven.
+        const float unsteady = (0.35f + 0.65f * driven)
+                             * (WOW_DEPTH * std::sin(wowPhase * dsp::TWO_PI_F) + FLUTTER_DEPTH * std::sin(flutterPhase * dsp::TWO_PI_F));
+        wowPhase = (float) dsp::wrapPhase((double) wowPhase + WOW_HZ / sampleRate);
+        flutterPhase = (float) dsp::wrapPhase((double) flutterPhase + FLUTTER_HZ / sampleRate);
+
+        const float d = timeSmooth.next(timeSec) * (float) sampleRate * (1.0f + unsteady);
         const float wetL = hpL.highPass(lpL.lowPass(lineL.readHermite(d)));
         const float wetR = hpR.highPass(lpR.lowPass(lineR.readHermite(d)));
 
         const float loopGain = fbSmooth.next(feedback) * MAX_LOOP_GAIN * BAND_MAKEUP;
-        const float drive = 1.0f + 7.0f * driveSmooth.next(driveAmt);
-        // What goes onto the tape: unity gain for small signals, never beyond +-1 / drive (which
-        // is what holds a loop gain above 1). What is heard is brought back up by sqrt(drive).
-        lineL.write(fxb::flushDenormal(fxb::softSat((left + wetL * loopGain) * drive) / drive));
-        lineR.write(fxb::flushDenormal(fxb::softSat((right + wetR * loopGain) * drive) / drive));
+        // What goes onto the tape: unity gain for small signals, held near +-1 / drive (which is
+        // what holds a loop gain above 1). What is heard is brought back up by sqrt(drive).
+        lineL.write(fxb::flushDenormal(record(left + wetL * loopGain, drive, preL, deL)));
+        lineR.write(fxb::flushDenormal(record(right + wetR * loopGain, drive, preR, deR)));
 
         const float makeup = std::sqrt(drive);
         left = wetL * makeup;
@@ -149,13 +171,30 @@ private:
     // The band's two corners sit a factor 2.2 either side of its centre, where they pass 0.829 together:
     // made up for, so that FDBK means the same wherever TONE is.
     static constexpr float BAND_MAKEUP = 1.0f / 0.829f;
+    // The tape: the treble above EMPHASIS_HZ is recorded (1 + EMPHASIS) times hotter and played back
+    // as much quieter; BIAS is the offset that makes the saturation lopsided.
+    static constexpr float EMPHASIS_HZ = 3000.0f, EMPHASIS = 2.0f, BIAS = 0.25f;
+    static constexpr float WOW_HZ = 0.6f, FLUTTER_HZ = 7.0f;
+    static constexpr float WOW_DEPTH = 0.003f, FLUTTER_DEPTH = 0.0006f;      // shares of the echo time, fully driven
+
+    // One pass over the record head. Silence in gives silence out exactly; the offset the lopsided
+    // curve leaves on a loud signal is taken out by the loop's high-pass before it is heard or fed back.
+    static float record(float x, float drive, fxb::OnePole& pre, fxb::OnePole& de)
+    {
+        static const float biasOut = fxb::softSat(BIAS);
+        static const float slope = 1.0f - biasOut * biasOut;         // the curve's gain at the offset
+        const float hot = x + EMPHASIS * pre.highPass(x);
+        const float taped = (fxb::softSat(hot * drive + BIAS) - biasOut) / (drive * slope);
+        return taped - (EMPHASIS / (1.0f + EMPHASIS)) * de.highPass(taped);
+    }
 
     float timeSec = 0.375f, feedback = 0.55f, tone = 0.5f, driveAmt = 0.3f;
     float appliedTone = -1.0f;
     int toneCount = 0;
     fxb::DelayLine lineL, lineR;
-    fxb::OnePole lpL, lpR, hpL, hpR;
+    fxb::OnePole lpL, lpR, hpL, hpR, preL, preR, deL, deR;
     fxb::Smoother timeSmooth, toneSmooth, fbSmooth, driveSmooth;
+    float wowPhase = 0.0f, flutterPhase = 0.0f;
 };
 
 // -------------------------------------------------------------------------------------------

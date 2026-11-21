@@ -543,9 +543,12 @@ both. Nothing you play is written into the pad: let go and every value is back w
 {{QNT}} (a press waits for the next sixteenth, eighth, beat or bar while the sequencer plays, so a repeat or a
 stop lands on the grid); <code>PRESSURE</code> holds {{CURV}}, whether pressure answers early
 (<code>SOFT</code>) or late (<code>HARD</code>).</p>
-<p><b>The pads' own effects.</b> <code>DUB</code> is a dub echo: every repeat passes a band filter ({{TONE}}
-places it) and a saturator ({{DRIV}}); at the top of {{FDBK}} it goes on by itself until you ease off, which is
-why it starts with pressure on {{FDBK}}. <code>FRZ</code> catches the sound for a moment ({{GRAB}}) and holds it
+<p><b>The pads' own effects.</b> <code>DUB</code> is a dub echo, a tape echo with a hand on its
+feedback: every repeat passes a band filter ({{TONE}} places it) and goes onto the tape again. {{DRIV}} is how
+hard the tape is hit. A quiet repeat comes back as it went; a hot one comes back squashed, thickened by its
+octave and with its treble worn off, and the next one more so, while the pitch drifts a little as a tape's
+does. At the top of {{FDBK}} it goes on by itself, howling at the level the tape will hold, until you ease
+off, which is why it starts with pressure on {{FDBK}}. <code>FRZ</code> catches the sound for a moment ({{GRAB}}) and holds it
 for as long as the pad is down. Let go and it dies away over {{DEC}}; with {{SPRL}} up it spirals away, climbing
 octave on octave as it goes. {{SHIM}} is the same climb while you hold, and starts on pressure.
 <code>RPT</code> repeats the last slice of the beat ({{DIV}}); it starts with pressure shortening the slices, down

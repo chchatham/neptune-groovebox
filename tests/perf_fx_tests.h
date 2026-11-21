@@ -11,6 +11,7 @@
 #include "../src/ui/ScreenManager.h"
 #include "../src/ui/GrammarHooks.h"
 #include "../src/project/ProjectBridge.h"
+#include "fast_measure.h"
 
 // PERF: effects played from the pads, on any track or on the whole mix.
 class PerfFxTests : public juce::UnitTest
@@ -420,6 +421,89 @@ public:
             }
             expect(worst < 8.0f, "bounded: " + juce::String(worst));
             expectEquals(b.rack.getNonFiniteCount(), 0);
+        }
+
+        beginTest("DUB's tape: flat when quiet; when hot the treble gives way first, the octave appears, the pitch wavers");
+        {
+            const double sr = 48000.0;
+            // The first echo (TIME 0.25 s, no feedback) of one second of a sine: how loud `hz` comes back in it.
+            auto echo = [&](double hz, float level, float driv, float toneCell)
+            {
+                DubDelay dub;
+                dub.prepare(sr, 64);
+                dub.setParameter(DubDelay::Time, 0.25f);
+                dub.setParameter(DubDelay::Feedback, 0.0f);
+                dub.setParameter(DubDelay::Tone, toneCell);
+                dub.setParameter(DubDelay::DriveAmt, driv);
+                dub.reset();
+                Signal out((size_t) (1.5 * sr));
+                for (size_t i = 0; i < out.size(); ++i)
+                {
+                    float l = i < (size_t) sr ? level * (float) std::sin(6.283185307179586 * hz * (double) i / sr) : 0.0f, r = l;
+                    dub.process(l, r);
+                    out[i] = l;
+                }
+                return out;
+            };
+            auto level = [&](const Signal& x, double hz) { return std::sqrt(fastmeasure::goertzel(x, 24000, 24000, hz, sr)); };
+            // How much of its quiet gain a tone keeps when it is 40 times (32 dB) hotter.
+            auto kept = [&](double hz)
+            {
+                const double quiet = level(echo(hz, 0.01f, 0.5f, 0.7f), hz) / 0.01, hot = level(echo(hz, 0.4f, 0.5f, 0.7f), hz) / 0.4;
+                return hot / quiet;
+            };
+            const double bass = kept(300.0), treble = kept(6000.0);
+            logMessage("DUB tape: gain kept when hot, 300 Hz " + juce::String(bass, 3) + ", 6 kHz " + juce::String(treble, 3));
+            expect(bass < 0.9, "a hot repeat is squashed: " + juce::String(bass));
+            expect(treble < 0.7 * bass, "and its treble gives way first: " + juce::String(treble) + " against " + juce::String(bass));
+
+            {
+                // Quiet, the tape is flat: the pre-emphasis is undone on playback, and what is left is TONE's band.
+                // (Measured as a level, not in one narrow band: the wow spreads a 6 kHz tone over several hertz.)
+                const double a = rms(echo(6000.0, 0.005f, 0.0f, 0.7f), 24000, 48000) / rms(echo(300.0, 0.005f, 0.0f, 0.7f), 24000, 48000);
+                const double centre = 150.0 * std::pow(5000.0 / 150.0, 0.7);
+                auto band = [&](double hz)
+                {
+                    const double lp = centre * 2.2, hp = centre / 2.2;
+                    return (1.0 / std::sqrt(1.0 + (hz / lp) * (hz / lp))) * ((hz / hp) / std::sqrt(1.0 + (hz / hp) * (hz / hp)));
+                };
+                const double wanted = band(6000.0) / band(300.0);
+                logMessage("DUB tape: quiet 6 kHz against 300 Hz " + juce::String(a, 3) + ", the band alone " + juce::String(wanted, 3));
+                expect(a > 0.8 * wanted && a < 1.25 * wanted, "flat when quiet: " + juce::String(a) + " against " + juce::String(wanted));
+            }
+
+            {
+                // The lopsided curve: a driven 300 Hz tone comes back with its octave, a quiet one without.
+                const auto hot = echo(300.0, 0.4f, 0.5f, 0.7f), quiet = echo(300.0, 0.004f, 0.5f, 0.7f);
+                const double octaveHot = level(hot, 600.0) / level(hot, 300.0), octaveQuiet = level(quiet, 600.0) / level(quiet, 300.0);
+                const double thirdHot = level(hot, 900.0) / level(hot, 300.0);
+                logMessage("DUB tape: octave of a hot tone " + juce::String(octaveHot, 4) + " (third harmonic " + juce::String(thirdHot, 4) + "), of a quiet one " + juce::String(octaveQuiet, 5));
+                expect(octaveHot > 0.03, "even harmonics when driven: " + juce::String(octaveHot));
+                expect(thirdHot > 0.03, "and odd ones: " + juce::String(thirdHot));
+                expect(octaveQuiet < 0.005, "clean when quiet: " + juce::String(octaveQuiet));
+            }
+
+            for (float driv : { 0.0f, 1.0f })
+            {
+                // Wow and flutter: the phase of a steady quiet 100 Hz tone's echo, read every 20 ms, wanders.
+                const auto out = echo(100.0, 0.01f, driv, 0.0f);
+                double lo = 1.0e9, hi = -1.0e9;
+                for (size_t from = 14400; from + 960 <= 57600; from += 960)
+                {
+                    double c = 0.0, q = 0.0;
+                    for (size_t i = from; i < from + 960; ++i)
+                    {
+                        const double w = 6.283185307179586 * 100.0 * (double) i / sr;
+                        c += out[i] * std::cos(w); q += out[i] * std::sin(w);
+                    }
+                    const double phase = std::atan2(c, q);
+                    lo = std::min(lo, phase); hi = std::max(hi, phase);
+                }
+                // The echo time moves by up to 0.36 % (0.9 ms of 250) fully driven, about a third of that at rest.
+                logMessage("DUB tape: DRIV " + juce::String(driv, 0) + ", phase of a 100 Hz echo wanders over " + juce::String(hi - lo, 3) + " rad");
+                expect(hi - lo > (driv > 0.5f ? 0.3 : 0.1), "the transport is not steady: " + juce::String(hi - lo));
+                expect(hi - lo < (driv > 0.5f ? 1.4 : 0.5), "and not seasick: " + juce::String(hi - lo));
+            }
         }
 
         beginTest("DUB and FRZ at every corner of their cells: held, let go, ten seconds on - bounded, and dying unless FDBK is at the top");

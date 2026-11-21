@@ -709,7 +709,7 @@ EXTRA = [
     ("TIME", "Echo time / stop time", "PERF", "FX (DUB, STOP)", "seconds, or a division with SYNC", "DUB: the time between repeats. STOP: how long the tape takes to stop."),
     ("FDBK", "Feedback", "PERF", "FX (DUB)", "0–100", "How much of each repeat goes round again; the top of the range feeds on itself."),
     ("TONE", "Loop tone", "PERF", "FX (DUB)", "0–100", "Where the band filter in the echo's loop sits, low to high: every repeat is narrowed towards it."),
-    ("DRIV", "Loop drive", "PERF", "FX (DUB)", "0–100", "How hard the repeats are driven into saturation."),
+    ("DRIV", "Loop drive", "PERF", "FX (DUB)", "0–100", "How hard the repeats hit the tape: more squash and harmonics, more treble lost on every repeat, a less steady pitch."),
     ("GRAB", "Grab time", "PERF", "FX (FRZ)", "0.02–2 s", "How long the freeze listens after the press before it shuts its input."),
     ("SHIM", "Shimmer", "PERF", "FX (FRZ)", "0–100", "Octave-up feedback while the pad is held: the frozen sound climbs."),
     ("SPRL", "Spiral", "PERF", "FX (FRZ)", "0–100", "Octave-up feedback after the release: the sound spirals away upward as it dies."),

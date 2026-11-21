@@ -5,8 +5,8 @@ controls; no button cap is covered.
 
 | File | Paper | Skin |
 |---|---|---|
-| `overlay-letter.pdf` | US Letter, landscape | dark (matches the panel) |
-| `overlay-a4.pdf` | A4, landscape | dark |
+| `overlay-letter.pdf` | US Letter, landscape | black (for transparency film, or label stock) |
+| `overlay-a4.pdf` | A4, landscape | black |
 | `overlay-letter-light.pdf` | US Letter, landscape | light (saves ink; use it for the test fit) |
 | `overlay-a4-light.pdf` | A4, landscape | light |
 | `overlay.html` | source of all four | add `?paper=a4`, `?skin=light` or both |
@@ -21,9 +21,22 @@ Sheets 1 and 2 hold the pieces. Sheet 3 is for plain paper: where to put the rul
 1. Open the PDF in Preview or Acrobat (not the browser's own viewer if it only offers "Fit").
 2. Orientation: landscape. Scale: **100 %** / "Actual size". Switch off "Fit to page", "Scale to fit",
    "Shrink oversized pages" and borderless enlargement.
-3. Dark skin: best quality, and "print backgrounds" on if you print `overlay.html` from a browser.
+3. Black skin: best quality, and "print backgrounds" on if you print `overlay.html` from a browser.
 4. Lay a ruler on the print. The two red marks on every ruler are 100 mm apart; the inch ruler reads 8 in.
    Check both the horizontal and the upright ruler. If either is off, the scaling is still on.
+
+## Transparency film
+
+The black skin is made for it: each piece is solid black (`#000`), which is the only thing a print on clear
+film can use to hide the unit's own lettering. Nothing on a piece is white (a printer has no white ink, so
+white would be a clear hole): plain labels are yellow, Shift is orange, Func is blue.
+
+- Coloured ink on clear film is see-through: it tints what is under it and cannot be brighter than that. Over
+  the unit's black panel the yellow is the most visible of the colours, but expect it faint, the orange
+  fainter and the blue faintest. **Not tried on the unit.**
+- Choose the printer's transparency setting and its densest output; hold the print to a lamp, and if the black
+  lets light through, print a second sheet and stack the two.
+- The light version is of no use on film: its white is clear.
 
 ## Paper
 
@@ -36,7 +49,7 @@ Sheets 1 and 2 hold the pieces. Sheet 3 is for plain paper: where to put the rul
 
 ## Cut
 
-- Dashed grey lines are the cuts. On the dark skin the colour runs 1.5 mm past them (bleed); the short
+- Dashed grey lines are the cuts. On the black skin the colour runs 1.5 mm past them (bleed); the short
   black marks outside each corner give the same lines for a ruler and knife.
 - Faint grey outlines round each piece are the unit's own controls, drawn to show what the piece sits
   against. They fall away with the offcuts.
@@ -90,8 +103,8 @@ drawn marks are ones that need no explaining.
 
 | Mark | Meaning |
 |---|---|
-| white (black on the light skin) | the control by itself |
-| amber, solid diamond | with **Shift** held. The big diamond sits over the Shift key; a row or zone that is all Shift carries one diamond |
+| yellow (black on the light skin) | the control by itself |
+| orange (amber on the light skin), solid diamond | with **Shift** held. The big diamond sits over the Shift key; a row or zone that is all Shift carries one diamond |
 | blue, ring | with **Func** held. The big ring sits beside the Func key |
 | diamond and ring together | with Shift and Func held |
 | ▶ ● | Play, Record |
@@ -103,10 +116,10 @@ drawn marks are ones that need no explaining.
 
 **K — knobs and top pads.** A line rings knobs 1–4 and runs into the top row of the little 4 × 2 grid;
 another rings knobs 5–8 and runs into the bottom row: on grid screens knobs 1–4 turn the top row of cells,
-5–8 the bottom row. Over each top pad, in amber: the screen Shift + that pad opens. The line along the pads
+5–8 the bottom row. Over each top pad, in the Shift colour: the screen Shift + that pad opens. The line along the pads
 marks the beats of the sixteen steps (1, 5; on F2: 9, 13).
 
-**F2 — bottom pads.** Under each bottom pad, in amber: the screen Shift + that pad opens (pad 8 opens
+**F2 — bottom pads.** Under each bottom pad, in the Shift colour: the screen Shift + that pad opens (pad 8 opens
 nothing).
 
 **R — right margin.** ‹ › beside the two small buttons: KNOB PAGE back / on; with Func: JUMP (a section, or

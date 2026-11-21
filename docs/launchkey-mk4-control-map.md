@@ -312,8 +312,11 @@ and audio), `src/dsp/effects/PerfEffects.h` (the pads' own effects), `src/ui/scr
 - *FX*: nothing, the pads' own four, then the insert types (all but DUCK). Turning FX gives the layer that
   effect's starting values, its usual MODE and a starting pressure amount (one undo step for a turn through the
   list). Turning it to `--` empties the layer.
-  - DUB: echo with a band filter and saturation in its loop. TIME, FDBK (the top feeds on itself, held by the
-    saturation), TONE (where the band sits, 150 Hz - 5 kHz), DRIV. Starts in time (1/8D) with pressure on FDBK.
+  - DUB: tape echo with a band filter and the tape in its loop: record pre-emphasis, a lopsided saturation and
+    playback de-emphasis (a hot repeat comes back squashed, thicker by its octave and duller, the next one more
+    so), wow and flutter on the echo time. TIME, FDBK (the top feeds on itself, held by the tape), TONE (where
+    the band sits, 150 Hz - 5 kHz), DRIV (how hard the tape is hit; also how unsteady it runs). Starts in time
+    (1/8D) with pressure on FDBK.
   - FRZ: catches the sound for GRAB after the press, then holds it for as long as the pad is down; let go, it
     dies away in DEC. SHIM = octave-up feedback while held (pressure to start with), SPRL = octave-up feedback
     after the release: the held sound climbs away.

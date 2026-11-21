@@ -6,7 +6,7 @@
 <!--
   PRINTABLE OVERLAY ("SKIN") FOR THE LAUNCHKEY MINI 25 MK4 RUNNING NEPTUNE.
   Print at 100 % ("Actual size", never "Fit"), LANDSCAPE. Check a ruler on the sheet before cutting.
-    overlay.html                      Letter, dark skin         overlay.html?paper=a4            A4, dark skin
+    overlay.html                      Letter, black skin         overlay.html?paper=a4            A4, black skin
     overlay.html?skin=light           Letter, ink-saving        overlay.html?paper=a4&skin=light A4, ink-saving
   Everything is drawn by the script below from the DIMENSION TABLE that follows. To correct the fit,
   change a number in the table and reload. All values are millimetres from the top-left corner of the
@@ -92,7 +92,10 @@ const DIM = {
 </script>
 <style id="pagecss">@page { size: 279.4mm 215.9mm; margin: 0; }</style>
 <style>
-  :root { --panel: #131416; --ink: #F4F1EA; --shift: #FFB000; --func: #55C6F5; --dim: #8b8e92; --cut: #8a8a8a;
+  /* The dark skin is for transparency film: pure black, the only thing that hides the unit's own print, and no
+     white anywhere on a piece (a printer has no white ink: white would be a clear hole). Plain labels are
+     yellow, Shift is orange so that it stays apart from the yellow. */
+  :root { --panel: #000000; --ink: #FFE600; --shift: #FF7A00; --func: #55C6F5; --dim: #B39B00; --cut: #8a8a8a;
           --pw: 279.4mm; --ph: 215.9mm; }
   body.light { --panel: #ffffff; --ink: #111111; --shift: #B85400; --func: #005FB8; --dim: #777777; --cut: #9a9a9a; }
   body.a4 { --pw: 297mm; --ph: 210mm; }
@@ -441,7 +444,7 @@ function measure(svg, x, y, k) {
 function legend(svg, x, y) {
   const g = G(svg, `translate(${x},${y})`), k = C.ink, cw = 62, rh = 10.5;
   const items = [
-    [(g, x, y) => I.shift(g, x, y, 1.8), 'amber, diamond: with Shift held'], [(g, x, y) => I.func(g, x, y, 1.8), 'blue, ring: with Func held'], [(g, x, y) => { I.shift(g, x - 2, y, 1.4); I.func(g, x + 2, y, 1.4); }, 'with Shift and Func held'],
+    [(g, x, y) => I.shift(g, x, y, 1.8), LIGHT ? 'amber, diamond: with Shift held' : 'orange, diamond: with Shift held'], [(g, x, y) => I.func(g, x, y, 1.8), 'blue, ring: with Func held'], [(g, x, y) => { I.shift(g, x - 2, y, 1.4); I.func(g, x + 2, y, 1.4); }, 'with Shift and Func held'],
     [(g, x, y) => I.play(g, x, y, 4, k), 'Play'], [(g, x, y) => I.rec(g, x, y, 4, k), 'Record'], [(g, x, y) => { I.undo(g, x - 2.2, y, 4, C.fn); I.redo(g, x + 2.2, y, 4, C.fn); }, 'undo, redo'],
     [(g, x, y) => { I.chev(g, x - 1.4, y, 3.4, -1, k); I.chev(g, x + 1.4, y, 3.4, 1, k); }, 'back, on'], [(g, x, y) => I.rows(g, x, y, 6, 'top', k), 'the solid bar: that row of pads'],
     [(g, x, y) => { for (let i = 0; i < 4; i++) { FR(g, x - 4.2 + i * 2.2, y - 2.1, 1.8, 1.8, k, 0.2); FR(g, x - 4.2 + i * 2.2, y + 0.3, 1.8, 1.8, k, 0.2); } }, 'the eight cells of a grid screen']
