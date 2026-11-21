@@ -56,6 +56,8 @@ int main()
         o->setProperty("name", juce::String(AudioEngine::effectTypeName((EffectType) t)));
         juce::Array<juce::var> a;
         for (int i = 0; i < 4; ++i) a.add(specVar(e->getParamSpec(i)));
+        for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)                    // the cells of page FX2
+            if (e->getExtraSpec(i).isValid()) a.add(specVar(e->getExtraSpec(i)));
         o->setProperty("specs", a);
         fx.add(juce::var(o));
     }

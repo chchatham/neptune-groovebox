@@ -48,14 +48,13 @@ public:
 
     static ParamPage page()
     {
-        static const char* const types[] = { "SOFT", "HARD", "FOLD", "ASYM" };
         ParamPage p;
         p.name = "DIRT";
         p.section = "FX";
         const int b = TrackFxParam::DIRT_BASE;
         p.params = {{
             { "DRIV", b + Drive, 0, 1, 0 },
-            { "TYPE", b + Type, 0, 3, 0, ParamKind::Choice, "", types, 4 },
+            { "TYPE", b + Type, 0, (float) (sat::Count - 1), 0, ParamKind::Choice, "", sat::names(), sat::Count },
             { "BITS", b + Bits, 0, 1, 0 },                              // bit crusher
             { "RATE", b + Rate, 0, 1, 0 },                              // sample-rate reducer
             { "FDBK", b + Feedback, 0, 1, 0 },                          // tuned feedback amount

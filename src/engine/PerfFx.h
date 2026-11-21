@@ -79,8 +79,10 @@ namespace PerfFx
         // How far each value moves, -1..1 of its range: [0..3] the cells, [4] WET.
         std::array<float, VALUES> press { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };          // while the pad is down
         std::array<float, VALUES> pressure { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };       // with the pad's pressure
+        // The effect's cells beyond its four (EffectBase::getExtraSpec): set, not played.
+        std::array<float, EffectBase::MAX_EXTRAS> extra { 0.0f, 0.0f, 0.0f, 0.0f };
     };
-    static constexpr int LAYER_FIELDS = 20;
+    static constexpr int LAYER_FIELDS = 20 + EffectBase::MAX_EXTRAS;
 
     struct Setting
     {
@@ -155,6 +157,12 @@ public:
         auto& s = slotOf(pad, layer);
         return (s.fx && cell >= 0 && cell < 4) ? s.fx->getParamSpec(cell) : ParamSpec();
     }
+    // Its cells beyond the four (EffectBase::getExtraSpec).
+    ParamSpec extraSpec(int pad, int layer, int index) const
+    {
+        auto& s = slotOf(pad, layer);
+        return s.fx ? s.fx->getExtraSpec(index) : ParamSpec();
+    }
     // The cell the effect locks to the tempo (its TIME or RATE), or -1.
     int syncCell(int pad, int layer) const { auto& s = slotOf(pad, layer); return s.fx ? s.fx->getSyncParamIndex() : -1; }
     bool canSync(int pad, int layer) const { return syncCell(pad, layer) >= 0; }
@@ -208,6 +216,8 @@ public:
             {
                 const ParamSpec spec = fx->getParamSpec(i);
                 fresh.cell[(size_t) i] = spec.isValid() ? spec.defaultVal : 0.0f;
+                const ParamSpec more = fx->getExtraSpec(i);
+                fresh.extra[(size_t) i] = more.isValid() ? more.defaultVal : 0.0f;
                 const std::string label(spec.isValid() && spec.label != nullptr ? spec.label : "");
                 if (label == "MIX") hasMixCell = true;
                 if (! routed && (label == "DPTH" || label == "CUT" || label == "SHIM"
@@ -324,6 +334,7 @@ public:
                                     l.sync ? 1.0f : 0.0f, (float) l.division });
                 v.insert(v.end(), l.press.begin(), l.press.end());
                 v.insert(v.end(), l.pressure.begin(), l.pressure.end());
+                v.insert(v.end(), l.extra.begin(), l.extra.end());
             }
         }
         return v;
@@ -373,6 +384,9 @@ public:
                     p.press[(size_t) i] = f(10 + i, 0);
                     p.pressure[(size_t) i] = f(15 + i, 0);
                 }
+                // (A list from before the extra cells: each keeps the value its kind starts with.)
+                for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+                    p.extra[(size_t) i] = f(20 + i, p.extra[(size_t) i]);
             }
             set(pad, s);
         }
@@ -471,6 +485,7 @@ private:
             std::atomic<bool> sync { false };
             std::atomic<float> wet { 1.0f };
             std::array<std::atomic<float>, 4> cell;
+            std::array<std::atomic<float>, EffectBase::MAX_EXTRAS> extra;
             std::array<std::atomic<float>, PerfFx::VALUES> press, pressure;
         } live;
         std::atomic<int> where { PerfFx::NOWHERE };
@@ -483,6 +498,7 @@ private:
         int target = PerfFx::NOWHERE;
         float env = 0.0f, wetNow = 1.0f;
         std::array<float, 4> applied;
+        std::array<float, EffectBase::MAX_EXTRAS> appliedExtra;
         int appliedDivision = -1;
         int quietSamples = 0;
 
@@ -497,6 +513,7 @@ private:
         void forgetApplied()
         {
             applied.fill(std::numeric_limits<float>::quiet_NaN());
+            appliedExtra.fill(std::numeric_limits<float>::quiet_NaN());
             appliedDivision = -1;
         }
 
@@ -518,6 +535,8 @@ private:
             live.wet = l.wet;
             for (int i = 0; i < 4; ++i)
                 live.cell[(size_t) i] = l.cell[(size_t) i];
+            for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+                live.extra[(size_t) i] = l.extra[(size_t) i];
             for (int i = 0; i < PerfFx::VALUES; ++i)
             {
                 live.press[(size_t) i] = l.press[(size_t) i];
@@ -603,6 +622,14 @@ private:
             else if (! std::isfinite(c))     c = spec.defaultVal;
             else                             c = spec.isDiscrete() ? std::round(spec.clamp(c)) : spec.clamp(c);
         }
+        for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+        {
+            const ParamSpec spec = s.fx ? s.fx->getExtraSpec(i) : ParamSpec();
+            float& c = p.extra[(size_t) i];
+            if (! spec.isValid())            c = 0.0f;
+            else if (! std::isfinite(c))     c = spec.defaultVal;
+            else                             c = spec.isDiscrete() ? std::round(spec.clamp(c)) : spec.clamp(c);
+        }
         p.sync = p.sync && s.fx && s.fx->canSync();
         p.division = juce::jlimit(0, FxSync::NUM_DIVISIONS - 1, p.division);
         return p;
@@ -635,6 +662,15 @@ private:
             {
                 s.applied[(size_t) i] = v;
                 fx.setUserParameter(i, v);
+            }
+        }
+        for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+        {
+            const float v = s.live.extra[(size_t) i].load(std::memory_order_relaxed);
+            if (v != s.appliedExtra[(size_t) i])
+            {
+                s.appliedExtra[(size_t) i] = v;
+                fx.setExtra(i, v);
             }
         }
         s.wetNow = juce::jlimit(0.0f, 1.0f, s.live.wet.load(std::memory_order_relaxed) + moveOf(PerfFx::WET_VALUE));

@@ -5,10 +5,11 @@
 #include "PanelDimensions.h"
 
 // The printed overlay ("skin"), drawn on the on-screen panel: the six pieces of docs/overlay/overlay.html
-// in their places, with the same words, colours and marks. This is a port of that file's script (the
+// in their places, with the same words and marks. This is a port of that file's script (the
 // PIECES and ART sections): every label, size and position is the script's, in millimetres. Change the
 // overlay there first, then here; the "Panel Dimensions" test checks the numbers and the words.
-//   white = the control alone; amber with a diamond = with Shift; blue with a ring = with Func.
+//   white = the control alone; amber with a diamond = with Shift; blue with a ring = with Func. These are the
+//   screen's own colours (and the lit controls'), on purpose not the film skin's: the print has no white.
 class PanelOverlay
 {
 public:

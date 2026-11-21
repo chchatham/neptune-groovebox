@@ -427,7 +427,7 @@ public:
         {
             const double sr = 48000.0;
             // The first echo (TIME 0.25 s, no feedback) of one second of a sine: how loud `hz` comes back in it.
-            auto echo = [&](double hz, float level, float driv, float toneCell)
+            auto echo = [&](double hz, float amp, float driv, float toneCell)
             {
                 DubDelay dub;
                 dub.prepare(sr, 64);
@@ -439,20 +439,18 @@ public:
                 Signal out((size_t) (1.5 * sr));
                 for (size_t i = 0; i < out.size(); ++i)
                 {
-                    float l = i < (size_t) sr ? level * (float) std::sin(6.283185307179586 * hz * (double) i / sr) : 0.0f, r = l;
+                    float l = i < (size_t) sr ? amp * (float) std::sin(6.283185307179586 * hz * (double) i / sr) : 0.0f, r = l;
                     dub.process(l, r);
                     out[i] = l;
                 }
                 return out;
             };
             auto level = [&](const Signal& x, double hz) { return std::sqrt(fastmeasure::goertzel(x, 24000, 24000, hz, sr)); };
-            // How much of its quiet gain a tone keeps when it is 40 times (32 dB) hotter.
-            auto kept = [&](double hz)
-            {
-                const double quiet = level(echo(hz, 0.01f, 0.5f, 0.7f), hz) / 0.01, hot = level(echo(hz, 0.4f, 0.5f, 0.7f), hz) / 0.4;
-                return hot / quiet;
-            };
-            const double bass = kept(300.0), treble = kept(6000.0);
+            // How much of its quiet gain a tone keeps when it is 100 times (40 dB) hotter.
+            const float QUIET = 0.004f, HOT = 0.4f;
+            auto kept = [&](const Signal& quiet, const Signal& hot, double hz) { return (level(hot, hz) / HOT) / (level(quiet, hz) / QUIET); };
+            const auto quiet300 = echo(300.0, QUIET, 0.5f, 0.7f), hot300 = echo(300.0, HOT, 0.5f, 0.7f);
+            const double bass = kept(quiet300, hot300, 300.0), treble = kept(echo(6000.0, QUIET, 0.5f, 0.7f), echo(6000.0, HOT, 0.5f, 0.7f), 6000.0);
             logMessage("DUB tape: gain kept when hot, 300 Hz " + juce::String(bass, 3) + ", 6 kHz " + juce::String(treble, 3));
             expect(bass < 0.9, "a hot repeat is squashed: " + juce::String(bass));
             expect(treble < 0.7 * bass, "and its treble gives way first: " + juce::String(treble) + " against " + juce::String(bass));
@@ -474,35 +472,29 @@ public:
 
             {
                 // The lopsided curve: a driven 300 Hz tone comes back with its octave, a quiet one without.
-                const auto hot = echo(300.0, 0.4f, 0.5f, 0.7f), quiet = echo(300.0, 0.004f, 0.5f, 0.7f);
-                const double octaveHot = level(hot, 600.0) / level(hot, 300.0), octaveQuiet = level(quiet, 600.0) / level(quiet, 300.0);
-                const double thirdHot = level(hot, 900.0) / level(hot, 300.0);
+                const double octaveHot = level(hot300, 600.0) / level(hot300, 300.0), octaveQuiet = level(quiet300, 600.0) / level(quiet300, 300.0);
+                const double thirdHot = level(hot300, 900.0) / level(hot300, 300.0);
                 logMessage("DUB tape: octave of a hot tone " + juce::String(octaveHot, 4) + " (third harmonic " + juce::String(thirdHot, 4) + "), of a quiet one " + juce::String(octaveQuiet, 5));
                 expect(octaveHot > 0.03, "even harmonics when driven: " + juce::String(octaveHot));
                 expect(thirdHot > 0.03, "and odd ones: " + juce::String(thirdHot));
                 expect(octaveQuiet < 0.005, "clean when quiet: " + juce::String(octaveQuiet));
             }
 
-            for (float driv : { 0.0f, 1.0f })
+            // Wow and flutter: the phase of a steady quiet 100 Hz tone's echo, read every 20 ms, wanders. The echo
+            // time moves by up to 0.36 % (0.9 ms of 250) fully driven, about a third of that at rest.
+            struct { float driv; double least, most; } const transports[] = { { 0.0f, 0.1, 0.5 }, { 1.0f, 0.3, 1.4 } };
+            for (const auto& t : transports)
             {
-                // Wow and flutter: the phase of a steady quiet 100 Hz tone's echo, read every 20 ms, wanders.
-                const auto out = echo(100.0, 0.01f, driv, 0.0f);
+                const auto out = echo(100.0, 0.01f, t.driv, 0.0f);
                 double lo = 1.0e9, hi = -1.0e9;
                 for (size_t from = 14400; from + 960 <= 57600; from += 960)
                 {
-                    double c = 0.0, q = 0.0;
-                    for (size_t i = from; i < from + 960; ++i)
-                    {
-                        const double w = 6.283185307179586 * 100.0 * (double) i / sr;
-                        c += out[i] * std::cos(w); q += out[i] * std::sin(w);
-                    }
-                    const double phase = std::atan2(c, q);
+                    const double phase = fastmeasure::phase(out, from, 960, 100.0, sr);
                     lo = std::min(lo, phase); hi = std::max(hi, phase);
                 }
-                // The echo time moves by up to 0.36 % (0.9 ms of 250) fully driven, about a third of that at rest.
-                logMessage("DUB tape: DRIV " + juce::String(driv, 0) + ", phase of a 100 Hz echo wanders over " + juce::String(hi - lo, 3) + " rad");
-                expect(hi - lo > (driv > 0.5f ? 0.3 : 0.1), "the transport is not steady: " + juce::String(hi - lo));
-                expect(hi - lo < (driv > 0.5f ? 1.4 : 0.5), "and not seasick: " + juce::String(hi - lo));
+                logMessage("DUB tape: DRIV " + juce::String(t.driv, 0) + ", phase of a 100 Hz echo wanders over " + juce::String(hi - lo, 3) + " rad");
+                expect(hi - lo > t.least, "the transport is not steady: " + juce::String(hi - lo));
+                expect(hi - lo < t.most, "and not seasick: " + juce::String(hi - lo));
             }
         }
 
@@ -950,7 +942,7 @@ public:
             expectEquals(rack.get(2, 0).kind, (int) DUB);
             expect(rack.get(9).empty());
             // More fields and more layers than this build knows (a later one's file): the known ones are read.
-            std::vector<float> wider { 2.0f, 1.0f, 1.0f, 6.0f, 5.0f, 23.0f };
+            std::vector<float> wider { 2.0f, 1.0f, 1.0f, 6.0f, 5.0f, (float) (LAYER_FIELDS + 3) };
             const auto padAt = good.begin() + (long) (head + 2 * perPad);
             wider.insert(wider.end(), padAt, padAt + PAD_FIELDS);
             wider.insert(wider.end(), { 9.0f, 9.0f });

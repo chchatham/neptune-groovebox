@@ -94,7 +94,7 @@ namespace GrammarHooks
             return (target >= AudioEngine::EFFECT_PARAM_BASE
                     && target < ProjectBridge::INSERT_TYPE_BASE + AudioEngine::MAX_INSERTS_PER_TRACK)
                 || TrackFxParam::isTrackFxParam(target) || AudioEngine::isArpLockParam(target)
-                || AudioEngine::isInsertSwitchParam(target);
+                || AudioEngine::isInsertSwitchParam(target) || AudioEngine::isInsertExtraParam(target);
         };
         // Cleared: the three blocks at their defaults (off), no insert slots, the arp locks off.
         h.fxDefaults = [](ParamMap& sound)

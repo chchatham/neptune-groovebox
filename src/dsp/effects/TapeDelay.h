@@ -82,8 +82,7 @@ public:
         for (auto* f : { &lpL, &lpR, &hpL, &hpR })
             f->reset();
         timeSmooth.snap(timeSec);
-        wowPhase = 0.0;
-        flutterPhase = 0.0;
+        transport.reset();
     }
 
     void process(float& left, float& right) override
@@ -95,14 +94,7 @@ public:
 
         float mod = 0.0f;
         if (age > 0.0f)
-        {
-            mod = age * (WOW_DEPTH * (float) std::sin(wowPhase * dsp::TWO_PI_D)
-                         + FLUTTER_DEPTH * (float) std::sin(flutterPhase * dsp::TWO_PI_D));
-            wowPhase += WOW_HZ / sampleRate;
-            if (wowPhase >= 1.0) wowPhase -= 1.0;
-            flutterPhase += FLUTTER_HZ / sampleRate;
-            if (flutterPhase >= 1.0) flutterPhase -= 1.0;
-        }
+            mod = age * transport.next(sampleRate);      // (full depth at AGE 1)
 
         float d = timeSmooth.next(timeSec) * (float) sampleRate * (1.0f + mod);
 
@@ -119,10 +111,6 @@ public:
 
 private:
     static constexpr float MAX_LOOP_GAIN = 1.1f;
-    static constexpr double WOW_HZ = 0.6;
-    static constexpr double FLUTTER_HZ = 7.0;
-    static constexpr float WOW_DEPTH = 0.003f;       // fraction of the delay time at AGE 1
-    static constexpr float FLUTTER_DEPTH = 0.0006f;
 
     // What goes onto the tape: soft saturation, unity gain for small signals, never beyond
     // +/- 1 / drive.
@@ -149,6 +137,5 @@ private:
     fxb::DelayLine lineL, lineR;
     fxb::OnePole lpL, lpR, hpL, hpR;
     fxb::Smoother timeSmooth;
-    double wowPhase = 0.0;
-    double flutterPhase = 0.0;
+    fxb::TapeTransport transport;
 };

@@ -2,6 +2,7 @@
 
 #include "EffectBase.h"
 #include "FxBlocks.h"
+#include "../Saturation.h"
 #include <array>
 
 // Guitar-amp style model built from standard stages (the usual amp-simulation chain described in
@@ -28,12 +29,13 @@
 // TONE  -1..+1: dark (bass up, treble down) .. bright (bass down, treble up), +/- 9 dB
 // CAB   speaker roll-off frequency
 // LEVL  output level in dB
+// SAT   (second page) the curve of both clipping stages: any of src/dsp/Saturation.h, TANH to start with
 class AmpSim : public EffectBase
 {
 public:
     enum Param { Gain = 0, Tone, Cab, Level };
 
-    AmpSim() { prepare(44100.0, 0); }
+    AmpSim() { stage2Curve.set(sat::Tanh, BIAS); prepare(44100.0, 0); }
 
     ParamSpec getParamSpec(int index) const override
     {
@@ -47,6 +49,17 @@ public:
             default: return {};
         }
     }
+
+    ParamSpec getExtraSpec(int index) const override
+    {
+        if (index != 0) return {};
+        return { "SAT", 0, 0, (float) (sat::Count - 1), (float) sat::Tanh, ParamKind::Choice, "", sat::names(), sat::Count };
+    }
+    void setExtra(int index, float value) override
+    {
+        if (index == 0 && std::isfinite(value)) stage2Curve.set((int) std::lround(value), BIAS);
+    }
+    float getExtra(int index) const override { return index == 0 ? (float) stage2Curve.curve : 0.0f; }
 
     void setParameter(int id, float value) override
     {
@@ -134,8 +147,9 @@ public:
         float level = levelSmooth.next(dsp::dbToLinear(levelDb));
         float stage2 = 1.0f + 3.0f * gain;
 
-        left = processChannel(ch[0], left, drive, stage2) * level;
-        right = processChannel(ch[1], right, drive, stage2) * level;
+        const sat::Biased curve = stage2Curve;
+        left = processChannel(ch[0], left, drive, stage2, curve) * level;
+        right = processChannel(ch[1], right, drive, stage2, curve) * level;
     }
 
 private:
@@ -165,14 +179,13 @@ private:
         }
     }
 
-    static float clipStages(Channel& c, float x, float stage2)
+    static float clipStages(Channel& c, float x, float stage2, const sat::Biased& curve)
     {
-        static const float biasOut = std::tanh(BIAS);
-        float y = c.interstage.lowPass(std::tanh(x));
-        return std::tanh(y * stage2 + BIAS) - biasOut;   // asymmetric; exactly 0 for 0 in
+        float y = c.interstage.lowPass(sat::shape(curve.curve, x));
+        return curve(y * stage2);                       // worked off-centre: asymmetric; exactly 0 for 0 in
     }
 
-    static float processChannel(Channel& c, float x, float drive, float stage2)
+    static float processChannel(Channel& c, float x, float drive, float stage2, const sat::Biased& curve)
     {
         x = c.inputHp.process(x) * drive;
 
@@ -180,8 +193,8 @@ private:
         // every other sample.
         float a = c.up[1].process(c.up[0].process(2.0f * x));
         float b = c.up[1].process(c.up[0].process(0.0f));
-        a = clipStages(c, a, stage2);
-        b = clipStages(c, b, stage2);
+        a = clipStages(c, a, stage2, curve);
+        b = clipStages(c, b, stage2, curve);
         float y = c.down[1].process(c.down[0].process(a));
         c.down[1].process(c.down[0].process(b));
 
@@ -193,6 +206,7 @@ private:
     }
 
     float gain = 0.4f;
+    sat::Biased stage2Curve;       // SAT, worked at BIAS for the second stage; the first uses it centred
     float tone = 0.0f;
     float cabHz = 4500.0f;
     float levelDb = 0.0f;

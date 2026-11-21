@@ -28,7 +28,8 @@
 //          each value for as long as the pad is down (-100 .. +100 of its range).
 //   PRES   what pressure does. CURV: how it answers. Knobs 4 - 8: how far full pressure moves WET
 //          and each value.
-//   MORE   SYNC and DIV lock the layer's effect to the tempo; CLR empties the pad (four clicks).
+//   MORE   SYNC and DIV lock the layer's effect to the tempo; knobs 3-6 are the effect's cells beyond its
+//          four (the dub echo's SAT); CLR empties the pad (four clicks).
 // LTCH, QNT and CURV are the pad's; everything else is the shown layer's.
 // Copy / clear / paste act on the shown pad, all its layers. FX, CLR, clear and paste are undo steps.
 // Pad lights: the colour of the pad's first effect; dim = waiting, full = down, half = ringing.
@@ -429,6 +430,17 @@ private:
                              [lay] { return lay().sync ? 1.0f : 0.0f; },
                              [this](float v) { if (canBeInTime()) change([v](PerfFx::Layer& l) { l.sync = v > 0.5f; }); });
         more.cells[1] = divisionCell("DIV", 1);
+        // The effect's cells beyond its four (the dub echo's SAT, the amp's): knobs 3-6.
+        for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+        {
+            ParamSpec spec = rack.extraSpec(shown, layer, i);
+            if (! spec.isValid())
+                continue;
+            spec.id = 2 + i;
+            more.cells[(size_t) (2 + i)] = cell(spec,
+                              [lay, i] { return lay().extra[(size_t) i]; },
+                              [this, i](float v) { change([v, i](PerfFx::Layer& l) { l.extra[(size_t) i] = v; }); });
+        }
         static const char* const clearNames[] = { ">>>>" };
         more.cells[7] = cell({ "CLR", 7, 0, 0, 0, K::Choice, "", clearNames, 1 },
                              [] { return 0.0f; }, [](float) {},

@@ -171,7 +171,7 @@ namespace ProjectBridge
         // Stale insert-slot entries are rebuilt below.
         for (auto it = out.begin(); it != out.end();)
             it = ((it->first >= AudioEngine::EFFECT_PARAM_BASE && it->first < TrackFxParam::DIRT_BASE)
-                  || AudioEngine::isInsertSwitchParam(it->first)) ? out.erase(it) : std::next(it);
+                  || AudioEngine::isInsertSwitchParam(it->first) || AudioEngine::isInsertExtraParam(it->first)) ? out.erase(it) : std::next(it);
 
         if (auto* engine = live.audio.getEngine(t))
             for (auto& page : engine->getParamPages())
@@ -210,6 +210,12 @@ namespace ProjectBridge
             for (int p = 0; p < 4; ++p)
                 out[AudioEngine::EFFECT_PARAM_BASE + slot * 4 + p] =
                     live.audio.getTrackParameter(t, AudioEngine::EFFECT_PARAM_BASE + slot * 4 + p);
+            // (Only the extra cells the effect has: a file from before them reads the same as one without.)
+            if (auto* chain = live.audio.getInsertChain(t))
+                if (auto* fx = const_cast<EffectChain*>(chain)->getEffect(slot))
+                    for (int p = 0; p < EffectBase::MAX_EXTRAS; ++p)
+                        if (fx->getExtraSpec(p).isValid())
+                            out[AudioEngine::INSERT_EXTRA_BASE + slot * EffectBase::MAX_EXTRAS + p] = fx->getExtra(p);
         }
         return out;
     }

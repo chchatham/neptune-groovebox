@@ -38,6 +38,10 @@ namespace fastmeasure
     // (the sampler suites' pitch and spectrum measurements).
     double goertzel(const std::vector<float>& x, size_t from, size_t n, double hz, double sampleRate);
 
+    // Phase in radians of `hz` in x[from, from + n), by projection on its sine and cosine (how far an
+    // echo's timing wanders: "Perf FX").
+    double phase(const std::vector<float>& x, size_t from, size_t n, double hz, double sampleRate);
+
     // Level of harmonic h of `hz` in x, by projection on its sine and cosine ("Wavetable Embed").
     double harmonic(const std::vector<float>& x, double hz, int h, double sampleRate);
 

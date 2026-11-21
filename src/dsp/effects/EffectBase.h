@@ -81,6 +81,15 @@ public:
     // native range.
     virtual ParamSpec getParamSpec(int /*index*/) const { return {}; }
 
+    // Cells beyond the four: an effect with more to set describes up to MAX_EXTRAS further cells
+    // (index 0..3), shown on the second page of its slot (TRK FX "FX2", PERF "MORE"). Same rules as
+    // the four: native range, set and read back truly. They are not moved by tempo sync, nor by a
+    // PERF pad's press or pressure.
+    static constexpr int MAX_EXTRAS = 4;
+    virtual ParamSpec getExtraSpec(int /*index*/) const { return {}; }
+    virtual void setExtra(int /*index*/, float /*value*/) {}
+    virtual float getExtra(int /*index*/) const { return 0.0f; }
+
     // ---- Tempo sync ---------------------------------------------------------------------------
     // An effect whose four parameters include a delay TIME (seconds) or an LFO RATE (Hz) can lock
     // it to a division of the tempo. While synced the division sets that parameter and the knob's

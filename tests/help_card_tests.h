@@ -754,7 +754,7 @@ public:
             names.clear();
             pads = r.card(Key::Func, 1);
             for (auto& l : pads.padRows[0].labels) names.add(l.text);
-            expectEquals(names.joinIntoString(" ").trim(), juce::String("TRCK ARPL DIRT TALK MDFX FX"));
+            expectEquals(names.joinIntoString(" ").trim(), juce::String("TRCK ARPL DIRT TALK MDFX FX FX2"));
         }
 
         beginTest("FUNC: EDIT says what copy / clear / paste act on, and that is what they then do (every screen, with and without a held step)");

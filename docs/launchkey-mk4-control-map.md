@@ -329,7 +329,8 @@ and audio), `src/dsp/effects/PerfEffects.h` (the pads' own effects), `src/ui/scr
   1/4 BAR: while the sequencer plays a press takes hold on the next of these, to the sample; stopped, at once),
   then the press amounts for WET and the four values. **PRES** (name bar: PRESSURE) = CURV (LIN / SOFT / HARD)
   and the pressure amounts for WET and the four values. **MORE** = SYNC + DIV (the layer's TIME or RATE as a
-  division of the tempo; `NO TIME CELL` where the effect has none), CLR (four clicks: empties the pad, all
+  division of the tempo; `NO TIME CELL` where the effect has none), knobs 3-6 = the effect's cells beyond its
+  four (DUB: SAT, the tape's saturation curve), CLR (four clicks: empties the pad, all
   layers). LTCH, QNT and CURV belong to the pad; everything else to the shown layer. A knob with nothing drawn
   over it does nothing.
 - *Edits*: Func + Record / Play / > copy, clear and paste the shown pad (all layers, targets and all); FX, CLR,
@@ -447,10 +448,16 @@ second** the bottom-row pad of the screen you are already on (DRUMS, CHORD or SC
 playing with pressure on every other screen until the same gesture unpins them. A quick press does nothing (it was
 too easy to do by accident). A PIN tag shows in the name bar.
 
+**Saturation curves** (`src/dsp/Saturation.h`; the index is stored, the list only grows at the end): SOFT HARD
+FOLD ASYM TANH FAST ATAN ALGB SLOW CUBE DIOD TUBE TRI RECT HALF XOVR EVEN CHB3. Offered by the waveshaper insert
+(CURV; ASYM works any curve off-centre for even harmonics), the DIRT block (TYPE), the amp insert (SAT on FX2,
+both stages; starts on TANH) and the dub echo (SAT on PERF's MORE page; starts on FAST). What each does to a
+sine is printed by the "Saturation" tests.
+
 **Screens.** Shift + top row: 1 PARAM (the engine's own pages only; a drum track shows one DR page that follows the
 selected pad), 2 TRACKS (paged mixer: VOL, PAN, SND1, SND2, ENG — knob N = track N; on ENG the knob chooses a pending
-engine and that track's top pad commits it), 3 TRK FX (TRACK, ARPLK, DIRT, TALK, MODFX, FX — the same six pages on
-every track), 4 STEP, 5 PRESET (pads play the track; with AU on, scrolling auditions and the previous sound returns
+engine and that track's top pad commits it), 3 TRK FX (TRACK, ARPLK, DIRT, TALK, MODFX, FX, FX2 — the same seven pages on
+every track; FX2 = SLOT, TYPE and, under knobs 5-8, the slot's cells beyond its four: the amp's SAT), 4 STEP, 5 PRESET (pads play the track; with AU on, scrolling auditions and the previous sound returns
 unless LD is used), 6 SONG, 7 SETTINGS, 8 AT ROUTE (per track; destinations from that track's engine). Bottom row:
 1 STEP, 2 DRUMS, 3 CHORD, 4 SCALE, 5 WAVE, 6 FLTR. The name bar shows "T n" on every screen. Bar screens show the full
 name and value of the knob just turned in the name bar. The 4 × 2 grid stays.

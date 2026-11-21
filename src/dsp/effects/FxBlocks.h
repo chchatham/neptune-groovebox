@@ -19,7 +19,30 @@ inline float flushDenormal(float x) { return std::abs(x) < 1.0e-15f ? 0.0f : x; 
 // Bounded, monotonic saturator: the project's tanh approximation (dsp::fastTanh) is only tanh-like
 // for |x| <= 3 (beyond that it grows as x / 9), so the input is clamped there. At 3 it reaches
 // exactly 1 with zero slope, which makes the clamp seamless. Output is always within -1..1.
-inline float softSat(float x) { return dsp::fastTanh(std::clamp(x, -3.0f, 3.0f)); }
+constexpr float softSat(float x) { return dsp::fastTanh(std::clamp(x, -3.0f, 3.0f)); }
+
+// A tape transport's unsteadiness: slow wow and faster flutter, as a share of the delay time (to be
+// scaled by the caller, then delay *= 1 + that). The arithmetic is TapeDelay's, moved here unchanged.
+struct TapeTransport
+{
+    static constexpr double WOW_HZ = 0.6, FLUTTER_HZ = 7.0;
+    static constexpr float WOW_DEPTH = 0.003f, FLUTTER_DEPTH = 0.0006f;
+
+    void reset() { wowPhase = flutterPhase = 0.0; }
+
+    float next(double sampleRate)
+    {
+        const float mod = WOW_DEPTH * (float) std::sin(wowPhase * dsp::TWO_PI_D)
+                        + FLUTTER_DEPTH * (float) std::sin(flutterPhase * dsp::TWO_PI_D);
+        wowPhase += WOW_HZ / sampleRate;
+        if (wowPhase >= 1.0) wowPhase -= 1.0;
+        flutterPhase += FLUTTER_HZ / sampleRate;
+        if (flutterPhase >= 1.0) flutterPhase -= 1.0;
+        return mod;
+    }
+
+    double wowPhase = 0.0, flutterPhase = 0.0;
+};
 
 // One-pole parameter smoother (exponential approach, y += a (target - y)).
 struct Smoother

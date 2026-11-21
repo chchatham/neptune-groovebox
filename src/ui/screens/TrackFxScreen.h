@@ -26,7 +26,7 @@ public:
 
     static constexpr int NUM_PAGES = 6;
 
-    // One page key per page (six pages, eight keys).
+    // One page key per page (seven pages, eight keys).
     int getPageKeyCount() const override { return ready() ? juce::jmin(8, (int) pages.size()) : 0; }
     void onPageKey(int index) override { if (ready() && index >= 0 && index < (int) pages.size()) goToPage(index); }
     int getActivePageKey() const override { return currentPageIndex; }
@@ -50,12 +50,20 @@ protected:
         fx.name = "FX";
         fx.section = "FX";
         out.push_back(fx);     // cells are resolved in resolvePage()
+
+        // The same slot's cells beyond its four (an effect that has none leaves the lower row empty).
+        ParamPage more;
+        more.name = "FX2";
+        more.section = "FX";
+        out.push_back(more);
     }
 
     void resolvePage(ParamPage& page) const override
     {
         if (page.name == "FX")
             fillFxPage(page);
+        else if (page.name == "FX2")
+            fillFxExtraPage(page);
     }
 
     // Every track has these pages. An insert effect's own cells only mean the same thing on a
@@ -66,7 +74,7 @@ protected:
             return false;
         const bool slotCell = spec.id == FX_ON || spec.id == FX_WET
                            || (spec.id >= AudioEngine::EFFECT_PARAM_BASE && spec.id < AudioEngine::EFFECT_PARAM_BASE + AudioEngine::MAX_INSERTS_PER_TRACK * 4)
-                           || AudioEngine::isInsertSwitchParam(spec.id);
+                           || AudioEngine::isInsertSwitchParam(spec.id) || AudioEngine::isInsertExtraParam(spec.id);
         if (!slotCell || audioEngine == nullptr)
             return true;
         EffectType a, b;
@@ -164,7 +172,10 @@ protected:
                 }
                 // The slot's stored parameter values belonged to the previous effect.
                 for (int i = 0; i < 4; ++i)
+                {
                     track.soundParams.erase(AudioEngine::EFFECT_PARAM_BASE + fxSelectedSlot * 4 + i);
+                    track.soundParams.erase(AudioEngine::INSERT_EXTRA_BASE + fxSelectedSlot * EffectBase::MAX_EXTRAS + i);
+                }
                 return true;
             }
             case FX_ON:
@@ -327,6 +338,23 @@ private:
                 page.params[(size_t) (4 + i)] = spec;
             }
         }
+    }
+
+    // FX2: the slot and its type again (so the page says what it belongs to), then the extra cells.
+    void fillFxExtraPage(ParamPage& page) const
+    {
+        const int trackIdx = sequencer->getSelectedTrack();
+        int maxSlot = juce::jmin(insertCount(trackIdx), AudioEngine::MAX_INSERTS_PER_TRACK - 1);
+        page.params[0] = { "SLOT", FX_SLOT, 0, (float) maxSlot, 0, ParamKind::Int };
+        page.params[1] = { "TYPE", FX_TYPE, 0, (float) (NUM_FX_TYPES - 1), 0, ParamKind::Choice, "", fxTypeNames(), NUM_FX_TYPES };
+        if (auto* fx = effectOf(trackIdx))
+            for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+            {
+                ParamSpec spec = fx->getExtraSpec(i);
+                if (spec.isValid())
+                    spec.id = AudioEngine::INSERT_EXTRA_BASE + fxSelectedSlot * EffectBase::MAX_EXTRAS + i;
+                page.params[(size_t) (4 + i)] = spec;
+            }
     }
 
     static float speedFromIndex(int i)

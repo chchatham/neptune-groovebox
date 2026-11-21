@@ -130,6 +130,18 @@ namespace fastmeasure
         return s1 * s1 + s2 * s2 - c * s1 * s2;
     }
 
+    double phase(const std::vector<float>& x, size_t from, size_t n, double hz, double sampleRate)
+    {
+        double c = 0.0, s = 0.0;
+        for (size_t i = from; i < std::min(from + n, x.size()); ++i)
+        {
+            const double a = 2.0 * 3.14159265358979323846 * hz * (double) i / sampleRate;
+            c += x[i] * std::cos(a);
+            s += x[i] * std::sin(a);
+        }
+        return std::atan2(c, s);
+    }
+
     double harmonic(const std::vector<float>& x, double hz, int h, double sampleRate)
     {
         double c = 0.0, s = 0.0;

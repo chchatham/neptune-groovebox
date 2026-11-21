@@ -424,13 +424,14 @@ machine), then its LFOs.</p>
 <p><b>Pads:</b> the track's steps, for locks: dim = empty, green = has a note, orange = has locks, white = held. A
 bottom-row pad under a knob that has a pressure range is violet and plays that range instead.</p>""")
     screen("TRK FX — track effects", [("TRK FX", 1, "TRACK"), ("TRK FX", 6, "FX")], """
-<p>The same six pages on every track, each with a page key ([[Func]] + top pad 1 to 6):</p>
+<p>The same seven pages on every track, each with a page key ([[Func]] + top pad 1 to 7):</p>
 <ul>
 <li>{{TRACK}}: {{VOL PAN SND1 SND2}} | {{BUS1 BUS2 LEN SPD}}. The send cells are labelled by what the bus carries
 ({{RVB1}}, {{DLY2}}).</li>
 <li>{{ARPLK}}: {{GATE VEL RTCH}}, there to be locked per step so the arp changes along the pattern.</li>
 <li>{{DIRT}}, {{TALK}}, {{MODFX}}: the three character blocks (Chapter 8).</li>
 <li>{{FX}}: {{SLOT TYPE ON WET}} and the chosen insert's four controls.</li>
+<li>{{FX2}}: the same slot's further controls, where its effect has more than four (the amp's {{SAT}}).</li>
 </ul>
 <p><b>Pads:</b> as on {{PARAM}}; every cell here can be locked and given a pressure range.</p>""")
     screen("DRUMS — drum pads", [("DRUMS", 1, "DRUMS")], """
@@ -555,8 +556,9 @@ octave on octave as it goes. {{SHIM}} is the same climb while you hold, and star
 to 1/64, and {{DCAY}} and {{PTCH}} make each repeat quieter or step it up or down in pitch. <code>STOP</code>
 is a tape stopping over {{TIME}}; let go and the sound is back.</p>
 <p><b>Knob page MORE:</b> {{SYNC}} locks the layer's time or rate to the tempo and {{DIV}} chooses the division;
-the effect's own time knob then shows the division too. {{CLR}}, four clicks, empties the pad, all its
-layers.</p>
+the effect's own time knob then shows the division too. Knobs 3 to 6 hold what the layer's effect has beyond
+its four controls: on the dub echo {{SAT}}, the curve of its tape (Chapter 8, Saturation curves). {{CLR}}, four
+clicks, empties the pad, all its layers.</p>
 <p><b>Good to know:</b> a layer on a track acts after that track's fader, so an echo you threw keeps ringing when
 you pull the fader down or mute the track, and one on <code>MSTR</code> sits before the master limiter, which
 catches a feedback that got away. [[Shift]] + [[Play]] silences everything, latched pads included.
@@ -969,6 +971,7 @@ arp's {{VARY}} page); the track's sound then keeps whatever the strip last gave 
     # =========================================================================================
     fx_rows = [(f"<code>{f['name']}</code>", ctx["fx_names"][f["name"]],
                 " ".join(f"<code>{html.escape(s['label'])}</code>" for s in f["specs"] if s["id"] >= 0)) for f in params["effects"]]
+    CURVE_ROWS = [(f"<code>{name}</code>", text) for name, text in [('SOFT', 'soft knee, then a slow rise instead of a ceiling'), ('HARD', 'hard clip'), ('FOLD', 'sine wavefolder: past the top the wave turns back on itself'), ('ASYM', 'two different knees: the upper half bends early, the lower late'), ('TANH', 'the true hyperbolic tangent: the textbook soft clip'), ('FAST', 'almost TANH, a little squarer at the top'), ('ATAN', 'arctangent: a rounder knee that never quite flattens'), ('ALGB', 'between TANH and ATAN'), ('SLOW', 'the gentlest knee: compresses long before it clips'), ('CUBE', 'cubic: clean until late, then a firm ceiling'), ('DIOD', 'an early, rounded knee, as of a diode pair'), ('TUBE', 'lopsided ceilings, as of a valve stage: even harmonics by itself'), ('TRI', 'triangle wavefolder: harder and brighter than FOLD'), ('RECT', 'full-wave rectifier: the octave above (thin when driven hard)'), ('HALF', 'half-wave rectifier: the lower half cut away'), ('XOVR', 'a dead zone round zero: quiet sound vanishes, loud sound rasps'), ('EVEN', 'adds the second harmonic, more as the level rises'), ('CHB3', 'a full-level sine comes out as its third harmonic; quiet sound passes three times louder')]]
     ch.append(("Effects", [
         ("Signal path", fmt("""
 <p>Engine → {{DIRT}} → {{TALK}} → {{MODFX}} → insert slots → mixer (volume, pan) → master EQ, compressor, limiter.
@@ -976,8 +979,8 @@ Each track also sends to two shared buses. All of a track's effect pages are on 
         ("The three character blocks", fmt("""
 <p>On every track, always available, bypassed while at zero.</p>
 <ul>
-<li>{{DIRT}}: {{DRIV TYPE BITS RATE}} | {{FDBK TUNE DAMP MIX}}. Distortion with four curves, bit and sample-rate
-reduction, and a tuned feedback path that turns it into a resonator.</li>
+<li>{{DIRT}}: {{DRIV TYPE BITS RATE}} | {{FDBK TUNE DAMP MIX}}. Distortion with any of the saturation curves
+below ({{TYPE}}), bit and sample-rate reduction, and a tuned feedback path that turns it into a resonator.</li>
 <li>{{TALK}}: {{VOWL SHFT RESO MIX}} | {{RATE DPTH ENV BITE}}. A vowel filter. The vowel can be moved by hand, by its
 own LFO, or by how hard you play.</li>
 <li>{{MODFX}}: chorus, flanger, phaser and rotary speaker, a rate and a depth each ({{CH.R CH.D}} | {{FL.R FL.D}} |
@@ -988,7 +991,21 @@ own LFO, or by how hard you play.</li>
 knobs 5 to 8 are the effect's own four controls.</p>
 <div class="note"><b>Careful</b>Turning {{TYPE}} replaces the effect and its four values at once, without the four-click
 confirmation. Undo ([[Func]] + [[Shift]] + [[Play]]) brings the effect back as it was; a scroll through the list
-counts as one step.</div>""") + table(["TYPE", "Effect", "Knobs 5–8"], fx_rows, "cols3")),
+counts as one step.</div>
+<p>An effect with more than four controls has the rest on the next page, {{FX2}}, under knobs 5 to 8: the same slot,
+shown again by {{SLOT}} and {{TYPE}}. They are saved, locked per step and given pressure ranges like the others.</p>""")
+         + table(["TYPE", "Effect", "Knobs 5–8, then page FX2"], fx_rows, "cols3")),
+        ("Saturation curves", fmt("""
+<p>One list of curves is shared by everything that lets you choose how a sound is bent: the waveshaper insert
+({{WSH}}, its {{CURV}}), the {{DIRT}} block's {{TYPE}}, the amp insert ({{AMP}}, {{SAT}} on page {{FX2}}: the
+curve of both its stages) and the dub echo on {{PERF}} ({{SAT}} on its {{MORE}} page: the curve of its tape).
+The amp starts on <code>TANH</code>, the dub echo on <code>FAST</code>.</p>
+<p>On the waveshaper, {{ASYM}} works the chosen curve off-centre, which adds even harmonics (the octave) to any
+of them; at 0 a curve that treats both halves of the wave alike gives odd harmonics only.</p>""")
+         + table(["Curve", "What it does"], CURVE_ROWS, "cols2")
+         + fmt("""<div class="note"><b>Good to know</b>The folders, the rectifiers and <code>HARD</code> make very bright
+harmonics; on high notes with the drive up some of them fold back as rough, unrelated tones. The amp is the
+cleanest place to use them: it works at twice the sample rate.</div>""")),
         ("Tempo sync", fmt("""
 <p>An insert that has a {{TIME}} (the delays) or a {{RATE}} (chorus, flanger, phaser, tremolo, auto-pan, ensemble,
 ring modulator, vibrato, wah) shows {{SYNC}} in cell 3 in place of {{ON}}. With {{SYNC}} on, that cell picks one of

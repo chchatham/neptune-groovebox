@@ -715,7 +715,7 @@ private:
         for (auto it = values.begin(); it != values.end();)
         {
             const int id = it->first;
-            const bool insert = isInsertType(id) || AudioEngine::isInsertSwitchParam(id)
+            const bool insert = isInsertType(id) || AudioEngine::isInsertSwitchParam(id) || AudioEngine::isInsertExtraParam(id)
                                 || (id >= AudioEngine::EFFECT_PARAM_BASE && id < AudioEngine::EFFECT_PARAM_BASE + AudioEngine::MAX_INSERTS_PER_TRACK * 4);
             it = insert ? values.erase(it) : std::next(it);
         }
@@ -756,6 +756,18 @@ private:
             if (!EngineParamRange::contains(id) && !RangeParam::isRangeParam(id) && !isInsertType(id)
                 && audioEngine->getTrackParameter(trackIdx, id) != value)
                 audioEngine->setTrackParameter(trackIdx, id, value);
+        // An effect's extra cells that the values do not name (a sound saved before the cell existed) are
+        // at their starting values, not at what the slot's effect was left on.
+        if (auto* chain = audioEngine->getInsertChain(trackIdx))
+            for (int slot = 0; slot < chain->getEffectCount(); ++slot)
+                if (auto* fx = chain->getEffect(slot))
+                    for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+                    {
+                        const ParamSpec spec = fx->getExtraSpec(i);
+                        const int id = AudioEngine::INSERT_EXTRA_BASE + slot * EffectBase::MAX_EXTRAS + i;
+                        if (spec.isValid() && values.count(id) == 0 && fx->getExtra(i) != spec.defaultVal)
+                            audioEngine->setTrackParameter(trackIdx, id, spec.defaultVal);
+                    }
     }
 
     // Put back the sound the track had before anything was auditioned.

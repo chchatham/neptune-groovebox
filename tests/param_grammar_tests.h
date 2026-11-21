@@ -78,7 +78,7 @@ public:
 
     void runTest() override
     {
-        const juce::StringArray trackPages { "TRACK", "ARPLK", "DIRT", "TALK", "MODFX", "FX" };
+        const juce::StringArray trackPages { "TRACK", "ARPLK", "DIRT", "TALK", "MODFX", "FX", "FX2" };
 
         // ================================================================== the split
         beginTest("PARAM shows only the engine's own pages; the six track pages are gone from it");
@@ -155,13 +155,13 @@ public:
             }
         }
 
-        beginTest("TRK FX has exactly the six pages on every engine");
+        beginTest("TRK FX has exactly the seven pages on every engine");
         {
             for (int e = 0; e <= (int) EngineType::MIDITrack; ++e)
             {
                 Rig rig((EngineType) e);
                 expectEquals(rig.fx.getName(), juce::String("TRK FX"));
-                expectEquals(rig.fx.getPageCount(), 6);
+                expectEquals(rig.fx.getPageCount(), 7);
                 expect(pageNames(rig.fx) == trackPages, "Engine " + juce::String(e) + ": " + pageNames(rig.fx).joinIntoString(" "));
                 expect(rig.fx.getEncoderLayout() == Screen::EncoderLayout::Grid && !rig.fx.usesEncoderBar());
                 expectEquals(rig.fx.getSubPage(), juce::String("TRACK"));
@@ -633,9 +633,11 @@ public:
             p.onPageKey(p.getPageKeyCount());
             expectEquals(p.getPageName(), juce::String("OSC"), "Keys without a section do nothing");
 
-            // TRK FX: one key per page (TRACK, ARPLK, DIRT, TALK, MODFX, FX); sections still jump with Func + bank.
+            // TRK FX: one key per page (TRACK, ARPLK, DIRT, TALK, MODFX, FX, FX2); sections still jump with Func + bank.
             auto& fx = rig.fx;
-            expectEquals(fx.getPageKeyCount(), 6);
+            expectEquals(fx.getPageKeyCount(), 7);
+            fx.onPageKey(6);
+            expectEquals(fx.getPageName(), juce::String("FX2"));
             fx.onPageKey(2);
             expectEquals(fx.getPageName(), juce::String("DIRT"));
             fx.onPageKey(5);

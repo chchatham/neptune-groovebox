@@ -508,6 +508,14 @@ public:
             return kind == 1 ? fx->getMix() : (fx->isEnabled() ? 1.0f : 0.0f);
         }
 
+        if (isInsertExtraParam(id))
+        {
+            const int offset = id - INSERT_EXTRA_BASE, slot = offset / EffectBase::MAX_EXTRAS;
+            auto* chain = const_cast<EffectChain*>(getInsertChain(trackIndex));
+            auto* fx = (chain && slot < chain->getEffectCount()) ? chain->getEffect(slot) : nullptr;
+            return fx ? fx->getExtra(offset % EffectBase::MAX_EXTRAS) : 0.0f;
+        }
+
         if (id >= EFFECT_PARAM_BASE && id < EngineParamRange::THIRD_BASE)     // 400 up is the engine's third block
         {
             int offset = id - EFFECT_PARAM_BASE;
@@ -1046,6 +1054,9 @@ public:
     static constexpr int INSERT_SYNC_BASE = 296;
     static constexpr int INSERT_DIV_BASE = 304;
     static bool isInsertSwitchParam(int id) { return id >= INSERT_ON_BASE && id < INSERT_DIV_BASE + MAX_INSERTS_PER_TRACK; }
+    // INSERT_EXTRA_BASE + slot * 4 + n: the effect's cells beyond its four (EffectBase::getExtraSpec; TRK FX page FX2).
+    static constexpr int INSERT_EXTRA_BASE = 312;
+    static bool isInsertExtraParam(int id) { return id >= INSERT_EXTRA_BASE && id < INSERT_EXTRA_BASE + MAX_INSERTS_PER_TRACK * EffectBase::MAX_EXTRAS; }
 
     void addEngine(int trackIndex, std::shared_ptr<EngineBase> engine)
     {
@@ -1841,6 +1852,15 @@ private:
                 if (off) arp->clearParamLock(param);
                 else     arp->setParamLock(param, value);
             }
+            return;
+        }
+
+        if (isInsertExtraParam(id))
+        {
+            const int offset = id - INSERT_EXTRA_BASE, slot = offset / EffectBase::MAX_EXTRAS;
+            auto* chain = getInsertChain(trackIndex);
+            if (auto* fx = (chain && slot < chain->getEffectCount()) ? chain->getEffect(slot) : nullptr)
+                fx->setExtra(offset % EffectBase::MAX_EXTRAS, value);
             return;
         }
 

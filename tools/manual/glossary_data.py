@@ -117,7 +117,7 @@ DESC = {
     ],
     "TYPE": [
         ("Drums/", "Drum type", "Synthesis model of this drum voice (16 models; Appendix C). KSYN, the kick machine, adds the KICK page; CSYN, the cymbal machine, the CYM page."),
-        ("TRK FX DIRT/", "Distortion type", "SOFT, HARD, FOLD (wavefolder) or ASYM (asymmetric)."),
+        ("TRK FX DIRT/", "Distortion curve", "One of the eighteen saturation curves (Chapter 8): SOFT, HARD, FOLD, ASYM, then TANH to CHB3."),
         ("TRK FX/FX", "Insert effect type", "Which effect is in the selected insert slot (30 types; Appendix C). Changing it replaces the effect and its four values."),
         (None, "Filter type", "Filter model: SVF, SEM, LADR (ladder), DIOD (diode), COMB, or OFF."),
     ],
@@ -164,7 +164,7 @@ DESC = {
         (None, "Release", "Time the envelope takes to fall to silence after the note ends."),
     ],
     "CURV": [
-        ("Insert WSH/", "Shaping curve", "SOFT, HARD, FOLD or ASYM transfer curve."),
+        ("Insert WSH/", "Shaping curve", "One of the eighteen saturation curves (Chapter 8): SOFT, HARD, FOLD, ASYM, then TANH to CHB3."),
         (None, "Envelope curve", "Shape of the envelope segments, from logarithmic through linear to exponential."),
     ],
     "KEY": [
@@ -519,7 +519,8 @@ DESC = {
     "HORN": [(None, "Horn speed", "Fast-speed rotation of the treble horn.")],
     "DRUM": [(None, "Drum speed", "Fast-speed rotation of the bass rotor.")],
     "ACCL": [(None, "Acceleration", "How quickly the rotors change speed.")],
-    "ASYM": [(None, "Asymmetry", "Bends the curve to one side for even harmonics.")],
+    "ASYM": [(None, "Asymmetry", "Works the chosen curve off-centre, on any curve: even harmonics (the octave) join the odd ones.")],
+    "SAT": [(None, "Saturation curve", "The curve of the amp's two clipping stages: one of the eighteen saturation curves (Chapter 8). TANH to start with. On page FX2.")],
     "FILT": [(None, "Smoothing filter", "Softens the reducer's aliasing.")],
     "PDLY": [(None, "Pre-delay", "Gap before the reverb starts.")],
     "DISP": [(None, "Dispersion", "The spring's characteristic chirp.")],
@@ -575,8 +576,8 @@ EXTRA = [
     ("GATE", "Arp gate lock", "TRK FX", "ARPLK", "0–100", "Per-step lock of the arpeggiator's gate length."),
     ("VEL", "Arp velocity lock", "TRK FX", "ARPLK", "0–100", "Per-step lock of the arpeggiator's velocity."),
     ("RTCH", "Arp ratchet lock", "TRK FX", "ARPLK", "1–4", "Per-step lock of the arpeggiator's ratchet count."),
-    ("SLOT", "Insert slot", "TRK FX", "FX", "slot number", "Which of the track's insert slots the page shows."),
-    ("TYPE", "Insert effect type", "TRK FX", "FX", "30 types", "Effect in the selected slot. Changing it replaces the effect and its four values."),
+    ("SLOT", "Insert slot", "TRK FX", "FX, FX2", "slot number", "Which of the track's insert slots the page shows."),
+    ("TYPE", "Insert effect type", "TRK FX", "FX, FX2", "30 types", "Effect in the selected slot. Changing it replaces the effect and its values."),
     ("ON", "Insert on", "TRK FX", "FX", "OFF / ON", "Switches the slot on or off. Effects with a TIME or RATE show SYNC here instead."),
     ("WET", "Insert wet level", "TRK FX", "FX", "0–100", "How much of the effect is heard; 0 takes it out."),
     # STEP
@@ -710,6 +711,7 @@ EXTRA = [
     ("FDBK", "Feedback", "PERF", "FX (DUB)", "0–100", "How much of each repeat goes round again; the top of the range feeds on itself."),
     ("TONE", "Loop tone", "PERF", "FX (DUB)", "0–100", "Where the band filter in the echo's loop sits, low to high: every repeat is narrowed towards it."),
     ("DRIV", "Loop drive", "PERF", "FX (DUB)", "0–100", "How hard the repeats hit the tape: more squash and harmonics, more treble lost on every repeat, a less steady pitch."),
+    ("SAT", "Tape curve", "PERF", "MORE (DUB)", "the eighteen saturation curves", "The curve the dub echo's tape saturates with (Chapter 8). FAST to start with."),
     ("GRAB", "Grab time", "PERF", "FX (FRZ)", "0.02–2 s", "How long the freeze listens after the press before it shuts its input."),
     ("SHIM", "Shimmer", "PERF", "FX (FRZ)", "0–100", "Octave-up feedback while the pad is held: the frozen sound climbs."),
     ("SPRL", "Spiral", "PERF", "FX (FRZ)", "0–100", "Octave-up feedback after the release: the sound spirals away upward as it dies."),

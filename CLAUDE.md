@@ -74,6 +74,7 @@ src/
 │   │                         building blocks), one header per effect; PerfEffects.h = the PERF pads' own (dub echo, freeze,
 │   │                         beat repeat, tape stop: not insert types)
 │   ├── WaveTables.h, WaveMorph.h — the wavetable engine's built-in tables; key-frame morph algorithms and their FFT
+│   ├── Saturation.h        — the saturation curves: one list shared by the waveshaper, DIRT, the amp and the dub echo
 │   └── Envelope.h, EnvelopeChain.h, LFO.h, ModMatrix.h, DSPUtils.h
 ├── arpeggiator/            — Arpeggiator.h (one per track), VariationMacros.h, MutateSystem.h, RhythmCapture.h
 ├── ui/

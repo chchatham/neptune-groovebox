@@ -432,6 +432,21 @@ public:
                     fx->setMix((corner & 1) ? 1.0f : 0.5f);
                     run(rate.sr, rate.block, seconds);
                 }
+                // Its cells beyond the four (a choice of curve): every choice, and values far outside.
+                for (int i = 0; i < EffectBase::MAX_EXTRAS; ++i)
+                {
+                    const ParamSpec spec = fx->getExtraSpec(i);
+                    if (! spec.isValid()) continue;
+                    for (float v = spec.minVal; v <= spec.maxVal; v += spec.isDiscrete() ? 1.0f : (spec.maxVal - spec.minVal) / 4.0f)
+                    {
+                        fx->setExtra(i, v);
+                        run(rate.sr, rate.block, seconds / 4.0);
+                    }
+                    for (float v : { -1.0e9f, 1.0e9f, std::numeric_limits<float>::quiet_NaN() })
+                        fx->setExtra(i, v);
+                    run(rate.sr, rate.block, seconds / 4.0);
+                    fx->setExtra(i, spec.defaultVal);
+                }
                 // Tempo-synced times and rates at both ends of the tempo and of the division list.
                 for (float bpm : { 20.0f, 300.0f })
                     for (int division : { 0, FxSync::NUM_DIVISIONS - 1, -5, 1000 })

@@ -2,30 +2,24 @@
 
 #include "EffectBase.h"
 #include "../DSPUtils.h"
+#include "../Saturation.h"
 #include <cmath>
 #include <algorithm>
 
-// Configurable waveshaper with multiple shaping curves.
-// Provides soft clip (tanh), hard clip, wavefolding, and asymmetric
-// distortion algorithms. Includes pre-gain, tone filter, and
-// output compensation. No buffers needed - pure computation.
-// No heap on audio thread.
+// Waveshaper: pre-gain into one of the saturation curves (src/dsp/Saturation.h), a DC blocker, a
+// tone filter and output compensation. ASYM works the chosen curve off-centre, which adds even
+// harmonics to any of them (on the ASYM curve, whose two halves differ already, it moves the knee).
+// No buffers - pure computation. No heap on the audio thread.
 class Waveshaper : public EffectBase
 {
 public:
-    static const char* const* curveNames()
-    {
-        static const char* const n[] = { "SOFT", "HARD", "FOLD", "ASYM" };
-        return n;
-    }
-
     ParamSpec getParamSpec(int index) const override
     {
         using K = ParamKind;
         switch (index)
         {
             case 0: return { "DRIV", 0, 0, 1, 0.3f };
-            case 1: return { "CURV", 1, 0, 3, 0, K::Choice, "", curveNames(), 4 };
+            case 1: return { "CURV", 1, 0, (float) (sat::Count - 1), 0, K::Choice, "", sat::names(), sat::Count };
             case 2: return { "TONE", 2, 0, 1, 0.7f };
             case 3: return { "ASYM", 3, 0, 1, 0.5f };
             default: return {};
@@ -35,23 +29,17 @@ public:
     enum Param
     {
         Drive = 0,      // 0 - 1 (maps to 1x - 40x gain)
-        Curve,          // 0 = soft clip, 1 = hard clip, 2 = fold, 3 = asymmetric
+        Curve,          // sat::Curve
         Tone,           // 0 - 1 (post-filter: dark to bright)
-        Asymmetry,      // 0 - 1 (positive bias for asymmetric mode)
+        Asymmetry,      // 0 - 1 (how far off-centre the curve is worked: 0 - 0.5)
         Mix             // 0 - 1
-    };
-
-    enum CurveType
-    {
-        SoftClip = 0,
-        HardClip = 1,
-        Fold = 2,
-        Asymmetric = 3
     };
 
     void prepare(double sr, int /*maxBlockSize*/) override
     {
         sampleRate = sr;
+        dcL.setCutoff(sr, DC_HZ);
+        dcR.setCutoff(sr, DC_HZ);
         updateCachedCoeffs();
         reset();
     }
@@ -60,6 +48,8 @@ public:
     {
         toneFilterL = 0.0f;
         toneFilterR = 0.0f;
+        dcL.reset();
+        dcR.reset();
     }
 
     void process(float& left, float& right) override
@@ -69,33 +59,9 @@ public:
         float dryL = left;
         float dryR = right;
 
-        // Pre-gain
-        float wetL = left * cachedGain;
-        float wetR = right * cachedGain;
-
-        // Apply shaping curve
-        switch (curve)
-        {
-            case SoftClip:
-                wetL = dsp::fastTanh(wetL);
-                wetR = dsp::fastTanh(wetR);
-                break;
-
-            case HardClip:
-                wetL = std::clamp(wetL, -1.0f, 1.0f);
-                wetR = std::clamp(wetR, -1.0f, 1.0f);
-                break;
-
-            case Fold:
-                wetL = wavefold(wetL);
-                wetR = wavefold(wetR);
-                break;
-
-            case Asymmetric:
-                wetL = asymmetricShape(wetL);
-                wetR = asymmetricShape(wetR);
-                break;
-        }
+        // Pre-gain, the curve, and out with the steady offset an off-centre or one-sided curve leaves.
+        float wetL = dcL.highPass(shaper(left * cachedGain));
+        float wetR = dcR.highPass(shaper(right * cachedGain));
 
         // Tone filter (one-pole lowpass)
         toneFilterL += cachedToneCoeff * (wetL - toneFilterL);
@@ -120,7 +86,8 @@ public:
                 updateCachedCoeffs();
                 break;
             case Curve:
-                curve = (CurveType)std::clamp((int)value, 0, 3);
+                curve = sat::valid((int) std::lround(value));
+                shaper.set(curve, asymmetry * 0.5f);
                 break;
             case Tone:
                 tone = std::clamp(value, 0.0f, 1.0f);
@@ -128,6 +95,7 @@ public:
                 break;
             case Asymmetry:
                 asymmetry = std::clamp(value, 0.0f, 1.0f);
+                shaper.set(curve, asymmetry * 0.5f);
                 break;
             case Mix:
                 mix = std::clamp(value, 0.0f, 1.0f);
@@ -149,26 +117,7 @@ public:
     }
 
 private:
-    // Sine-based wavefolder: folds back when signal exceeds [-1, 1]
-    static float wavefold(float x)
-    {
-        x = std::clamp(x, -5.0f, 5.0f);
-        // Multiple folds using sin(x * pi/2)
-        return std::sin(x * dsp::PI_F * 0.5f);
-    }
-
-    // Asymmetric distortion: positive half clipped differently from negative
-    float asymmetricShape(float x) const
-    {
-        float bias = asymmetry * 0.5f;
-        x += bias;
-        if (x > 0.0f)
-            x = dsp::fastTanh(x * 1.5f);
-        else
-            x = dsp::fastTanh(x * 0.8f);
-        x -= dsp::fastTanh(bias); // DC offset compensation
-        return x;
-    }
+    static constexpr float DC_HZ = 10.0f;
 
     void updateCachedCoeffs()
     {
@@ -185,7 +134,9 @@ private:
     float drive     = 0.3f;
     float tone      = 0.7f;
     float asymmetry = 0.0f;
-    CurveType curve = SoftClip;
+    int curve = sat::Soft;
+    sat::Biased shaper { sat::Soft, 0.0f, 0.0f, 1.0f };
+    fxb::OnePole dcL, dcR;
 
     float cachedGain = 1.0f;
     float cachedCompensation = 1.0f;

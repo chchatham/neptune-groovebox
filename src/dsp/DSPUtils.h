@@ -8,7 +8,7 @@ constexpr float PI_F = 3.14159265f;
 constexpr float TWO_PI_F = 6.283185307f;
 constexpr double TWO_PI_D = 6.283185307;
 
-inline float fastTanh(float x)
+constexpr float fastTanh(float x)
 {
     float x2 = x * x;
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
