@@ -328,7 +328,7 @@ public:
 
     static juce::String overlaySource()
     {
-        return juce::File(__FILE__).getParentDirectory().getParentDirectory()
+        return juce::File(NEPTUNE_TESTS_DIR).getParentDirectory()
                    .getChildFile("docs/overlay/overlay.html").loadFileAsString();
     }
 

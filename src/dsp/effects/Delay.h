@@ -1,184 +1,120 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "../DSPUtils.h"
-#include <array>
-#include <cmath>
-#include <algorithm>
+#include "DelayCore.h"
 
-class Delay : public EffectBase
+// The send delay (DLY): a setting of dly::Core (DelayCore.h) with Setup::send - one tap on each
+// side, the loop filter (low-pass 8 kHz, high-pass 80 Hz) at the heads, each side fed by itself or
+// by the other. With READ at FWD, DRIV and AGE at 0 and MODE at STER or PING it does, operation
+// for operation, what the send delay did before it was moved onto the core (the suites
+// "P01 Keyboard" and "Pinned On Cores" hold that in place); a turned TIME is now glided to (the
+// pitch of what is in the line bends) where it used to jump.
+//
+// TIME  echo time (can follow the tempo)
+// FDBK  how much comes back
+// MIX   dry / wet
+// MODE  STER = each side repeats on its own side; PING = each repeat changes sides;
+//       TAPE = STER on an unsteady, lightly driven tape (AGE counts from TAPE_AGE, DRIV from TAPE_DRIVE)
+// FX2:
+// READ  FWD, REV (each stretch of TIME comes back backwards), OCT+ / 5TH+ / OCT- (every repeat higher or lower)
+// DRIV  how hard the loop hits the tape stage: 0 = clean
+// SAT   the stage's curve: any of src/dsp/Saturation.h
+// AGE   wow and flutter of the transport: 0 = steady
+class Delay : public dly::Family
 {
 public:
+    enum Param { Time = 0, Feedback, Mix, ModeCell };
+    enum Extra { Read = 0, Drive, Sat, Age };
+    enum class Mode { Stereo, PingPong, Tape };
+
+    static constexpr float MIN_TIME = 0.01f, MAX_TIME = 2.0f;
+    static constexpr float TAPE_AGE = 0.35f, TAPE_DRIVE = 0.125f;
+    // The send delay's line was 192,000 samples round, and a place between two samples was worked
+    // out in it: it still is wherever 2 s fit that (up to 96 kHz), so a time that is not a whole
+    // number of samples is read at the places it always was.
+    static constexpr int RING = 192000;
+
     static const char* const* modeNames()
     {
         static const char* const names[] = { "STER", "PING", "TAPE" };
         return names;
     }
 
-    ParamSpec getParamSpec(int index) const override
+    Delay()
+    {
+        seed();
+        setWetOnly(false);     // pinned (P01): it mixes by itself in a chain too, sample for sample as it always did
+        // (The object as it always started, which is not what its cells call their defaults.)
+        setCell(Feedback, 0.4f);
+        mix = 1.0f;
+    }
+
+    void setTime(float seconds) { setCell(Time, seconds); }
+    void setFeedback(float fb) { setCell(Feedback, fb); }
+    void setMode(Mode m) { setCell(ModeCell, (float) (int) m); }
+    // The loop filter's corners (not cells: the send delay's own 8 kHz and 80 Hz unless set).
+    void setHighCut(float hz) { highCut = std::clamp(hz, 500.0f, 20000.0f); touch(); }
+    void setLowCut(float hz) { lowCut = std::clamp(hz, 20.0f, 2000.0f); touch(); }
+
+protected:
+    const ParamSpec* cells() const override
     {
         using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "TIME", 0, 0.01f, 2.0f, 0.375f, K::Log, "s" };
-            case 1: return { "FDBK", 1, 0, 0.95f, 0.35f };
-            case 2: return { "MIX", 2, 0, 1, 0.5f };
-            case 3: return { "MODE", 3, 0, 2, 0, K::Choice, "", modeNames(), 3 };
-            default: return {};
-        }
+        static const ParamSpec c[CELLS] = {
+            { "TIME", 0, MIN_TIME, MAX_TIME, 0.375f, K::Log, "s" },
+            { "FDBK", 1, 0, 0.95f, 0.35f },
+            { "MIX", 2, 0, 1, 0.5f },
+            { "MODE", 3, 0, 2, 0, K::Choice, "", modeNames(), 3 },
+            { "READ", 0, 0, (float) (dly::read::Count - 1), 0, K::Choice, "", dly::read::names(), dly::read::Count },
+            { "DRIV", 1, 0, 1, 0 },
+            { "SAT", 2, 0, (float) (sat::Count - 1), (float) sat::Fast, K::Choice, "", sat::names(), sat::Count },
+            { "AGE", 3, 0, 1, 0 } };
+        return c;
+    }
+    int mixCell() const override { return Mix; }
+
+    dly::Core::Setup setup() const override
+    {
+        dly::Core::Setup s;
+        s.send = true;
+        s.hermite = false;
+        s.filterInput = false;
+        s.ring = (double) MAX_TIME * sampleRate <= (double) RING ? RING : 0;
+        return s;
+    }
+    float lineSeconds() const override { return dly::roomFor(MAX_TIME, MAX_TIME); }
+
+    void configure(const float* v) override
+    {
+        const int mode = (int) std::lround(v[ModeCell]);
+        const bool tape = mode == (int) Mode::Tape;
+        const float time = v[Time];
+        core.setTapCount(1);
+        core.setTap(0, time, 1.0f, 1.0f, 1.0f);
+        core.setFeedback(v[Feedback]);
+        core.setCross(mode == (int) Mode::PingPong ? 1.0f : 0.0f);
+        core.setFilter(highCut, lowCut);
+        core.setTransport(tape ? TAPE_AGE + (1.0f - TAPE_AGE) * v[4 + Age] : v[4 + Age]);
+        dly::driven(core, tape ? TAPE_DRIVE + (1.0f - TAPE_DRIVE) * v[4 + Drive] : v[4 + Drive], v[4 + Sat]);
+        setRead(v[4 + Read], time);
+        set = true;
     }
 
-    void setParameter(int id, float value) override
+    // A cell set before anything has sounded is where it is set (there is nothing in the line to
+    // bend): the core is put there, not glided there.
+    void resetCore() override { core.reset(); fresh = true; set = false; }
+    void controlCore() override
     {
-        switch (id)
-        {
-            case 0: setTime(value); break;
-            case 1: setFeedback(value); break;
-            case 2: setMix(value); break;
-            case 3: setMode(static_cast<Mode>(std::clamp((int) std::lround(value), 0, 2))); break;
-            default: break;
-        }
+        if (fresh && set) core.reset();
+        set = false;
+        core.control();
     }
-
-    float getParameter(int id) const override
+    void runCore(float* left, float* right, int n, float mixFrom, float mixTo) override
     {
-        switch (id)
-        {
-            case 0: return delayTime;
-            case 1: return feedback;
-            case 2: return mix;
-            case 3: return (float) (int) mode;
-            default: return 0.0f;
-        }
-    }
-
-    enum class Mode { Stereo, PingPong, Tape };
-
-    void prepare(double sr, int /*maxBlockSize*/) override
-    {
-        sampleRate = sr;
-        recalcFilterCoeffs();
-        reset();
-    }
-
-    void reset() override
-    {
-        bufferL.fill(0.0f);
-        bufferR.fill(0.0f);
-        writePos = 0;
-        tapePhase = 0.0;
-    }
-
-    void setTime(float seconds) { delayTime = std::clamp(seconds, 0.01f, 2.0f); }
-    void setFeedback(float fb) { feedback = std::clamp(fb, 0.0f, 0.95f); }
-    void setMode(Mode m) { mode = m; }
-    void setHighCut(float hz) { highCut = std::clamp(hz, 500.0f, 20000.0f); recalcFilterCoeffs(); }
-    void setLowCut(float hz) { lowCut = std::clamp(hz, 20.0f, 2000.0f); recalcFilterCoeffs(); }
-    void setTapeWow(float w) { tapeWow = std::clamp(w, 0.0f, 1.0f); }
-
-    void process(float& left, float& right) override
-    {
-        if (!enabled) return;
-
-        float dryL = left;
-        float dryR = right;
-
-        float delaySamples = (float)(delayTime * sampleRate);
-        delaySamples = std::clamp(delaySamples, 1.0f, (float)(MAX_SAMPLES - 1));
-
-        if (mode == Mode::Tape)
-        {
-            tapePhase += 0.3 / sampleRate;
-            if (tapePhase >= 1.0) tapePhase -= 1.0;
-            float wobble = (float)std::sin(tapePhase * dsp::TWO_PI_D) * tapeWow * 0.002f;
-            delaySamples *= (1.0f + wobble);
-            delaySamples = std::clamp(delaySamples, 1.0f, (float)(MAX_SAMPLES - 1));
-        }
-
-        float readL = readInterp(bufferL, delaySamples);
-        float readR = readInterp(bufferR, delaySamples);
-
-        readL = applyFilters(readL, filterStateL);
-        readR = applyFilters(readR, filterStateR);
-
-        float writeL, writeR;
-        switch (mode)
-        {
-            case Mode::PingPong:
-                writeL = left + readR * feedback;
-                writeR = right + readL * feedback;
-                break;
-            case Mode::Stereo:
-            case Mode::Tape:
-            default:
-                writeL = left + readL * feedback;
-                writeR = right + readR * feedback;
-                break;
-        }
-
-        bufferL[(size_t)writePos] = writeL;
-        bufferR[(size_t)writePos] = writeR;
-        writePos = (writePos + 1) % MAX_SAMPLES;
-
-        left  = dryL * (1.0f - mix) + readL * mix;
-        right = dryR * (1.0f - mix) + readR * mix;
+        fresh = false;
+        core.run(left, right, n, mixFrom, mixTo);
     }
 
 private:
-    static constexpr int MAX_SAMPLES = 96000 * 2;
-
-    std::array<float, MAX_SAMPLES> bufferL {};
-    std::array<float, MAX_SAMPLES> bufferR {};
-    int writePos = 0;
-
-    float delayTime = 0.375f;
-    float feedback = 0.4f;
-    float highCut = 8000.0f;
-    float lowCut = 80.0f;
-    float tapeWow = 0.0f;
-    Mode mode = Mode::Stereo;
-    double tapePhase = 0.0;
-
-    struct FilterState { float lpZ = 0.0f; float hpZ = 0.0f; };
-    FilterState filterStateL, filterStateR;
-
-    float readInterp(const std::array<float, MAX_SAMPLES>& buf, float delaySamples) const
-    {
-        float readPosF = (float)writePos - delaySamples;
-        if (readPosF < 0.0f) readPosF += (float)MAX_SAMPLES;
-
-        int idx0 = (int)readPosF;
-        int idx1 = idx0 + 1;
-        float frac = readPosF - (float)idx0;
-
-        if (idx0 >= MAX_SAMPLES) idx0 -= MAX_SAMPLES;
-        if (idx1 >= MAX_SAMPLES) idx1 -= MAX_SAMPLES;
-        if (idx0 < 0) idx0 += MAX_SAMPLES;
-        if (idx1 < 0) idx1 += MAX_SAMPLES;
-
-        return buf[(size_t)idx0] * (1.0f - frac) + buf[(size_t)idx1] * frac;
-    }
-
-    float cachedLpCoeff = 0.5f;
-    float cachedHpCoeff = 0.01f;
-
-    void recalcFilterCoeffs()
-    {
-        if (sampleRate > 0.0)
-        {
-            cachedLpCoeff = 1.0f - std::exp(-dsp::TWO_PI_F * highCut / (float)sampleRate);
-            cachedHpCoeff = 1.0f - std::exp(-dsp::TWO_PI_F * lowCut / (float)sampleRate);
-        }
-    }
-
-    float applyFilters(float sample, FilterState& state) const
-    {
-        state.lpZ += cachedLpCoeff * (sample - state.lpZ);
-        float filtered = state.lpZ;
-
-        state.hpZ += cachedHpCoeff * (filtered - state.hpZ);
-        filtered = filtered - state.hpZ;
-
-        return filtered;
-    }
+    float highCut = 8000.0f, lowCut = 80.0f;
+    bool fresh = true, set = false;
 };

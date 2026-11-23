@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ParamSpec.h"
+#include "EngineModSection.h"
 #include "../dsp/LFO.h"
 #include <algorithm>
 #include <array>
@@ -66,6 +67,17 @@
 // at rest nothing is live: no route is read and the voices render exactly as without the page.
 // An engine's default routes (what its strip did before the page existed) are part of its
 // destination list (LfoDestList::stripRoute / stripVibrato).
+//
+//
+// Mod slots (EngineModSection.h, ids 700-772). The section also holds the engine's slots, their
+// pages (SLT1 ..., LSHP, placed in front of STRIP: insertModPages) and the custom LFO shape.
+// A voice's slots live in its VoiceLfos and are one more kind of source: whatever a slot is aimed
+// at is read through the same calls as the LFOs and the strip. A slot's DEST list is the engine's
+// own list at the LFOs' indices, then L1RT L1DP L2RT L2DP (one LFO's rate / depth; LRAT / LDPT
+// from a slot, as from the strip, move both), then AMT1 .. AM16 (another slot's amount).
+// The voice gives its slots what they need to know: setNote before noteOn, setEnvelopes each
+// sample while wantsEnvelopes(), and the engine setBlockSources once a block while slotsOn().
+// With no slot in use none of it runs and the voices render exactly as without the pages.
 //
 // Nothing here allocates or locks.
 // -----------------------------------------------------------------------------
@@ -228,7 +240,8 @@ class VoiceLfos
 public:
     static constexpr int NUM_LFOS = 2;
     static constexpr int NUM_STRIP = LfoDestList::STRIP_ROUTES;
-    static constexpr int NUM_SOURCES = NUM_LFOS + NUM_STRIP;    // what keyAt() counts: the LFOs, then the strip routes
+    static constexpr int NUM_SLOTS = VoiceModSlots::MAX;
+    static constexpr int NUM_SOURCES = NUM_LFOS + NUM_STRIP + NUM_SLOTS;    // what keyAt() counts: the LFOs, the strip routes, the mod slots
     static constexpr float PITCH_SEMITONES = 12.0f;
     static constexpr float CUTOFF_OCTAVES = 4.0f;
     static constexpr float RESONANCE_RANGE = 0.5f;
@@ -261,6 +274,7 @@ public:
             l.setSampleRate(sampleRate);
         gainSlew.setSampleRate(sampleRate);
         panSlew.setSampleRate(sampleRate);
+        mods.setSampleRate(sampleRate);
         glideStep = (float) (2.0 / (GLIDE_SECONDS * sampleRate));
         stripStep = (float) (1.0 / (STRIP_GLIDE_SECONDS * sampleRate));
     }
@@ -299,6 +313,7 @@ private:
         {
             l = LFO();
             l.setSampleRate(sampleRate);
+            l.setUserShape(userShape);
             out[(size_t) i] = 0.0f;
         }
         l.setRate(s.rate);
@@ -320,7 +335,7 @@ private:
         }
         edged[(size_t) i] = hasEdge((LFO::Shape) s.shape);
         catchUp[(size_t) i] = true;         // whatever changed, the output may have jumped
-        anyActive = on[0] || on[1] || stripLive;
+        anyActive = on[0] || on[1] || stripLive || slotsLive;
 
         key[(size_t) i] = on[(size_t) i] ? s.key : -1;
         lo[(size_t) i] = s.lo;
@@ -330,7 +345,7 @@ private:
         span[(size_t) i] = isLog[(size_t) i] ? 0.5f * std::log2(s.hi / s.lo) : s.hi - s.lo;
         baseValue[(size_t) i] = s.base;
         cross[(size_t) i] = on[(size_t) i] ? s.cross : 0;
-        anyKeyed = key[0] >= 0 || key[1] >= 0 || stripKeyed;
+        anyKeyed = key[0] >= 0 || key[1] >= 0 || stripKeyed || mods.keyed();
         updateCross();
     }
 
@@ -409,6 +424,32 @@ public:
     // True while the strip is up and has a route (or vibrato) to apply.
     bool stripOn() const { return stripLive; }
 
+    // ---- The mod slots -----------------------------------------------------------------------
+    // A slot's settings (EngineLfoSection, when one of its cells is set).
+    void applySlot(int slot, const VoiceModSlots::Settings& s)
+    {
+        mods.apply(slot, s, sounding());
+        anyClosing = anyClosing || mods.isClosing();
+        if (mods.takeChanged())
+            refreshSlots();
+    }
+    // The note that is about to start: call before noteOn / noteOnAndSample.
+    void setNote(int note, float velocity) { mods.setNote(note, velocity); }
+    // True while a slot reads the envelopes: the voice then gives them each sample, before tick().
+    bool wantsEnvelopes() const { return slotsLive && mods.usesEnvelopes(); }
+    void setEnvelopes(float amp, float filter) { mods.setEnvelopes(amp, filter); }
+    // Once a block (while the engine has a slot in use): this voice's pad pressure, the strip and
+    // the track input's follower, each 0..1.
+    void setBlockSources(float pressure, float strip, float input) { mods.setBlockSources(pressure, strip, input); }
+    // The track's custom LFO shape (LfoShapeParam): eight levels that stay the engine's.
+    void setUserShape(const float* levels)
+    {
+        userShape = levels;
+        for (auto& l : lfos)
+            l.setUserShape(levels);
+    }
+    const VoiceModSlots& getSlots() const { return mods; }
+
     // ---- Parameter destinations ------------------------------------------------------------
     // True when an LFO in use is routed to a parameter destination.
     bool keyed() const { return anyKeyed; }
@@ -416,13 +457,17 @@ public:
     bool has(int k) const
     {
         return anyKeyed && (key[0] == k || key[1] == k
-                            || (stripKeyed && (sKey[0] == k || sKey[1] == k || sKey[2] == k)));
+                            || (stripKeyed && (sKey[0] == k || sKey[1] == k || sKey[2] == k))
+                            || (mods.keyed() && mods.hasKey(k)));
     }
 
-    // The parameter source i is moving (-1: none): 0 and 1 are the LFOs, then the strip routes.
+    // The parameter source i is moving (-1: none): 0 and 1 are the LFOs, then the strip routes,
+    // then the mod slots.
     int keyAt(int i) const
     {
         i = std::clamp(i, 0, NUM_SOURCES - 1);
+        if (i >= NUM_LFOS + NUM_STRIP)
+            return mods.keyOf(i - NUM_LFOS - NUM_STRIP);
         return i < NUM_LFOS ? key[(size_t) i] : sKey[(size_t) (i - NUM_LFOS)];
     }
 
@@ -437,6 +482,8 @@ public:
             for (int r = 0; r < NUM_STRIP; ++r)
                 if (sKey[(size_t) r] == k)
                     set = movedByStrip(r, set);
+        if (mods.keyed())
+            set = mods.keyedValue(k, set);
         return set;
     }
 
@@ -456,6 +503,19 @@ public:
                 if (k < 0 || k == key[0] || k == key[1] || (r > 0 && k == sKey[0]) || (r > 1 && k == sKey[1]))
                     continue;       // already given, with every source on it
                 fn(k, value(k, sBase[(size_t) r]));
+            }
+        if (mods.keyed())
+            for (int a = 0; a < mods.count(); ++a)
+            {
+                const int slot = mods.slotAt(a);
+                const int k = mods.keyOf(slot);
+                if (k < 0 || k == key[0] || k == key[1] || (stripKeyed && (k == sKey[0] || k == sKey[1] || k == sKey[2])))
+                    continue;       // already given, with every source on it
+                bool earlier = false;
+                for (int b = 0; b < a && ! earlier; ++b)
+                    earlier = mods.keyOf(mods.slotAt(b)) == k;
+                if (! earlier)
+                    fn(k, value(k, mods.target(slot).base));
             }
     }
 
@@ -478,6 +538,7 @@ public:
         fresh = anyActive;
         for (auto& l : lfos)
             l.trigger();
+        mods.noteOn();
     }
 
     // Note-on for a voice that needs the LFO values at the moment of the hit (a drum's decay, a
@@ -520,7 +581,7 @@ public:
             return;
         for (int i = 0; i < NUM_LFOS; ++i)
         {
-            if (! on[(size_t) i])
+            if (! on[(size_t) i] && ! slotLfo[(size_t) i])
                 continue;
             // At most one cycle per call, so the random shapes draw as many values as a running LFO.
             auto& l = lfos[(size_t) i];
@@ -534,7 +595,8 @@ public:
     bool routed(int d) const
     {
         return (on[0] && dest[0] == d) || (on[1] && dest[1] == d)
-            || (stripLive && ((sOn[0] && sDest[0] == d) || (sOn[1] && sDest[1] == d) || (sOn[2] && sDest[2] == d)));
+            || (stripLive && ((sOn[0] && sDest[0] == d) || (sOn[1] && sDest[1] == d) || (sOn[2] && sDest[2] == d)))
+            || (slotsLive && mods.fixedRouted(d));
     }
 
     // Sum of the LFOs (and strip routes) routed to destination d, -1..1 each (0 if none is).
@@ -542,8 +604,9 @@ public:
     {
         const float a = (dest[0] == d ? glide[0] : 0.0f) + (dest[1] == d ? glide[1] : 0.0f);
         if (! stripLive)
-            return a;
-        return a + (sDest[0] == d ? sGlide[0] : 0.0f) + (sDest[1] == d ? sGlide[1] : 0.0f) + (sDest[2] == d ? sGlide[2] : 0.0f);
+            return slotsLive ? a + mods.fixedAmount(d) : a;
+        const float b = a + (sDest[0] == d ? sGlide[0] : 0.0f) + (sDest[1] == d ? sGlide[1] : 0.0f) + (sDest[2] == d ? sGlide[2] : 0.0f);
+        return slotsLive ? b + mods.fixedAmount(d) : b;
     }
 
     // A level destination as the gain the voice applies, 0..2, and a pan destination's amount:
@@ -559,10 +622,11 @@ public:
         const float a = ((dest[0] == d ? out[0] * absDepth[0] : 0.0f)
                        + (dest[1] == d ? out[1] * absDepth[1] : 0.0f)) * PITCH_SEMITONES;
         if (! stripLive)
-            return a;
-        return a + ((sDest[0] == d ? sOut[0] * sAbs[0] : 0.0f) + (sDest[1] == d ? sOut[1] * sAbs[1] : 0.0f)
+            return slotsLive ? a + mods.fixedPitch(d) * PITCH_SEMITONES : a;
+        const float b = a + ((sDest[0] == d ? sOut[0] * sAbs[0] : 0.0f) + (sDest[1] == d ? sOut[1] * sAbs[1] : 0.0f)
                     + (sDest[2] == d ? sOut[2] * sAbs[2] : 0.0f)) * PITCH_SEMITONES
                  + (d == stripPitchDest ? stripVibrato : 0.0f);
+        return slotsLive ? b + mods.fixedPitch(d) * PITCH_SEMITONES : b;
     }
 
     LFO& getLfo(int i) { return lfos[(size_t) std::clamp(i, 0, NUM_LFOS - 1)]; }
@@ -583,7 +647,11 @@ private:
         for (int i = 0; i < NUM_LFOS; ++i)
         {
             if (! on[(size_t) i])
+            {
+                if (slotLfo[(size_t) i])
+                    lfos[(size_t) i].process();     // a slot's source: its shape is read below
                 continue;
+            }
             const float raw = lfos[(size_t) i].process();
             out[(size_t) i] = closing[(size_t) i] ? 0.0f : raw;
             const float d = out[(size_t) i] - glide[(size_t) i];
@@ -608,6 +676,15 @@ private:
                 else
                     sGlide[(size_t) r] += d > 0.0f ? step : -step;
             }
+        if (slotsLive)
+        {
+            for (int i = 0; i < NUM_LFOS; ++i)
+                if (slotLfo[(size_t) i])
+                    mods.setLfo(i, lfos[(size_t) i].getShapeOutput(), LFO::isUnipolar(lfos[(size_t) i].getShape()));
+            mods.run(fresh);
+            if (mods.takeChanged())
+                refreshSlots();     // a slot has let go
+        }
         fresh = false;
         if (landing && sGlide[0] == 0.0f && sGlide[1] == 0.0f && sGlide[2] == 0.0f)
             refreshStrip();     // the strip has been let go of: at rest
@@ -628,6 +705,21 @@ private:
                 else if (sCross[(size_t) r] == 2)
                     for (int i = 0; i < NUM_LFOS; ++i) { depth[i] += sOut[(size_t) r]; hasDepth[i] = true; }
             }
+            if (mods.crossing())
+                for (int a = 0; a < mods.count(); ++a)
+                {
+                    const int slot = mods.slotAt(a);
+                    const ModSlotTarget& t = mods.target(slot);
+                    if (t.kind != ModSlotTarget::LfoRate && t.kind != ModSlotTarget::LfoDepth)
+                        continue;
+                    for (int i = 0; i < NUM_LFOS; ++i)
+                    {
+                        if (t.index >= 0 && t.index != i)
+                            continue;
+                        if (t.kind == ModSlotTarget::LfoRate)   { rate[i] += mods.outputOf(slot) * CROSS_RATE_OCTAVES; hasRate[i] = true; }
+                        else                                    { depth[i] += mods.outputOf(slot); hasDepth[i] = true; }
+                    }
+                }
             for (int i = 0; i < NUM_LFOS; ++i)
             {
                 if (hasRate[i])  lfos[(size_t) i].setRateMod(rate[i]);
@@ -639,7 +731,8 @@ private:
     // Which sources move an LFO changed: start from unmoved LFOs (run() sets what still applies).
     void updateCross()
     {
-        const bool crossed = cross[0] != 0 || cross[1] != 0 || sCross[0] != 0 || sCross[1] != 0 || sCross[2] != 0;
+        const bool crossed = cross[0] != 0 || cross[1] != 0 || sCross[0] != 0 || sCross[1] != 0 || sCross[2] != 0
+                             || mods.crossing();
         if (anyCross || crossed)
             for (auto& lfo : lfos)
             {
@@ -647,6 +740,17 @@ private:
                 lfo.setDepthMod(0.0f);
             }
         anyCross = crossed;
+    }
+
+    // The slots in use changed: the flags that say whether anything is live, keyed or moving an LFO.
+    void refreshSlots()
+    {
+        slotsLive = mods.live();
+        for (int i = 0; i < NUM_LFOS; ++i)
+            slotLfo[(size_t) i] = slotsLive && mods.uses(ModSrc::ofLfo(i));
+        anyActive = on[0] || on[1] || stripLive || slotsLive;
+        anyKeyed = key[0] >= 0 || key[1] >= 0 || stripKeyed || mods.keyed();
+        updateCross();
     }
 
     // The strip's routes as they stand with the strip where it is.
@@ -674,8 +778,8 @@ private:
         }
         stripLive = live || stripVibrato != 0.0f;
         stripKeyed = keyedNow;
-        anyActive = on[0] || on[1] || stripLive;
-        anyKeyed = key[0] >= 0 || key[1] >= 0 || stripKeyed;
+        anyActive = on[0] || on[1] || stripLive || slotsLive;
+        anyKeyed = key[0] >= 0 || key[1] >= 0 || stripKeyed || mods.keyed();
         if (crossChanged)
             updateCross();
     }
@@ -709,6 +813,13 @@ private:
                 else
                     left = true;
             }
+        if (mods.isClosing())
+        {
+            mods.finishClosing(now);
+            if (mods.takeChanged())
+                refreshSlots();
+            left = left || mods.isClosing();
+        }
         anyClosing = left;
     }
 
@@ -727,6 +838,10 @@ private:
     }
 
     std::array<LFO, NUM_LFOS> lfos;
+    VoiceModSlots mods;
+    std::array<bool, NUM_LFOS> slotLfo {};      // a slot reads this LFO: it runs whether or not it has a destination
+    bool slotsLive = false;
+    const float* userShape = nullptr;
     std::array<float, NUM_LFOS> out {};
     std::array<float, NUM_LFOS> absDepth {};
     std::array<int, NUM_LFOS> dest {};
@@ -837,7 +952,9 @@ public:
     }
 
     static constexpr int id(int lfo, Offset o) { return BASE + lfo * PER_LFO + (int) o; }
-    static constexpr bool owns(int paramId) { return paramId >= BASE && paramId < BASE + COUNT; }
+    static constexpr bool ownsMod(int paramId) { return EngineModSlots::owns(paramId); }
+    // The LFO and STRIP cells (158-181) and the mod slots, their count and the custom shape (700-772).
+    static constexpr bool owns(int paramId) { return (paramId >= BASE && paramId < BASE + COUNT) || ownsMod(paramId); }
 
     int numDests() const { return destCount; }
     const VoiceLfos::Settings& settings(int lfo) const { return lfoSettings[(size_t) std::clamp(lfo, 0, NUM_LFOS - 1)]; }
@@ -846,6 +963,8 @@ public:
     // The true current value.
     float get(int paramId) const
     {
+        if (ownsMod(paramId))
+            return modSlots.get(paramId);
         if (ownsStrip(paramId))
         {
             if (paramId == STRIP_VIBRATO)       return vibratoDepth;
@@ -884,6 +1003,8 @@ public:
     template <typename ForEachVoice, typename BaseOf>
     int set(int paramId, float value, const ForEachVoice& forEachVoice, const BaseOf& baseOf)
     {
+        if (ownsMod(paramId))
+            return setMod(paramId, value, forEachVoice, baseOf);
         if (ownsStrip(paramId))
             return setStrip(paramId, value, forEachVoice, baseOf);
         if (! ownsLfo(paramId))
@@ -1020,6 +1141,16 @@ public:
             const VoiceLfos::Settings copy = s;
             forEachVoice([lfo, &copy](VoiceLfos& v) { v.apply(lfo, copy, false); });
         }
+        if (anySlotOn && key >= 0)
+            for (int slot = 0; slot < EngineModSlots::MAX; ++slot)
+            {
+                auto& r = slotSettings[(size_t) slot];
+                if (r.target.kind != ModSlotTarget::Keyed || r.target.index != key || r.target.base == value)
+                    continue;
+                r.target.base = value;
+                const VoiceModSlots::Settings copy = r;
+                forEachVoice([slot, &copy](VoiceLfos& v) { v.applySlot(slot, copy); });
+            }
     }
 
     template <typename ForEachVoice>
@@ -1047,6 +1178,13 @@ public:
         const float now = stripNow;
         const int pitch = pitchDest;
         forEachVoice([now, pitch](VoiceLfos& v) { v.setStrip(now, 0.0f, pitch); });
+        const float* shape = modSlots.shape();
+        forEachVoice([shape](VoiceLfos& v) { v.setUserShape(shape); });
+        for (int slot = 0; slot < EngineModSlots::MAX; ++slot)
+        {
+            const VoiceModSlots::Settings copy = slotSettings[(size_t) slot];
+            forEachVoice([slot, &copy](VoiceLfos& v) { v.applySlot(slot, copy); });
+        }
     }
 
     // End of a block: keeps the LFOs of voices that did not sound (or stopped part-way) in time.
@@ -1076,7 +1214,7 @@ public:
     // to let go of one that has just been switched off (VoiceLfos::apply).
     bool anyOn() const
     {
-        if (letGo)
+        if (letGo || anySlotOn)
             return true;
         for (auto& s : lfoSettings)
             if (s.dest != 0 && s.depth != 0.0f)
@@ -1138,6 +1276,27 @@ public:
             pages.push_back(p);
     }
 
+    // ---- The mod slots -----------------------------------------------------------------------
+    // True while a slot is in use: the engine then gives every voice its block sources
+    // (VoiceLfos::setBlockSources) before the voices run.
+    bool slotsOn() const { return anySlotOn; }
+    const EngineModSlots& slots() const { return modSlots; }
+    int numSlotDests() const { return destCount + NUM_SLOT_EXTRA + EngineModSlots::MAX; }
+    // The names of a slot's DEST cell for the engine's list with these labels (the same count).
+    const EngineModSlots::DestNames& slotDestNames(const char* const* destLabels = nullptr) const
+    {
+        static const char* const extra[NUM_SLOT_EXTRA] = { "L1RT", "L1DP", "L2RT", "L2DP" };
+        return EngineModSlots::destNames(destLabels != nullptr ? destLabels : labels, destCount, extra, NUM_SLOT_EXTRA);
+    }
+
+    // SLT1 ... and LSHP, in front of the STRIP page (an engine's last pages stay STRIP, LFO1,
+    // LFO2). Call with the pages the engine shows, after appendPages.
+    void insertModPages(ParamPages& pages, const char* const* destLabels = nullptr) const
+    {
+        const auto& names = slotDestNames(destLabels);
+        modSlots.insertPages(pages, "STRIP", names.text.data(), names.count, ModSrc::BASIC_COUNT);
+    }
+
     // The "every voice's LFOs" argument for set / applyAll / endBlock, for a container of voices
     // that each have getLfos().
     template <typename Voices>
@@ -1153,6 +1312,18 @@ public:
             "LFO2 Rate", "LFO2 Depth", "LFO2 Shape", "LFO2 Trigger", "LFO2 Sync", "LFO2 Division", "LFO2 Fade", "LFO2 Dest",
             "Strip 1 Dest", "Strip 1 Amount", "Strip 2 Dest", "Strip 2 Amount", "Strip 3 Dest", "Strip 3 Amount",
             "Strip Vibrato", "Strip Vibrato Rate" };
+        if (ownsMod(paramId))
+        {
+            // (Kept for as long as the app runs: the callers want a C string.)
+            static const std::array<juce::String, EngineParamRange::FOURTH_END - EngineParamRange::FOURTH_BASE> modNames = []
+            {
+                std::array<juce::String, EngineParamRange::FOURTH_END - EngineParamRange::FOURTH_BASE> n;
+                for (int i = 0; i < (int) n.size(); ++i)
+                    n[(size_t) i] = EngineModSlots::name(EngineParamRange::FOURTH_BASE + i);
+                return n;
+            }();
+            return modNames[(size_t) (paramId - EngineParamRange::FOURTH_BASE)].toRawUTF8();
+        }
         return owns(paramId) ? names[paramId - BASE] : "";
     }
 
@@ -1217,6 +1388,135 @@ private:
         return keyBefore >= 0 && keyBefore != keyNow ? keyBefore : -1;
     }
 
+    // ---- The mod slots -----------------------------------------------------------------------
+    static constexpr int NUM_SLOT_EXTRA = 4;        // L1RT L1DP L2RT L2DP
+
+    // What a slot's DEST index is (see the top of the file).
+    ModSlotTarget slotTarget(int slot, int dest) const
+    {
+        ModSlotTarget t;
+        if (dest <= 0)
+            return t;
+        if (dest < destCount)
+        {
+            t.kind = ModSlotTarget::Fixed;
+            t.index = dest;
+            if (list != nullptr)
+            {
+                const auto& e = (*list)[dest];
+                if (e.cross != LfoDestList::None)
+                {
+                    t.kind = e.cross == LfoDestList::OtherRate ? ModSlotTarget::LfoRate : ModSlotTarget::LfoDepth;
+                    t.index = -1;       // both LFOs, as from the strip
+                }
+                else if (e.key >= 0)
+                {
+                    t.kind = ModSlotTarget::Keyed;
+                    t.index = e.key;
+                    t.lo = e.lo;
+                    t.hi = e.hi;
+                    t.log = e.log && e.lo > 0.0f;
+                    t.span = t.log ? 0.5f * std::log2(e.hi / e.lo) : e.hi - e.lo;
+                }
+            }
+            return t;
+        }
+        const int extra = dest - destCount;
+        if (extra < NUM_SLOT_EXTRA)
+        {
+            t.kind = extra % 2 == 0 ? ModSlotTarget::LfoRate : ModSlotTarget::LfoDepth;
+            t.index = extra / 2;
+            return t;
+        }
+        const int other = extra - NUM_SLOT_EXTRA;
+        if (other < modSlots.acting() && other != slot)
+        {
+            t.kind = ModSlotTarget::SlotAmount;
+            t.index = other;
+        }
+        return t;
+    }
+
+    // Slot `slot` as its voices should have it: nothing when it is beyond the slots in use.
+    template <typename BaseOf>
+    VoiceModSlots::Settings resolveSlot(int slot, const BaseOf& baseOf) const
+    {
+        VoiceModSlots::Settings r;
+        if (slot >= modSlots.acting())
+            return r;
+        const auto& m = modSlots.slot(slot);
+        r.src = m.src;
+        r.via = m.via;
+        r.amount = m.amount;
+        r.target = slotTarget(slot, m.dest);
+        if (r.target.kind == ModSlotTarget::Keyed)
+            r.target.base = baseOf(r.target.index);
+        const int amountDest = destCount + NUM_SLOT_EXTRA + slot;
+        for (int other = 0; other < modSlots.acting(); ++other)
+            if (other != slot && modSlots.slot(other).src != ModSrc::Off && modSlots.slot(other).dest == amountDest)
+                r.modulated = true;
+        return r;
+    }
+
+    static int slotKey(const VoiceModSlots::Settings& r)
+    {
+        return r.on() && r.target.kind == ModSlotTarget::Keyed ? r.target.index : -1;
+    }
+
+    // True while an LFO, a strip route or a slot is set to move parameter `key`.
+    bool keyHeld(int key) const
+    {
+        for (int lfo = 0; lfo < NUM_LFOS; ++lfo)
+            if (keyOf(lfo) == key)
+                return true;
+        for (auto& r : routes)
+            if (r.key == key && r.dest != 0 && r.amount != 0.0f)
+                return true;
+        for (auto& r : slotSettings)
+            if (slotKey(r) == key)
+                return true;
+        return false;
+    }
+
+    // A slot cell, the least number of slots shown or a level of the custom shape. Returns the key of a parameter a
+    // slot was moving and no longer is (-1 if none), as set() does for an LFO.
+    template <typename ForEachVoice, typename BaseOf>
+    int setMod(int paramId, float value, const ForEachVoice& forEachVoice, const BaseOf& baseOf)
+    {
+        const int change = modSlots.set(paramId, value, numSlotDests(), ModSrc::BASIC_COUNT);
+        if (change != EngineModSlots::SlotChanged)
+            return -1;      // (the LFOs read the shape's levels where they are; 772 only shows pages)
+
+        // Every slot whose settings are no longer what its voices have (one cell can change two
+        // slots: the one it belongs to and the one whose amount that slot moves).
+        int released = -1;
+        bool closing = false, on = false;
+        for (int slot = 0; slot < EngineModSlots::MAX; ++slot)
+        {
+            const VoiceModSlots::Settings now = resolveSlot(slot, baseOf);
+            auto& held = slotSettings[(size_t) slot];
+            on = on || now.on();
+            if (now.sameAs(held))
+                continue;
+            const int keyBefore = slotKey(held);
+            held = now;
+            forEachVoice([slot, &now, &closing](VoiceLfos& v) { v.applySlot(slot, now); closing = closing || v.isClosing(); });
+            if (keyBefore >= 0 && keyBefore != slotKey(now))
+            {
+                noteLetGo(keyBefore);
+                if (released < 0)
+                    released = keyBefore;
+            }
+        }
+        anySlotOn = on;
+        letGo = letGo || closing;
+        return released >= 0 && ! keyHeld(released) ? released : -1;
+    }
+
+    EngineModSlots modSlots;
+    std::array<VoiceModSlots::Settings, EngineModSlots::MAX> slotSettings {};
+    bool anySlotOn = false;
+
     std::array<VoiceLfos::StripRoute, NUM_STRIP> routes {};
     float vibratoDepth = 0.0f, vibratoRate = DEFAULT_VIBRATO_RATE;
     double vibratoPhase = 0.0;
@@ -1227,7 +1527,7 @@ private:
     const LfoDestList* list = nullptr;
     std::array<VoiceLfos::Settings, NUM_LFOS> lfoSettings {};
     mutable bool letGo = false;     // a voice is still letting go of a destination
-    std::array<int, 8> letGoKeys {};    // ... and the cells to put back when all have (afterLetGo)
+    std::array<int, 32> letGoKeys {};    // ... and the cells to put back when all have (afterLetGo)
     int numLetGo = 0;
 
     void noteLetGo(int key)

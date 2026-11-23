@@ -376,7 +376,7 @@ public:
             l.extra[0] = (float) Fast;
             rack.setLayer(0, 0, l);
             for (int i = 0; i < 3; ++i) { r.mgr.controlChangeReceived(1, 52, 127); r.mgr.controlChangeReceived(1, 52, 0); }
-            expectEquals(r.perf->getSubPage(), juce::String("MORE"));
+            expectEquals(r.perf->getSubPage(), juce::String("B1 MORE"));
             r.turn(2, 3);
             expectEquals((int) rack.get(0, 0).extra[0], (int) Fast + 3, "knob 3 on MORE");
             l = rack.get(0, 0);

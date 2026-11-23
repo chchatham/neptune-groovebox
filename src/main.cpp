@@ -18,6 +18,7 @@
 #include "ui/screens/ArpScreen.h"
 #include "ui/screens/CustomScaleScreen.h"
 #include "ui/screens/ChordPadScreen.h"
+#include "project/ChordSetManager.h"
 #include "ui/screens/PerfFxScreen.h"
 #include "controller/NotePadSlots.h"
 #include "ui/screens/SongScreen.h"
@@ -45,6 +46,8 @@
  #define NEPTUNE_HAS_TRACK_FX_SCREEN 1
 #endif
 #include "ui/SaveBox.h"
+#include "ui/ProjectSlots.h"
+#include "ui/ProjectBrowser.h"
 #include <optional>
 #include "project/ProjectManager.h"
 #include "sync/MIDIClock.h"
@@ -73,6 +76,18 @@ public:
     void closeButtonPressed() override
     {
         juce::JUCEApplication::getInstance()->systemRequestedQuit();
+    }
+
+    // Cmd+O: the list of projects (ui/ProjectBrowser.h). Keys nothing in the window uses arrive here.
+    std::function<void()> onOpenProjects;
+    bool keyPressed(const juce::KeyPress& key) override
+    {
+        if (key == juce::KeyPress('o', juce::ModifierKeys::commandModifier, 0))
+        {
+            if (onOpenProjects) onOpenProjects();
+            return true;
+        }
+        return DocumentWindow::keyPressed(key);
     }
 };
 
@@ -513,6 +528,9 @@ public:
         }
         scaleManager = std::make_unique<CustomScaleManager>();
         chordPads = std::make_unique<ChordPads>();
+        chordSetManager = std::make_unique<ChordSetManager>(
+            juce::File::getSpecialLocation(juce::File::userMusicDirectory)
+                .getChildFile("Neptune").getChildFile("Chords"));
         audioEngine->loadFactoryPerfPads();
         songMode = std::make_unique<SongMode>();
         projectManager = std::make_unique<ProjectManager>();
@@ -546,7 +564,32 @@ public:
             juce::Logger::writeToLog("[Project] Loaded: " + data.name);
         };
 
-        projectManager->startAutosave();
+        // The slots P01 ... P32 and what SETTINGS -> PROJ does with them (ui/ProjectSlots.h). Its
+        // actions come on the MIDI thread: whatever is a window on the Mac is posted.
+        projectSlots = std::make_unique<ProjectSlots>(*projectManager, projectSlotDir(0).getParentDirectory());
+        projectSlots->writesNothing = [] { return auditFolder().isNotEmpty(); };
+        projectSlots->remember = [](int slot)
+        {
+            if (slot >= 0) rememberProjectSlot(slot);
+            else           lastProjectFile().deleteFile();
+        };
+        projectSlots->askName = [this](int slot)
+        {
+            juce::MessageManager::callAsync([this, slot] { askProjectName(slot); });
+        };
+        projectSlots->settled = [this]
+        {
+            juce::MessageManager::callAsync([this]
+            {
+                if (saveBox != nullptr && saveBox->getName() == "Save project")
+                    saveBox.reset();
+            });
+        };
+        projectSlots->loaded = [this](int)
+        {
+            juce::MessageManager::callAsync([this] { closeProjectBrowser(); });     // it has done what it is for
+        };
+        mainWindow->onOpenProjects = [this] { openProjectBrowser(true); };
 
         midiClock = std::make_unique<MIDIClock>();
         midiClock->setTempo(sequencer->getTempo());
@@ -637,6 +680,25 @@ public:
             audioEngine->lanePressure(trackIdx, juce::jlimit(0, 127, note + shift), pressure);
         });
 
+        // PERF pad moves played back from the pattern: press, pressure, release.
+        sequencer->setPerfMoveCallback([this](const PerfFx::Move& move)
+        {
+            const int absPad = (int) move.bank * PerfFx::PADS + (int) move.pad;
+            auto& rack = audioEngine->getPerfFx();
+            switch (move.type)
+            {
+                case PerfFx::MOVE_PRESS:
+                    rack.pressAbs(absPad, (int) move.selectedTrack);
+                    break;
+                case PerfFx::MOVE_PRESSURE:
+                    rack.setPressureAbs(absPad, (float) move.pressure / 255.0f);
+                    break;
+                case PerfFx::MOVE_RELEASE:
+                    rack.releaseAbs(absPad);
+                    break;
+            }
+        });
+
         songPlayer.song = songMode.get();
         songPlayer.sequencer = sequencer.get();
         sequencer->addListener(&songPlayer);
@@ -658,10 +720,24 @@ public:
         // Patterns, tracks, mutes, fill and tempo for the hold layers and buttons; arpeggiators and
         // track sounds through the engine hooks (the Arp button switches the selected track's arp).
         screenManager->setSequencer(sequencer.get());
-        screenManager->setEngineHooks(GrammarHooks::make(*sequencer, *audioEngine, [this](float bpm)
         {
-            if (midiClock) midiClock->setTempo(bpm);
-        }));
+            auto hooks = GrammarHooks::make(*sequencer, *audioEngine, [this](float bpm)
+            {
+                if (midiClock) midiClock->setTempo(bpm);
+            });
+            // A cleared sound came from no preset any more: the track's preset name goes with it, so
+            // that a cleared track without trigs is an empty one again (where a multi preset may land).
+            hooks.applySound = [this, apply = hooks.applySound](int t, EngineType type, const ParamMap& params)
+            {
+                apply(t, type, params);
+                if (presetScreenRef != nullptr && EmptyTracks::isClearedSound(params))
+                    presetScreenRef->getTrackPresets().clear(t);
+            };
+            screenManager->setEngineHooks(std::move(hooks));
+        }
+        // The same structure lock for the sequencer: recordNote and setLength hold it so the audio
+        // thread (which only tries it) skips one block while a step vector is being modified.
+        sequencer->setStructureLock(GrammarHooks::structureLock(*audioEngine));
 
         screenManager->setScaleToggleCallback([this](bool enabled)
         {
@@ -679,6 +755,19 @@ public:
             if (!scaleManager || !isPitchedTrack(audioEngine->getEngine(sequencer->getSelectedTrack())))
                 return note;
             return GrammarHooks::snapToScale(*scaleManager, note);
+        });
+        // Scale held + Up / Down steps through scale pages (wrapping).
+        screenManager->setScalePageStep([this](int direction) -> juce::String
+        {
+            if (!scaleManager)
+                return {};
+            const int count = scaleManager->getPageCount();
+            if (count <= 0)
+                return {};
+            const int next = ((scaleManager->getActivePage() + direction) % count + count) % count;
+            scaleManager->setActivePage(next);
+            updateArpScales();
+            return juce::String(scaleManager->getPage(next).getName());
         });
 
         // Shift + pad = go to a screen (docs/launchkey-mk4-control-map.md, "CONTROL GRAMMAR"). Screen indices,
@@ -761,6 +850,7 @@ public:
             auto paramPages = std::make_unique<ParamPageScreen>(*sequencer, audioEngine.get());
             stepView->setLockPages(paramPages.get());
             stepView->setAudioEngine(audioEngine.get());
+            stepView->setStructureLock(GrammarHooks::structureLock(*audioEngine));
             stepView->showStatus = [this](const juce::String& text) { screenManager->showStatus(text); };
             screenManager->addScreen(std::move(stepView));
             screenManager->addScreen(std::move(paramPages));
@@ -867,65 +957,22 @@ public:
             h.getMaster = [this](int i) { return audioEngine->getMasterParam(i); };
             h.setMaster = [this](int i, float v) { audioEngine->setMasterParam(i, v); };
 
-            h.slotUsed = [this](int slot) { return projectSlotDir(slot).getChildFile("project.json").existsAsFile(); };
-            h.currentSlot = [this] { return currentProjectSlot(); };
-            h.loadSlot = [this](int slot)
-            {
-                settleProjectSave();
-                const bool ok = projectManager->loadProject(projectSlotDir(slot));
-                if (ok) rememberProjectSlot(slot);
-                return ok;
-            };
-            h.slotTitle = [this](int slot)
-            {
-                auto& title = slotTitles[(size_t) slot];
-                if (!title.has_value())
-                    title = ProjectManager::nameIn(projectSlotDir(slot));
-                return *title;
-            };
-            // Saved at once, under the name the project has; the Mac then asks for its name
-            // (askProjectName). The screen audit turns SVAS too: it saves nothing.
-            h.saveToSlot = [this](int slot)
-            {
-                if (auditFolder().isNotEmpty())
-                    return true;
-                const bool ok = projectManager->saveProjectAsPending(projectSlotDir(slot));
-                slotTitles[(size_t) slot].reset();
-                if (ok)
-                {
-                    rememberProjectSlot(slot);
-                    juce::MessageManager::callAsync([this, slot] { askProjectName(slot); });
-                }
-                return ok;
-            };
-            h.saveCurrent = [this]
-            {
-                if (auditFolder().isNotEmpty())
-                    return true;
-                settleProjectSave();
-                const bool ok = projectManager->saveProject();
-                if (const int now = currentProjectSlot(); ok && now >= 0)
-                    slotTitles[(size_t) now].reset();
-                return ok;
-            };
+            // PROJ: LOAD, SAVE and SVAS (a save is made at once; the Mac then asks for its name,
+            // askProjectName). The screen audit turns SAVE and SVAS too: they save nothing.
+            projectSlots->bind(h);
             h.newProject = [this]
             {
-                settleProjectSave();
+                projectSlots->settle();
                 projectManager->newProject();
+                projectSlots->changed();
                 // Same starting point as a freshly launched app: track 2 is the drum kit.
                 audioEngine->setEngineType(1, EngineType::Drum);
                 for (int p = 0; p < SequencerCore::MAX_PATTERNS; ++p)
                     if (sequencer->getPattern(p).getTrackCount() > 1)
                         sequencer->getPattern(p).getTrack(1).engineType = EngineType::Drum;
             };
-            h.getAutosave = [this] { return autosaveOn; };
-            h.setAutosave = [this](bool on)
-            {
-                autosaveOn = on;
-                if (on) projectManager->startAutosave();
-                else    projectManager->stopAutosave();
-            };
             auto settings = std::make_unique<SettingsScreen>(std::move(h));
+            settingsScreenRef = settings.get();
             screenManager->addScreen(std::move(settings));
         }
         {
@@ -955,12 +1002,21 @@ public:
             });
             scaleScreen->setLockHooks([this] { return screenManager->isScaleLocked(); },
                                       [this](bool on) { screenManager->setScaleLocked(on); });
+            scaleScreen->setLatchState([this] { return screenManager->isKeyLatchOn(); },
+                                       [this] { return screenManager->getLatchReleaseCount(); });
+            scaleScreenRef = scaleScreen.get();
             screenManager->addScreen(std::move(scaleScreen));
         }
         screenManager->addScreen(std::make_unique<SongScreen>(*songMode, *sequencer));
         {
             // Pressure routes are per track: the screen edits the selected track's.
             auto atScreen = std::make_unique<AftertouchScreen>(*audioEngine, [this] { return sequencer->getSelectedTrack(); });
+            // (the routes are cells of the track's sound: kept with its stored parameters like any cell)
+            atScreen->setStore([this](int t, int id, float value)
+            {
+                if (t >= 0 && t < sequencer->getPattern().getTrackCount())
+                    sequencer->getPattern().getTrack(t).soundParams[id] = value;
+            });
             atScreen->setNoteCallbacks(
                 [this](int note, int velocity) { notePadDown(note, velocity); },
                 [this](int note) { notePadUp(note); },
@@ -994,9 +1050,15 @@ public:
                 std::vector<ChordPads::Note> held;
                 for (auto& [note, velocity] : screenManager->getHeldKeys())
                     held.push_back({ note, (float) velocity / 127.0f });
-                // With the key latch on (not the arp latch), latched keys count as held.
-                // Arp-latched notes do NOT count: pressing a pad with arp latch on should
-                // play the pad's chord, not store the arp's notes onto it.
+                return held;
+            });
+            // Only physically held keys decide whether a pad stores a chord. Latched notes
+            // alone do not count: under a latch a pad press plays its chord.
+            chordScreen->setPhysicalKeysProvider([this]
+            {
+                std::vector<ChordPads::Note> held;
+                for (auto& [note, velocity] : screenManager->getPhysicallyHeldKeys())
+                    held.push_back({ note, (float) velocity / 127.0f });
                 return held;
             });
             chordScreen->setNoteCallback([this](int note, int velocity) { notePadDown(note, velocity, false); });
@@ -1015,19 +1077,33 @@ public:
             auto* chordRef = chordScreen.get();
             strumTimer.fn = [this, chordRef]
             {
-                if (!chordRef->strumIsWaiting())
+                const bool strum = chordRef->strumIsWaiting();
+                const bool scaleLatch = scaleScreenRef != nullptr && scaleScreenRef->latchIsWaiting();
+                if (!strum && !scaleLatch)
                     return;
                 const juce::ScopedLock ui(screenManager->getLock());
-                chordRef->serviceStrum();
+                if (strum) chordRef->serviceStrum();
+                if (scaleLatch) scaleScreenRef->serviceScaleLatch();
             };
+            // Chord set save / load: SETS page on CHORD, writing to ~/Music/Neptune/Chords/.
+            if (chordSetManager)
+                chordScreen->setChordSetCallbacks(
+                    [this](int slot, const ChordPads& c) { return !auditFolder().isNotEmpty() && chordSetManager->save(slot, c); },
+                    [this](int slot, ChordPads& c) { return chordSetManager->load(slot, c); },
+                    [this](int slot) { return chordSetManager->slotExists(slot); },
+                    ChordSetManager::NUM_SLOTS);
             screenManager->addScreen(std::move(chordScreen));
             strumTimer.startTimer(1);
         }
         jassert(screenManager->getScreenCount() == SCR_CHORD + 1);
         // PERF: effects played from the pads, on any track or the whole mix (engine/PerfFx.h).
-        screenManager->addScreen(std::make_unique<PerfFxScreen>(*audioEngine,
-            [this] { return sequencer->getSelectedTrack(); },
-            [this] { return sequencer->getPattern().getTrackCount(); }));
+        {
+            auto perfScreen = std::make_unique<PerfFxScreen>(*audioEngine,
+                [this] { return sequencer->getSelectedTrack(); },
+                [this] { return sequencer->getPattern().getTrackCount(); });
+            perfScreen->setSequencer(sequencer.get());
+            screenManager->addScreen(std::move(perfScreen));
+        }
         jassert(screenManager->getScreenCount() == SCR_PERF + 1);
 
         // Screen names change with their page, so the buttons and the copy / clear / paste defaults
@@ -1198,6 +1274,8 @@ public:
 
     void shutdown() override
     {
+        projectBrowserTimer.reset();
+        projectBrowser.reset();
         saveBox.reset();                     // an unanswered save box: the save stays under the name it has
         if (projectManager) projectManager->keepSaveAs();
         strumTimer.stopTimer();
@@ -1259,6 +1337,7 @@ private:
     std::unique_ptr<DrumPadScreen> drumPadScreen;
     PresetScreen* presetScreenRef = nullptr;     // owned by screenManager
     DrumPadScreen* drumPadScreenRef = nullptr;   // owned by screenManager
+    CustomScaleScreen* scaleScreenRef = nullptr; // owned by screenManager
 
     // The preset is already saved as `savedName` (SV never waits for the Mac); this asks for its
     // name in the save box (ui/SaveBox.h), offering the name of the preset the track's sound
@@ -1273,13 +1352,24 @@ private:
             return;
         juce::String offered = savedName;
         int track = 0;
+        std::vector<int> tracks;
         {
             const juce::ScopedLock ui(screenManager->getLock());
             projectManager->keepSaveAs();       // (a project's box still open: that save stays as it is)
             offered = presetScreenRef->suggestedName(savedName);
             track = presetScreenRef->getSavedTrack();
+            tracks = presetScreenRef->getSavedTracks();
         }
-        auto& box = openSaveBox("Save preset", "Save the sound of track " + juce::String(track + 1) + " as a preset",
+        // A track that is connected to others (its input, a DUCK) was saved with them, as a multi.
+        juce::String heading = "Save the sound of track " + juce::String(track + 1) + " as a preset";
+        if (tracks.size() > 1)
+        {
+            juce::StringArray numbers;
+            for (int t : tracks)
+                numbers.add(juce::String(t + 1));
+            heading = "Save tracks " + numbers.joinIntoString(", ") + " together as a multi preset";
+        }
+        auto& box = openSaveBox(tracks.size() > 1 ? "Save multi preset" : "Save preset", heading,
                                 offered, PresetManager::MAX_NAME_LENGTH,
                                 [savedName] { juce::Logger::writeToLog("[Preset] " + savedName + " kept under that name (saved again before the box was answered)"); });
         box.nameUse = [this, savedName](const juce::String& typed)
@@ -1312,72 +1402,157 @@ private:
         showSaveBox();
     }
 
-    // The same box for a project (SETTINGS -> PROJ -> SVAS, or SAVE of a project that has no slot
-    // yet). The project is already in its slot (ProjectManager::saveProjectAsPending); Save names
-    // it, Cancel takes the save back: the slot holds what it held and the project is the one it
+    // The same box for a project (SETTINGS -> PROJ -> SAVE or SVAS). The project is already in its
+    // slot (ProjectSlots::saveAs); Save names it - SAVE offers the name it has, so Return keeps it -
+    // and Cancel takes the save back: the slot holds what it held and the project is the one it
     // was. Anything else done with projects meanwhile, or quitting, keeps the save as it is.
     void askProjectName(int slot)
     {
-        if (mainWindow == nullptr || !projectManager->saveAsPending())
+        if (mainWindow == nullptr)
             return;
-        const auto slotName = SettingsScreen::slotName(slot);
-        const auto dir = projectSlotDir(slot);
-        const auto had = SettingsScreen::isUnnamed(projectManager->getProjectName()) ? juce::String("Untitled")
-                                                                                     : projectManager->getProjectName();
-        const bool replaced = ProjectManager::keptIn(dir).existsAsFile();
-        auto& box = openSaveBox("Save project", "Save the project in " + slotName, had, ProjectManager::MAX_NAME_LENGTH,
-                                {});      // (a later save-as has settled this one already)
+        ProjectSlots::BoxWords words;
+        {
+            const juce::ScopedLock ui(screenManager->getLock());
+            if (!projectSlots->pendingIn(slot))     // (settled already: loaded, saved elsewhere or a new project since)
+            {
+                juce::Logger::writeToLog("[Project] no box for " + SettingsScreen::slotName(slot)
+                                         + ": its save was settled before the box could open");
+                return;
+            }
+            words = projectSlots->boxWords(slot);
+        }
+        auto& box = openSaveBox("Save project", words.heading, words.offered, ProjectManager::MAX_NAME_LENGTH,
+                                {});      // (a later save has settled this one already)
         box.nameUse = [](const juce::String& typed)
         {
             return ProjectManager::cleanName(typed).isEmpty() ? SaveBox::NameUse::Empty : SaveBox::NameUse::New;
         };
-        box.hintFor = [slotName](SaveBox::NameUse use, const juce::String& typed)
+        box.hintFor = [words](SaveBox::NameUse use, const juce::String& typed)
         {
-            if (use != SaveBox::NameUse::New)
-                return juce::String();
-            return "Return or Save: " + slotName + " holds this project as \"" + ProjectManager::cleanName(typed) + "\".";
+            return use == SaveBox::NameUse::New ? words.saveHint(typed) : juce::String();
         };
-        box.setCancelHint(replaced ? "Escape or Cancel: " + slotName + " keeps the project it held."
-                                   : "Escape or Cancel: nothing is saved, " + slotName + " stays empty.");
-        box.onSave = [this, slot, dir](const juce::String& typed)
+        box.setCancelHint(words.cancelHint);
+        box.onSave = [this, slot](const juce::String& typed)
         {
             const juce::ScopedLock ui(screenManager->getLock());
             // (settled meanwhile by a load, a save or a new project: the box has nothing to name)
-            const bool ok = projectManager->pendingSaveDir() == dir && projectManager->nameSaveAs(typed);
-            slotTitles[(size_t) slot].reset();
+            const bool ok = projectSlots->nameSave(slot, typed);
             screenManager->showStatus(ok ? "SAVED" : "NOT NAMED");
-            juce::Logger::writeToLog("[Project] " + dir.getFileName() + (ok ? " named " : " not named ") + typed);
+            juce::Logger::writeToLog("[Project] " + SettingsScreen::slotName(slot) + (ok ? " named " : " not named ") + typed);
             return true;
         };
-        box.onCancel = [this, slot, dir]
+        box.onCancel = [this, slot]
         {
             const juce::ScopedLock ui(screenManager->getLock());
-            if (projectManager->pendingSaveDir() != dir)
+            if (!projectSlots->pendingIn(slot))
                 return;
-            const bool ok = projectManager->takeBackSaveAs();
-            slotTitles[(size_t) slot].reset();
-            const int now = currentProjectSlot();
-            if (now >= 0) rememberProjectSlot(now);
-            else          lastProjectFile().deleteFile();
+            const bool ok = projectSlots->takeBack(slot);
             screenManager->showStatus(ok ? "NOT SAVED" : "FAIL");
-            juce::Logger::writeToLog("[Project] save to " + dir.getFileName() + " taken back");
+            juce::Logger::writeToLog("[Project] save to " + SettingsScreen::slotName(slot) + " taken back");
         };
         showSaveBox();
+        juce::Logger::writeToLog("[Project] box open for " + words.slot + (words.replaces ? " (replaces what it held)" : " (was empty)"));
     }
 
-    // LOAD, SAVE or NEW with the project's box still open: the save it asks about stays as it is
-    // and the box goes (it has nothing left to name or take back).
-    void settleProjectSave()
+    // ---- The Mac's list of projects (ui/ProjectBrowser.h) ---------------------------------------
+    // Open while SETTINGS -> PROJ is showing on the controller (followProjectPage, ten times a
+    // second on the message thread: the controller's thread never touches a window), or opened
+    // with Cmd+O. Never during the screen audit, the screen dump or the snapshots.
+    bool projectWindowsAllowed() const
     {
-        if (!projectManager->saveAsPending())
-            return;
-        projectManager->keepSaveAs();
-        juce::MessageManager::callAsync([this]
-        {
-            if (saveBox != nullptr && saveBox->getName() == "Save project")
-                saveBox.reset();
-        });
+        return mainWindow != nullptr && settingsScreenRef != nullptr && projectSlots != nullptr
+            && auditFolder().isEmpty() && !standsAside() && screenAudit == nullptr
+            && juce::SystemStats::getEnvironmentVariable("NEPTUNE_SNAPSHOT_CONTROLLER", {}).isEmpty();
     }
+
+    void openProjectBrowser(bool fromMac)
+    {
+        if (!projectWindowsAllowed())
+            return;
+        if (projectBrowser == nullptr)
+        {
+            projectBrowser = std::make_unique<ProjectBrowserWindow>();
+            browserFromPage = !fromMac;
+            auto& b = projectBrowser->getBrowser();
+            b.onSelect = [this](int slot)
+            {
+                const juce::ScopedLock ui(screenManager->getLock());
+                settingsScreenRef->selectSlot(slot);
+                screenManager->requestRedraw();
+            };
+            b.onLoad = [this](int slot)
+            {
+                bool ok = false;
+                {
+                    const juce::ScopedLock ui(screenManager->getLock());
+                    ok = settingsScreenRef->loadSlot(slot);         // LOAD's own hook: ProjectSlots::load
+                    screenManager->showStatus((ok ? "LOADED " : "NO LOAD ") + SettingsScreen::slotName(slot));
+                    screenManager->requestRedraw();
+                }
+                juce::Logger::writeToLog("[Project] " + SettingsScreen::slotName(slot) + (ok ? " loaded" : " not loaded")
+                                         + " from the Projects window");
+            };
+            // (the window is inside its own key or click when it is closed: taken away afterwards)
+            b.onClose = [this] { juce::MessageManager::callAsync([this] { closeProjectBrowser(); }); };
+            browserVersion = -1;
+        }
+        refreshProjectBrowser();
+        projectBrowser->showBeside(mainWindow.get(), fromMac);
+    }
+
+    void closeProjectBrowser()
+    {
+        projectBrowser.reset();
+        browserFromPage = false;
+    }
+
+    // The rows when a slot was written, loaded or named; the highlight on the slot SLOT shows.
+    void refreshProjectBrowser()
+    {
+        if (projectBrowser == nullptr)
+            return;
+        std::vector<ProjectRow> rows;
+        int slot = 0;
+        bool fresh = false;
+        {
+            const juce::ScopedLock ui(screenManager->getLock());
+            slot = settingsScreenRef->getSelectedSlot();
+            if (projectSlots->version() != browserVersion)
+            {
+                browserVersion = projectSlots->version();
+                rows = projectSlots->rows();
+                fresh = true;
+            }
+        }
+        if (fresh) projectBrowser->getBrowser().setRows(std::move(rows), slot);
+        else       projectBrowser->getBrowser().showSlot(slot);
+    }
+
+    void followProjectPage()
+    {
+        if (!projectWindowsAllowed())
+            return;
+        bool showing = false;
+        {
+            const juce::ScopedLock ui(screenManager->getLock());
+            showing = screenManager->getActiveScreen() == settingsScreenRef && settingsScreenRef->showsProjects();
+        }
+        // (the page the app starts on opens nothing: only entering it does)
+        if (projectPagePolled && showing && !projectPageShowing)
+            openProjectBrowser(false);
+        else if (!showing && projectPageShowing && browserFromPage)
+            closeProjectBrowser();
+        projectPageShowing = showing;
+        projectPagePolled = true;
+        refreshProjectBrowser();
+    }
+
+    std::unique_ptr<ProjectSlots> projectSlots;
+    SettingsScreen* settingsScreenRef = nullptr;       // owned by screenManager
+    std::unique_ptr<ProjectBrowserWindow> projectBrowser;
+    bool browserFromPage = false;                      // opened by the PROJ page: leaving the page closes it
+    bool projectPageShowing = false, projectPagePolled = false;
+    int browserVersion = -1;
 
     // One box at a time: a save made while a box is open settles the earlier one as it stands
     // (`ifReplaced` of the earlier box) and the box asks about the new one.
@@ -1404,9 +1579,6 @@ private:
     }
     std::unique_ptr<SaveBoxWindow> saveBox;
     std::function<void()> saveBoxReplaced;       // what an unanswered box does when another takes its place
-    // The names of the projects in the slots, as SETTINGS -> PROJ shows them (read once from the
-    // slot's file; forgotten when the slot is written). Used under the screen lock.
-    std::array<std::optional<juce::String>, SettingsScreen::NUM_SLOTS> slotTitles;
 
     // NEPTUNE_SNAPSHOT_SAVE_BOX: the box as the app shows it, with a sample name and answers that do
     // nothing; its picture, and where it is and what has the keyboard, then quit.
@@ -1460,6 +1632,7 @@ private:
     }
     std::unique_ptr<CustomScaleManager> scaleManager;
     std::unique_ptr<ChordPads> chordPads;
+    std::unique_ptr<ChordSetManager> chordSetManager;
     std::unique_ptr<SongMode> songMode;
     std::unique_ptr<ProjectManager> projectManager;
     std::unique_ptr<MIDIClock> midiClock;
@@ -1486,6 +1659,7 @@ private:
     };
     std::unique_ptr<FunctionTimer> ledRefreshTimer;
     std::unique_ptr<FunctionTimer> sessionTimer;
+    std::unique_ptr<FunctionTimer> projectBrowserTimer;   // followProjectPage
     std::unique_ptr<FunctionTimer> panelPadTimer;      // only without a controller (see mirrorPadsToPanel)
 
     // Screen indices (the order of addScreen in initialise).
@@ -1544,7 +1718,6 @@ private:
     PerformanceControls performanceControls;
     SongPlayer songPlayer;
     int clockModeSetting = 0;      // 0 internal, 1 external, 2 auto, 3 link
-    bool autosaveOn = true;
 
     ProjectBridge::Live projectLive()
     {
@@ -1583,13 +1756,12 @@ private:
     static bool standsAside() { return dumpFolder().isNotEmpty() || saveBoxShot().isNotEmpty() || auditAside(); }
 
     // The screen audit runs on a thread of its own and sends the same messages the controller
-    // does. Nothing is loaded before it and autosave is off, so no project is touched.
+    // does. Nothing is loaded before it and no session is kept (restoreSession is not called), so
+    // no project is touched.
     // NEPTUNE_AUDIT_PHOTOS=1 makes it wait on every page for tools/screen_audit.py to photograph
     // the device.
     void startScreenAudit(bool connected)
     {
-        projectManager->stopAutosave();
-        autosaveOn = false;
         sequencer->setSelectedTrack(0);
         screenManager->setHelpMode(ScreenManager::HelpMode::Delayed);      // the audit checks the cards as shipped
 
@@ -1598,7 +1770,7 @@ private:
         a.deviceConnected = connected;
         a.photoHandshake = connected && juce::SystemStats::getEnvironmentVariable("NEPTUNE_AUDIT_PHOTOS", {}).isNotEmpty();
         a.log = [](const juce::String& text) { juce::Logger::writeToLog("[Audit] " + text); };
-        a.engineNames = { "synth", "FM", "macro", "wavetable", "wave seq", "sampler", "drums", "MIDI" };
+        a.engineNames = { "synth", "FM", "macro", "wavetable", "wave seq", "sampler", "drums", "MIDI", "resonator" };
         a.setEngine = [this](int e)
         {
             const int track = sequencer->getSelectedTrack();
@@ -1663,7 +1835,7 @@ private:
             }
         };
         static const char* const screenNames[] = { "TRACKS", "STEP", "PARAM", "DRUMS", "PRESET", "SETTINGS", "FLTR", "ARP", "SCALE", "SONG", "AT ROUTE", "WAVE" };
-        static const char* const engineNames[] = { "synth", "FM", "macro", "wavetable", "wave seq", "sampler", "drums", "MIDI" };
+        static const char* const engineNames[] = { "synth", "FM", "macro", "wavetable", "wave seq", "sampler", "drums", "MIDI", "resonator" };
         for (int i = 0; i < 12; ++i)
         {
             if (i == 2) continue;
@@ -1694,13 +1866,15 @@ private:
             pages("PERF");
         }
         const int track = sequencer->getSelectedTrack();
-        for (int e = 0; e < 8; ++e)
+        for (int e = 0; e < ENGINE_TYPE_COUNT; ++e)      // (every engine, the resonator too; AT ROUTE as each engine has it)
         {
             audioEngine->setEngineType(track, (EngineType) e, true);
             sequencer->getPattern().getTrack(track).engineType = (EngineType) e;
             screenManager->setActiveScreen(0);
             screenManager->setActiveScreen(2);
             pages(juce::String("PARAM ") + engineNames[e]);
+            screenManager->setActiveScreen(SCR_AT_ROUTE);
+            pages(juce::String("AT ROUTE ") + engineNames[e]);
         }
     }
 
@@ -1739,6 +1913,8 @@ private:
         sessionOn = true;
         sessionTimer = std::make_unique<FunctionTimer>([this] { saveSession(); });
         sessionTimer->startTimer(15000);
+        projectBrowserTimer = std::make_unique<FunctionTimer>([this] { followProjectPage(); });
+        projectBrowserTimer->startTimerHz(10);
     }
 
     void saveSession()
@@ -1771,16 +1947,6 @@ private:
         m.level = audioEngine->getMetronome().getLevel();
         m.countInBars = sequencer->getCountInBars();
         metronomeFile().replaceWithText(Metronome::toText(m));
-    }
-
-    int currentProjectSlot() const
-    {
-        if (!projectManager || !projectManager->hasFile())
-            return -1;
-        auto name = projectManager->getCurrentFile().getFileName();
-        if (name.length() == 3 && name.startsWithChar('P'))
-            return juce::jlimit(1, SettingsScreen::NUM_SLOTS, name.substring(1).getIntValue()) - 1;
-        return -1;
     }
 
     void applyClockMode(int mode)
@@ -1874,6 +2040,8 @@ private:
         const int count = arp->exportSteps(exported, 64);
         if (count <= 0) return false;
 
+        bool wroteAny = false;
+        const AudioEngine::StructureLock slock(audioEngine->structure());
         // Pattern steps are sixteenths; an arp step is getStepLengthBeats() quarter notes.
         const double stepsPerArpStep = arp->getStepLengthBeats() * 4.0;
         auto& track = sequencer->getPattern().getTrack(sequencer->getSelectedTrack());
@@ -1882,7 +2050,6 @@ private:
         track.setLength(length);
         track.clearAllSteps();
 
-        bool wroteAny = false;
         for (int i = 0; i < count; ++i)
         {
             const auto& e = exported[i];

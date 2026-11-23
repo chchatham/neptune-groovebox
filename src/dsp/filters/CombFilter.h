@@ -9,6 +9,10 @@
 // whole difference at once (59 samples for one knob click at 20 Hz), which is heard as a click and
 // a step in pitch. The glide takes about half a period of the comb (never less than a millisecond),
 // so a low sweep bends like a tape delay and a high one still follows an envelope or LFO at once.
+//
+// (Its line is its own: 8,192 samples read with a straight line, a dozen lines of code. The one
+// line of the effects is dly::Line, DelayCore.h; this filter sits in every voice of every engine,
+// and on that line its read would round differently in all of them. Left as it is in phase E6.)
 
 #include "../DSPUtils.h"
 #include <vector>

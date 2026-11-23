@@ -305,6 +305,9 @@ public:
     // app binds both to the scale pages; without them the lock is only a flag.
     void setScaleNameProvider(std::function<juce::String()> fn) { scaleName = std::move(fn); }
     void setKeySnap(std::function<int(int note)> fn) { keySnap = std::move(fn); }
+    // Scale + Up / Down steps through scale pages; the callback does the step and returns the
+    // name of the new page (shown in the name bar). A null callback disables the gesture.
+    void setScalePageStep(std::function<juce::String(int direction)> fn) { scalePageStep = std::move(fn); }
 
     // What Func + Record / Play / > act on when the screen itself declines (returns false).
     // What Func + Record / Play / > act on when no step is held: nothing (the default), the selected
@@ -470,6 +473,9 @@ public:
     // The keys that count as held now: physically down, or kept by the key latch. Each as the note
     // it sounds (scale lock) with the velocity it was played at. For the chord pads.
     std::vector<std::pair<int, int>> getHeldKeys() const;
+    // Only the keys whose finger is on the keyboard right now (no latched notes). Used by CHORD to
+    // decide when to store: a chord is stored only while keys are physically held.
+    std::vector<std::pair<int, int>> getPhysicallyHeldKeys() const;
     bool isLatchOn() const;         // key latch, or the selected track's arp latch while that arp is on
     bool isFillHeld() const { return fillHeld; }
 
@@ -659,6 +665,7 @@ private:
     int shiftPadScreenIndex[16] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     int settingsScreenIndex = -1, arpScreenIndex = -1, scaleScreenIndex = -1, stepScreenIndex = -1;
     std::function<juce::String()> scaleName;
+    std::function<juce::String(int direction)> scalePageStep;
     std::function<int(int)> keySnap;
     std::array<juce::int8, 128> keySounding {};     // what each held key plays (scale lock), -1 = itself
     std::array<juce::uint8, 128> keyVelocity {};    // the velocity each key was last played at
@@ -680,6 +687,7 @@ private:
     static constexpr juce::int64 PIN_HOLD_MS = 500;
     bool funcHeld = false;
     bool scaleHeld = false;
+    bool scaleLayerUsed = false;        // Scale + Up/Down was used: release does not toggle
     bool patternKeyHeld = false;
     int trackKeysHeld = 0;          // bit 0 = Up, bit 1 = Down, held as the Track layer
     bool trackLayerUsed = false;    // a pad or knob was used under it: its release does not page

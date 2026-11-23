@@ -2,91 +2,139 @@
 
 #include "../dsp/Envelope.h"
 #include "../dsp/DSPUtils.h"
+#include "../dsp/LevelCrusher.h"
 #include "../dsp/filters/SVFilter.h"
-#include "EngineLfoSection.h"
+#include "../dsp/PhaseOsc.h"
+#include "ModRouter.h"
 #include "CymbalMachine.h"
+#include "OscBank.h"
+#include "ResonatorVoice.h"
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
 #include <array>
 
-enum class DrumSynthType
-{
-    FMKick, AnalogKick, ModCyclesKick,
-    NoiseSnare, FMSnare,
-    Clap,
-    ClosedHat, OpenHat,
-    Cymbal, Tom, Rim, Shaker, Clave,
-    SubBass,
-    KickSynth,      // the kick machine: its own page of sweep, shape and knock controls (appended: projects store the number)
-    CymbalSynth     // the cymbal machine (CymbalMachine.h): its own page, CYM
-};
-
-// Per-slot aftertouch destination enum (matches DrumATDest in DrumKit.h)
-enum class DrumVoiceATDest
-{
-    Off = 0,
-    Pitch,
-    Decay,
-    Filter,
-    Level,
-    Drive,
-    Snap,
-    Pan
-};
+#include "DrumTypes.h"
 
 // What the cells do, by type (every cell is heard on every type: the "Dead Controls" tests).
 //   DEC   the length: the amp decay (hats, cymbal, clave and rim shot scale it to their own
 //         range); on SUB, which sounds for as long as it is held, the fade after it is let go.
-//   TONE  brightness, in the way of each drum: FMKK the level of the FM click; KICK how far the
-//         pitch falls (0 = no fall); MKIK the resonance of its filter; SNAR / FMSN the noise
-//         band (and FMSN's FM index); CLAP the band's width; hats and cymbal the high-pass; TOM
-//         the stick noise; RIM its noise; SHKR from a broad hiss to a narrow, pitched rattle;
-//         CLAV the upper partial; SUB sine -> triangle -> squared-off; KSYN a low-pass; CSYN how
-//         much of the top there is (the middle = the cymbal as it is).
+//   TONE  brightness, in the way of each drum: SNAR / FMSN the noise band (and FMSN's FM
+//         index); CLAP the band's width; hats and cymbal the high-pass; TOM the stick noise; RIM
+//         its noise; SHKR from a broad hiss to a narrow, pitched rattle; CLAV the upper partial;
+//         SUB sine -> triangle -> squared-off; the kicks (KSYN and its points FMKK KICK MKIK) a
+//         low-pass; CSYN how much of the top there is (the middle = the cymbal as it is).
 //   DRIV  saturation (a soft clip that keeps the peak level) on every type; SNAR / FMSN also
 //         shift from the body to the noise with it, CLAP adds claps, SHKR deepens its rattle.
 //   SNAP  the front edge, 0.5 = the drum as it is: below, the onset is softened (it fades in
 //         over up to about 12 ms); above, the first milliseconds are lifted (to +6 dB) and the
-//         drums that start from a sine get a short noise click. TOM and KSYN set their attack
-//         time with it instead, CLAP also the length of each clap. CSYN: what strikes the cymbal,
-//         from a soft mallet (0) through a stick (0.5) to a hard tip with a loud tick (1).
+//         drums that start from a sine get a short noise click. TOM and the kicks set their attack
+//         time with it instead (the kicks: EDGE of their KCK2 page is SNAP as the others have it),
+//         CLAP also the length of each clap. RSN, and BANK's METL and RING: what strikes it, from
+//         a soft mallet (0) through a stick (0.5) to a hard tip (1).
+// [KICKS] FMKK, KICK and MKIK were three sine-sweep kicks of their own. They are points of the
+// kick machine now (KickPoint below: its KICK and KCK2 cells at a setting): a pad of one of those
+// TYPEs is a kick machine whose cells start where that kick was. kickPoint() turns a kick written
+// with the old type's cells (TUNE DEC TONE DRIV SNAP LEVL) into the kick machine's, which is how
+// the kits and the sample bank's hits were re-made ("Kick Points" measures old against new).
+// [U2b] RSN, the resonator drum: TUNE is its pitch in Hz, DEC how long it rings (times what the
+// sound says: a gong's second is longer than a clave's), TONE its tilt, SNAP the exciter's
+// hardness, DRIV the saturation after it. Everything else is the sound (SND) and the seven cells
+// of its RSN page, which are added to the sound's own.
 class DrumVoice
 {
 public:
-    // LFO destinations (EngineLfoSection), in the order of the DEST cell. Every drum voice has its
-    // own pair of LFOs, set from the kit's two LFO pages, so KEY / ONE / HALF restart with each
-    // hit of that drum and HOLD freezes a new value at each hit.
-    //   Pitch, tone, drive, level and pan follow the LFO while the hit sounds.
-    //   Decay and snap shape the envelopes, which are set up when the drum is struck, so they
-    //   take the LFO's value at that moment (as do the parts of tone and drive that are fixed at
-    //   the strike: the clap's burst count and spacing, filters tuned from TUNE).
-    // The list goes on with the kick machine's eight cells (DrumEngine::lfoDests; their key is the
-    // KickParam index): SWEP and SHAP follow the LFO while the hit sounds, as does the pitch of
-    // the knock (KTON); SWPT, SCRV, KNCK, HOLD, ACRV and the knock's length are set at the strike.
-    enum LfoDest
+    // [U4] What the kit's modulation router can move on a drum (DrumEngine::kitDests builds the
+    // table in this order; a DEST cell stores the index, so the first 42 are where the kit's LFO
+    // destinations were before the router). One router for the kit: its LFO, STRIP, XIN and slot
+    // cells are the kit's, each drum has its own LFOs (mod::Voice), and the cells that are a
+    // drum's own - the kick machine's, the resonator drum's - are read from this drum's own set
+    // values (mod::Voice::useBase on modBase).
+    //   PTCH          TUNE as a ratio, an octave either way with the amount squared (per sample)
+    //   DEC           DEC x 1/4 .. x 4 at full depth (+-2 octaves of time), read at the strike
+    //                 (and by the resonator drum, which follows its DEC while it rings)
+    //   TONE DRIV     +-1 around the cell (0..1), per sample
+    //   SNAP          +-1 around the cell, read at the strike
+    //   AMP           a gain 0..2 (below 0 from an audio-rate slot: ring modulation), per sample
+    //   PAN           +-0.5 around PAN (the whole width), per sample
+    //   SWEP .. ACRV  the kick machine's eight cells, this drum's own, in each cell's own scale:
+    //                 SWEP SHAP KTON while the hit sounds, the others at the strike
+    //   LRAT LDPT     the other LFOs' rate and depth
+    //   MRPH .. HARD  the resonator drum's 24 cells (its page's sound, this drum's own values)
+    //   PM            the phase of the drum's oscillator, a cycle either way at full depth (several
+    //                 slots up to two), per sample: the
+    //                 track input on it (XIN, or a free slot with source XIN) is phase modulation
+    //                 of a kick or a tom by another track
+    //   WPOS          where in its WAVE (a table) the oscillator reads, 0..1, per sample
+    //   ETIM FTIM     the time of the amp envelope / of the drum's second envelope (the sweep, the
+    //                 body: on the resonator drum its filter's), x 1/8 .. x 8
+    enum ModDest
     {
-        LfoOff = 0,
-        LfoPitch,       // TUNE, +-12 semitones, depth squared
-        LfoDecay,       // DEC x 1/4 .. x 4 (+-2 octaves of time), per hit
-        LfoTone,        // +-1 around TONE (0..1)
-        LfoDrive,       // +-1 around DRIV (0..1)
-        LfoSnap,        // +-1 around SNAP (0..1), per hit
-        LfoAmp,         // gain 0..2
-        LfoPan,         // +-0.5 around PAN (0..1), i.e. the whole width
-        NumLfoDests
+        ModOff = 0, ModPitch, ModDecay, ModTone, ModDrive, ModSnap, ModAmp, ModPan,
+        ModKickFirst,                                       // the kick machine's eight
+        ModLfoRate = ModKickFirst + 8, ModLfoDepth,
+        ModRsnFirst,                                        // the resonator drum's 24 (rsnDestCells())
+        ModPhase = ModRsnFirst + 24, ModWavePos,
+        ModEnvTime, ModFilterTime,
+        NumModDests
     };
+    static constexpr int NUM_RSN_DESTS = 24;
+    static constexpr float PHASE_LIMIT = 4.0f * 3.14159265f;    // radians, what PM may add up to
 
-    static const char* const* lfoDestLabels()
+    // The resonator drum's destinations, in the table's order: the voice cell behind each.
+    static const std::array<int, NUM_RSN_DESTS>& rsnDestCells()
     {
-        static const char* const names[NumLfoDests] = {
-            "OFF", "PTCH", "DEC", "TONE", "DRIV", "SNAP", "AMP", "PAN" };
-        return names;
+        static const std::array<int, NUM_RSN_DESTS> cells = []
+        {
+            using V = ResonatorVoice;
+            std::array<int, NUM_RSN_DESTS> c {};
+            int n = 0;
+            for (int cell : { (int) V::Morph, (int) V::ExciterMorph, (int) V::Energy })
+                c[(size_t) n++] = cell;
+            for (int i = 0; i < res::NumBody; ++i)   c[(size_t) n++] = V::BodyFirst + i;
+            for (int i = 0; i < res::NumMore; ++i)   c[(size_t) n++] = V::MoreFirst + i;
+            for (int i = 0; i < res::NumExcite; ++i) c[(size_t) n++] = V::ExciteFirst + i;
+            jassert(n == NUM_RSN_DESTS);
+            return c;
+        }();
+        return cells;
     }
 
-    VoiceLfos& getLfos() { return lfos; }
-    // -0.5..0.5 from LFOs routed to the pan (as of the last processed sample); the engine adds it.
-    float getLfoPan() const { return lfoPan; }
+    // This drum's side of the kit's router, and its own set values (one per destination of the
+    // table; the engine fills them from the table's bases: 1 for PTCH, DEC, AMP, ETIM, FTIM).
+    mod::Voice& getMod() { return mods; }
+    const mod::Voice& getMod() const { return mods; }
+    void initModBase(const mod::DestTable& table)
+    {
+        for (int i = 0; i < mod::DestTable::MAX; ++i)
+            modBase[(size_t) i] = table[i].base;
+        for (int k = 0; k < NumKickParams; ++k)
+            modBase[(size_t) (ModKickFirst + k)] = kick[(size_t) k];
+    }
+    float modBaseOf(int dest) const { return modBase[(size_t) std::clamp(dest, 0, mod::DestTable::MAX - 1)]; }
+
+    // The oscillator's wave (phaseosc::waveLabels(): SINE, CYCL, the built-in tables). It is the
+    // wave of the drum's own oscillator - the body of the kicks, SUB, TOM, RIM, CLAV, the snares'
+    // body and the FM drums' carrier - read with PM on its phase; the FM drums' modulator stays a
+    // sine. CYCL has no sample here and reads as the sine.
+    void setWave(int index)
+    {
+        waveIndex = std::clamp(index, 0, phaseosc::waveCount() - 1);
+        wave = phaseosc::Wave::of(phaseosc::waveTable(waveIndex, nullptr));
+    }
+    int getWave() const { return waveIndex; }
+    // Whether this drum's type reads the wave at all.
+    bool readsWave() const
+    {
+        switch (synthType)
+        {
+            case DrumSynthType::NoiseSnare: case DrumSynthType::FMSnare: case DrumSynthType::Tom:
+            case DrumSynthType::Rim: case DrumSynthType::Clave: case DrumSynthType::SubBass: case DrumSynthType::KickSynth:
+                return true;
+            default:
+                return false;
+        }
+    }
 
     void setSampleRate(double sr)
     {
@@ -94,24 +142,48 @@ public:
         ampEnv.setSampleRate(sr);
         pitchEnv.setSampleRate(sr);
         filter.setSampleRate(sr);
-        for (auto* band : { &hatBandHigh, &hatBandLow })
-        {
-            band->setSampleRate(sr);
-            band->setMode(SVFilter::Mode::BandPass);
-            band->setResonance(1.6f);
-        }
-        hatBandHigh.setCutoff(7100.0f);
-        hatBandLow.setCutoff(3440.0f);
         cym.setSampleRate(sr);
-        lfos.setSampleRate(sr);
+        bank.setSampleRate(sr);
+        rsn.setSampleRate(sr);
+        rsn.setDrum(true);
+        mods.prepare(sr);
+        for (auto* o : { &osc1, &osc2, &knockOsc })
+            o->setSampleRate(sr);
         strikeDeclick.setSampleRate(sr);
+        crusher.prepare(sr);
         levelStep = (float) (1.0 / (0.004 * sr));       // a level's whole range in 4 ms
     }
 
+    // [FOLD] What a pad's TYPE cell offers: the first ten. TOM, SNAR, FMSN, CSYN, RIM and CLAV
+    // (10-15) are no longer offered: their stored numbers keep their meaning, and what each is now
+    // is ONE rule, CymbalPresets::typeNow (a sound of the resonator drum), which DrumEngine applies
+    // wherever a type reaches a pad. Not setType: see there.
+    static constexpr int NUM_OFFERED = (int) DrumSynthType::OscBank + 1;
+
     void setType(DrumSynthType type)
     {
-        if (synthType == DrumSynthType::CymbalSynth && type != synthType)
+        // (What were drum types and are sounds now: see the top of the file. The three kicks that
+        // are points of the kick machine are the kick machine: its cells are given with
+        // applyKickPoint.)
+        if (isKickPoint(type))
+            type = DrumSynthType::KickSynth;
+        if (type == DrumSynthType::ClosedHat || type == DrumSynthType::OpenHat)
+        {
+            bank.setParam(OscBank::ParModel, type == DrumSynthType::OpenHat ? (float) OscBank::OpenHat : (float) OscBank::Hat);
+            type = DrumSynthType::OscBank;
+        }
+        // [FOLD] TOM, SNAR, FMSN, CSYN, RIM and CLAV are resonator drum sounds now. The fold is
+        // DrumEngine's (CymbalPresets::typeNow), not here: setType(Tom) still runs processTom,
+        // which is what SampleBank::renderHit uses to render its built-in hits unchanged.
+        if (type != synthType)
+        {
+            cym.setPressure(0.0f);
             cym.reset();
+            bank.setPressure(0.0f);
+            bank.reset();
+            rsn.setPadEnergy(0.0f);
+            rsn.reset();
+        }
         synthType = type;
     }
     DrumSynthType getType() const { return synthType; }
@@ -142,7 +214,10 @@ public:
     void setKickParam(int index, float value)
     {
         if (index >= 0 && index < NumKickParams)
+        {
             kick[(size_t) index] = value;
+            modBase[(size_t) (ModKickFirst + index)] = value;      // (this drum's own set value for the router)
+        }
     }
     float getKickParam(int index) const { return (index >= 0 && index < NumKickParams) ? kick[(size_t) index] : 0.0f; }
     static float kickDefault(int index)
@@ -151,12 +226,237 @@ public:
         return (index >= 0 && index < NumKickParams) ? defaults[index] : 0.0f;
     }
 
-    // --- The cymbal machine (type CymbalSynth) -----------------------------------------------------
+    // The kick machine's second page, KCK2: what FMKK, KICK and MKIK had that it had not. Each at 0
+    // is the kick machine as it was (and 0 is what every kick pad of a project saved before this
+    // page stored there). Read at the strike.
+    enum Kick2Param
+    {
+        KickKind = 0,    // KIND  what KNCK and KTON make: TICK, the knock (a damped sine tick, as
+                         //       before), or FM: a sine at a ratio of TUNE (KTON: x0.5 .. x8, x2 at
+                         //       0.5) moves the body's frequency, as deep as KNCK says (x8 at 1) at
+                         //       the start and falling with the square of the sweep: the FM click
+        KickLin,         // LIN   0..1: the sweep falls in pitch (0: as before) .. in frequency (1:
+                         //       it stays high longer, as FMKK, KICK and MKIK fell)
+        KickRes,         // RES   0..1: the low-pass's resonance (Q 0.71 .. 3.71)
+        KickFiltSweep,   // LPSW  0..20: the low-pass opens with the sweep, x(1 + LPSW) at its start
+        KickFiltTrack,   // LPKT  0..1: what TONE's low-pass is measured from: 200 Hz (0) .. TUNE (1)
+        KickSat,         // SAT   0..1: the body saturated before the amp envelope, so the tail is as
+                         //       rough as the start (MKIK's drive)
+        KickEdge,        // EDGE  -1..1: the front edge as SNAP is on the other drums, 0 = none:
+                         //       below 0 the onset softened (it starts at 1 + EDGE of its level and
+                         //       comes back over half the decay, 2 .. 25 ms); above 0 the first 3 ms
+                         //       lifted (to +6 dB) and a noise click of about a millisecond
+        KickPath,        // PATH  the order of the stages. KSYN (as before): the body through the
+                         //       envelope, the knock added, the kick machine's own drive (back up to
+                         //       full scale), then the low-pass over all of it. DRUM (as FMKK, KICK and
+                         //       MKIK were, and as the other drums are): the low-pass on the body only,
+                         //       SAT, the envelope, the knock added, and DRIV the kit's common drive
+                         //       (a clip that keeps the kit about as loud) after everything
+        NumKick2Params
+    };
+    enum KickKindChoice { KindTick = 0, KindFm, NumKickKinds };
+    enum KickPathChoice { PathKsyn = 0, PathDrum, NumKickPaths };
+    static constexpr float FM_CLICK_DEPTH = 8.0f;           // KIND FM: the depth at KNCK 1
+    static constexpr float KICK_SWEEP_OPEN = 20.0f;         // LPSW's top
+
+    void setKick2Param(int index, float value)
+    {
+        if (index >= 0 && index < NumKick2Params && std::isfinite(value))
+            kick2[(size_t) index] = value;
+    }
+    float getKick2Param(int index) const { return (index >= 0 && index < NumKick2Params) ? kick2[(size_t) index] : 0.0f; }
+
+    // Whether a type is one of the three kicks that are points of the kick machine now.
+    static bool isKickPoint(DrumSynthType t)
+    {
+        return t == DrumSynthType::FMKick || t == DrumSynthType::AnalogKick || t == DrumSynthType::ModCyclesKick;
+    }
+    // A kick as the kick machine: the pad's DR cells and its KICK and KCK2 pages.
+    struct KickPoint
+    {
+        float tune = 100.0f, decay = 0.3f, tone = 0.5f, drive = 0.0f, snap = 0.5f, level = 0.8f;
+        std::array<float, NumKickParams> kick {};
+        std::array<float, NumKick2Params> kick2 {};
+    };
+
+    // A kick written with the cells of one of the old kick types (or of the kick machine itself,
+    // which is returned as it is), as the kick machine. What the old types did, and where it is now:
+    //   FMKK  a sine falling in frequency from 4 x TUNE (0.1 s, curve -0.8) with an FM click at 2 x
+    //         TUNE whose depth was 4 x TONE (x 1.5 at full DRIV)  -> SWEP 24 st, LIN 1, KIND FM,
+    //         KNCK TONE / 2, TONE 1 (the low-pass at 80 x TUNE)
+    //   KICK  a sine falling in frequency from (1 + 8 TONE^2) x TUNE (0.15 s, curve -0.6)
+    //         -> SWEP 12 log2(1 + 8 TONE^2), LIN 1, TONE 1
+    //   MKIK  FMKK's sweep and a click of depth 2, through a low-pass on the body at 2 x TUNE that
+    //         opened ten times wider with the sweep, resonance TONE, saturated by DRIV after it and
+    //         before the envelope -> as FMKK with KNCK 0.25, TONE log 2 / log 80 (2 x TUNE), LPSW 9,
+    //         RES TONE, SAT DRIV, DRIV 0
+    //   All three: PATH DRUM (their order of stages; DRIV the common drive, as it was), LPKT 1 (TONE
+    //   a low-pass from TUNE, so it has something to take from a sine), the decay as the kick
+    //   machine's (HOLD 0, ACRV -0.5, the old curve); SNAP is EDGE at 2 x (SNAP - 0.5) with the
+    //   kick machine's shortest attack (1 ms, the old one).
+    static KickPoint kickPoint(DrumSynthType type, float tune, float decay, float tone, float drive, float snap, float level)
+    {
+        KickPoint p;
+        p.tune = tune; p.decay = decay; p.tone = tone; p.drive = drive; p.snap = snap; p.level = level;
+        for (int n = 0; n < NumKickParams; ++n)
+            p.kick[(size_t) n] = kickDefault(n);
+        if (! isKickPoint(type))
+            return p;
+
+        tone = std::clamp(tone, 0.0f, 1.0f);
+        drive = std::clamp(drive, 0.0f, 1.0f);
+        snap = std::clamp(snap, 0.0f, 1.0f);
+        const bool fm = type == DrumSynthType::FMKick, kick = type == DrumSynthType::AnalogKick;
+        p.kick[KickSweep] = kick ? 12.0f * std::log2(1.0f + 8.0f * tone * tone) : 24.0f;
+        p.kick[KickSweepTime] = kick ? 0.15f : 0.1f;
+        p.kick[KickSweepCurve] = kick ? -0.6f : -0.8f;
+        p.kick[KickShape] = 0.0f;
+        p.kick[KickKnock] = fm ? std::min(1.0f, tone * 0.5f * (drive > 0.0f ? 1.0f + drive * 0.5f : 1.0f)) : (kick ? 0.0f : 0.25f);
+        p.kick[KickKnockTone] = 0.5f;
+        p.kick[KickHold] = 0.0f;
+        p.kick[KickAmpCurve] = -0.5f;
+        p.kick2[KickKind] = kick ? (float) KindTick : (float) KindFm;
+        p.kick2[KickLin] = 1.0f;
+        p.kick2[KickPath] = (float) PathDrum;
+        p.kick2[KickFiltTrack] = 1.0f;
+        if (type == DrumSynthType::ModCyclesKick)
+        {
+            p.tone = std::log(2.0f) / std::log(80.0f);
+            p.kick2[KickFiltSweep] = 9.0f;
+            p.kick2[KickRes] = tone;
+            p.kick2[KickSat] = drive;
+            p.drive = 0.0f;
+        }
+        else
+            p.tone = 1.0f;
+        p.snap = 1.0f;
+        p.kick2[KickEdge] = (snap - 0.5f) * 2.0f;
+        return p;
+    }
+
+    // The point a pad's TYPE starts from when it is turned to one of the old kicks (its other
+    // cells as they stand): the kick at the old type's middle TONE, no DRIV, SNAP 0.5.
+    static KickPoint kickPointOf(DrumSynthType type)
+    {
+        return kickPoint(type, 100.0f, 0.3f, 0.5f, 0.0f, 0.5f, 0.8f);
+    }
+
+    // The kick machine's cells (and, withCells, the DR cells) from a point.
+    void applyKickPoint(const KickPoint& p, bool withCells = true)
+    {
+        if (withCells)
+        {
+            setTune(p.tune); setDecay(p.decay); setTone(p.tone); setDrive(p.drive); setSnap(p.snap); setLevel(p.level);
+        }
+        for (int n = 0; n < NumKickParams; ++n)
+            setKickParam(n, p.kick[(size_t) n]);
+        for (int n = 0; n < NumKick2Params; ++n)
+            setKick2Param(n, p.kick2[(size_t) n]);
+    }
+
+    // --- The cymbal machine (type CymbalSynth; kept until the owner has decided: see the top) ---------
     // TUNE is its size (8000 = the model's own pitch), DEC how long it rings, TONE its brightness,
-    // SNAP what strikes it; the eight cells of CymbalMachine::Param are the rest. Read at the strike
-    // (LOFI at once).
+    // SNAP what strikes it; the eight cells of CymbalMachine::Param are the rest.
     void setCymbalParam(int index, float value) { cym.setParam(index, value); }
     float getCymbalParam(int index) const { return cym.getParam(index); }
+    const CymbalMachine& getCymbalMachine() const { return cym; }
+
+    // --- The oscillator bank (type OscBank) ------------------------------------------------------
+    // TUNE moves its squares (8000 = their own pitches), DEC is how long it rings, TONE its
+    // brightness, SNAP what strikes METL and RING (the hats: the front edge, as on every drum);
+    // the eight cells of OscBank::Param are the rest. Read at the strike (LOFI at once).
+    void setBankParam(int index, float value) { bank.setParam(index, value); }
+    float getBankParam(int index) const { return bank.getParam(index); }
+    const OscBank& getBank() const { return bank; }
+    bool bankIsHat() const { return OscBank::isHat(bank.isActive() ? bank.struck() : bank.model()); }
+
+    // --- The resonator drum (type Resonator) -----------------------------------------------------
+    // The voice is the RSN engine's (ResonatorVoice.h, as a drum). The sound is given cell by cell:
+    // a cell of the voice has the sound's own value (setResonatorBase) and what the pad adds
+    // (setResonatorOffset: the cells of the pad's RSN page); DEC, TONE and SNAP act on three of
+    // them. What a sound holds beside the voice's cells (level, envelope, filter, curve) goes
+    // to getResonator() directly.
+    ResonatorVoice& getResonator() { return rsn; }
+    const ResonatorVoice& getResonator() const { return rsn; }
+    void setResonatorBase(int cell, float value)
+    {
+        if (cell >= 0 && cell < ResonatorVoice::NumCells && std::isfinite(value))
+        {
+            rsnBase[(size_t) cell] = value;
+            rsnStale = true;
+        }
+    }
+    float getResonatorBase(int cell) const { return rsnBase[(size_t) std::clamp(cell, 0, (int) ResonatorVoice::NumCells - 1)]; }
+    void setResonatorOffset(int cell, float value)
+    {
+        if (cell >= 0 && cell < ResonatorVoice::NumCells && std::isfinite(value))
+        {
+            rsnOffset[(size_t) cell] = value;
+            rsnStale = true;
+        }
+    }
+    // What the sound says of its host: how many seconds a second of DEC is, what the pad's
+    // pressure is (energy for a bow or a brush; damping: a hat closed by the finger), and whether
+    // it sounds only for as long as the pad is held (the open hat).
+    // envelopeLength: DEC is the length of the sound's envelope (a sound cut to length by it:
+    // not CHAN RING) and the body's own decay stays the sound's; else DEC is the body's decay.
+    // driveWire: how much of DRIV is added to WIRE (a snare driven harder is more wires).
+    // soundDec: the DEC the sound was made at (with envelopeLength the body's own decay goes
+    // with DEC from there: a tom twice as long rings twice as long inside its envelope too).
+    // lofi: the base amount of level-following crush (the cymbal machine's LOFI). DRIV adds on top
+    // of it (the host hint driveLofi says how much): so a sound that specifies lofi and driveLofi
+    // gets its grain from DRIV the way a snare gets its wires from driveWire.
+    void setResonatorHost(float decScale, float pressEnergy, float pressDamp, bool gated, bool envelopeLength, float driveWire = 0.0f,
+                          float soundDec = 0.3f, float lofi = 0.0f, float driveLofi = 0.0f)
+    {
+        rsnEnvelopeLength = envelopeLength;
+        rsnDriveWire = driveWire;
+        rsnLofi = std::clamp(lofi, 0.0f, 1.0f);
+        rsnDriveLofi = std::clamp(driveLofi, 0.0f, 1.0f);
+        rsnSoundDec = soundDec >= 0.001f ? soundDec : 0.3f;
+        rsnDecScale = decScale >= 0.01f ? std::min(decScale, 16.0f) : 1.0f;
+        rsnPressEnergy = pressEnergy;
+        rsnPressDamp = pressDamp;
+        rsnGated = gated;
+        rsnStale = true;
+    }
+    // A drum of the kit against a voice of the RSN engine at the same settings (a kit has no
+    // sixteen voices sounding at once to leave room for).
+    static constexpr float RSN_HOST_GAIN = 2.0f;
+    // How often (in samples) a resonator drum's cells are worked out again under an LFO, the strip or a slot.
+    static constexpr int RSN_LOOK = 16;
+
+    // The pad's own pressure, whatever the kit routes it to: the energy of a bowed or brushed
+    // resonator drum and the hand on a hat (as its sound says), and what holds the bank's bands
+    // up with its EXC cell (a sound that has rung out starts again under the pad).
+    void setPadPressure(float pressure)
+    {
+        if (pending)
+        {
+            // (Struck at the next block: the pressure comes after the strike, as it came after the note.)
+            waitingPad = pressure;
+            padWaiting = true;
+            return;
+        }
+        padPress = pressure > 0.0f ? std::min(pressure, 1.0f) : 0.0f;
+        if (synthType == DrumSynthType::CymbalSynth)
+        {
+            cym.setPressure(padPress);
+            active = active || cym.isActive();
+        }
+        else if (synthType == DrumSynthType::OscBank)
+        {
+            bank.setPressure(padPress);
+            active = active || bank.isActive();
+        }
+        else if (synthType == DrumSynthType::Resonator)
+        {
+            rsn.setPadEnergy(padPress * rsnPressEnergy);
+            if (rsnPressDamp != 0.0f)
+                rsnStale = true;
+            active = active || rsn.isActive();
+        }
+    }
 
     // --- Per-slot expression routing ---
     void setAftertouchDest(DrumVoiceATDest dest) { atDest = dest; }
@@ -172,6 +472,13 @@ public:
     {
         float panMod = 0.0f;
         float mod = pressure * atDepth;
+        if (pending)
+        {
+            // (As setPadPressure: applied after the strike. The pan is the engine's: at once.)
+            waitingPressure = pressure;
+            pressureWaiting = true;
+            return atDest == DrumVoiceATDest::Pan ? (mod * 2.0f - 1.0f) * 0.5f : 0.0f;
+        }
 
         switch (atDest)
         {
@@ -214,6 +521,7 @@ public:
     // Clear all aftertouch modulation (call on noteOff or pressure=0)
     void clearAftertouch()
     {
+        pressureWaiting = false;        // (a pressure that came before the strike and is gone again)
         atPitchMod = 0.0f;
         if (atDecayMod != 0.0f)
         {
@@ -236,6 +544,16 @@ public:
             cym.setDecayStretch(longer);        // its modes ring on
             return;
         }
+        if (synthType == DrumSynthType::OscBank)
+        {
+            bank.setDecayStretch(longer);
+            return;
+        }
+        if (synthType == DrumSynthType::Resonator)
+        {
+            rsnStale = true;                    // its modes ring on (pushResonator)
+            return;
+        }
         if (synthType == DrumSynthType::KickSynth || synthType == DrumSynthType::SubBass)
             ampEnv.setRelease(struckRelease * longer);
         else
@@ -256,29 +574,58 @@ public:
         return std::clamp(level + atLevelMod, 0.0f, 1.0f);
     }
 
+    // A hit, struck at once, with nothing modulating it: the voice on its own (process()).
     void noteOn(float vel)
     {
         // Struck again while it rings: its oscillators and filter start over, which would cut the
         // ringing off at whatever value it had (a click). That value is carried down over 2 ms under
-        // the new hit, whose own first sample is not touched. (The cymbal machine does not start
-        // over: a second stroke adds to what is ringing.)
-        if (active && synthType != DrumSynthType::CymbalSynth)
+        // the new hit, whose own first sample is not touched. (A cymbal of the bank and the
+        // resonator drum do not start over: a second stroke adds to what is ringing.)
+        if (active && ! strokeAdds())
             strikeDeclick.armTail();
+        pending = false;
         struck = true;
-        // The LFOs are read at the strike (decay, snap, ...) and run on from that value.
-        lfos.noteOnAndSample();
-        lfos.snapSlews();       // a strike starts the drum again
-        lfoGain = 1.0f;
-        lfoPan = 0.0f;
-        if (! lfos.anyOn())
-        {
-            strike(vel);
-            return;
-        }
-        const SetValues set = applyLfos();
         strike(vel);
-        restore(set);
     }
+
+    // Per-pad modulation (U5): what the pad's own LFO and two slots add on top of the kit's
+    // router, at control rate. Each destination's entry is a share of the destination's span
+    // (-1..1), as a slot's sum is in the router. Written by DrumEngine::computePadMod before
+    // render, every sub-block.
+    struct PadModOffsets
+    {
+        float v[NumModDests] {};
+        bool active = false;
+    };
+    PadModOffsets padModOffsets {};
+    // What a pad's own LFO and slots can move: the entries render() has a branch for. Not the
+    // other LFOs' rate and depth (LRAT, LDPT: the kit's LFOs are the router's), nor the two that
+    // need a value per sample (PM, WPOS), nor the cells of the track's effects (which are moved by
+    // one voice for the whole track: the router's leader). The pad's DEST cells offer these only.
+    static bool padDestActs(int dest)
+    {
+        return dest > ModOff && dest < NumModDests && dest != ModLfoRate && dest != ModLfoDepth
+            && dest != ModPhase && dest != ModWavePos;
+    }
+
+    // A hit in the kit (DrumEngine::noteOn): the router's note-on now (the LFOs restart, the
+    // randoms are drawn), the strike at this drum's next sub-block, after the router has been read
+    // (mod::Voice::tick), so that DEC, SNAP, the kick machine's cells and the strip take the values
+    // they have at the strike: the note-on's snap. The voice counts as sounding from now on.
+    // key: what KEY reads (the drum's place in the kit).
+    // What comes for this drum before the strike - its pressure, a note-off, a choke - is kept and
+    // done right after it, in that order: as it came after the note.
+    void trigger(const mod::Router& router, int key, float vel)
+    {
+        mods.noteOn(router, key, vel);
+        if (! pending)
+            tailOnStrike = active && ! strokeAdds();
+        pending = true;                 // (two hits before a block: one, at the later velocity)
+        pendingVelocity = vel;
+        pendingOff = pendingChoke = false;
+        active = true;
+    }
+    bool isPending() const { return pending; }
 
     // Letting the pad (or the step) go. A drum is a one-shot: it rings for its DEC however short
     // the tap was. SUB, the held bass note, sounds for as long as it is held and then fades
@@ -287,10 +634,20 @@ public:
     // and closes when that ends, so a tap on it is a closed hat and a held hit an open one.
     void noteOff()
     {
-        if (synthType == DrumSynthType::OpenHat)
+        if (pending)
         {
-            ampEnv.setRelease(HAT_CLOSE_SECONDS);
-            ampEnv.noteOff();
+            pendingOff = true;
+            return;
+        }
+        if (synthType == DrumSynthType::OscBank)
+        {
+            bank.release();             // (the open hat closes; nothing else of the bank hears it)
+            return;
+        }
+        if (synthType == DrumSynthType::Resonator)
+        {
+            if (rsnGated)
+                rsn.choke();
             return;
         }
         if (synthType != DrumSynthType::SubBass)
@@ -302,9 +659,24 @@ public:
     // Cut short by another drum of its choke group (the closed hat stops the open one).
     void choke()
     {
+        if (pending)
+        {
+            pendingChoke = true;
+            return;
+        }
         if (synthType == DrumSynthType::CymbalSynth)
         {
             cym.choke();                        // a hand on it: gone in about a twentieth of a second
+            return;
+        }
+        if (synthType == DrumSynthType::OscBank)
+        {
+            bank.choke();                       // a hat closes; a hand on a cymbal: gone in about a twentieth of a second
+            return;
+        }
+        if (synthType == DrumSynthType::Resonator)
+        {
+            rsn.choke();
             return;
         }
         if (synthType == DrumSynthType::KickSynth)
@@ -319,83 +691,231 @@ public:
 
     bool isActive() const { return active; }
 
+    // One sample of the voice on its own: nothing modulates it.
     float process()
     {
         if (!active)
             return 0.0f;
+        if (pending)
+            strikePending();
+        return strikeDeclick.process(processCore());
+    }
 
-        if (! lfos.anyOn())
+    // The envelopes the router's ENV and FENV read (a drum has no filter envelope; the resonator
+    // drum's are its voice's).
+    float ampLevel() { return synthType == DrumSynthType::Resonator ? rsn.getAmpEnvelope().getCurrentLevel() : ampEnv.getCurrentLevel(); }
+    float filterLevel() { return synthType == DrumSynthType::Resonator ? rsn.getFilter().getEnvelope().getCurrentLevel() : 0.0f; }
+
+    // One sub-block of the kit (DrumEngine::processBlock), for a drum that sounds: the samples
+    // into out[] for as long as it sounds (how many: returned; the rest of the n is silence), and
+    // the pan the router adds to this drum's (-0.5 .. 0.5) into pan[] when panMoved comes back
+    // true. pressure: this drum's pad. (router: the kit's. A pad's own LFO and slots are not
+    // router slots yet: they come as padModOffsets.)
+    int render(const mod::Router& router, int n, float* out, float* pan, bool& panMoved, float pressure)
+    {
+        mods.useBase(modBase.data());
+        if (synthType == DrumSynthType::Resonator)
         {
-            lfoGain = 1.0f;
-            lfoPan = 0.0f;
-            lfos.snapSlews();
-            return strikeDeclick.process(processCore());
+            // The resonator drum's cells as they are without modulation are their set values.
+            const auto& cells = rsnDestCells();
+            const float longer = 1.0f + 2.0f * atDecayMod;
+            for (int d = 0; d < NUM_RSN_DESTS; ++d)
+                modBase[(size_t) (ModRsnFirst + d)] = rsnCell(cells[(size_t) d], longer);
+        }
+        const bool kitMoves = mods.tick(router, n, ampLevel(), filterLevel(), pressure);
+        const bool padMoves = padModOffsets.active;
+        if (! kitMoves && ! padMoves)
+        {
+            // Nothing moves this drum: the voice as it is on its own.
+            rsnKeyed = false;
+            panMoved = false;
+            // (An envelope time the pad's own modulation was holding goes back to its set value.)
+            for (int t = 0; t < 2; ++t)
+                if (padTimeHeld[t])
+                {
+                    padTimeHeld[t] = false;
+                    setControl(ModEnvTime + t, modBase[(size_t) (ModEnvTime + t)]);
+                }
+            if (pending)
+                strikePending();
+            int i = 0;
+            for (; i < n && active; ++i)
+                out[i] = strikeDeclick.process(processCore());
+            return i;
         }
 
-        // The voice's parameters are moved for this sample only (the set values stay).
-        lfos.tick();
-        const SetValues set = applyLfos();
-        if (lfos.routed(LfoTone) && tone != lastLfoTone)
-            retuneFilterForTone();
-        lfoGain = lfos.gain(LfoAmp);
-        lfoPan = std::clamp(lfos.panAmount(LfoPan) * 0.5f, -0.5f, 0.5f);
-        const float out = strikeDeclick.process(processCore() * lfoGain);
-        restore(set);
-        return out;
+        // What moves at control rate: for this sub-block (the hand-over lists every one still
+        // routed; one that is let go comes once with its set value).
+        float decayFactor = 1.0f, snapOffset = 0.0f;
+        float kitTime[2] = { modBase[(size_t) ModEnvTime], modBase[(size_t) ModFilterTime] };    // ETIM, FTIM as the kit has them
+        std::array<float, NumKickParams> setKick = kick;
+        rsnMoved = 0;
+        if (kitMoves)
+        {
+            mods.forEachControl([&](int dest, float value)
+            {
+                if (dest == ModDecay)                                   decayFactor = value;
+                else if (dest == ModSnap)                               snapOffset = value;
+                else if (dest >= ModKickFirst && dest < ModKickFirst + NumKickParams)
+                    kick[(size_t) (dest - ModKickFirst)] = value;
+                else if (dest >= ModRsnFirst && dest < ModRsnFirst + NUM_RSN_DESTS)
+                {
+                    const int c = rsnDestCells()[(size_t) (dest - ModRsnFirst)];
+                    rsnMod[(size_t) c] = value;
+                    rsnMoved |= uint64_t (1) << c;
+                }
+                else
+                {
+                    if (dest == ModEnvTime || dest == ModFilterTime)
+                        kitTime[dest - ModEnvTime] = value;
+                    setControl(dest, value);
+                }
+            });
+        }
+
+        // Per-pad modulation (U5): what the pad's own LFO and slots add to each destination
+        // (DrumEngine::computePadMod, every sub-block), on top of what the kit's router made of it.
+        // The control-rate destinations go by the router's own law (mod::Voice::lawOf: the share
+        // times the entry's span - 72 st for SWEP, octaves of time for DEC, ETIM and FTIM -, held
+        // to the entry's limits), so a pad's LFO on a cell moves it as far as the kit's would.
+        float padPitchOffset = 0.0f, padToneOffset = 0.0f, padDriveOffset = 0.0f;
+        float padAmpOffset = 0.0f, padPanOffset = 0.0f;
+        const auto& po = padModOffsets.v;
+        if (padMoves)
+        {
+            const auto& table = router.dests();
+            if (po[ModDecay] != 0.0f)
+                decayFactor = mod::Voice::lawOf(table[ModDecay], decayFactor, po[ModDecay]);
+            if (po[ModSnap] != 0.0f)
+                snapOffset = mod::Voice::lawOf(table[ModSnap], snapOffset, po[ModSnap]);
+            // The kick machine's cells (as the kit's router left them for this sub-block).
+            for (int k = 0; k < NumKickParams; ++k)
+                if (po[ModKickFirst + k] != 0.0f)
+                    kick[(size_t) k] = mod::Voice::lawOf(table[ModKickFirst + k], kick[(size_t) k], po[ModKickFirst + k]);
+            // The resonator drum's cells: from what the kit's router made of the cell this
+            // sub-block, or from the cell as it is set (never from what was left there before).
+            for (int d = 0; d < NUM_RSN_DESTS; ++d)
+                if (po[ModRsnFirst + d] != 0.0f)
+                {
+                    const int c = rsnDestCells()[(size_t) d];
+                    const float from = ((rsnMoved >> c) & 1u) ? rsnMod[(size_t) c] : modBase[(size_t) (ModRsnFirst + d)];
+                    rsnMod[(size_t) c] = mod::Voice::lawOf(table[ModRsnFirst + d], from, po[ModRsnFirst + d]);
+                    rsnMoved |= uint64_t (1) << c;
+                }
+            // Per-sample destinations: constant offsets applied in the sample loop below.
+            if (po[ModPitch] != 0.0f)   padPitchOffset = std::exp2(po[ModPitch]);      // a ratio
+            if (po[ModTone] != 0.0f)    padToneOffset = po[ModTone];
+            if (po[ModDrive] != 0.0f)   padDriveOffset = po[ModDrive];
+            if (po[ModAmp] != 0.0f)     padAmpOffset = po[ModAmp];
+            if (po[ModPan] != 0.0f)     padPanOffset = po[ModPan] * 0.5f;
+        }
+        // The envelopes' times: a factor on what the kit has (its route's value, or 1), and given
+        // back when the pad's modulation lets go of it.
+        for (int t = 0; t < 2; ++t)
+        {
+            const int dest = ModEnvTime + t;
+            const bool now = padMoves && po[dest] != 0.0f;
+            if (now)
+                setControl(dest, mod::Voice::lawOf(router.dests()[dest], kitTime[t], po[dest]));
+            else if (padTimeHeld[t])
+                setControl(dest, kitTime[t]);
+            padTimeHeld[t] = now;
+        }
+
+        rsnKeyed = rsnMoved != 0;
+        if (rsnKeyed)
+            rsnLook = 1;        // (the resonator looks at what the router has for it at the sub-block's start)
+        const float* pitchIn = kitMoves ? mods.buffer(ModPitch) : nullptr;
+        const float* toneIn = kitMoves ? mods.buffer(ModTone) : nullptr;
+        const float* driveIn = kitMoves ? mods.buffer(ModDrive) : nullptr;
+        const float* ampIn = kitMoves ? mods.buffer(ModAmp) : nullptr;
+        const float* panIn = kitMoves ? mods.buffer(ModPan) : nullptr;
+        const float* phaseIn = kitMoves ? mods.buffer(ModPhase) : nullptr;
+        const float* placeIn = kitMoves ? mods.buffer(ModWavePos) : nullptr;
+
+        // The cells are moved for these samples only (the set values stay).
+        const float setTune = tune, setDecay = decay, setTone = tone, setDrive = drive, setSnap = snap;
+        if (decayFactor != 1.0f)
+            decay = std::max(0.001f, decay * decayFactor);
+        snap = std::clamp(snap + snapOffset, 0.0f, 1.0f);
+        int i = 0;
+        for (; i < n && active; ++i)
+        {
+            float pitchMul = padPitchOffset != 0.0f ? padPitchOffset : 1.0f;
+            if (pitchIn) tune = setTune * pitchIn[i] * pitchMul;
+            else if (padPitchOffset != 0.0f) tune = setTune * padPitchOffset;
+            float toneOff = padToneOffset;
+            if (toneIn)  tone = std::clamp(setTone + toneIn[i] + toneOff, 0.0f, 1.0f);
+            else if (toneOff != 0.0f) tone = std::clamp(setTone + toneOff, 0.0f, 1.0f);
+            float drvOff = padDriveOffset;
+            if (driveIn) drive = std::clamp(setDrive + driveIn[i] + drvOff, 0.0f, 1.0f);
+            else if (drvOff != 0.0f) drive = std::clamp(setDrive + drvOff, 0.0f, 1.0f);
+            phaseNow = phaseIn ? phaseIn[i] : 0.0f;
+            placeNow = placeIn ? placeIn[i] : 0.0f;
+            if (pending)
+                strikePending();
+            else if ((toneIn || toneOff != 0.0f) && tone != lastLfoTone)
+                retuneFilterForTone();
+            float ampMul = 1.0f + padAmpOffset;
+            if (ampIn) ampMul = ampIn[i] + padAmpOffset;
+            else if (padAmpOffset == 0.0f) ampMul = 1.0f;
+            out[i] = strikeDeclick.process(processCore() * ampMul);
+            float panVal = padPanOffset;
+            if (panIn) panVal += panIn[i];
+            pan[i] = panVal;
+        }
+        tune = setTune;
+        decay = setDecay;
+        tone = setTone;
+        drive = setDrive;
+        snap = setSnap;
+        kick = setKick;
+        phaseNow = placeNow = 0.0f;
+        panMoved = panIn != nullptr || padPanOffset != 0.0f;
+        return i;
+    }
+
+    // A control-rate destination that is not read for the sub-block only: the envelopes' times.
+    // (Also what the engine hands back to a drum that has stopped sounding: restore().)
+    void setControl(int dest, float value)
+    {
+        if (dest == ModEnvTime)
+        {
+            ampEnv.setTimeScale(value);
+            rsn.getAmpEnvelope().setTimeScale(value);
+        }
+        else if (dest == ModFilterTime)
+        {
+            pitchEnv.setTimeScale(value);
+            rsn.getFilter().setEnvTimeScale(value);
+        }
     }
 
 private:
-    // kickKey / kickValue: one per source that can move a kick-machine cell (two LFOs, the strip's routes).
-    struct SetValues
+    // The strike that trigger() left for this sub-block, then what came for the drum after it.
+    void strikePending()
     {
-        float tune, decay, tone, drive, snap;
-        int kickKey[VoiceLfos::NUM_SOURCES];
-        float kickValue[VoiceLfos::NUM_SOURCES];
-    };
-
-    // Replaces the parameters by their LFO-modulated values; restore() puts the set values back.
-    SetValues applyLfos()
-    {
-        SetValues set { tune, decay, tone, drive, snap, {}, {} };
-        for (int& k : set.kickKey)
-            k = -1;
-        if (lfos.keyed())
-            for (int i = 0; i < VoiceLfos::NUM_SOURCES; ++i)
-            {
-                // A kick-machine cell: this voice's own value, moved in the cell's own scale
-                // (once, by every source routed to it).
-                const int k = lfos.keyAt(i);
-                bool seen = false;
-                for (int j = 0; j < i; ++j)
-                    seen = seen || set.kickKey[j] == k;
-                if (k < 0 || k >= NumKickParams || seen)
-                    continue;
-                set.kickKey[i] = k;
-                set.kickValue[i] = kick[(size_t) k];
-                kick[(size_t) k] = lfos.value(k, kick[(size_t) k]);
-            }
-        const float semis = lfos.pitchSemitones(LfoPitch);
-        if (semis != 0.0f)
-            tune *= std::exp2(semis / 12.0f);
-        const float dec = lfos.amount(LfoDecay);
-        if (dec != 0.0f)
-            decay = std::max(0.001f, decay * std::exp2(2.0f * dec));
-        tone = std::clamp(tone + lfos.amount(LfoTone), 0.0f, 1.0f);
-        drive = std::clamp(drive + lfos.amount(LfoDrive), 0.0f, 1.0f);
-        snap = std::clamp(snap + lfos.amount(LfoSnap), 0.0f, 1.0f);
-        return set;
-    }
-
-    void restore(const SetValues& set)
-    {
-        tune = set.tune;
-        decay = set.decay;
-        tone = set.tone;
-        drive = set.drive;
-        snap = set.snap;
-        for (int i = 0; i < VoiceLfos::NUM_SOURCES; ++i)
-            if (set.kickKey[i] >= 0)
-                kick[(size_t) set.kickKey[i]] = set.kickValue[i];
+        pending = false;
+        if (tailOnStrike)
+            strikeDeclick.armTail();
+        tailOnStrike = false;
+        struck = true;
+        strike(pendingVelocity);
+        if (pressureWaiting)
+        {
+            pressureWaiting = false;
+            applyAftertouch(waitingPressure);
+        }
+        if (padWaiting)
+        {
+            padWaiting = false;
+            setPadPressure(waitingPad);
+        }
+        if (pendingChoke)
+            choke();
+        if (pendingOff)
+            noteOff();
+        pendingOff = pendingChoke = false;
     }
 
     // The filters whose tuning comes from TONE (see strike()), for a tone that moves during the hit.
@@ -407,8 +927,6 @@ private:
             case DrumSynthType::Clap:
                 filter.setResonance(0.7f + tone * 4.0f);
                 break;
-            case DrumSynthType::ClosedHat:
-            case DrumSynthType::OpenHat:
             case DrumSynthType::Cymbal:
                 filter.setCutoff(tone * 10000.0f + 500.0f);
                 break;
@@ -416,11 +934,10 @@ private:
             case DrumSynthType::FMSnare:
                 filter.setCutoff(tone * 5000.0f + 500.0f);
                 break;
-            case DrumSynthType::ModCyclesKick:
-                filter.setResonance(0.707f + tone * 3.0f);
-                break;
             case DrumSynthType::KickSynth:
-                filter.setCutoff(200.0f * std::pow(80.0f, tone));
+                kickLpTune = -1.0f;         // (worked out again: kickLowPass)
+                kickFilterCount = 0;        // fresh coefficients now
+                filter.setCutoff(kickLowPass(pitchEnv.getCurrentLevel()));
                 break;
             case DrumSynthType::Shaker:
                 filter.setResonance(shakerQ(tone));
@@ -428,12 +945,25 @@ private:
             case DrumSynthType::CymbalSynth:
                 cymTop = cymbalTop(tone);
                 break;
+            case DrumSynthType::OscBank:
+                if (bankIsHat())
+                    bank.setHatTone(tone);
+                else
+                    cymTop = cymbalTop(tone);
+                break;
             default:
                 break;
         }
     }
 
-    // The cymbal machine's TONE while it sounds: the gain of everything above about 2.5 kHz,
+    // A stroke on these adds to what still rings; every other drum starts over.
+    bool strokeAdds() const
+    {
+        return synthType == DrumSynthType::Resonator || synthType == DrumSynthType::CymbalSynth
+            || (synthType == DrumSynthType::OscBank && ! bankIsHat());
+    }
+
+    // TONE of the bank's METL and RING while they sound: the gain of everything above about 2.5 kHz,
     // -18 dB .. 0 (the middle) .. +9 dB.
     static float cymbalTop(float tone) { return std::exp2((tone - 0.5f) * (tone < 0.5f ? 6.0f : 3.0f)); }
 
@@ -443,14 +973,8 @@ private:
     // The types that have no drive of their own in their process function.
     bool usesCommonDrive() const
     {
-        switch (synthType)
-        {
-            case DrumSynthType::ModCyclesKick:      // saturates before its amp envelope
-            case DrumSynthType::KickSynth:          // before its low-pass
-                return false;
-            default:
-                return true;
-        }
+        // (The kick machine has its own, before its low-pass; with PATH DRUM it has the common one.)
+        return synthType != DrumSynthType::KickSynth || kickDrumPath;
     }
 
     // The types whose sound starts from a sine at zero: SNAP gives them a click.
@@ -458,9 +982,6 @@ private:
     {
         switch (synthType)
         {
-            case DrumSynthType::FMKick:
-            case DrumSynthType::AnalogKick:
-            case DrumSynthType::ModCyclesKick:
             case DrumSynthType::NoiseSnare:
             case DrumSynthType::FMSnare:
             case DrumSynthType::Rim:
@@ -475,8 +996,7 @@ private:
     // SNAP on every type but TOM and KSYN (their attack time): 0.5 leaves the drum as it is.
     bool usesCommonSnap() const
     {
-        return synthType != DrumSynthType::Tom && synthType != DrumSynthType::KickSynth
-            && synthType != DrumSynthType::CymbalSynth;
+        return synthType != DrumSynthType::Tom && synthType != DrumSynthType::KickSynth && ! strokeAdds();
     }
 
     // DRIV and SNAP after the drum itself.
@@ -520,6 +1040,21 @@ private:
             }
             edgeEnv *= edgeDecay;
         }
+        else if (synthType == DrumSynthType::KickSynth && kickEdge != 0.0f && edgeEnv > 1.0e-4f)
+        {
+            // The kick machine's EDGE: what SNAP is on the other drums, as a cell of its own.
+            if (kickEdge < 0.0f)
+            {
+                sample *= 1.0f + kickEdge * edgeEnv;
+            }
+            else
+            {
+                sample *= 1.0f + kickEdge * EDGE_LIFT * edgeEnv;
+                sample += nextNoise() * kickEdge * CLICK_LEVEL * clickEnv * ampEnv.getCurrentLevel();
+                clickEnv *= clickDecay;
+            }
+            edgeEnv *= edgeDecay;
+        }
         return sample;
     }
 
@@ -529,16 +1064,11 @@ private:
         active = true;
         lastLfoTone = tone;
 
-        osc1Phase = 0.0;
-        osc2Phase = 0.0;
-        // (A cymbal machine that is still ringing is struck again: nothing of it starts over.)
-        if (! (synthType == DrumSynthType::CymbalSynth && cym.isActive()))
+        osc1.reset();
+        osc2.reset();
+        // (What a stroke adds to is struck again while it rings: nothing of it starts over.)
+        if (! (strokeAdds() && (bank.isActive() || rsn.isActive() || cym.isActive())))
             filter.reset();
-        // (The hats' oscillators start every hit from the same place: the same hit every time.)
-        static constexpr double hatStart[6] = { 0.0, 0.31, 0.62, 0.17, 0.83, 0.45 };
-        for (int i = 0; i < 6; ++i) hatPhase[i] = hatStart[i];
-        hatBandHigh.reset();
-        hatBandLow.reset();
 
         // Clap burst state
         clapBurstCount = 0;
@@ -557,8 +1087,12 @@ private:
         struckSnap = std::clamp(snap + atSnapMod, 0.0f, 1.0f);
         edgeEnv = 1.0f;
         clickEnv = 1.0f;
-        const float edgeSeconds = struckSnap < 0.5f ? std::clamp(0.5f * struckDecay, EDGE_SOFT_MIN, EDGE_SOFT_MAX)
-                                                    : EDGE_HARD_SECONDS;
+        // (The kick machine's is its EDGE, its decay the DEC cell.)
+        const bool kickSoft = synthType == DrumSynthType::KickSynth && kick2[KickEdge] < 0.0f;
+        const float edgeSeconds = kickSoft ? std::clamp(0.5f * decay, EDGE_SOFT_MIN, EDGE_SOFT_MAX)
+                                : struckSnap < 0.5f && synthType != DrumSynthType::KickSynth
+                                      ? std::clamp(0.5f * struckDecay, EDGE_SOFT_MIN, EDGE_SOFT_MAX)
+                                      : EDGE_HARD_SECONDS;
         edgeDecay = std::exp(-1.0f / (edgeSeconds * (float) sampleRate));
         clickDecay = std::exp(-1.0f / (CLICK_SECONDS * (float) sampleRate));
 
@@ -583,8 +1117,6 @@ private:
                 filter.setResonance(q);
                 break;
             }
-            case DrumSynthType::ClosedHat:
-            case DrumSynthType::OpenHat:
             case DrumSynthType::Cymbal:
                 filter.setMode(SVFilter::Mode::HighPass);
                 filter.setCutoff(tone * 10000.0f + 500.0f);
@@ -601,25 +1133,31 @@ private:
                 filter.setCutoff(tune);
                 filter.setResonance(shakerQ(tone));
                 break;
-            case DrumSynthType::ModCyclesKick:
-                filter.setMode(SVFilter::Mode::LowPass);
-                filter.setCutoff(tune * 20.0f);
-                filter.setResonance(0.707f + tone * 3.0f);
-                break;
             case DrumSynthType::KickSynth:
             {
-                // TONE: a low-pass over the whole drum, 200 Hz .. 16 kHz.
+                // The second page as it stands at the strike.
+                kickFm = kick2[KickKind] >= 0.5f;
+                kickLin = std::clamp(kick2[KickLin], 0.0f, 1.0f);
+                kickSat = std::clamp(kick2[KickSat], 0.0f, 1.0f);
+                kickLpSweep = std::clamp(kick2[KickFiltSweep], 0.0f, KICK_SWEEP_OPEN);
+                kickLpTrack = std::clamp(kick2[KickFiltTrack], 0.0f, 1.0f);
+                kickEdge = std::clamp(kick2[KickEdge], -1.0f, 1.0f);
+                kickDrumPath = kick2[KickPath] >= 0.5f;
+                // TONE: a low-pass over the whole drum, 200 Hz .. 16 kHz (from TUNE x 1 .. x 80 with
+                // LPKT; opened by the sweep with LPSW); RES its resonance.
                 filter.setMode(SVFilter::Mode::LowPass);
-                filter.setCutoff(200.0f * std::pow(80.0f, tone));
-                filter.setResonance(0.707f);
+                kickLpTune = -1.0f;
+                filter.setCutoff(kickLowPass(1.0f));
+                filter.setResonance(0.707f + std::clamp(kick2[KickRes], 0.0f, 1.0f) * 3.0f);
                 kickSample = 0;
+                kickFilterCount = 0;    // fresh coefficients on the first sample
                 kickHoldSamples = (int) (std::clamp(kick[KickHold], 0.0f, 0.3f) * sampleRate);
                 kickReleased = false;
                 // The knock: a damped sine tick, 300 Hz .. 6 kHz, lasting 12 ms (dull) .. 1.5 ms (bright).
                 knockLevel = std::clamp(kick[KickKnock], 0.0f, 1.0f);
                 const float knockSeconds = 0.012f * std::pow(0.125f, std::clamp(kick[KickKnockTone], 0.0f, 1.0f));
                 knockDecay = std::exp(-1.0f / (knockSeconds * (float) sampleRate));
-                knockPhase = 0.0;
+                knockOsc.reset();
                 break;
             }
             case DrumSynthType::CymbalSynth:
@@ -637,9 +1175,100 @@ private:
                 cym.strike(hit);
                 break;
             }
+            case DrumSynthType::OscBank:
+            {
+                filter.setMode(SVFilter::Mode::LowPass);
+                filter.setCutoff(2500.0f);
+                filter.setResonance(0.5f);
+                cymTop = cymbalTop(tone);
+                OscBank::Strike hit;
+                hit.velocity = velocity;
+                hit.tune = tune * bendRatio * std::exp2(atPitchMod);
+                hit.decay = decay;
+                hit.tone = tone;
+                hit.snap = struckSnap;
+                bank.strike(hit);
+                break;
+            }
+            case DrumSynthType::Resonator:
+                rsnStale = true;
+                pushResonator();
+                rsn.setFrequency((double) (tune * bendRatio * std::exp2(atPitchMod)));
+                rsn.setStroke(velocity);
+                rsn.noteOn();
+                break;
             default:
                 break;
         }
+    }
+
+    // The resonator's cells that follow the pad: each is the sound's own value plus what the pad
+    // adds, DEC, TONE, SNAP and the pad's pressure on top, and whatever an LFO, the strip or a
+    // slot is routed to. Worked out again only when one of them moved.
+    void pushResonator()
+    {
+        const float longer = 1.0f + 2.0f * atDecayMod;
+        const bool keyed = rsnKeyed;
+        if (! rsnStale && decay == rsnSeen[0] && tone == rsnSeen[1] && snap + atSnapMod == rsnSeen[2] && longer == rsnSeen[3]
+            && drive == rsnSeen[4])
+        {
+            // (What an LFO, the strip or a slot moves is looked at as often as the resonator looks
+            // at its cells, not every sample: sixteen pads under two LFOs cost fifteen times what
+            // they cost without, and nothing of it was heard - the resonator glides between looks.)
+            if (! keyed || --rsnLook > 0)
+                return;
+        }
+        rsnLook = RSN_LOOK;
+        rsnStale = false;
+        rsnSeen = { decay, tone, snap + atSnapMod, longer, drive };
+        if (rsnEnvelopeLength)
+            rsn.getAmpEnvelope().setDecay(std::clamp(decay * rsnDecScale * longer, 0.001f, 20.0f));
+        for (int c = 0; c < ResonatorVoice::NumCells; ++c)
+        {
+            float v = rsnCell(c, longer);
+            // (What the router made of the cell, as of this sub-block's start, is what the resonator hears.)
+            if (keyed && ((rsnMoved >> c) & 1u))
+                v = rsnMod[(size_t) c];
+            rsn.setCell(c, v);
+        }
+    }
+
+    // A cell of the resonator drum without modulation: the sound's own value, what the pad adds,
+    // DEC, TONE, SNAP, DRIV and the pad's pressure. (Also the router's set value of the cell.)
+    float rsnCell(int c, float longer) const
+    {
+        using V = ResonatorVoice;
+        {
+            float v = rsnBase[(size_t) c] + rsnOffset[(size_t) c];
+            if (c == V::Decay)
+            {
+                v = rsnEnvelopeLength ? std::clamp(v * decay * longer / rsnSoundDec, 0.01f, 60.0f)
+                                      : std::clamp(decay * rsnDecScale * longer, 0.01f, 60.0f);
+                // (A finger that damps - a hat closed by it - shortens the whole of it too.)
+                if (rsnPressDamp > 0.0f)
+                    v = std::max(0.01f, v * (1.0f - std::min(0.95f, padPress * rsnPressDamp)));
+            }
+            else if (c == V::BodyFirst + res::Tilt)     v -= (tone - 0.5f) * 0.6f;
+            else if (c == V::ExciteFirst + res::Hard)   v += (std::min(1.0f, snap + atSnapMod) - 0.5f) * 0.8f;
+            else if (c == V::BodyFirst + res::Damp)     v += padPress * rsnPressDamp;
+            else if (c == V::ExciteFirst + res::Cont && rsnPressDamp > 0.0f)
+                v -= 0.5f * padPress * rsnPressDamp;        // (... and what feeds it is cut short: the plates' burst)
+            else if (c == V::MoreFirst + res::Wire)     v += drive * rsnDriveWire;
+            else if (c == V::Energy)                    v = std::clamp(v, 0.0f, 1.0f);
+            return v;
+        }
+    }
+
+    float processResonator()
+    {
+        pushResonator();
+        rsn.setFrequency((double) tune);
+        float out = rsn.process(0.0f, 0.0f) * RSN_HOST_GAIN;
+        // The level-following crusher from the sound's hint: its own base amount plus what DRIV adds.
+        const float lofiAmount = rsnLofi + drive * rsnDriveLofi;
+        if (lofiAmount > 0.001f)
+            out = crusher.process(out, std::min(lofiAmount, 1.0f));
+        return out;
     }
 
     float processCore()
@@ -686,14 +1315,9 @@ private:
 
         switch (synthType)
         {
-            case DrumSynthType::FMKick:       sample = processFMKick(); break;
-            case DrumSynthType::AnalogKick:    sample = processAnalogKick(); break;
-            case DrumSynthType::ModCyclesKick: sample = processModCyclesKick(); break;
             case DrumSynthType::NoiseSnare:    sample = processNoiseSnare(); break;
             case DrumSynthType::FMSnare:       sample = processFMSnare(); break;
             case DrumSynthType::Clap:          sample = processClap(); break;
-            case DrumSynthType::ClosedHat:     sample = processClosedHat(); break;
-            case DrumSynthType::OpenHat:       sample = processOpenHat(); break;
             case DrumSynthType::Cymbal:        sample = processCymbal(); break;
             case DrumSynthType::Tom:           sample = processTom(); break;
             case DrumSynthType::Rim:           sample = processRim(); break;
@@ -702,6 +1326,9 @@ private:
             case DrumSynthType::SubBass:       sample = processSubBass(); break;
             case DrumSynthType::KickSynth:     sample = processKickSynth(); break;
             case DrumSynthType::CymbalSynth:   sample = processCymbalSynth(); break;
+            case DrumSynthType::OscBank:       sample = processBank(); break;
+            case DrumSynthType::Resonator:     sample = processResonator(); break;
+            default: break;
         }
         sample = finish(sample);
 
@@ -712,16 +1339,20 @@ private:
         }
 
         if (synthType == DrumSynthType::CymbalSynth)
-            active = cym.isActive();            // it has no envelope here: it rings until its modes have died
+            active = cym.isActive();
+        else if (synthType == DrumSynthType::OscBank)
+            active = bank.isActive();           // (they have no envelope here)
+        else if (synthType == DrumSynthType::Resonator)
+            active = rsn.isActive();            // it rings until its modes have died
         else if (!ampEnv.isActive() && !pitchEnv.isActive())
             active = false;
 
         tune = setTune;
         drive = setDrive;
         tone = setTone;
-        // (The cymbal machine takes the velocity at each stroke: a soft stroke does not turn down
-        // what a hard one left ringing.)
-        return sample * levelNow * (synthType == DrumSynthType::CymbalSynth ? 1.0f : velocity);
+        // (What a stroke adds to takes the velocity at each stroke: a soft stroke does not turn
+        // down what a hard one left ringing.)
+        return sample * levelNow * (strokeAdds() ? 1.0f : velocity);
     }
 
 public:
@@ -730,12 +1361,21 @@ public:
         ampEnv.reset();
         pitchEnv.reset();
         filter.reset();
-        osc1Phase = 0.0;
-        osc2Phase = 0.0;
+        osc1.reset();
+        osc2.reset();
         active = false;
+        pending = pendingOff = pendingChoke = tailOnStrike = false;
+        pressureWaiting = padWaiting = false;
         clapBurstCount = 0;
         clapBurstSample = 0;
+        cym.setPressure(0.0f);
         cym.reset();
+        bank.setPressure(0.0f);
+        bank.reset();
+        padPress = 0.0f;
+        rsn.setPadEnergy(0.0f);
+        rsn.reset();
+        crusher.reset();
         clearAftertouch();
         strikeDeclick.reset();
     }
@@ -743,7 +1383,7 @@ public:
 private:
     // --- Synthesis internals ---
     double sampleRate = 44100.0;
-    DrumSynthType synthType = DrumSynthType::FMKick;
+    DrumSynthType synthType = DrumSynthType::KickSynth;
     bool active = false;
 
     // Parameters
@@ -769,8 +1409,14 @@ private:
     bool tunePressed = false;
     float lastPressedTune = 0.0f;
 
-    // Oscillators (simple phase-accumulating sines)
-    double osc1Phase = 0.0, osc2Phase = 0.0;
+    // The oscillators (dsp/PhaseOsc.h): the drum's own (its WAVE, PM on its phase; the cymbal's
+    // and the shaker's phase counter), the second (a sine: the FM drums' modulator, the clave's
+    // upper partial), the kick machine's knock (a sine)
+    phaseosc::PhaseOsc osc1, osc2, knockOsc;
+    phaseosc::Wave wave;                // the sine until WAVE says otherwise
+    int waveIndex = phaseosc::WAVE_SINE;
+    float phaseNow = 0.0f;              // PM, radians, for this sample (render)
+    float placeNow = 0.0f;              // WPOS, for this sample
 
     // Kick machine
     std::array<float, NumKickParams> kick { { 36.0f, 0.06f, -0.6f, 0.0f, 0.3f, 0.5f, 0.0f, -0.4f } };
@@ -778,11 +1424,36 @@ private:
     int kickHoldSamples = 0;
     bool kickReleased = false;
     float knockLevel = 0.0f, knockDecay = 0.0f;
-    double knockPhase = 0.0;
+    std::array<float, NumKick2Params> kick2 {};                     // its second page (0: as it was)
+    bool kickFm = false, kickDrumPath = false;                    // ... as struck
+    float kickLin = 0.0f, kickSat = 0.0f, kickLpSweep = 0.0f, kickLpTrack = 0.0f, kickEdge = 0.0f;
+    float kickLpTune = -1.0f, kickLpTone = -1.0f, kickLpBase = 1000.0f, kickLpSet = 1000.0f;     // the low-pass as last set
+    int kickFilterCount = 0;                // samples until the next coefficient update
+    static constexpr int KICK_FILTER_BLOCK = 8;     // update per sub-block of 8 samples
+    float kickRatioOf = -1.0f, kickFmRatioOf = -1.0f;              // the cells the two ratios below are of
+    double kickRatio = 1.0, kickFmRatio = 2.0;
 
-    // Cymbal machine
+    // The cymbal machine
     CymbalMachine cym;
-    float cymTop = 1.0f;           // TONE: the gain of its top
+
+    // The oscillator bank
+    OscBank bank;
+    float cymTop = 1.0f;           // TONE: the gain of its top (METL, RING)
+
+    // The resonator drum
+    ResonatorVoice rsn;
+    //                                                      MRPH  XMPH  DCAY  ENRG  IN    VSEN  LAG
+    std::array<float, ResonatorVoice::NumCells> rsnBase { { 6.0f, 0.0f, 0.5f, 0.5f, 0.0f, 1.0f, 0.015f } };
+    std::array<float, ResonatorVoice::NumCells> rsnOffset {};
+    std::array<float, 5> rsnSeen { { -1.0f, -1.0f, -1.0f, -1.0f, -1.0f } };
+    float rsnDriveWire = 0.0f, rsnLofi = 0.0f, rsnDriveLofi = 0.0f, rsnSoundDec = 0.3f;
+    float rsnDecScale = 1.0f, rsnPressEnergy = 0.0f, rsnPressDamp = 0.0f, padPress = 0.0f;
+    bool rsnGated = false, rsnStale = true, rsnEnvelopeLength = false;
+    int rsnLook = 0;
+
+    // The resonator drum's level-following crusher (its sound's lofi / driveLofi): the one the
+    // cymbal machine and the oscillator bank hold for their LOFI (dsp/LevelCrusher.h).
+    dsp::LevelCrusher crusher;
 
     // Noise
     uint32_t noiseSeed = 12345;
@@ -801,16 +1472,21 @@ private:
 
     // Filter
     SVFilter filter;
-    SVFilter hatBandHigh, hatBandLow;           // the hats' two band-passes
-    double hatPhase[6] = {};
-    static constexpr float HAT_MAKEUP = 3.0f;
-    static constexpr float HAT_CLOSE_SECONDS = 0.045f;      // an open hat closing: the closed hat's tail
 
-    // LFOs
-    VoiceLfos lfos;
-    float lfoGain = 1.0f;
-    float lfoPan = 0.0f;
-    float lastLfoTone = -1.0f;
+    // The kit's modulation router, this drum's side (DrumEngine; one router for the kit)
+    mod::Voice mods;
+    std::array<float, mod::DestTable::MAX> modBase {};      // this drum's set values, by destination (initModBase)
+    std::array<float, ResonatorVoice::NumCells> rsnMod {};  // the resonator drum's cells as the router moves them
+    uint64_t rsnMoved = 0;              // ... which of them it moves (this sub-block)
+    bool rsnKeyed = false;              // ... any
+    bool padTimeHeld[2] = { false, false };     // the pad's own modulation has ETIM / FTIM (render gives them back)
+    float lastLfoTone = -1.0f;          // the TONE the filters were last tuned for
+
+    // A hit waiting for this drum's next sub-block (trigger), and what came for it after the note
+    bool pending = false, tailOnStrike = false, pendingOff = false, pendingChoke = false;
+    float pendingVelocity = 1.0f;
+    bool pressureWaiting = false, padWaiting = false;
+    float waitingPressure = 0.0f, waitingPad = 0.0f;
 
     // SNAP: the front edge of the hit
     static constexpr float EDGE_SOFT_MIN = 0.002f;          // the fade-in below 0.5: half the decay, within these
@@ -837,18 +1513,21 @@ private:
 
     // --- Helpers ---
 
-    float sine(double& phase, double freq)
+    // The drum's own oscillator: one sample on, then its wave read with PM on its phase. On the
+    // sine without PM: the arithmetic the drum had before PhaseOsc (the phase plus the step,
+    // wrapped; the sine of it as a float), the same samples.
+    float body(double freq)
     {
-        phase += freq / sampleRate;
-        phase = dsp::wrapPhase(phase);
-        return std::sin((float)(phase * dsp::TWO_PI_D));
+        const double step = freq / sampleRate;
+        osc1.advance(step);
+        return wave.isSine() ? osc1.sine(phaseNow) : osc1.read(wave, step, phaseNow, placeNow);
     }
 
-    float square(double& phase, double freq)
+    // The second oscillator, a sine.
+    float sine2(double freq)
     {
-        phase += freq / sampleRate;
-        phase = dsp::wrapPhase(phase);
-        return phase < 0.5 ? 1.0f : -1.0f;
+        osc2.advance(freq / sampleRate);
+        return osc2.sine(0.0f);
     }
 
     static float saturate(float x, float amount)
@@ -868,51 +1547,6 @@ private:
 
         switch (synthType)
         {
-            case DrumSynthType::FMKick:
-            {
-                ampP.attack = 0.001f;
-                ampP.decay = decay;
-                ampP.sustain = 0.0f;
-                ampP.release = 0.01f;
-                ampP.decayCurve = -0.5f;
-
-                pitchP.attack = 0.0f;
-                pitchP.decay = 0.1f;
-                pitchP.sustain = 0.0f;
-                pitchP.release = 0.001f;
-                pitchP.decayCurve = -0.8f;
-                break;
-            }
-            case DrumSynthType::AnalogKick:
-            {
-                ampP.attack = 0.001f;
-                ampP.decay = decay;
-                ampP.sustain = 0.0f;
-                ampP.release = 0.01f;
-                ampP.decayCurve = -0.5f;
-
-                pitchP.attack = 0.0f;
-                pitchP.decay = 0.15f;
-                pitchP.sustain = 0.0f;
-                pitchP.release = 0.001f;
-                pitchP.decayCurve = -0.6f;
-                break;
-            }
-            case DrumSynthType::ModCyclesKick:
-            {
-                ampP.attack = 0.001f;
-                ampP.decay = decay;
-                ampP.sustain = 0.0f;
-                ampP.release = 0.01f;
-                ampP.decayCurve = -0.5f;
-
-                pitchP.attack = 0.0f;
-                pitchP.decay = 0.1f;
-                pitchP.sustain = 0.0f;
-                pitchP.release = 0.001f;
-                pitchP.decayCurve = -0.8f;
-                break;
-            }
             case DrumSynthType::NoiseSnare:
             {
                 // Amp envelope controls overall (noise-dominated)
@@ -953,34 +1587,6 @@ private:
                 ampP.sustain = 0.0f;
                 ampP.release = 0.01f;
                 ampP.decayCurve = -0.4f;
-
-                pitchP.attack = 0.0f;
-                pitchP.decay = 0.001f;
-                pitchP.sustain = 0.0f;
-                pitchP.release = 0.001f;
-                break;
-            }
-            case DrumSynthType::ClosedHat:
-            {
-                ampP.attack = 0.0f;
-                ampP.decay = 0.03f + decay * 0.25f;         // (the kit's 0.04 = 40 ms)
-                ampP.sustain = 0.0f;
-                ampP.release = 0.005f;
-                ampP.decayCurve = -0.3f;
-
-                pitchP.attack = 0.0f;
-                pitchP.decay = 0.001f;
-                pitchP.sustain = 0.0f;
-                pitchP.release = 0.001f;
-                break;
-            }
-            case DrumSynthType::OpenHat:
-            {
-                ampP.attack = 0.0f;
-                ampP.decay = 0.1f + decay * 0.9f;
-                ampP.sustain = 0.0f;
-                ampP.release = 0.02f;
-                ampP.decayCurve = -0.3f;
 
                 pitchP.attack = 0.0f;
                 pitchP.decay = 0.001f;
@@ -1075,9 +1681,9 @@ private:
                 pitchP.release = 0.001f;
                 break;
             }
-            case DrumSynthType::CymbalSynth:
+            default:
             {
-                // (Not used: the cymbal machine's modes each have their own decay.)
+                // (Not used: the bank and the resonator drum have their own.)
                 ampP.attack = 0.0f;
                 ampP.decay = decay;
                 ampP.sustain = 1.0f;
@@ -1114,74 +1720,6 @@ private:
 
     // --- Per-type process methods ---
 
-    float processFMKick()
-    {
-        float pitchEnvVal = pitchEnv.process();
-        float ampEnvVal = ampEnv.process();
-
-        // Carrier frequency: sweeps from tune*4 down to tune
-        double carrierFreq = tune + tune * 3.0 * pitchEnvVal;
-
-        // Modulator at tune*2 with very short decay (reuse pitchEnv for timing)
-        // Modulator has extra-short decay: dies faster than pitch sweep
-        double modFreq = tune * 2.0;
-        float modAmp = pitchEnvVal * pitchEnvVal; // Squared for faster click decay
-        // TONE: the level of the click (0.5 = x1)
-        float modSample = sine(osc2Phase, modFreq) * modAmp * 2.0f * (tone * 2.0f);
-
-        // Feedback on modulator when drive > 0
-        if (drive > 0.0f)
-            modSample += modSample * drive * 0.5f;
-
-        // Apply FM: modulator offsets carrier phase
-        double modulatedFreq = carrierFreq + modSample * carrierFreq * 0.5;
-        float out = sine(osc1Phase, modulatedFreq);
-
-        out *= ampEnvVal;
-        return out;
-    }
-
-    float processAnalogKick()
-    {
-        float pitchEnvVal = pitchEnv.process();
-        float ampEnvVal = ampEnv.process();
-
-        // Pure sine, gentler pitch sweep: tune*3 down to tune. TONE: how far it falls, from not at
-        // all (0) through tune*3 (0.5) to tune*9 (1).
-        const double fall = (double) (tone * 2.0f) * (double) (tone * 2.0f);
-        double freq = tune + tune * 2.0 * fall * pitchEnvVal;
-        float out = sine(osc1Phase, freq);
-
-        out *= ampEnvVal;
-        return out;
-    }
-
-    float processModCyclesKick()
-    {
-        float pitchEnvVal = pitchEnv.process();
-        float ampEnvVal = ampEnv.process();
-
-        // Sine body with FM click (like FMKick)
-        double carrierFreq = tune + tune * 3.0 * pitchEnvVal;
-        double modFreq = tune * 2.0;
-        float modAmp = pitchEnvVal * pitchEnvVal;
-        float modSample = sine(osc2Phase, modFreq) * modAmp * 2.0f;
-        double modulatedFreq = carrierFreq + modSample * carrierFreq * 0.5;
-        float out = sine(osc1Phase, modulatedFreq);
-
-        // Resonant lowpass filter sweeping cutoff
-        float filterCutoff = (float)(tune * 2.0 + tune * 18.0 * pitchEnvVal);
-        filter.setCutoff(filterCutoff);
-        out = filter.process(out);
-
-        // Soft saturation from drive
-        if (drive > 0.0f)
-            out = saturate(out, drive);
-
-        out *= ampEnvVal;
-        return out;
-    }
-
     float processNoiseSnare()
     {
         float ampEnvVal = ampEnv.process();
@@ -1192,7 +1730,7 @@ private:
         float filteredNoise = filter.process(noise) * ampEnvVal;
 
         // Sine body at tune Hz
-        float body = sine(osc1Phase, (double)tune) * bodyEnvVal;
+        float body = this->body((double)tune) * bodyEnvVal;
 
         // Drive controls noise-to-body mix: 0 = more body, 1 = more noise
         float bodyMix = 1.0f - drive;
@@ -1210,10 +1748,10 @@ private:
         // FM body: carrier at tune, modulator at tune*1.47 (inharmonic)
         double modFreq = tune * 1.47;
         float modIndex = tone * 3.0f;
-        float mod = sine(osc2Phase, modFreq) * modIndex;
+        float mod = sine2(modFreq) * modIndex;
         // Apply FM to carrier phase
         double carrierFreq = tune + mod * tune * 0.5;
-        float body = sine(osc1Phase, carrierFreq) * bodyEnvVal;
+        float body = this->body(carrierFreq) * bodyEnvVal;
 
         // Noise component
         float noise = nextNoise();
@@ -1266,45 +1804,6 @@ private:
         return out;
     }
 
-    // The hats: six square oscillators at fixed, unrelated pitches (the classic analog drum-machine
-    // recipe: a dense metallic cluster, the same at every hit), through two band-passes and then
-    // the TONE high-pass. TUNE moves the whole cluster (8000 = the classic pitches). The closed and
-    // the open hat are one sound with two lengths.
-    float processClosedHat()
-    {
-        float ampEnvVal = ampEnv.process();
-        (void)pitchEnv.process(); // Advance unused envelope
-
-        static constexpr double hz[6] = { 205.3, 304.4, 369.6, 522.7, 540.0, 800.0 };
-        const double scale = std::clamp((double) tune / 8000.0, 0.125, 1.5);
-
-        float sum = 0.0f;
-        for (int i = 0; i < 6; ++i)
-        {
-            const double inc = hz[i] * scale / sampleRate;
-            double& ph = hatPhase[i];
-            ph += inc;
-            if (ph >= 1.0) ph -= 1.0;
-            // A band-limited square: the two edges are rounded over one sample each.
-            float sq = ph < 0.5 ? 1.0f : -1.0f;
-            sq += dsp::polyBLEP(ph, inc);
-            double half = ph + 0.5;
-            if (half >= 1.0) half -= 1.0;
-            sq -= dsp::polyBLEP(half, inc);
-            sum += sq;
-        }
-        sum *= (1.0f / 6.0f);
-
-        const float metal = hatBandHigh.process(sum) + 0.35f * hatBandLow.process(sum);
-        return filter.process(metal) * ampEnvVal * HAT_MAKEUP;
-    }
-
-    float processOpenHat()
-    {
-        // The same sound with a long decay (configureEnvelopes); noteOff() closes it.
-        return processClosedHat();
-    }
-
     float processCymbal()
     {
         float ampEnvVal = ampEnv.process();
@@ -1319,12 +1818,11 @@ private:
             // Slight drift: use noise-seeded offset per partial
             double drift = 1.0 + (double)((noiseSeed >> (i * 3)) & 0xFF) * 0.0001;
             double freq = tune * ratios[i] * drift;
-            double partialPhase = osc1Phase * ratios[i] * drift;
+            double partialPhase = osc1.getPhase() * ratios[i] * drift;
             partialPhase -= std::floor(partialPhase);
             sum += (partialPhase < 0.5 ? 1.0f : -1.0f);
         }
-        osc1Phase += tune / sampleRate;
-        osc1Phase = dsp::wrapPhase(osc1Phase);
+        osc1.advance(tune / sampleRate);
 
         sum *= (1.0f / 8.0f);
         float out = filter.process(sum) * ampEnvVal;
@@ -1338,7 +1836,7 @@ private:
 
         // Sine with mild pitch sweep: tune*1.5 to tune over 50ms
         double freq = tune + tune * 0.5 * pitchEnvVal;
-        float body = sine(osc1Phase, freq);
+        float body = this->body(freq);
 
         // Short noise transient through bandpass
         float noise = nextNoise();
@@ -1355,7 +1853,7 @@ private:
         (void)pitchEnv.process();
 
         // Single sine burst at tune Hz (default 800Hz)
-        float body = sine(osc1Phase, (double)tune);
+        float body = this->body((double)tune);
 
         // Tone adds noise component
         float noise = 0.0f;
@@ -1376,11 +1874,10 @@ private:
         // (The band-pass has a gain of Q; noise through it grows with sqrt(Q). Level as at Q 2.)
         float filtered = filter.process(noise) * std::sqrt(2.0f / shakerQ(tone));
 
-        // Tremolo: use osc1Phase as LFO
-        osc1Phase += 80.0 / sampleRate; // ~80 Hz tremolo
-        osc1Phase = dsp::wrapPhase(osc1Phase);
+        // Tremolo: the first oscillator's phase as an LFO
+        osc1.advance(80.0 / sampleRate); // ~80 Hz tremolo
         float tremoloDepth = 0.3f + drive * 0.5f;
-        float tremolo = 1.0f - tremoloDepth * (0.5f + 0.5f * std::sin((float)(osc1Phase * dsp::TWO_PI_D)));
+        float tremolo = 1.0f - tremoloDepth * (0.5f + 0.5f * std::sin((float)(osc1.getPhase() * dsp::TWO_PI_D)));
 
         float out = filtered * ampEnvVal * tremolo;
         return out;
@@ -1392,8 +1889,8 @@ private:
         (void)pitchEnv.process();
 
         // Two sines at tune Hz and tune*1.33 Hz
-        float s1 = sine(osc1Phase, (double)tune);
-        float s2 = sine(osc2Phase, (double)(tune * 1.33));
+        float s1 = body((double)tune);
+        float s2 = sine2((double)(tune * 1.33));
         // TONE: the level of the upper partial (0.5 = as loud as the lower one)
         float out = (s1 + s2 * (tone * 2.0f)) * 0.5f * ampEnvVal;
 
@@ -1403,6 +1900,10 @@ private:
     // The kick machine. Body: one oscillator whose pitch falls from TUNE + SWEP semitones to TUNE
     // over SWPT (curve SCRV), shaped from sine through triangle to a squared-off wave by SHAP.
     // Knock: a short damped tick added at the start. Then drive (soft clip) and the TONE low-pass.
+    // KCK2 (each at 0 the above): LIN the sweep in frequency, KIND FM the click as FM of the body,
+    // PATH DRUM the low-pass on the body before SAT and the envelope and DRIV the common drive in
+    // finish(), LPSW / LPKT / RES its cutoff following the sweep and TUNE and its resonance, EDGE
+    // the front edge (finish()).
     float processKickSynth()
     {
         const float pitchEnvVal = pitchEnv.process();
@@ -1416,24 +1917,80 @@ private:
         if (kickReleased && !ampEnv.isActive())
             pitchEnv.noteOff();         // the tail is over: let the voice go idle
 
-        const double freq = (double) tune * std::exp2((double) (std::clamp(kick[KickSweep], 0.0f, 72.0f) * pitchEnvVal) / 12.0);
-        osc1Phase = dsp::wrapPhase(osc1Phase + freq / sampleRate);
-        const float s = std::sin((float) (osc1Phase * dsp::TWO_PI_D));
+        // The sweep: in pitch (SWEP semitones above TUNE at its start), or with LIN towards a fall
+        // in frequency (from 2^(SWEP/12) x TUNE, straight down to TUNE as the envelope falls).
+        const float sweep = std::clamp(kick[KickSweep], 0.0f, 72.0f);
+        double freq;
+        if (kickLin > 0.0f)
+        {
+            // (The ratio at the sweep's start, and the FM ratio below, are worked out again only
+            // when their cell moved: SWEP and KTON can be moved under the hit.)
+            if (sweep != kickRatioOf)
+            {
+                kickRatioOf = sweep;
+                kickRatio = std::exp2((double) sweep / 12.0);
+            }
+            const double inHz = (double) tune * (1.0 + (kickRatio - 1.0) * (double) pitchEnvVal);
+            freq = kickLin >= 1.0f ? inHz
+                                   : (double) tune * std::exp2((double) (sweep * pitchEnvVal) / 12.0);
+            if (kickLin < 1.0f)
+                freq += (double) kickLin * (inHz - freq);
+        }
+        else
+            freq = (double) tune * std::exp2((double) (sweep * pitchEnvVal) / 12.0);
+        // KIND FM: the click is a sine at KTON's ratio of TUNE moving the body's frequency.
+        if (kickFm)
+        {
+            const float ktone = std::clamp(kick[KickKnockTone], 0.0f, 1.0f);
+            if (ktone != kickFmRatioOf)
+            {
+                kickFmRatioOf = ktone;
+                kickFmRatio = std::exp2(4.0 * (double) ktone - 1.0);
+            }
+            const float depth = std::clamp(kick[KickKnock], 0.0f, 1.0f) * FM_CLICK_DEPTH * (pitchEnvVal * pitchEnvVal);
+            const float m = sine2((double) tune * kickFmRatio) * depth;
+            freq += (double) m * freq * 0.5;
+        }
+        const float s = body(freq);
+
+        // The low-pass follows the sweep (LPSW) or TUNE as it moves (LPKT): updated per
+        // sub-block of KICK_FILTER_BLOCK samples with interpolation, not every sample.
+        // The std::tan in setCutoff is the heaviest per-sample work; the sweep is smooth enough
+        // that 8-sample updates are inaudible ("Kick Points" measures old against new).
+        if (kickLpSweep > 0.0f || (kickLpTrack > 0.0f && tune != kickLpTune))
+        {
+            if (--kickFilterCount <= 0)
+            {
+                kickFilterCount = KICK_FILTER_BLOCK;
+                const float was = kickLpSet;
+                const float cutoff = kickLowPass(pitchEnvVal);
+                if (cutoff != was)
+                    filter.setCutoff(cutoff);
+            }
+        }
 
         // SHAP 0..0.5: sine -> triangle (same phase, same peaks). 0.5..1: the triangle pushed into
-        // a limiter until it is nearly square.
-        float body = shaped(s, std::clamp(kick[KickShape], 0.0f, 1.0f)) * ampEnvVal;
+        // a limiter until it is nearly square. PATH DRUM: the low-pass here, on the body only.
+        // SAT: then saturated, before the envelope.
+        float body = shaped(s, std::clamp(kick[KickShape], 0.0f, 1.0f));
+        if (kickDrumPath)
+            body = filter.process(body);
+        if (kickSat > 0.0f)
+            body = saturate(body, kickSat);
+        body *= ampEnvVal;
 
         float knock = 0.0f;
-        if (knockLevel > 0.0001f)
+        if (knockLevel > 0.0001f && ! kickFm)
         {
             const double knockHz = 300.0 * std::pow(20.0, (double) std::clamp(kick[KickKnockTone], 0.0f, 1.0f));
-            knockPhase = dsp::wrapPhase(knockPhase + knockHz / sampleRate);
-            knock = std::sin((float) (knockPhase * dsp::TWO_PI_D)) * knockLevel;
+            knockOsc.advance(knockHz / sampleRate);
+            knock = knockOsc.sine(0.0f) * knockLevel;
             knockLevel *= knockDecay;
         }
 
         float out = body + knock;
+        if (kickDrumPath)
+            return out;                 // (DRIV: the common drive, in finish())
         if (drive > 0.0f)
         {
             const float gain = 1.0f + drive * 9.0f;
@@ -1442,12 +1999,39 @@ private:
         return filter.process(out);
     }
 
-    // The cymbal machine (CymbalMachine.h), then TONE: everything above about 2.5 kHz turned
-    // down or up (the split is a 6 dB / octave one, so it tilts more than it cuts).
+    // The kick machine's low-pass for a sweep at p (1 at its start): TONE's 200 Hz .. 16 kHz, from
+    // TUNE with LPKT, opened by the sweep with LPSW. (TONE and the base are worked out again only
+    // when TONE or TUNE moved.)
+    float kickLowPass(float p)
+    {
+        if (kickLpTune != tune || kickLpTone != tone)
+        {
+            kickLpTune = tune;
+            kickLpTone = tone;
+            kickLpBase = kickLpTrack > 0.0f ? 200.0f * std::pow(std::max(tune, 1.0f) / 200.0f, kickLpTrack) * std::pow(80.0f, tone)
+                                            : 200.0f * std::pow(80.0f, tone);
+        }
+        kickLpSet = kickLpSweep > 0.0f ? kickLpBase * (1.0f + kickLpSweep * p) : kickLpBase;
+        return kickLpSet;
+    }
+
+    // The cymbal machine (CymbalMachine.h), then TONE as after the bank's METL and RING (below).
     float processCymbalSynth()
     {
-        // (The offset keeps the split's filter out of denormal numbers when LOFI has gated the tail to nothing.)
         const float in = cym.process(tune) + 1.0e-18f;
+        const float low = filter.process(in);
+        return low + cymTop * (in - low);
+    }
+
+    // The oscillator bank (OscBank.h). A hat has TONE's high-pass in it; after METL and RING, TONE
+    // is everything above about 2.5 kHz turned down or up (the split is a 6 dB / octave one, so
+    // it tilts more than it cuts).
+    float processBank()
+    {
+        if (bankIsHat())
+            return bank.process(tune);
+        // (The offset keeps the split's filter out of denormal numbers when LOFI has gated the tail to nothing.)
+        const float in = bank.process(tune) + 1.0e-18f;
         const float low = filter.process(in);
         return low + cymTop * (in - low);
     }
@@ -1458,7 +2042,7 @@ private:
         (void)pitchEnv.process();
 
         // Fixed pitch oscillator (no sweep). TONE: a sine (0) -> triangle -> squared-off.
-        float out = shaped(sine(osc1Phase, (double)tune), tone);
+        float out = shaped(body((double)tune), tone);
         out *= ampEnvVal;
         return out;
     }

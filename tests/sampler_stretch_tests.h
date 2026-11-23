@@ -293,12 +293,13 @@ public:
                 expect(! e.isRebuildParam(id), "id " + juce::String(id));
         }
 
-        beginTest("Pages: SAMPL GRAIN SLICE STRCH TONE FILTR AMP STRIP LFO1 LFO2, eight working cells each, ids round-trip");
+        beginTest("Pages: SAMPL GRAIN SLICE STRCH TONE FILTR AMP XIN SLT1 LSHP STRIP LFO1 LFO2, eight working cells each, ids round-trip");
         {
             S e;
             auto pages = e.getParamPages();
-            const char* names[] = { "SAMPL", "GRAIN", "SLICE", "STRCH", "TONE", "FILTR", "AMP", "STRIP", "LFO1", "LFO2" };
-            expectEquals((int) pages.size(), 10);
+            // (XIN since phase U4: the sampler is on the modulation router, whose page it is.)
+            const char* names[] = { "SAMPL", "GRAIN", "SLICE", "STRCH", "TONE", "FILTR", "AMP", "XIN", "SLT1", "LSHP", "STRIP", "LFO1", "LFO2" };
+            expectEquals((int) pages.size(), 13);
             const char* cells[4][8] = {
                 { "SMPL", "MODE", "STRT", "END", "LPST", "LPEN", "ROOT", "NORM" },
                 { "SIZE", "DENS", "SCAN", "SPRY", "PJIT", "SPRD", "SHAP", "RVRS" },
@@ -308,7 +309,7 @@ public:
                 { 24, 6, 1, 2, 3, 4, 46, 47 }, { 32, 33, 34, 35, 36, 37, 38, 39 },
                 { 40, 18, 41, 42, 0, 43, 44, 45 }, { 48, 49, 50, 51, 52, 53, 54, 55 } };
             std::set<int> seen;
-            for (size_t pi = 0; pi < pages.size() && pi < 10; ++pi)
+            for (size_t pi = 0; pi < pages.size() && pi < 13; ++pi)
             {
                 expect(pages[pi].name == names[pi], names[pi]);
                 expect(pages[pi].name.length() <= 5);
@@ -319,7 +320,7 @@ public:
                     expect(p.isValid(), pages[pi].name + " cell " + juce::String(c));
                     expect(label.length() <= 4 && label == label.toUpperCase(), label);
                     expect(seen.insert(p.id).second, "id used once: " + label);
-                    expect((p.id >= 0 && p.id < 100) || EngineLfoSection::owns(p.id), label);
+                    expect((p.id >= 0 && p.id < 100) || mod::Router::owns(p.id), label);
                     expect(e.getParameterName(p.id).isNotEmpty(), label);
                     if (pi < 4)
                     {
@@ -373,6 +374,15 @@ public:
         {
             for (int c = 0; c < NUM_LEGACY_CONFIGS; ++c)
             {
+                // Variant 3 has two LFOs and a RAND start: since phase U4 those are the modulation
+                // router's and the voice's one generator, so its renders are no longer the old
+                // samples (old against new, with numbers: the suite "U4 Sampler"). What stays true
+                // of it is what this test is about: the STRCH cells are not heard while ALGO is OFF.
+                if (c % 4 == 3)
+                {
+                    expect(legacyHash(c, true) == legacyHash(c), "config " + juce::String(c) + " with the STRCH cells moved");
+                    continue;
+                }
                 expect(legacyHash(c) == legacyHashes()[c], "config " + juce::String(c));
                 expect(legacyHash(c, true) == legacyHashes()[c], "config " + juce::String(c) + " with the STRCH cells moved");
             }

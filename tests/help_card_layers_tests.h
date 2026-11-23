@@ -37,7 +37,7 @@ public:
         using Mode = ScreenManager::HelpMode;
         static const Key layerKeys[] = { Key::Pattern, Key::Track, Key::Record };
 
-        beginTest("One table: five keys with cards, their names, and only Record acts when let go after its card");
+        beginTest("One table: five keys with cards, their names, and no key acts when let go after its card");
         {
             Rig r;
             expectEquals((int) Key::NumKeys, 5);
@@ -51,7 +51,7 @@ public:
             expectEquals(nameOf(Key::Track), juce::String("Up / Down"));
             expectEquals(nameOf(Key::Record), juce::String("Record"));
             for (int k = 0; k < (int) Key::NumKeys; ++k)
-                expect(ScreenManager::helpKeyActsOnReleaseAfterCard((Key) k) == ((Key) k == Key::Record));
+                expect(!ScreenManager::helpKeyActsOnReleaseAfterCard((Key) k));
             expectEquals(r.card(Key::Pattern, 0).title, juce::String("> PATTERNS"));
             expectEquals(r.card(Key::Pattern, 1).title, juce::String("> BUTTONS, KNOBS"));
             expectEquals(r.card(Key::Track, 0).title, juce::String("UP DOWN: TRACKS"));
@@ -90,10 +90,8 @@ public:
                 expectEquals(r.home->getPageIndex(), 0);
                 if (key == Key::Record)
                 {
-                    // Record let go does what Record does - also after its card.
-                    expect(r.mgr.isRecordArmed(), "Record after its card: recording on, as always");
-                    r.tap(RECORD);
-                    expect(!r.mgr.isRecordArmed());
+                    // A hold that showed the card does NOT arm recording.
+                    expect(!r.mgr.isRecordArmed(), "Record after its card: not armed (card took the hold)");
                     r.wait(3000);
                 }
                 expect(r.picture() == screen, nameOf(key) + ": letting go gives the screen back exactly");
@@ -299,7 +297,7 @@ public:
             r.mgr.setHelpMode(Mode::Delayed);
         }
 
-        beginTest("Record: alone it still arms when let go, after a short hold and after the card; Record + Play still records");
+        beginTest("Record: a short hold arms; a hold that showed the card does NOT arm; Record + Play still records");
         {
             Rig r;
             r.press(RECORD);
@@ -311,6 +309,7 @@ public:
             expect(!r.seq.isPlaying());
             expectEquals(r.text(), juce::String("REC FREE"));
 
+            // A hold that showed the help card does NOT arm on release.
             r.wait(3000);
             r.press(RECORD);
             r.wait();
@@ -323,10 +322,14 @@ public:
                 return c;
             };
             auto card = recordCard();
-            expectEquals(card.lines[0].text, juce::String("LET GO   RECORD OFF"), "armed: letting go switches it off");
+            expectEquals(card.lines[0].text, juce::String("LET GO   RECORD OFF"), "card says what a tap does");
             expectEquals(card.lines[2].text, juce::String("+ PLAY   RECORD NOW"));
             r.release(RECORD);
-            expect(!r.mgr.isRecordArmed(), "after the card too");
+            expect(r.mgr.isRecordArmed(), "after the card: still armed (the hold was just reading)");
+
+            // A short tap turns recording off.
+            r.tap(RECORD);
+            expect(!r.mgr.isRecordArmed(), "a tap still toggles");
 
             // Record + Play under the card.
             r.wait(3000);
@@ -356,9 +359,13 @@ public:
             expectEquals(card.lines[2].text, juce::String("+ PLAY   FREE / QUANT"));
             expectEquals(card.lines[3].text, juce::String(" NOW: REC QUANT"));
             r.release(RECORD);
-            expect(!r.mgr.isRecordArmed() && r.seq.isPlaying(), "Record alone ends recording and keeps playing");
+            // A hold that showed the card does NOT toggle recording.
+            expect(r.mgr.isRecordArmed() && r.seq.isPlaying(), "card took the hold: recording still on");
+            // A tap disarms it.
+            r.tap(RECORD);
+            expect(!r.mgr.isRecordArmed() && r.seq.isPlaying(), "Record tap ends recording and keeps playing");
 
-            // Playing, not recording.
+            // Playing, not recording. The card now describes what a tap does.
             r.press(RECORD);
             r.wait();
             card = recordCard();
@@ -366,6 +373,8 @@ public:
             expectEquals(card.lines[2].text, juce::String("+ PLAY   RECORD ON"));
             expectEquals(card.lines[3].text, juce::String(" PLAYING GOES ON"));
             r.release(RECORD);
+            // Card took the hold: still not armed.
+            expect(!r.mgr.isRecordArmed());
             r.tap(PLAY);
             expect(!r.seq.isPlaying() && !r.mgr.isRecordArmed());
         }
@@ -739,7 +748,7 @@ public:
                         r.release(ccOf(key));
                         if (key == Key::Record)
                         {
-                            r.tap(RECORD);                  // (its release switched recording on)
+                            // The card took the hold: recording is not armed.
                             expect(!r.mgr.isRecordArmed(), juce::String(screenNames[screen]));
                             r.mgr.setActiveScreen(screen);
                         }

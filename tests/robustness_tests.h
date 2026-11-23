@@ -257,6 +257,7 @@ public:
                   "blocks of 1 to 4096, the rate and block changed under held notes");
         for (int t = 0; t < robust::NUM_SOUND_ENGINES; ++t)
             sweepEngine(robust::soundEngine(t), robust::deep() ? 40 : 4, (int) rates().size(), {}, {});
+        sweepEngine(EngineType::Resonator, robust::deep() ? 40 : 4, (int) rates().size(), {}, {});
     }
 
     // One engine type through the cases: 0 as it comes, 1 every cell at its lowest, 2 at its highest,

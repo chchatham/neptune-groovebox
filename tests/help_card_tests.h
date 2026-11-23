@@ -142,8 +142,9 @@ namespace helptest
             track(0).soundParams[moved.id] = movedValue;
             audio.setTrackParameter(0, MixParam::VOLUME, 0.4f);
             track(0).soundParams[MixParam::VOLUME] = 0.4f;
-            audio.setTrackParameter(0, TrackFxParam::DIRT_BASE, 0.6f);
-            track(0).soundParams[TrackFxParam::DIRT_BASE] = 0.6f;
+            // (The old fill() set DIRT_BASE here, which is now dead. The insert effect for
+            //  the TRK FX clear test is added in the test itself, not in fill(), so that URig
+            //  callers who add their own inserts are not affected.)
 
             track(0).getStep(0).trig = true;
             track(0).getStep(0).paramLocks[moved.id] = movedDefault;
@@ -207,9 +208,10 @@ namespace helptest
         }
         juce::String soundText()
         {
+            const int inserts = audio.getInsertChain(0) ? audio.getInsertChain(0)->getEffectCount() : 0;
             return juce::String((int) audio.getEngine(0)->getType()) + " " + juce::String(audio.getTrackParameter(0, moved.id), 3)
                  + " " + juce::String(audio.getTrackParameter(0, MixParam::VOLUME), 3)
-                 + " " + juce::String(audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), 3);
+                 + " FX" + juce::String(inserts);
         }
         juce::String allText()
         {
@@ -754,7 +756,7 @@ public:
             names.clear();
             pads = r.card(Key::Func, 1);
             for (auto& l : pads.padRows[0].labels) names.add(l.text);
-            expectEquals(names.joinIntoString(" ").trim(), juce::String("TRCK ARPL DIRT TALK MDFX FX FX2"));
+            expectEquals(names.joinIntoString(" ").trim(), juce::String("TRCK ARPL FX FX2 IN S1FX S1FX S2FX"));
         }
 
         beginTest("FUNC: EDIT says what copy / clear / paste act on, and that is what they then do (every screen, with and without a held step)");
@@ -769,7 +771,7 @@ public:
                 { "", "" }, { "", "" }, { "", "" }, { "", "" }, { "", "" },     // ARP SCALE SONG AT ROUTE WAVE
                 { "CLEAR T1 FX",     "CLEAR S1 LOCKS" },        // TRK FX: the track's effects
                 { "", "" },                                     // CHORD
-                { "CLEAR PERF PAD 1", "CLEAR PERF PAD 1" } };   // PERF: the pad on the knobs
+                { "CLEAR B1 PAD 1", "CLEAR B1 PAD 1" } };        // PERF: the pad on the knobs (B1 = bank 1)
 
             for (int screen = 0; screen < NUM_SCREENS; ++screen)
             {
@@ -778,6 +780,8 @@ public:
                     const juce::String where = juce::String(screenNames[screen]) + (held ? " + step" : "");
                     Rig r;
                     r.fill();
+                    if (screen == TRKFX)
+                        r.audio.addInsertEffect(0, EffectType::DriveEffect);   // so "CLEAR T1 FX" has something to clear
                     r.mgr.setActiveScreen(screen);
                     if (held)
                     {
@@ -881,7 +885,7 @@ public:
                         }
                         else if (name == "T1 FX")
                         {
-                            expectWithinAbsoluteError(r.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), 0.0f, 1.0e-6f, where + ": the effect is off");
+                            expectEquals(r.audio.getInsertChain(0)->getEffectCount(), 0, where + ": the inserts are cleared");
                             expectWithinAbsoluteError(r.audio.getTrackParameter(0, r.moved.id), r.movedValue, 1.0e-4f, where + ": the engine stays");
                             expectWithinAbsoluteError(r.audio.getTrackParameter(0, MixParam::VOLUME), 0.4f, 1.0e-4f, where + ": the mixer stays");
                             expect(original.startsWith("T0: " + r.stepsText(0)), where + ": the steps stay");
@@ -891,7 +895,8 @@ public:
                             expectEquals(verb, juce::String("RESET"), where);
                             expectWithinAbsoluteError(r.audio.getTrackParameter(0, r.moved.id), r.movedDefault, 1.0e-4f, where);
                             expectWithinAbsoluteError(r.audio.getTrackParameter(0, MixParam::VOLUME), 0.4f, 1.0e-4f, where + ": the mixer stays");
-                            expectWithinAbsoluteError(r.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), 0.6f, 1.0e-6f, where + ": the effects stay");
+                            // (TrackFx params are no longer a fixed section; old DIRT_BASE reads 0.)
+                            expectWithinAbsoluteError(r.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), 0.0f, 1.0e-6f, where + ": old TrackFx params read 0");
                             expect(original.startsWith("T0: " + r.stepsText(0)), where + ": the steps stay");
                         }
                         else if (name == "STEP 1")
@@ -905,7 +910,7 @@ public:
                             expectEquals(r.stepText(0, 0), juce::String("0t0 "), where + ": the locks go, the trig stays");
                             expectEquals(r.stepText(0, 3), juce::String("3t1 "), where);
                         }
-                        else if (name == "PERF PAD 1")
+                        else if (name == "B1 PAD 1")
                         {
                             expect(r.audio.getPerfFx().get(0).empty(), where + ": the pad is empty");
                             expect(original.startsWith("T0: " + r.stepsText(0)) && original.endsWith(r.soundText()), where + ": steps and sound stay");

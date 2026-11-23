@@ -1,12 +1,11 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "FxBlocks.h"
+#include "DelayCore.h"
 
-// Left / centre / right delay: one mono delay line (the two inputs summed) read at three taps.
-// The left tap is heard on the left only, the right tap on the right only and the centre tap on
-// both (at -3 dB). Feedback is taken from the centre tap through a one-pole low-pass (the classic
-// L/C/R delay topology found in rack multi-effects; delay line and filter from FxBlocks.h).
+// Left / centre / right delay: a setting of dly::Core (DelayCore.h). One line (the two inputs
+// summed) read at three taps. The left tap is heard on the left only, the right tap on the right
+// only and the centre tap on both (at -3 dB). Feedback is taken from the centre tap through a
+// low-pass (the classic L/C/R topology of rack multi-effects).
 //
 // TIME  centre tap time
 // FDBK  feedback from the centre tap
@@ -14,105 +13,66 @@
 //       right = TIME x (1 + SPRD/2). 0 = all three together, 1 = half / whole / one and a half
 //       (eighth, quarter, dotted quarter), 0.67 = triplet spacing
 // MIX   dry / wet
-class LCRDelay : public EffectBase
+// FX2:
+// WOW   the tape transport's wow and flutter on all three taps (0 = a steady line)
+// DRIV  the tape stage in the loop: 0 = clean; up, every repeat is squashed, thickened and duller
+// SAT   the curve DRIV works: any of src/dsp/Saturation.h
+// READ  FWD, REV, OCT+ / 5TH+ / OCT- (see DelayCore.h)
+class LCRDelay : public dly::Family
 {
 public:
     enum Param { Time = 0, Feedback, Spread, Mix };
+    enum Extra { Wow = 0, Drive, Sat, Read };
 
     static constexpr float MIN_TIME = 0.02f;
     static constexpr float MAX_TIME = 1.0f;
     static constexpr float CENTRE_GAIN = 0.70710678f;
 
-    LCRDelay()
-    {
-        mix = 0.4f;
-        prepare(44100.0, 0);
-    }
-
-    ParamSpec getParamSpec(int index) const override
-    {
-        using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "TIME", 0, MIN_TIME, MAX_TIME, 0.36f, K::Log, "s" };
-            case 1: return { "FDBK", 1, 0, 0.95f, 0.35f };
-            case 2: return { "SPRD", 2, 0, 1, 1.0f };
-            case 3: return { "MIX", 3, 0, 1, 0.4f };
-            default: return {};
-        }
-    }
-
-    void setParameter(int id, float value) override
-    {
-        switch (id)
-        {
-            case Time:     timeSec = std::clamp(value, MIN_TIME, MAX_TIME); break;
-            case Feedback: feedback = std::clamp(value, 0.0f, 0.95f); break;
-            case Spread:   spread = std::clamp(value, 0.0f, 1.0f); break;
-            case Mix:      setMix(value); break;
-            default: break;
-        }
-    }
-
-    float getParameter(int id) const override
-    {
-        switch (id)
-        {
-            case Time:     return timeSec;
-            case Feedback: return feedback;
-            case Spread:   return spread;
-            case Mix:      return mix;
-            default:       return 0.0f;
-        }
-    }
+    LCRDelay() { seed(); }
 
     // Tap times in seconds for the current settings (left, centre, right).
-    float getLeftTime() const { return timeSec * (1.0f - 0.5f * spread); }
-    float getCentreTime() const { return timeSec; }
-    float getRightTime() const { return timeSec * (1.0f + 0.5f * spread); }
+    float getLeftTime() const { return cell(Time) * (1.0f - 0.5f * cell(Spread)); }
+    float getCentreTime() const { return cell(Time); }
+    float getRightTime() const { return cell(Time) * (1.0f + 0.5f * cell(Spread)); }
 
-    void prepare(double sr, int /*maxBlockSize*/) override
+protected:
+    const ParamSpec* cells() const override
     {
-        sampleRate = sr;
-        line.prepare((int) ((double) MAX_TIME * 1.5 * sr) + 16);
-        timeSmooth.setTime(sr, 60.0f);
-        spreadSmooth.setTime(sr, 60.0f);
-        damping.setCutoff(sr, 5000.0f);
-        reset();
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "TIME", 0, MIN_TIME, MAX_TIME, 0.36f, K::Log, "s" },
+            { "FDBK", 1, 0, 0.95f, 0.35f },
+            { "SPRD", 2, 0, 1, 1.0f },
+            { "MIX", 3, 0, 1, 0.4f },
+            { "WOW", 0, 0, 1, 0 },
+            { "DRIV", 1, 0, 1, 0 },
+            { "SAT", 2, 0, (float) (sat::Count - 1), (float) sat::Fast, K::Choice, "", sat::names(), sat::Count },
+            { "READ", 3, 0, (float) (dly::read::Count - 1), 0, K::Choice, "", dly::read::names(), dly::read::Count } };
+        return c;
     }
-
-    void reset() override
+    int mixCell() const override { return Mix; }
+    dly::Core::Setup setup() const override
     {
-        line.clear();
-        damping.reset();
-        timeSmooth.snap(timeSec);
-        spreadSmooth.snap(spread);
+        dly::Core::Setup s;
+        s.stereo = false;
+        s.filterInput = false;      // the first echoes are as bright as the input
+        s.emphasis = s.makeup = true;
+        s.glideMs = 60.0f;
+        return s;
     }
+    float lineSeconds() const override { return dly::roomFor(MAX_TIME * 1.5f, MAX_TIME); }
 
-    void process(float& left, float& right) override
+    void configure(const float* v) override
     {
-        if (!enabled) return;
-
-        float t = timeSmooth.next(timeSec) * (float) sampleRate;
-        float s = 0.5f * spreadSmooth.next(spread);
-
-        float tapL = line.readHermite(t * (1.0f - s));
-        float tapC = line.readHermite(t);
-        float tapR = line.readHermite(t * (1.0f + s));
-
-        float in = 0.5f * (left + right);
-        line.write(fxb::flushDenormal(in + feedback * damping.lowPass(tapC)));
-
-        left = lerp(left, tapL + CENTRE_GAIN * tapC, mix);
-        right = lerp(right, tapR + CENTRE_GAIN * tapC, mix);
+        const float time = v[Time], side = 0.5f * v[Spread];
+        core.setTapCount(3);
+        core.setTap(0, time * (1.0f - side), 1.0f, 0.0f, 0.0f);
+        core.setTap(1, time, CENTRE_GAIN, CENTRE_GAIN, 1.0f);
+        core.setTap(2, time * (1.0f + side), 0.0f, 1.0f, 0.0f);
+        core.setFeedback(v[Feedback]);
+        core.setFilter(5000.0f, 0.0f);
+        core.setTransport(v[4 + Wow]);
+        dly::driven(core, v[4 + Drive], v[4 + Sat]);
+        setRead(v[4 + Read], time);
     }
-
-private:
-    float timeSec = 0.36f;
-    float feedback = 0.35f;
-    float spread = 1.0f;
-
-    fxb::DelayLine line;
-    fxb::OnePole damping;
-    fxb::Smoother timeSmooth, spreadSmooth;
 };

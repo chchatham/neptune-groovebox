@@ -1,12 +1,14 @@
 #pragma once
 
 #include "Track.h"
+#include "../engine/PerfFx.h"
 #include <vector>
 
 struct Pattern
 {
     std::vector<Track> tracks;
     float swing = 0.0f; // 0.0 = no swing, 1.0 = full triplet
+    PerfFx::MoveLane perfMoves;     // recorded PERF pad moves for this pattern
 
     Pattern(int trackCount = 8)
     {
@@ -40,6 +42,7 @@ struct Pattern
     {
         for (auto& track : tracks)
             track.clearAllSteps();
+        perfMoves.clear();
     }
 
     Pattern duplicate() const
@@ -47,6 +50,7 @@ struct Pattern
         Pattern copy((int) tracks.size());
         copy.tracks = tracks;
         copy.swing = swing;
+        copy.perfMoves = perfMoves;
         return copy;
     }
 };

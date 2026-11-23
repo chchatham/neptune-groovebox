@@ -1,189 +1,144 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "../DSPUtils.h"
-#include <cmath>
-#include <algorithm>
+#include "Detector.h"
 
-// Transient shaper using an envelope follower.
-// Detects the signal envelope with fast attack and adjustable release,
-// then uses the difference between fast and slow envelopes to identify
-// transients (attack phase) vs. sustain. The attack and sustain gains
-// are applied independently. No buffers needed - pure computation.
-// No heap on audio thread.
-class TransientShaper : public EffectBase
+// Transient shaper, TRNS: makes the attacks and the tails of a sound louder or softer without a
+// threshold, so it works the same on a quiet sound as on a loud one (the differential-envelope
+// idea of the hardware transient designers; structure as in Zoelzer, "DAFX", dynamics chapter).
+//
+// The key's level (dyn::Detector, peak) is held over its own ripple: the largest level of the last
+// 10 to 20 ms (dyn::PeakHold), let go with a short release. That envelope, p, is followed three
+// ways (dyn::Follower each):
+//   fast   rises to p in a millisecond or so, falls with it
+//   slow   rises to p in tens of milliseconds, falls with it
+//   tail   rises with p, falls several times slower
+// While the level rises, fast runs ahead of slow: (fast - slow) / fast is the attack, 0..1. While it
+// falls, p drops under tail: (tail - p) / tail is the tail, 0..1. On a steady sound both are
+// exactly 0. Each has its own gain and the two are multiplied:
+//   1 + 3 ATK attack   (ATK below 0: 1 / (1 + 3 |ATK| attack), the same in dB the other way)
+//   1 + 3 SUS tail     (likewise)
+// so each knob reaches about +/- 12 dB. With both at 0 and OUT at 0 dB the sound passes untouched,
+// sample for sample (the old shaper bent everything through a tanh).
+//
+// The gain is never switched from one to the other (it was the attack's OR the tail's until the
+// review of phase E3, and stepped by up to 12 dB in one sample at the hand-over). What is left
+// is where a hit begins: a ratio of two levels goes from 0 to 1 in a sample when the level comes
+// out of nothing, and the tail of the hit before is let go at once. Keyed by itself, that step of
+// the gain sits on the step of the sound and belongs to it (an attack is not smoothed). Keyed from
+// the track's input it would be a click in a sound that has no step of its own there, so the gain
+// then goes through a 1 ms smoother: a steady sound keyed by a drum gets a swell.
+//
+// ATK  attacks softer (-1) .. sharper (+1)        SUS  tails shorter (-1) .. longer (+1)
+// SPD  how fast the followers are                 OUT  output level
+// The cells are CellEffect's (every continuous one moves with modulateCell); the slot's WET leaves
+// the dry sound beside the shaped one.
+// KEY  (FX2) what the detector listens to: SELF, or IN = the track's input: this track gets the
+//      attacks and tails of another one (a pad that swells on every drum hit, or drops under it)
+class TransientShaper : public dyn::Keyed<TransientShaper>
 {
 public:
-    ParamSpec getParamSpec(int index) const override
-    {
-        using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "ATK", 0, -1, 1, 0 };
-            case 1: return { "SUS", 1, -1, 1, 0 };
-            case 2: return { "SPD", 2, 0, 1, 0.5f };
-            case 3: return { "OUT", 3, -12, 12, 0, K::Linear, "dB" };
-            default: return {};
-        }
-    }
-
     enum Param
     {
         Attack = 0,     // -1 to 1 (negative = soften, positive = sharpen attacks)
         Sustain,        // -1 to 1 (negative = reduce sustain, positive = boost)
         Speed,          // 0 - 1 (envelope follower speed / sensitivity)
-        Output,         // -12 to 12 dB (output gain compensation)
-        Mix             // 0 - 1
+        Output          // -12 to 12 dB (output gain compensation)
     };
+    static constexpr int KEY_EXTRA = 0;
 
-    void prepare(double sr, int /*maxBlockSize*/) override
+    static constexpr float DEPTH = 3.0f;        // a knob at its end: x4 (12 dB) at d = 1
+    static constexpr float HOLD_MS = 10.0f;     // bridges the half-waves of anything from 50 Hz up
+    static constexpr float TAIL_FALL = 4.0f;    // the tail follower's fall against the slow one's rise
+
+    TransientShaper() { seed(); }
+
+
+    void tick(float& left, float& right, float keyLeft, float keyRight)
     {
-        sampleRate = sr;
-        recalcCoeffs();
-        reset();
+        const float p = peak.up(held.push(detector.level(keyLeft, keyRight)));
+        const float f = fast.up(p);
+        const float s = slow.up(p);
+        const float t = tail.up(p);
+        const float gain = shaped(attackSmooth.next(attackNow), std::max(0.0f, f - s) / (f + FLOOR))
+                         * shaped(sustainSmooth.next(sustainNow), (t - p) / (t + FLOOR));
+        if (keyConnected()) gainSmooth.next(gain); else gainSmooth.snap(gain);
+        applyGain(left, right, gainSmooth.value() * outputSmooth.next(outputNow));
     }
 
-    void reset() override
+protected:
+    const ParamSpec* cells() const override
     {
-        envFast = 0.0f;
-        envSlow = 0.0f;
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "ATK", 0, -1, 1, 0 },
+            { "SUS", 1, -1, 1, 0 },
+            { "SPD", 2, 0, 1, 0.5f },
+            { "OUT", 3, -12, 12, 0, K::Linear, "dB" },
+            dyn::keySpec(KEY_EXTRA),
+            {}, {}, {} };
+        return c;
     }
 
-    void process(float& left, float& right) override
+    void prepareCore() override
     {
-        if (!enabled) return;
-
-        float dryL = left;
-        float dryR = right;
-
-        // Detect input level (peak of stereo pair)
-        float inputLevel = std::max(std::abs(left), std::abs(right));
-
-        // Fast envelope follower (tracks transients)
-        if (inputLevel > envFast)
-            envFast += fastAttackCoeff * (inputLevel - envFast);
-        else
-            envFast += fastReleaseCoeff * (inputLevel - envFast);
-
-        // Slow envelope follower (tracks sustain/body)
-        if (inputLevel > envSlow)
-            envSlow += slowAttackCoeff * (inputLevel - envSlow);
-        else
-            envSlow += slowReleaseCoeff * (inputLevel - envSlow);
-
-        // Transient signal: difference between fast and slow envelopes
-        // Positive = attack phase, near zero = sustain phase
-        float transientAmount = envFast - envSlow;
-        transientAmount = std::max(0.0f, transientAmount);
-
-        // Sustain signal: slow envelope level
-        float sustainAmount = envSlow;
-
-        // Compute gain modification
-        float gain = 1.0f;
-
-        // Attack shaping: boost or cut during transient phase
-        // attack > 0: boost transients, attack < 0: soften transients
-        if (transientAmount > 0.001f)
-        {
-            float attackBoost = 1.0f + attack * 3.0f * transientAmount;
-            attackBoost = std::max(attackBoost, 0.01f);
-            gain *= attackBoost;
-        }
-
-        // Sustain shaping: boost or cut during sustain phase
-        // sustain > 0: boost sustain, sustain < 0: reduce sustain
-        if (sustainAmount > 0.001f && transientAmount < sustainAmount * 0.5f)
-        {
-            float sustainBoost = 1.0f + sustain * 2.0f;
-            sustainBoost = std::max(sustainBoost, 0.01f);
-            gain *= sustainBoost;
-        }
-
-        // Output gain compensation
-        gain *= outputGainLinear;
-
-        // Apply gain
-        float wetL = left * gain;
-        float wetR = right * gain;
-
-        // Soft clip to prevent harsh overloads
-        wetL = dsp::fastTanh(wetL);
-        wetR = dsp::fastTanh(wetR);
-
-        left  = dryL * (1.0f - mix) + wetL * mix;
-        right = dryR * (1.0f - mix) + wetR * mix;
+        detector.prepare(sampleRate);
+        for (auto* s : { &attackSmooth, &sustainSmooth, &outputSmooth })
+            s->setTime(sampleRate, 10.0f);
+        gainSmooth.setTime(sampleRate, GAIN_MS);
     }
 
-    void setParameter(int id, float value) override
+    void resetCore() override
     {
-        switch (id)
-        {
-            case Attack:
-                attack = std::clamp(value, -1.0f, 1.0f);
-                break;
-            case Sustain:
-                sustain = std::clamp(value, -1.0f, 1.0f);
-                break;
-            case Speed:
-                speed = std::clamp(value, 0.0f, 1.0f);
-                recalcCoeffs();
-                break;
-            case Output:
-                outputDb = std::clamp(value, -12.0f, 12.0f);
-                outputGainLinear = dsp::dbToLinear(outputDb);
-                break;
-            case Mix:
-                mix = std::clamp(value, 0.0f, 1.0f);
-                break;
-        }
+        detector.reset();
+        held.reset();
+        peak.reset(0.0f);
+        fast.reset(0.0f);
+        slow.reset(0.0f);
+        tail.reset(0.0f);
+        attackSmooth.snap(attackNow);
+        sustainSmooth.snap(sustainNow);
+        outputSmooth.snap(outputNow);
+        gainSmooth.snap(1.0f);
+        dropKey();
     }
 
-    float getParameter(int id) const override
+    void configure(const float* v) override
     {
-        switch (id)
-        {
-            case Attack:  return attack;
-            case Sustain: return sustain;
-            case Speed:   return speed;
-            case Output:  return outputDb;
-            case Mix:     return mix;
-            default:      return 0.0f;
-        }
+        attackNow = v[Attack];
+        sustainNow = v[Sustain];
+        outputNow = dsp::dbToLinear(v[Output]);
+        const float spd = v[Speed];
+        if (spd == speedSet && sampleRate == rateSet) return;
+        speedSet = spd;
+        rateSet = sampleRate;
+        // Slow .. fast: the envelope lets go in 40 .. 10 ms, the fast follower rises in 3 .. 0.3 ms,
+        // the slow one in 60 .. 10 ms (about how long an attack lasts, as the shaper hears it), and
+        // the tail falls in 240 .. 40 ms.
+        peak.setTimes(sampleRate, 0.0f, lerp(40.0f, 10.0f, spd));
+        held.length = std::max(1, (int) (HOLD_MS * 0.001 * sampleRate));
+        const float fastMs = lerp(3.0f, 0.3f, spd), slowMs = lerp(60.0f, 10.0f, spd);
+        fast.setTimes(sampleRate, fastMs, 0.0f);
+        slow.setTimes(sampleRate, slowMs, 0.0f);
+        tail.setTimes(sampleRate, 0.0f, TAIL_FALL * slowMs);
     }
 
 private:
-    float attack   = 0.0f;
-    float sustain  = 0.0f;
-    float speed    = 0.5f;
-    float outputDb = 0.0f;
-    float outputGainLinear = 1.0f;
+    static constexpr float FLOOR = 1.0e-6f;     // -120 dB: below it there is no attack and no tail
+    static constexpr float GAIN_MS = 1.0f;      // the gain's own rise and fall under a key from outside
 
-    // Envelope follower state
-    float envFast = 0.0f;
-    float envSlow = 0.0f;
-
-    // Envelope follower coefficients
-    float fastAttackCoeff  = 0.0f;
-    float fastReleaseCoeff = 0.0f;
-    float slowAttackCoeff  = 0.0f;
-    float slowReleaseCoeff = 0.0f;
-
-    void recalcCoeffs()
+    // What a knob at `amount` makes of a share of 0..1: up to x4, or down to a quarter.
+    static float shaped(float amount, float share)
     {
-        if (sampleRate <= 0.0) return;
-
-        // Fast envelope: 0.1-2ms attack, 5-50ms release (speed adjusts)
-        float fastAttackMs  = lerp(2.0f, 0.1f, speed);
-        float fastReleaseMs = lerp(50.0f, 5.0f, speed);
-
-        // Slow envelope: 10-50ms attack, 100-500ms release
-        float slowAttackMs  = lerp(50.0f, 10.0f, speed);
-        float slowReleaseMs = lerp(500.0f, 100.0f, speed);
-
-        fastAttackCoeff  = 1.0f - std::exp(-1.0f / (float)(fastAttackMs * 0.001 * sampleRate));
-        fastReleaseCoeff = 1.0f - std::exp(-1.0f / (float)(fastReleaseMs * 0.001 * sampleRate));
-        slowAttackCoeff  = 1.0f - std::exp(-1.0f / (float)(slowAttackMs * 0.001 * sampleRate));
-        slowReleaseCoeff = 1.0f - std::exp(-1.0f / (float)(slowReleaseMs * 0.001 * sampleRate));
+        const float x = DEPTH * std::abs(amount) * share;
+        return amount >= 0.0f ? 1.0f + x : 1.0f / (1.0f + x);
     }
+
+    float attackNow = 0.0f, sustainNow = 0.0f, outputNow = 1.0f;
+    float speedSet = -1.0f;
+    double rateSet = 0.0;
+
+    dyn::Detector detector;
+    dyn::PeakHold held;
+    dyn::Follower peak, fast, slow, tail;
+    fxb::Smoother attackSmooth, sustainSmooth, outputSmooth, gainSmooth;
 };

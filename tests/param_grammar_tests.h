@@ -78,12 +78,13 @@ public:
 
     void runTest() override
     {
-        const juce::StringArray trackPages { "TRACK", "ARPLK", "DIRT", "TALK", "MODFX", "FX", "FX2" };
+        const juce::StringArray trackPages { "TRACK", "ARPLK", "FX", "FX2", "IN" };
 
         // ================================================================== the split
         beginTest("PARAM shows only the engine's own pages; the six track pages are gone from it");
         {
             for (auto type : { EngineType::UnifiedVoice, EngineType::FM, EngineType::MacroOsc, EngineType::Wavetable,
+                               EngineType::Resonator,
                                EngineType::WaveSeq, EngineType::Sampler, EngineType::MIDITrack })
             {
                 Rig rig(type);
@@ -111,6 +112,7 @@ public:
         beginTest("MAIN: every engine with a filter opens on cutoff, resonance and its level envelope");
         {
             for (auto type : { EngineType::UnifiedVoice, EngineType::FM, EngineType::MacroOsc, EngineType::Wavetable,
+                               EngineType::Resonator,
                                EngineType::WaveSeq, EngineType::Sampler })
             {
                 SequencerCore seq;
@@ -155,14 +157,19 @@ public:
             }
         }
 
-        beginTest("TRK FX has exactly the seven pages on every engine");
+        beginTest("TRK FX has exactly the eight pages on every engine, then the two pages of each send");
         {
-            for (int e = 0; e <= (int) EngineType::MIDITrack; ++e)
+            for (int e = 0; e < ENGINE_TYPE_COUNT; ++e)
             {
                 Rig rig((EngineType) e);
                 expectEquals(rig.fx.getName(), juce::String("TRK FX"));
-                expectEquals(rig.fx.getPageCount(), 7);
-                expect(pageNames(rig.fx) == trackPages, "Engine " + juce::String(e) + ": " + pageNames(rig.fx).joinIntoString(" "));
+                // (the track's five as they are now; the sends' four came with the sends' chains)
+                juce::StringArray all = pageNames(rig.fx), first = all;
+                first.removeRange(5, all.size());
+                expectEquals(rig.fx.getPageCount(), 9);
+                expect(first == trackPages, "Engine " + juce::String(e) + ": " + all.joinIntoString(" "));
+                all.removeRange(0, 5);
+                expect(all == juce::StringArray({ "S1FX", "S1FX2", "S2FX", "S2FX2" }), "Engine " + juce::String(e) + ": " + all.joinIntoString(" "));
                 expect(rig.fx.getEncoderLayout() == Screen::EncoderLayout::Grid && !rig.fx.usesEncoderBar());
                 expectEquals(rig.fx.getSubPage(), juce::String("TRACK"));
             }
@@ -203,17 +210,10 @@ public:
             fx.onPadRelease(5);
             expectWithinAbsoluteError(track.getStep(5).paramLocks[AudioEngine::ARP_LOCK_BASE + 2], 2.0f, 0.001f);
 
-            // DIRT, TALK, MODFX: the three blocks.
-            expect(fx.selectPageByName("DIRT"));
-            fx.onEncoderChange(0, 20);
-            expectWithinAbsoluteError(rig.value(TrackFxParam::DIRT_BASE + DirtBlock::Drive), 0.2f, 0.001f);
-            expect(fx.selectPageByName("TALK"));
-            fx.onEncoderChange(3, 50);
-            expectWithinAbsoluteError(rig.value(TrackFxParam::TALK_BASE + TalkBlock::Mix), 0.5f, 0.001f);
-            expectWithinAbsoluteError(track.soundParams[TrackFxParam::TALK_BASE + TalkBlock::Mix], 0.5f, 0.001f);
-            expect(fx.selectPageByName("MODFX"));
-            fx.onEncoderChange(1, 40);
-            expectWithinAbsoluteError(rig.value(TrackFxParam::MODFX_BASE + ModFxBlock::ChorusDepth), 0.4f, 0.001f);
+            // DIRT, TALK and MODFX are now insert types: no pages on TRK FX.
+            expect(!fx.selectPageByName("DIRT"), "no DIRT page");
+            expect(!fx.selectPageByName("TALK"), "no TALK page");
+            expect(!fx.selectPageByName("MODFX"), "no MODFX page");
 
             // FX: SLOT TYPE ON WET / the effect's four cells; SYNC replaces ON, TIME becomes the division.
             expect(fx.selectPageByName("FX"));
@@ -251,20 +251,31 @@ public:
             expect(drums != nullptr);
             if (drums == nullptr) return;
             const auto all = drums->getParamPages();
-            // The engine lists a DR, a KICK and a CYM page for each of the 16 pads, then STRIP and its LFO pages.
+            // The engine lists a DR, a KICK, a CYM, a PLFO and a PSLT page for each of the 16 pads
+            // (U5: PLFO and PSLT are per-pad modulation), then the pads' WAV1 and WAV2 and the
+            // modulation router's XIN, SLT1, LSHP, STRIP and LFO pages (U4-DRUM: WAV1, WAV2 and
+            // XIN are new; the five that were there are the last five, as they were).
             const int extra = (int) all.size() - DrumEngine::PAGES_PER_PAD * DrumEngine::NUM_VOICES;
-            expectEquals(extra, 3);
+            expectEquals(extra, 8);
+            {
+                const char* const was[5] = { "SLT1", "LSHP", "STRIP", "LFO1", "LFO2" };
+                for (int i = 0; i < 5; ++i)
+                    expectEquals(all[all.size() - 5 + (size_t) i].name, juce::String(was[i]));
+            }
             // The default kit's lower left pad (the one DRUMS starts on) is a kick machine, which
             // has a page more; this part is about an ordinary pad, the kick's page comes below.
+            // The screen shows: DR + (PLFO + PSLT) + kit-wide extra.
+            static constexpr int PAD_MOD_PAGES = 2;    // PLFO + PSLT, always shown
             expect(drums->isKickMachine(8));
-            drums->setParameter(8 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE, (float) (int) DrumSynthType::FMKick);
+            drums->setParameter(8 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE, (float) (int) DrumSynthType::Clap);     // [KICKS] (FMKK is a kick machine now)
 
             expectEquals(drums->getSelectedVoice(), 8, "The pad DRUMS starts on");
-            expectEquals(rig.param.getPageCount(), 1 + extra);
+            expectEquals(rig.param.getPageCount(), 1 + PAD_MOD_PAGES + extra);
             expectEquals(rig.param.getPageName(), juce::String("DR 9"));
             auto names = pageNames(rig.param);
+            // After DR and PLFO + PSLT, the kit-wide pages.
             for (int i = 0; i < extra; ++i)
-                expectEquals(names[1 + i], all[(size_t) (DrumEngine::PAGES_PER_PAD * DrumEngine::NUM_VOICES + i)].name);
+                expectEquals(names[1 + PAD_MOD_PAGES + i], all[(size_t) (DrumEngine::PAGES_PER_PAD * DrumEngine::NUM_VOICES + i)].name);
             int drPages = 0;
             for (auto& n : names) drPages += n.startsWith("DR ") ? 1 : 0;
             expectEquals(drPages, 1);
@@ -272,7 +283,7 @@ public:
             // Selecting another pad changes the page in place.
             drums->setSelectedVoice(2);
             expectEquals(rig.param.getPageName(), juce::String("DR 3"));
-            expectEquals(rig.param.getPageCount(), 1 + extra);
+            expectEquals(rig.param.getPageCount(), 1 + PAD_MOD_PAGES + extra);
             expectEquals(rig.param.getCurrentPage().params[2].id, 2 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TONE);
             rig.param.onEncoderChange(2, 20);                           // TONE 0 -> 0.2 on voice 3 only (a sub pad: 0 = a sine)
             expectWithinAbsoluteError(drums->getParameter(2 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TONE), 0.2f, 0.001f);
@@ -283,20 +294,21 @@ public:
             {
                 rig.param.onArrowRight();
                 const auto other = rig.param.getPageName();
-                drums->setSelectedVoice(11);
+                drums->setSelectedVoice(13);                // (a pad with no page of its own after its DR page: the clap; [KICKS] pad 10 is a kick machine now)
                 expectEquals(rig.param.getPageName(), other);
                 rig.param.onArrowLeft();
-                expectEquals(rig.param.getPageName(), juce::String("DR 12"));
+                expectEquals(rig.param.getPageName(), juce::String("DR 14"));
             }
             drums->setSelectedVoice(99);
             expectEquals(drums->getSelectedVoice(), DrumEngine::NUM_VOICES - 1);
 
-            // A pad set to the kick machine (TYPE KSYN) gets a KICK page after its DR page.
+            // A pad set to the kick machine (TYPE KSYN) gets a KICK page after its DR page, and its
+            // second page KCK2 ([KICKS]).
             drums->setSelectedVoice(0);
             rig.param.setCurrentPageIndex(0);
-            expectEquals(rig.param.getPageCount(), 1 + extra);
+            expectEquals(rig.param.getPageCount(), 1 + PAD_MOD_PAGES + extra);
             rig.audio.setTrackParameter(0, DrumEngine::TYPE, (float) (int) DrumSynthType::KickSynth);
-            expectEquals(rig.param.getPageCount(), 2 + extra);
+            expectEquals(rig.param.getPageCount(), 3 + PAD_MOD_PAGES + extra);
             rig.param.onArrowRight();
             expectEquals(rig.param.getPageName(), juce::String("KICK"));
             const char* kickLabels[8] = { "SWEP", "SWPT", "SCRV", "SHAP", "KNCK", "KTON", "HOLD", "ACRV" };
@@ -308,7 +320,7 @@ public:
             expect(drums->getParameter(sweepId) > 36.0f, "SWEP reaches the engine");
             expect(rig.track().soundParams.count(sweepId) == 1, "and is stored with the sound");
             drums->setSelectedVoice(1);                                 // an ordinary pad: no KICK page
-            expectEquals(rig.param.getPageCount(), 1 + extra);
+            expectEquals(rig.param.getPageCount(), 1 + PAD_MOD_PAGES + extra);
         }
 
         beginTest("Kick machine: sweep, shape, knock, hold and decay each change the sound as named");
@@ -376,9 +388,9 @@ public:
             const auto longer = render([&](DrumVoice& v) { plain(v); v.setDecay(1.0f); });
             expect(energy(longer, 13230, 22050) > 10.0 * energy(base, 13230, 22050));
 
-            // The fourteen older types are untouched by the kick's cells.
+            // The older types are untouched by the kick's cells ([KICKS] the clap: KICK is a kick machine now).
             DrumVoice a, b;
-            for (auto* v : { &a, &b }) { v->setSampleRate(44100.0); v->setType(DrumSynthType::AnalogKick); }
+            for (auto* v : { &a, &b }) { v->setSampleRate(44100.0); v->setType(DrumSynthType::Clap); }
             b.setKickParam(DrumVoice::KickSweep, 70.0f);
             b.setKickParam(DrumVoice::KickKnock, 1.0f);
             a.noteOn(1.0f); b.noteOn(1.0f);
@@ -455,6 +467,7 @@ public:
 
             // Which pages have one: by their cells.
             for (auto type : { EngineType::UnifiedVoice, EngineType::FM, EngineType::MacroOsc, EngineType::Wavetable,
+                               EngineType::Resonator,
                                EngineType::WaveSeq, EngineType::Sampler })
             {
                 int found = 0;
@@ -621,6 +634,9 @@ public:
             expectEquals(p.getPageName(), juce::String("F ENV"));
             p.onPageKey(fltr);
             expectEquals(p.getPageName(), juce::String("FILTR"), "Wraps to the section's first page");
+            // (U4-UV: the router's STRIP page is the MOD section's first, then the screen's MOD pages.)
+            p.onPageKey(sections.indexOf("MOD"));
+            expectEquals(p.getPageName(), juce::String("STRIP"));
             p.onPageKey(sections.indexOf("MOD"));
             expectEquals(p.getPageName(), juce::String("MOD"));
             p.onPageKey(sections.indexOf("MOD"));
@@ -633,20 +649,20 @@ public:
             p.onPageKey(p.getPageKeyCount());
             expectEquals(p.getPageName(), juce::String("OSC"), "Keys without a section do nothing");
 
-            // TRK FX: one key per page (TRACK, ARPLK, DIRT, TALK, MODFX, FX, FX2); sections still jump with Func + bank.
+            // TRK FX: one key per page (TRACK, ARPLK, FX, FX2, IN); sections still jump with Func + bank.
             auto& fx = rig.fx;
-            expectEquals(fx.getPageKeyCount(), 7);
-            fx.onPageKey(6);
+            expectEquals(fx.getPageKeyCount(), 8);    // min(8, 9 pages)
+            fx.onPageKey(4);
+            expectEquals(fx.getPageName(), juce::String("IN"));
+            fx.onPageKey(3);
             expectEquals(fx.getPageName(), juce::String("FX2"));
             fx.onPageKey(2);
-            expectEquals(fx.getPageName(), juce::String("DIRT"));
-            fx.onPageKey(5);
             expectEquals(fx.getPageName(), juce::String("FX"));
-            expectEquals(fx.getActivePageKey(), 5);
+            expectEquals(fx.getActivePageKey(), 2);
             fx.onPageKey(1);
             expectEquals(fx.getPageName(), juce::String("ARPLK"));
             fx.onSectionNext();
-            expectEquals(fx.getPageName(), juce::String("DIRT"));
+            expectEquals(fx.getPageName(), juce::String("FX"));
             fx.onSectionPrev();
             expectEquals(fx.getPageName(), juce::String("TRACK"));
         }
@@ -1445,7 +1461,7 @@ public:
             auto all = [&]
             {
                 std::vector<float> v;
-                for (int id = 0; id < EngineParamRange::THIRD_END; ++id)
+                for (int id = 0; id < EngineParamRange::END; ++id)
                     if (EngineParamRange::contains(id)) v.push_back(rig.value(id));
                 return v;
             };
@@ -1496,7 +1512,7 @@ public:
             // A never-visited architecture still starts from its own sound.
             Rig fresh;
             fresh.param.onArrowRight();
-            auto freshAll = [&] { std::vector<float> v; for (int id = 0; id < EngineParamRange::THIRD_END; ++id) if (EngineParamRange::contains(id)) v.push_back(fresh.value(id)); return v; };
+            auto freshAll = [&] { std::vector<float> v; for (int id = 0; id < EngineParamRange::END; ++id) if (EngineParamRange::contains(id)) v.push_back(fresh.value(id)); return v; };
             fresh.audio.setTrackParameter(0, UnifiedParam::ARCH, 1.0f);
             expect(freshAll() == monoFresh, "the starting sound itself is unchanged");
         }
@@ -1504,6 +1520,7 @@ public:
         beginTest("Filter key tracking runs from -100 to +100 on every engine with a filter: below 0 high notes get darker");
         {
             for (auto type : { EngineType::UnifiedVoice, EngineType::FM, EngineType::MacroOsc, EngineType::Wavetable,
+                               EngineType::Resonator,
                                EngineType::WaveSeq, EngineType::Sampler })
             {
                 const juce::String tag = "engine " + juce::String((int) type) + ": ";

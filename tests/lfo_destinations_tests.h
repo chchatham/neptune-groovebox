@@ -57,6 +57,7 @@ public:
     static const std::vector<EngineType>& engineTypes()
     {
         static const std::vector<EngineType> types = { EngineType::UnifiedVoice, EngineType::FM, EngineType::MacroOsc,
+                                                       EngineType::Resonator,
                                                        EngineType::Wavetable, EngineType::WaveSeq, EngineType::Sampler,
                                                        EngineType::Drum };
         return types;
@@ -64,6 +65,7 @@ public:
 
     static juce::String engineName(EngineType t)
     {
+        if (t == EngineType::Resonator) return "resonator";
         static const char* const names[] = { "synth", "FM", "macro", "wavetable", "wave seq", "sampler", "drums" };
         return names[(int) t];
     }
@@ -76,7 +78,10 @@ public:
         return e;
     }
 
-    // The DEST cell of LFO 1 (the unified voice's is built by the PARAM screen from the same list).
+    // The DEST cell of LFO 1 (the unified voice's is built by the PARAM screen from the same list):
+    // what the ENGINE can have moved. The cells of the track's effects that follow in the cell (E4,
+    // mod::TrackDest) are not the voices' and are heard only through an AudioEngine with an effect
+    // in the slot: "Effect Destinations" has them, every engine, with the click check.
     static std::vector<juce::String> destLabels(EngineBase& e)
     {
         std::vector<juce::String> out;
@@ -89,9 +94,32 @@ public:
         for (auto& page : e.getParamPages())
             for (auto& p : page.params)
                 if (p.id == S::id(0, S::Dest))
-                    for (int i = 0; i < p.numChoices; ++i)
+                    for (int i = 0; i < mod::TrackDest::firstIn(p.choices, p.numChoices); ++i)
                         out.push_back(p.choices[i]);
         return out;
+    }
+
+    // A PHASE destination (mod::Phase in the engine's router table: what is added to an
+    // oscillator's phase - FM's PMn / PMAL, the wavetable's and the wave sequencer's PM). The same
+    // sound at every whole period, so a value HELD there is heard only against another
+    // oscillator; it is heard while it MOVES. The one place where a test treats a phase apart.
+    static bool isPhase(EngineType type, const juce::String& label)
+    {
+        const mod::DestTable* t = nullptr;
+        switch (type)
+        {
+            case EngineType::FM:        t = &FMEngine::lfoDests(); break;
+            case EngineType::Wavetable: t = &WavetableEngine::lfoDests(); break;
+            case EngineType::WaveSeq:   t = &WaveSeqEngine::lfoDests(); break;
+            case EngineType::Sampler:   t = &SamplerEngine::lfoDests(); break;
+            case EngineType::MacroOsc:  t = &MacroOscEngine::lfoDests(0); break;
+            case EngineType::Drum:      t = &DrumEngine::lfoDests(); break;
+            case EngineType::Resonator: t = &ResonatorEngine::lfoDests(); break;
+            case EngineType::UnifiedVoice: t = &UnifiedVoiceEngine::routerDests(); break;
+            default:                    break;
+        }
+        const int d = t != nullptr ? t->indexOfLabel(label.toRawUTF8()) : -1;
+        return d > 0 && (*t)[d].period > 0.0f;
     }
 
     static int indexOf(const std::vector<juce::String>& labels, const juce::String& label)
@@ -269,7 +297,8 @@ public:
             case EngineType::FM:
                 for (int op = 0; op < 6; ++op)
                     set(op * 10 + 1, 0.8f);         // every operator in the sound: a bright one
-                if (label.length() == 4 && juce::CharacterFunctions::isDigit(label[3]))
+                if ((label.length() == 4 && juce::CharacterFunctions::isDigit(label[3]))
+                    || (label.startsWith("PM") && label != "PMAL"))    // (an operator's phase: PM1 .. PM6, U4-FM)
                 {
                     // An operator's own cell: six carriers, each a partial of its own, so every
                     // operator is heard directly (deep in a chain an operator's envelope is hardly
@@ -286,15 +315,106 @@ public:
                         set(op * 10 + 6, 0.5f);
                     }
                     plan.events = { { 0.0, 72, 1.0f }, { 0.12, 72, 0.0f }, { 0.25, 72, 1.0f }, { 0.37, 72, 0.0f } };
+                    // An operator's position: every operator reads a table that has one (the
+                    // vowels: every place along it is another sound), from the middle of it.
+                    if (label.startsWith("POS"))
+                    {
+                        variant << "tables ";
+                        for (int op = 0; op < 6; ++op)
+                        {
+                            set(op * 10 + FMEngine::OP_WAVE, (float) (phaseosc::FIRST_TABLE_WAVE + 9));
+                            set(op * 10 + FMEngine::OP_POSITION, 0.5f);
+                        }
+                    }
                 }
                 prepareVoiceFilter(e, FMEngine::FilterBase, label, variant);
+                break;
+            case EngineType::Resonator:
+                prepareVoiceFilter(e, ResonatorEngine::FilterBase, label, variant);
+                if (isOneOf(label, { "COUP", "REED" }))
+                {
+                    // The junction's two cells: under an exciter that has one.
+                    variant << "bowed ";
+                    set(ResonatorEngine::ExciterMorphParam, (float) res::Bow);
+                }
+                if (isOneOf(label, { "MEET", "SPRD" }))
+                {
+                    // Where a junction meets a heavy body: a bowed bar.
+                    variant << "bowed bar ";
+                    set(ResonatorEngine::MorphParam, (float) res::Bar);
+                    set(ResonatorEngine::ExciterMorphParam, (float) res::Bow);
+                }
+                if (label == "DIR")
+                {
+                    // The exciter's own sound: one that lasts.
+                    variant << "scraped ";
+                    set(ResonatorEngine::ExciterMorphParam, (float) res::Scrape);
+                }
+                if (isOneOf(label, { "GPOS", "SCAN", "SPRY", "GSIZ", "GPIT", "PJIT" }))
+                {
+                    // The GRAIN page: a scrape whose grains are read from a drum break (something
+                    // happens along it); for the place itself, a place that does not move by itself.
+                    variant << "grains ";
+                    set(ResonatorEngine::ExciterMorphParam, (float) res::Scrape);
+                    set(ResonatorEngine::GrainSample, (float) (SampleBank::get().breakIndex(0) + 1));
+                    if (label == "GPOS")
+                        set(ResonatorEngine::GrainScanParam, 0.0f);
+                }
                 break;
             case EngineType::MacroOsc:
                 // (All four macros act in every model, the default one included: "Dead Controls".)
                 prepareVoiceFilter(e, MacroOscEngine::FilterBase, label, variant);
+                if (label != "BMIX" && isOneOf(label, { "BMRP", "BDCY", "BCUP", "BDMP", "BPOS", "BTUN", "BKTK",
+                                                        "BCNT", "BGRN", "BRED", "BHRD", "BRDM", "BKDC", "BDIR", "BWIR" }))
+                {
+                    // BODY's cells are heard with the body in (U4-MACRO; as on the wave sequencer).
+                    variant << "body ";
+                    set(MacroOscEngine::BodyBase + VoiceBody::Mix, 0.7f);
+                    // BDY2 cells need specific body conditions to be audible.
+                    // Each distinct setup gets its own variant so the strip-route
+                    // baseline (cached by variant) matches the resting render.
+                    if (isOneOf(label, { "BRED", "BCNT" }))
+                    {
+                        variant << "coupled ";
+                        set(MacroOscEngine::BodyBase + VoiceBody::Couple, 0.5f);         // the reed/bow needs coupling
+                    }
+                    if (isOneOf(label, { "BDIR", "BGRN" }))
+                    {
+                        variant << "grains ";
+                        set(MacroOscEngine::BodyBase + VoiceBody::Grain, 0.5f);          // DIRE needs grain impulses; GRAN is heard with grains present
+                        set(MacroOscEngine::BodyBase + VoiceBody::Couple, 0.3f);
+                        set(MacroOscEngine::BodyBase + VoiceBody::Decay, 4.0f);          // long decay so grains ring
+                    }
+                    if (label == "BRDM")
+                    {
+                        variant << "rdam ";
+                        set(MacroOscEngine::BodyBase + VoiceBody::Couple, 0.3f);         // release damp heard on a ringing body
+                        set(MacroOscEngine::BodyBase + VoiceBody::Decay, 4.0f);          // long ring so RDAM shows
+                        set(MacroOscEngine::AmpRelease, 0.05f);                          // short release: the voice stops quickly,
+                                                                                          // so the body alone carries the tail and RDAM acts
+                        plan.seconds = 1.0;
+                        plan.events = { { 0.0, 60, 0.7f }, { 0.3, 60, 0.0f } };         // one note, 0.7 s of tail
+                    }
+                    if (label == "BKDC")
+                    {
+                        variant << "kdcy ";
+                        plan.events = { { 0.0, 84, 0.7f }, { 0.2, 84, 0.0f }, { 0.25, 84, 0.7f }, { 0.45, 84, 0.0f } };  // C5: pitch-dependent decay differs from C4
+                    }
+                }
                 break;
             case EngineType::Wavetable:
                 prepareVoiceFilter(e, WavetableEngine::FilterBase, label, variant);
+                if (isOneOf(label, { "BAL", "OFSB", "RESB", "DRVB" }))
+                {
+                    // Filter B's own cells: B in the path, a high-pass beside the ladder.
+                    using F = VoiceFilterSection;
+                    const int dual = WavetableEngine::FilterDualBase - (int) F::Count;
+                    variant << "filter B ";
+                    set(dual + F::ModeB, 2.0f);
+                    set(dual + F::Routing, 2.0f);
+                    set(dual + F::ResonanceB, 0.4f);
+                    set(dual + F::DriveB, 0.3f);
+                }
                 set(WavetableEngine::TableSelect, 7.0f);                    // SPEC: every frame is different
                 set(WavetableEngine::Position, 0.3f);
                 if (label == "MDPT")
@@ -347,6 +467,41 @@ public:
                     set(WaveSeqEngine::AmpSustain, 1.0f);
                     plan.seconds = 1.25;
                     plan.events = { { 0.0, 48, 0.7f }, { 1.15, 48, 0.0f } };
+                }
+                if (label != "BMIX" && isOneOf(label, { "BMRP", "BDCY", "BCUP", "BDMP", "BPOS", "BTUN", "BKTK",
+                                                        "BCNT", "BGRN", "BRED", "BHRD", "BRDM", "BKDC", "BDIR", "BWIR" }))
+                {
+                    // BODY's cells are heard with the body in (BMIX brings it in by itself).
+                    variant << "body ";
+                    set(WaveSeqEngine::BodyBase + VoiceBody::Mix, 0.7f);
+                    // Each distinct BDY2 setup gets its own variant (strip-route baseline).
+                    if (isOneOf(label, { "BRED", "BCNT" }))
+                    {
+                        variant << "coupled ";
+                        set(WaveSeqEngine::BodyBase + VoiceBody::Couple, 0.5f);
+                    }
+                    if (isOneOf(label, { "BDIR", "BGRN" }))
+                    {
+                        variant << "grains ";
+                        set(WaveSeqEngine::BodyBase + VoiceBody::Grain, 0.5f);
+                        set(WaveSeqEngine::BodyBase + VoiceBody::Couple, 0.3f);
+                        set(WaveSeqEngine::BodyBase + VoiceBody::Decay, 4.0f);
+                    }
+                    if (label == "BRDM")
+                    {
+                        variant << "rdam ";
+                        set(WaveSeqEngine::BodyBase + VoiceBody::Couple, 0.3f);
+                        set(WaveSeqEngine::BodyBase + VoiceBody::Decay, 4.0f);    // long ring so RDAM shows
+                        set(WaveSeqEngine::AmpRelease, 0.05f);                    // short release: the voice stops quickly,
+                                                                                   // so the body alone carries the tail and RDAM acts
+                        plan.seconds = 1.5;
+                        plan.events = { { 0.0, 60, 0.7f }, { 0.3, 60, 0.0f } };  // one note, 1.2 s of tail
+                    }
+                    if (label == "BKDC")
+                    {
+                        variant << "kdcy ";
+                        plan.events = { { 0.0, 84, 0.7f }, { 0.5, 84, 0.0f } };
+                    }
                 }
                 break;
             case EngineType::Sampler:
@@ -410,6 +565,35 @@ public:
                 // The kick machine (pad 9), struck twice.
                 for (auto& ev : plan.events)
                     ev.note = 8;
+                // WPOS: the place in the pad's WAVE, a table of several frames (U4-DRUM).
+                if (label == "WPOS")
+                {
+                    const auto& tables = WavetableFactory::builtInTables();
+                    for (int t = 0; t < (int) tables.size(); ++t)
+                        if (tables[(size_t) t]->numFrames > 4)
+                        {
+                            set(DrumEngine::WAVE_BASE + 8, (float) (phaseosc::FIRST_TABLE_WAVE + t));
+                            break;
+                        }
+                    variant << "a table on its WAVE ";
+                }
+                // A cell of the resonator drum: that pad as one. A gong (it rings, and every latent
+                // is heard on it); the brushed ride for what the exciter is made of and its own
+                // sound; the bowed cymbal for the junction and where it meets.
+                if (isOneOf(label, { "MRPH", "XMPH", "ENRG", "STIF", "SHT", "SHEL", "ODD", "DAMP", "TILT", "HUM", "POS", "MEMB", "DROP",
+                                     "WIRE", "MEET", "SPRD", "PAIR", "HAND", "DIR", "CONT", "GRAN", "COUP", "REED", "HARD" }))
+                {
+                    // (STIF: a body with a line in it, the clave's; a body of a table has none.)
+                    const bool junction = isOneOf(label, { "COUP", "REED", "MEET", "SPRD" });
+                    const char* sound = junction ? "BARB" : (isOneOf(label, { "CONT", "GRAN", "DIR" }) ? "SNRS" : (label == "STIF" ? "CLAV" : "GONG"));
+                    if (junction)       // (the bow at its hardest: it speaks within the note)
+                        set(DrumEngine::SOUND_BASE + 8 * DrumEngine::SOUND_CELLS + DrumEngine::RsnEnergy, 0.5f);
+                    variant << "resonator drum " << sound << " ";
+                    set(8 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE, (float) (int) DrumSynthType::Resonator);
+                    set(DrumEngine::SOUND_BASE + 8 * DrumEngine::SOUND_CELLS + DrumEngine::RsnSound, (float) resonatorSoundIndex(sound));
+                    set(8 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TUNE, 300.0f);
+                    set(8 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::DECAY, 0.3f);
+                }
                 break;
             default:
                 break;
@@ -463,7 +647,8 @@ public:
 
     struct Heard { float difference = 0.0f; bool finite = true; float peak = 0.0f; };
 
-    // The destination with the LFO at +-full depth against depth 0 (the larger of the two).
+    // The destination with the LFO at +-full depth against depth 0 (the larger of the two): a
+    // square, or a sine on a phase (isPhase: a square moves a phase only at its edges).
     // `stills` keeps the depth-0 renders: the destinations with the same set-up share one.
     static Heard hear(EngineType type, const juce::String& label, const std::vector<juce::String>& labels,
                       std::map<juce::String, std::vector<float>>& stills)
@@ -480,7 +665,7 @@ public:
                 stills[plan.variant] = render(plain);
             }
             const auto& still = stills[plan.variant];
-            setLfo(*plan.engine, plan.source, dest, depth, SQR, FREE, 3.1f);
+            setLfo(*plan.engine, plan.source, dest, depth, isPhase(type, label) ? SIN : SQR, FREE, 3.1f);
             const auto moved = render(plan);
             for (float s : moved)
             {
@@ -501,7 +686,7 @@ public:
     static std::set<juce::String> glossaryKeys()
     {
         std::set<juce::String> keys;
-        const auto file = juce::File(__FILE__).getParentDirectory().getParentDirectory()
+        const auto file = juce::File(NEPTUNE_TESTS_DIR).getParentDirectory()
                               .getChildFile("tools/manual/glossary_data.py");
         juce::StringArray lines;
         file.readLines(lines);
@@ -570,6 +755,7 @@ public:
             juce::String counts;
             for (auto type : engineTypes())
             {
+                if (type == EngineType::Resonator) { expect(destLabels(*makeEngine(type)).size() >= 30, "resonator"); continue; }
                 const int n = (int) destLabels(*makeEngine(type)).size();
                 counts << engineName(type) << " " << n << "  ";
                 expect(n >= floors[(int) type], engineName(type) + " has " + juce::String(n) + " destinations, floor "
@@ -581,7 +767,7 @@ public:
 
         beginTest("labels: unique within an engine, four characters at most, in the manual's glossary");
         {
-            const auto glossary = glossaryKeys();
+            auto glossary = glossaryKeys();
             expect(glossary.size() > 200, "glossary_data.py was read (" + juce::String((int) glossary.size()) + " names)");
             auto check = [&](const juce::String& where, const std::vector<juce::String>& labels)
             {
@@ -594,7 +780,17 @@ public:
                            where + ": " + label + " is not in tools/manual/glossary_data.py");
                 }
             };
+            // BODY's eight destinations (VoiceBodySection.h, phase U3 of the unification) enter the
+            // glossary with the manual's chapter on it, as RSN's names do: until then they are
+            // checked for everything but that.
+            for (int cell = 0; cell < VoiceBody::NumCells; ++cell)
+                glossary.insert(VoiceBodySection::destLabel(cell));
+            // (So do the resonator's own names where the kit offers them as destinations of its
+            // resonator drum, phase U2b.)
+            for (int i = 0; i < ResonatorEngine::lfoDests().size(); ++i)
+                glossary.insert(ResonatorEngine::lfoDests()[i].label);
             for (auto type : engineTypes())
+                if (type != EngineType::Resonator)      // RSN's names enter the glossary with its manual chapter ("Resonator" tests the rest)
                 check(engineName(type), destLabels(*makeEngine(type)));
             // The macro oscillator names its four macros per model.
             for (int model = 0; model < 8; ++model)
@@ -602,7 +798,7 @@ public:
                 MacroOscEngine e;
                 e.setParameter(MacroOscEngine::ModelParam, (float) model);
                 check("macro model " + juce::String(model), destLabels(e));
-                expectEquals((int) destLabels(e).size(), MacroOscEngine::lfoDests(0).size());
+                expectEquals((int) destLabels(e).size(), MacroOscEngine::lfoDests(0).visible());
             }
             // The extra envelopes' DEST.
             std::vector<juce::String> env;
@@ -647,10 +843,16 @@ public:
                 stops.push_back((int) next);
                 at = next;
             }
-            expectEquals((int) at, (int) labels.size() - 1, engineName(type) + ": the last entry is reached");
+            // (The engine's own groups, then one for each insert slot of the track and one for
+            // MODFX: E4. The unified voice's cell here is the voice's own list.)
+            const int trackGroups = dest.numChoices > (int) labels.size() ? mod::TrackDest::GROUPS : 0;
+            expectEquals((int) at, dest.numChoices - 1, engineName(type) + ": the last entry is reached");
             expect(! stops.empty() && stops.front() == 1, engineName(type) + ": first stop is the first destination");
-            expect((int) stops.size() >= 3 && (int) stops.size() <= 16,
+            expect((int) stops.size() - trackGroups >= 3 && (int) stops.size() - trackGroups <= 16,
                    engineName(type) + ": " + juce::String((int) stops.size()) + " stops from OFF to the end");
+            for (int g = 0; g < trackGroups; ++g)
+                expect(std::find(stops.begin(), stops.end(), (int) labels.size() + mod::TrackDest::groupStart(g)) != stops.end(),
+                       engineName(type) + ": a stop at the track's group " + juce::String(g + 1));
             // Down again, by the same stops.
             for (int i = (int) stops.size() - 2; i >= 0; --i)
             {
@@ -832,11 +1034,15 @@ public:
             // The synth's mixer drive: the route's set value is the knob's.
             UnifiedVoiceEngine u;
             const auto labels = destLabels(u);
+            // (U4-UV: an LFO without WHL / VEL / PRES is the router's: its slot is aimed at DRIV, and the
+            // router keeps the knob's value as the set value it moves around.)
             setLfo(u, 0, indexOf(labels, "DRIV"), 0.5f, SIN, FREE, 4.0f);
-            expectEquals(u.getVoice(0).getParamRoute(0), (int) UnifiedParam::MIX_DRIVE);
-            expectEquals(u.getVoice(3).getParamRoute(0), (int) UnifiedParam::MIX_DRIVE);
+            expectEquals(u.getRouter().lfo(0).dest, indexOf(labels, "DRIV"));
+            expectEquals(u.getVoice(0).getParamRoute(0), -1, "not on the classic path");
+            u.setParameter(UnifiedParam::MIX_DRIVE, 0.7f);
+            expectEquals(u.getRouter().baseOf(indexOf(labels, "DRIV")), 0.7f);
             setLfo(u, 0, (int) UnifiedVoice::LfoDest::Cutoff, 0.5f, SIN, FREE, 4.0f);
-            expectEquals(u.getVoice(0).getParamRoute(0), -1);
+            expectEquals(u.getRouter().lfo(0).dest, (int) UnifiedVoice::LfoDest::Cutoff);
         }
     }
 };

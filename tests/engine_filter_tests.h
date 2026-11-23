@@ -324,10 +324,9 @@ public:
                 sawFenv = sawFenv || page.name == "F ENV";
                 for (auto& p : page.params)
                 {
-                    const juce::String where = juce::String(rig.name) + " " + page.name + " " + juce::String(p.label);
-                    expect(p.isValid(), where + " is an empty cell");
                     if (! p.isValid())
-                        continue;
+                        continue;       // an empty cell is legal on any page (the owner: empty knobs are fine); every other check is for every page
+                    const juce::String where = juce::String(rig.name) + " " + page.name + " " + juce::String(p.label);
                     const juce::String label(p.label);
                     expect(label.isNotEmpty() && label.length() <= 4 && label == label.toUpperCase(), where + " label");
                     expect(EngineParamRange::contains(p.id), where + " id in the engine ranges (0-149, 158-189)");

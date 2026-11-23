@@ -159,6 +159,29 @@ public:
             out.push_back(s);
         }
         {
+            // The operators' positions need operators that read a table: six carriers, each on the
+            // vowel table (every place along it another wave), from the middle of it.
+            Subject s; s.name = "FM WAVE"; s.type = EngineType::FM;
+            s.only = { "POS1", "POS2", "POS3", "POS4", "POS5", "POS6" };
+            s.make = []
+            {
+                auto e = std::make_unique<FMEngine>();
+                e->prepareToPlay(SR, BLOCK);
+                e->setParameter(FMEngine::AlgorithmParam, 5.0f);
+                for (int op = 0; op < 6; ++op)
+                {
+                    e->setParameter(op * 10 + 1, 0.25f);
+                    e->setParameter(op * 10 + 4, 0.001f);
+                    e->setParameter(op * 10 + 6, 1.0f);
+                    e->setParameter(op * 10 + FMEngine::OP_WAVE, (float) (phaseosc::FIRST_TABLE_WAVE + 9));
+                    e->setParameter(op * 10 + FMEngine::OP_POSITION, 0.5f);
+                }
+                voiceFilter(*e, FMEngine::FilterBase);
+                return std::unique_ptr<EngineBase>(std::move(e));
+            };
+            out.push_back(s);
+        }
+        {
             Subject s; s.name = "Macro"; s.type = EngineType::MacroOsc;
             s.make = []
             {
@@ -174,6 +197,54 @@ public:
             out.push_back(s);
         }
         {
+            // (U4-MACRO) BODY's destinations need the body in: the same steady tone through a plate.
+            Subject s; s.name = "Macro BODY"; s.type = EngineType::MacroOsc; s.everything = false;
+            s.only = { "BMIX", "BMRP", "BDCY", "BCUP", "BDMP", "BPOS", "BTUN", "BKTK",
+                        "BCNT", "BGRN", "BRED", "BHRD", "BRDM", "BKDC", "BDIR", "BWIR" };
+            const auto plain = out.back().make;
+            s.make = [plain]
+            {
+                auto e = plain();
+                e->setParameter(MacroOscEngine::BodyBase + VoiceBody::Mix, 0.7f);
+                e->setParameter(MacroOscEngine::BodyBase + VoiceBody::Morph, (float) res::Plate);
+                return e;
+            };
+            out.push_back(s);
+        }
+        {
+            Subject s; s.name = "Resonator"; s.type = EngineType::Resonator;
+            s.make = []
+            {
+                auto e = std::make_unique<ResonatorEngine>();
+                e->prepareToPlay(SR, BLOCK);
+                e->setParameter(ResonatorEngine::MorphParam, (float) res::Tube);            // bowed: a steady tone
+                e->setParameter(ResonatorEngine::ExciterMorphParam, (float) res::Bow);
+                e->setParameter(ResonatorEngine::AmpAttack, 0.001f);
+                e->setParameter(ResonatorEngine::AmpSustain, 1.0f);
+                voiceFilter(*e, ResonatorEngine::FilterBase);
+                return std::unique_ptr<EngineBase>(std::move(e));
+            };
+            out.push_back(s);
+        }
+        {
+            // The GRAIN page's destinations need grains: a dense scrape read from the bank's held tone.
+            Subject s; s.name = "Resonator GRAIN"; s.type = EngineType::Resonator; s.everything = false;
+            s.only = { "GPOS", "SCAN", "SPRY", "GSIZ", "GPIT", "PJIT" };
+            s.make = []
+            {
+                auto e = std::make_unique<ResonatorEngine>();
+                e->prepareToPlay(SR, BLOCK);
+                e->setParameter(ResonatorEngine::ExciterMorphParam, (float) res::Scrape);
+                e->setParameter(ResonatorEngine::ExciteBase + res::Grain, 0.4f);
+                e->setParameter(ResonatorEngine::GrainSample, (float) (SampleBank::get().defaultIndex() + 1));
+                e->setParameter(ResonatorEngine::GrainSizeParam, 0.1f);
+                e->setParameter(ResonatorEngine::AmpAttack, 0.001f);
+                e->setParameter(ResonatorEngine::AmpSustain, 1.0f);
+                return std::unique_ptr<EngineBase>(std::move(e));
+            };
+            out.push_back(s);
+        }
+        {
             Subject s; s.name = "Wavetable"; s.type = EngineType::Wavetable;
             s.make = []
             {
@@ -184,6 +255,28 @@ public:
                 e->setParameter(WavetableEngine::AmpAttack, 0.001f);
                 e->setParameter(WavetableEngine::AmpSustain, 1.0f);
                 voiceFilter(*e, WavetableEngine::FilterBase);
+                return std::unique_ptr<EngineBase>(std::move(e));
+            };
+            out.push_back(s);
+        }
+        {
+            // The wavetable engine with filter B in the path (a band-pass two octaves below
+            // filter A, beside it): the cells of the filter section's dual block.
+            Subject s; s.name = "Wavetable FLTB"; s.type = EngineType::Wavetable; s.everything = false;
+            s.only = { "BAL", "OFSB", "RESB", "DRVB" };
+            s.make = []
+            {
+                auto e = std::make_unique<WavetableEngine>();
+                e->prepareToPlay(SR, BLOCK);
+                e->setParameter(WavetableEngine::TableSelect, 2.0f);
+                e->setParameter(WavetableEngine::Position, 0.5f);
+                e->setParameter(WavetableEngine::AmpAttack, 0.001f);
+                e->setParameter(WavetableEngine::AmpSustain, 1.0f);
+                voiceFilter(*e, WavetableEngine::FilterBase);
+                const int dual = WavetableEngine::FilterDualBase - (int) VoiceFilterSection::Count;
+                e->setParameter(dual + VoiceFilterSection::ModeB, 1.0f);
+                e->setParameter(dual + VoiceFilterSection::OffsetB, -24.0f);
+                e->setParameter(dual + VoiceFilterSection::Routing, 2.0f);
                 return std::unique_ptr<EngineBase>(std::move(e));
             };
             out.push_back(s);
@@ -208,6 +301,21 @@ public:
                 e->setParameter(WaveSeqEngine::AmpSustain, 1.0f);
                 voiceFilter(*e, WaveSeqEngine::FilterBase);
                 return std::unique_ptr<EngineBase>(std::move(e));
+            };
+            out.push_back(s);
+        }
+        {
+            // BODY's destinations need the body in: the same steady tone through a plate.
+            Subject s; s.name = "WaveSeq BODY"; s.type = EngineType::WaveSeq; s.everything = false;
+            s.only = { "BMIX", "BMRP", "BDCY", "BCUP", "BDMP", "BPOS", "BTUN", "BKTK",
+                        "BCNT", "BGRN", "BRED", "BHRD", "BRDM", "BKDC", "BDIR", "BWIR" };
+            const auto plain = out.back().make;
+            s.make = [plain]
+            {
+                auto e = plain();
+                e->setParameter(WaveSeqEngine::BodyBase + VoiceBody::Mix, 0.7f);
+                e->setParameter(WaveSeqEngine::BodyBase + VoiceBody::Morph, (float) res::Plate);
+                return e;
             };
             out.push_back(s);
         }
@@ -244,6 +352,40 @@ public:
             out.push_back(s);
         }
         {
+            // The resonator drum's cells, on a pad that is one (pad 9 as a gong, which rings).
+            Subject s; s.name = "Drum RSN"; s.type = EngineType::Drum; s.low = 8; s.high = 8; s.voices = 0; s.everything = false;
+            s.only = { "MRPH", "XMPH", "ENRG", "STIF", "SHT", "SHEL", "ODD", "DAMP", "TILT", "HUM", "POS", "MEMB", "DROP", "WIRE",
+                       "PAIR", "HAND", "HARD" };
+            s.make = []
+            {
+                auto e = std::make_unique<DrumEngine>();
+                e->prepareToPlay(SR, BLOCK);
+                e->setParameter(8 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE, (float) (int) DrumSynthType::Resonator);
+                e->setParameter(DrumEngine::SOUND_BASE + 8 * DrumEngine::SOUND_CELLS + DrumEngine::RsnSound, (float) resonatorSoundIndex("GONG"));
+                e->setParameter(8 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TUNE, 300.0f);
+                return std::unique_ptr<EngineBase>(std::move(e));
+            };
+            out.push_back(s);
+        }
+        {
+            // The resonator's second eight latents that need a body and an exciter the main patch
+            // has not: a scraped plate, with a grip (where a junction meets, pairs, the exciter itself).
+            Subject s; s.name = "Resonator BOD2"; s.type = EngineType::Resonator; s.everything = false;
+            s.only = { "MEET", "SPRD", "PAIR", "DIR" };
+            s.make = []
+            {
+                auto e = std::make_unique<ResonatorEngine>();
+                e->prepareToPlay(SR, BLOCK);
+                e->setParameter(ResonatorEngine::MorphParam, (float) res::Plate);
+                e->setParameter(ResonatorEngine::ExciterMorphParam, (float) res::Scrape);
+                e->setParameter(ResonatorEngine::ExciteBase + res::Couple, 0.75f);
+                e->setParameter(ResonatorEngine::AmpAttack, 0.001f);
+                e->setParameter(ResonatorEngine::AmpSustain, 1.0f);
+                return std::unique_ptr<EngineBase>(std::move(e));
+            };
+            out.push_back(s);
+        }
+        {
             // The kick machine's own cells, on the pad that has it (most are read at the strike).
             Subject s; s.name = "Drum KICK"; s.type = EngineType::Drum; s.low = 8; s.high = 8; s.voices = 0; s.everything = false;
             s.only = { "SWEP", "SWPT", "SCRV", "SHAP", "KNCK", "KTON", "HOLD", "ACRV" };
@@ -258,7 +400,7 @@ public:
         return out;
     }
 
-    // A drum kit has its pressure destination in its voices (as AudioEngine::pushDrumPressure sets it).
+    // A drum kit has its pressure destination in its voices (as DrumEngine::applyKitPressure sets it from the kit's pressure slot).
     static void drumPressure(DrumEngine& drum, AftertouchRouter::Destination dest)
     {
         using D = AftertouchRouter::Destination;
@@ -467,7 +609,10 @@ public:
         for (auto& page : e.getParamPages())
             if (auto* cell = page.find(destCellId(s)))
             {
-                for (int i = 0; i < cell->numChoices; ++i)
+                // (The engine's own. The cells of the track's effects that follow, E4's
+                // mod::TrackDest, sound through an AudioEngine only: "Effect Destinations" sweeps
+                // them under a held sound, with this audit's measure.)
+                for (int i = 0; i < mod::TrackDest::firstIn(cell->choices, cell->numChoices); ++i)
                     out.push_back(cell->choices[i]);
                 break;
             }
@@ -517,6 +662,14 @@ public:
         return {};
     }
 
+    // The strip moving a destination all the way within 20 ms.
+    static std::vector<Allowed> stripAllowed()
+    {
+        return { { "Resonator", "MRPH", "the strip takes the bowed tube through the comb to the bell: on the way the body has every "
+                                        "harmonic, and a bowed comb's own steps are fifty times the tube's - brightness, not a click "
+                                        "(the 'Resonator' suite judges a morph against the brightest body on its way)" } };
+    }
+
     // Destinations that do nothing to the audit's patch: nothing was heard, so nothing is proven.
     // Each is here with the reason; a new destination that is inert has to be given a patch that
     // uses it, or a line here.
@@ -530,7 +683,15 @@ public:
         const char* const granular = "granular mode only: audited on 'Sampler GRAN'";
         const char* const notHere = "needs slices or a time stretch, which the audit's patch has not (not audited)";
         const char* const atStart = "read once, when the note starts";
+        const char* const filterB = "a cell of filter B, which is out of the path here (ROUT SNGL): audited on 'Wavetable FLTB'";
         const char* const kickCell = "a cell of the kick machine: audited on 'Drum KICK' (pad 9)";
+        const char* const rsnCell = "a cell of the resonator drum: the body's are audited on 'Drum RSN' (pad 9 as a gong), and all of "
+                                    "them on the RSN engine, whose voice it is ('Resonator', 'Resonator BOD2')";
+        const char* const bod2 = "needs a heavy body under a grip, even partials, or an exciter that is heard (the audit's patch is a "
+                                 "bowed tube): audited on 'Resonator BOD2'";
+        const char* const bodyOff = "BODY is off in the audit's patch: audited on 'WaveSeq BODY'";
+        const char* const macroBodyOff = "BODY is off in the audit's patch: audited on 'Macro BODY'";
+        const char* const noSample = "the exciter's grains have no sample in the audit's patch: audited on 'Resonator GRAIN'";
         std::vector<Allowed> a = {
             { "*", "ATK*", stage }, { "*", "DEC*", stage }, { "*", "REL*", stage },
             { "*", "FATK", stage }, { "*", "FDEC", stage }, { "*", "FREL", stage },
@@ -551,6 +712,16 @@ public:
             { "Wavetable", "SPD", "the scan's speed; the scan is off (see the scan test)" },
             { "WaveSeq", "RATE", oneStep }, { "WaveSeq", "XFAD", oneStep }, { "WaveSeq", "PRNG", oneStep },
             { "WaveSeq", "P*", oneStep }, { "WaveSeq", "L*", oneStep }, { "WaveSeq", "T*", oneStep },
+            { "WaveSeq", "BMRP", bodyOff }, { "WaveSeq", "BDCY", bodyOff }, { "WaveSeq", "BCUP", bodyOff }, { "WaveSeq", "BDMP", bodyOff },
+            { "WaveSeq", "BPOS", bodyOff }, { "WaveSeq", "BTUN", bodyOff }, { "WaveSeq", "BKTK", bodyOff },
+            { "WaveSeq", "BCNT", bodyOff }, { "WaveSeq", "BGRN", bodyOff }, { "WaveSeq", "BRED", bodyOff }, { "WaveSeq", "BHRD", bodyOff },
+            { "WaveSeq", "BRDM", bodyOff }, { "WaveSeq", "BKDC", bodyOff }, { "WaveSeq", "BDIR", bodyOff }, { "WaveSeq", "BWIR", bodyOff },
+            { "Macro", "BMRP", macroBodyOff }, { "Macro", "BDCY", macroBodyOff }, { "Macro", "BCUP", macroBodyOff }, { "Macro", "BDMP", macroBodyOff },
+            { "Macro", "BPOS", macroBodyOff }, { "Macro", "BTUN", macroBodyOff }, { "Macro", "BKTK", macroBodyOff },
+            { "Macro", "BCNT", macroBodyOff }, { "Macro", "BGRN", macroBodyOff }, { "Macro", "BRED", macroBodyOff }, { "Macro", "BHRD", macroBodyOff },
+            { "Macro", "BRDM", macroBodyOff }, { "Macro", "BKDC", macroBodyOff }, { "Macro", "BDIR", macroBodyOff }, { "Macro", "BWIR", macroBodyOff },
+            { "Resonator", "GPOS", noSample }, { "Resonator", "SCAN", noSample }, { "Resonator", "SPRY", noSample },
+            { "Resonator", "GSIZ", noSample }, { "Resonator", "GPIT", noSample }, { "Resonator", "PJIT", noSample },
             { "Sampler", "GPOS", granular }, { "Sampler", "SIZE", granular }, { "Sampler", "DENS", granular },
             { "Sampler", "SPD", granular }, { "Sampler", "SCAN", granular }, { "Sampler", "SPRY", granular },
             { "Sampler", "PJIT", granular }, { "Sampler", "SPRD", granular }, { "Sampler", "RVRS", granular },
@@ -560,10 +731,34 @@ public:
             { "Sampler", "VELF", atStart }, { "Sampler", "SUS", atStart },
             { "Drum", "SWEP", kickCell }, { "Drum", "SWPT", kickCell }, { "Drum", "SCRV", kickCell }, { "Drum", "SHAP", kickCell },
             { "Drum", "KNCK", kickCell }, { "Drum", "KTON", kickCell }, { "Drum", "HOLD", kickCell }, { "Drum", "ACRV", kickCell },
+            { "Drum", "WPOS", "the place in a pad's WAVE: the audit's pads read the sine, which has no place (per sample, ramped between sub-blocks: \"U4 Drum\" hears it on a table)" },
+            { "Drum", "FTIM", "the time of a drum's second envelope: the audit's pads are SUB, whose second envelope does nothing (\"U4 Drum\" hears it on the kick machine's sweep)" },
+            { "Resonator", "MEET", bod2 }, { "Resonator", "SPRD", bod2 }, { "Resonator", "PAIR", bod2 }, { "Resonator", "DIR", bod2 },
+            { "Drum RSN", "*", "a struck gong: the cell is heard at the strike or moves a body that rings on (the LFO's edges are judged all the same)" },
+            // BDY2: cells that need a configuration the audit's body patch does not provide.
+            // BDIR needs GRAN > 0 (the direct output is from grains; without them only the onset click).
+            // BCNT, BGRN, BRED, BRDM: need specific excitation/release conditions the bowed-plate audit does not reach.
+            { "Macro BODY", "BCNT", "CONT vs burst: the audit's bowed body is driven continuously by the voice; switching to burst is too subtle" },
+            { "Macro BODY", "BGRN", "GRAN: grain impulses beside the voice; on a bowed plate the effect is below the threshold" },
+            { "Macro BODY", "BRED", "REED: the friction curve; needs COUP > 0 (the audit's plate has none)" },
+            { "Macro BODY", "BRDM", "RDAM: release damping; only heard on note-off, the LFO does not cross a note-off" },
+            { "Macro BODY", "BDIR", "DIRE needs grain impulses (GRAN > 0); the audit's body has none" },
+            { "WaveSeq BODY", "BDIR", "DIRE needs grain impulses (GRAN > 0); the audit's body has none" },
+            { "WaveSeq BODY", "BCNT", "CONT vs burst: the audit's bowed body is driven continuously by the voice; switching to burst is too subtle" },
+            { "WaveSeq BODY", "BGRN", "GRAN: grain impulses beside the voice; on a bowed tube the effect is below the threshold" },
+            { "WaveSeq BODY", "BRED", "REED: the friction curve; needs COUP > 0 and a specific excitation for the LFO's edges to be heard" },
+            { "WaveSeq BODY", "BRDM", "RDAM: release damping; only heard on note-off, the LFO does not cross a note-off" },
         };
+        for (const char* cell : { "MRPH", "XMPH", "ENRG", "STIF", "SHT", "SHEL", "ODD", "DAMP", "TILT", "HUM", "POS", "MEMB", "DROP", "WIRE",
+                                  "MEET", "SPRD", "PAIR", "HAND", "DIR", "CONT", "GRAN", "COUP", "REED", "HARD" })
+            a.push_back({ "Drum", cell, rsnCell });
         for (const char* cell : { "LVL3", "RAT3", "DET3", "FDB3", "SUS3", "LVL4", "RAT4", "DET4", "FDB4", "SUS4",
-                                  "LVL5", "RAT5", "DET5", "FDB5", "SUS5", "LVL6", "RAT6", "DET6", "FDB6", "SUS6" })
+                                  "LVL5", "RAT5", "DET5", "FDB5", "SUS5", "LVL6", "RAT6", "DET6", "FDB6", "SUS6",
+                                  "PM3", "PM4", "PM5", "PM6" })     // (the phases of the same four: U4-FM)
             a.push_back({ "FM", cell, silentOp });
+        a.push_back({ "FM", "POS*", "a table's position, and the audit's operators are sines: audited on 'FM WAVE'" });
+        for (const char* cell : { "BAL", "OFSB", "RESB", "DRVB" })
+            a.push_back({ "Wavetable", cell, filterB });
         return a;
     }
 
@@ -665,7 +860,7 @@ public:
                 const auto a = render(*e, blocks, { noteOn(0, s.low),
                                                     { up, [](EngineBase& x) { x.setModWheel(1.0f); } },
                                                     { down, [](EngineBase& x) { x.setModWheel(0.0f); } } }, bs);
-                judge("strip 0 -> 1 -> 0", s, dests[(size_t) d], measure(a, { up * bs, down * bs }, window, SETTLE), {});
+                judge("strip 0 -> 1 -> 0", s, dests[(size_t) d], measure(a, { up * bs, down * bs }, window, SETTLE), stripAllowed());
             }
         }
 
@@ -992,7 +1187,7 @@ public:
             Rig rig;
             while (rig.audio.getSendCount() < 2)
                 rig.audio.addSendBus(rig.audio.getSendCount() == 0 ? EffectType::ReverbEffect : EffectType::DelayEffect);
-            rig.audio.setSendBusEffect(1, EffectType::DelayEffect);
+            rig.audio.setInsertEffect(AudioEngine::sendTrack(1), 0, EffectType::DelayEffect);
             const int end = blocksFor(1.6);
             const auto a = rig.render(end, { { 0, play }, { first, trackParam(MixParam::SEND_BASE + 1, 1.0f) },
                                              { blocksFor(0.9), trackParam(MixParam::SEND_BASE + 1, 0.0f) } });

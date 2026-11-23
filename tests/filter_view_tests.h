@@ -401,7 +401,8 @@ public:
                 const juce::String name = "Engine " + juce::String((int) type);
                 auto b = rig.binding();
                 expect(rig.screen.hasFilter(), name);
-                expectEquals(rig.screen.getPageCount(), 2, name);
+                // (FILTR and F ENV; the wavetable engine has the section's dual block: FLT B between them.)
+                expectEquals(rig.screen.getPageCount(), type == EngineType::Wavetable ? 3 : 2, name);
                 const char* names[8] = { "CT", "RS", "TY", "MD", "EN", "DR", "MO", "KT" };
                 for (int i = 0; i < 8; ++i)
                     expectEquals(rig.screen.getEncoderName(i), juce::String(names[i]), name);

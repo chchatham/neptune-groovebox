@@ -233,7 +233,7 @@ namespace bench
         };
         std::printf("\n%-34s %8s %10s\n", "synth, 4 notes, plus", "average", "worst blk");
         fxCase("nothing", [](AudioEngine&) {});
-        fxCase("DIRT + TALK + MODFX all on", [](AudioEngine& a) { for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id) a.setTrackParameter(0, id, 0.5f); });
+        fxCase("DIRT + TALK inserts", [](AudioEngine& a) { a.addInsertEffect(0, EffectType::DirtInsertEffect); a.addInsertEffect(0, EffectType::TalkInsertEffect); });
         for (int t = 0; t < (int) EffectType::NumEffectTypes; ++t)
         {
             const juce::String label = juce::String("insert ") + AudioEngine::effectTypeName((EffectType) t);

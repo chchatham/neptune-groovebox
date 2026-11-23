@@ -5,7 +5,7 @@
 
 // -----------------------------------------------------------------------------
 // The save box: the Mac's window that asks for the name of what the controller has just saved -
-// a preset (PRESET -> SV) or a project (SETTINGS -> PROJ -> SVAS). Shown here with a preset:
+// a preset (PRESET -> SV) or a project (SETTINGS -> PROJ -> SAVE or SVAS). Shown here with a preset:
 //
 //   Save the sound of track 3 as a preset
 //   [ Unknown Soldier ]                       <- the offered name, selected: typing replaces it

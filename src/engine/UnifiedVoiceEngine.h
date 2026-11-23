@@ -8,6 +8,24 @@
 #include <vector>
 
 // The parameter ids (namespace UnifiedParam) are in UnifiedVoice.h.
+//
+// ON THE MODULATION ROUTER (U4-UV; ModRouter.h, "PER ENGINE: unified voice"). One mod::Router for
+// the engine (four LFOs, the extra envelopes as ENV2 .. ENV5), one mod::Voice in each voice,
+// rendered by sub-blocks (UnifiedVoice::render) and mixed sample by sample in voice order as before.
+//   on the router    the LFOs (setLfo with every cell; DPTH and DEST for an LFO without WHL / VEL
+//                    / PRES), the sixteen free slots and LSHP (700-772), the STRIP page (158-165)
+//                    and the XIN page (166-173) (PageIds: 174-189 are the stored LFO cells), the
+//                    pressure route PAN, PM / RING / SYNC (the old XIN cell's three behaviours; a
+//                    stored XIN / XDPT becomes the XIN page's first route: setLegacyXin), ETIM / FTIM
+//   the voice's own  what "P01 Keyboard" pins bit for bit and the router cannot hold bit for bit:
+//                    an LFO with a WHL, VEL or PRES amount (the classic path: LFOBank, its leads,
+//                    its destinations; the router has no additive depth, and its control rate is
+//                    not the per-sample path P01's DuneDrone plays with the strip up), the pressure
+//                    routes VOL CUT FM TIMB WAVE VIB, the strip's built-in vibrato (steps aside for
+//                    an LFO's WHL or the STRIP page), bend; and the extra envelopes' DEST (the
+//                    router has no fixed slot for it)
+//   EVAR             Envelope::setTimeScale (the same product as the scaled copy it replaces, drawn
+//                    when the copy was drawn; "U4 Unified" proves it bit for bit against the old class)
 class UnifiedVoiceEngine : public EngineBase
 {
 public:
@@ -19,6 +37,19 @@ public:
         // The voice pool never changes size, so the audio thread never sees a reallocation; the
         // allocator decides how many of them are in use.
         voices.resize((size_t) MAX_VOICES);
+        // The track's custom LFO shape (USR / USRS): every LFO reads the router's eight levels (LSHP).
+        // The router's per-note randoms: seeded by the voice's number, so a render repeats (the
+        // ANLG page's spread is still the system random's, under P01's pin).
+        for (int i = 0; i < MAX_VOICES; ++i)
+        {
+            auto& v = voices[(size_t) i];
+            for (int l = 0; l < LFOBank::MAX_LFOS; ++l)
+                v.getLFOBank().getLFO(l).setUserShape(router.shape());
+            v.getRouterVoice().seed(0, i);
+        }
+        routerDests().registerGroups();
+        // The six pressure destinations the voice plays on its own path (updatePressure).
+        router.setOwnPressure(ownPressureDests(), true);
         UnifiedVoice::sharedTables();        // built here, on the message thread, not at the first note
         installAllocatorCallbacks();
 
@@ -32,6 +63,7 @@ public:
     void prepareToPlay(double sr, int /*samplesPerBlock*/) override
     {
         sampleRate = sr;
+        router.prepare(sr);
         for (auto& v : voices)
             v.setSampleRate(sr);
         // Glide coefficients depend on the sample rate.
@@ -49,30 +81,110 @@ public:
 
         const float gain = HEADROOM * unisonGain;       // LEVL is applied by each voice (UnifiedVoice::setLevel)
 
-        for (int i = 0; i < numSamples; ++i)
+        // The modulation router, once a block. (The pressure slots aimed at the six destinations
+        // the voice plays itself - updatePressure - are left out by the router: setOwnPressure in
+        // the constructor. PAN and everything else is the router's.)
+        // When an LFO in use has a WHL amount the strip goes to those LFOs and nothing else:
+        // the router's strip routes see 0 (the voice's LFO path handles the strip instead).
+        const float routerStrip = wheelIsRouted() ? 0.0f : modWheelNow;
+        router.beginBlock(audioInput.left, audioInput.right, audioInput.connected() ? audioInput.frames : 0,
+                          audioInput.envelope, routerStrip, sampleRate);
+        // RING: a slot that brings the track input there takes its amount of the dry mixer away
+        // while the track has an input (the ring, (1 - d) + d x; without an input, the voice).
+        // And an input that comes or goes under a route that reads it is a swapped sound (the
+        // track's declick), as it was under the old XIN cell.
         {
-            // An LFO routed to PAN moves its own voice between the channels (balance law: the
-            // centre is unchanged, so a patch without that routing sounds exactly as before).
-            float sampleL = 0.0f, sampleR = 0.0f;
-            for (auto& voice : voices)
+            float dry = 0.0f;
+            bool reads = false;
+            const auto isInput = [this](int place)
             {
-                if (!voice.isActive())
+                const int source = router.sources().source(place);
+                return source >= mod::Src::Xin && source <= mod::Src::XinBand;
+            };
+            for (int x = 0; x < mod::Router::NUM_XIN; ++x)
+            {
+                const int dest = (int) router.get(mod::Router::xinId(x * 4 + mod::Router::XinDest1));
+                const float amount = router.get(mod::Router::xinId(x * 4 + mod::Router::XinAmount1));
+                reads = reads || (dest != 0 && amount != 0.0f);
+                if (dest == UnifiedVoice::RRing)
+                    dry += amount;
+            }
+            for (int k = 0; k < mod::Router::NUM_FREE; ++k)
+            {
+                const auto& slot = router.slot(k);
+                if (! isInput(slot.src) || slot.dest == 0)
                     continue;
-                const float s = voice.process();
-                const float pan = voice.getPanMod();
-                sampleL += pan > 0.0f ? s * (1.0f - pan) : s;
-                sampleR += pan < 0.0f ? s * (1.0f + pan) : s;
+                reads = reads || slot.amount != 0.0f;
+                if (slot.dest == UnifiedVoice::RRing)
+                    dry += slot.amount;
             }
+            const bool live = reads && audioInput.connected();
+            if (live != inputHeard)
+            {
+                inputHeard = live;
+                if (reads)
+                    soundSwapped();
+            }
+            if (! audioInput.connected())
+                dry = 0.0f;
+            const bool syncLive = router.routed(UnifiedVoice::RSync);
+            for (auto& v : voices)
+            {
+                v.setRingDry(dry);
+                v.setSyncLive(syncLive);
+            }
+        }
+        // XMOD and FFM work through oscillator 2: it runs while the router moves either.
+        const bool osc2Routed = router.routed(UnifiedVoice::RXmod) || router.routed(UnifiedVoice::RFilterFm);
+        if (osc2Routed != osc2ForRouter)
+        {
+            osc2ForRouter = osc2Routed;
+            applyOscLevels();
+        }
 
-            if (right)
+        // Sub-blocks (the router's control rate), the voices one after the other inside each (they
+        // share the router's per-sample buffers); then the samples are mixed as they always were,
+        // voice by voice in order, for each sample.
+        for (int offset = 0; offset < numSamples;)
+        {
+            const int n = router.beginChunk(offset, numSamples);
+            for (int v = 0; v < MAX_VOICES; ++v)
             {
-                left[i] += sampleL * gain;
-                right[i] += sampleR * gain;
+                auto& voice = voices[(size_t) v];
+                if (! voice.isActive())
+                {
+                    made[(size_t) v] = 0;
+                    voice.idle(router, n);
+                    continue;
+                }
+                made[(size_t) v] = voice.render(router, n, voiceOut[(size_t) v].data(), voicePan[(size_t) v].data());
             }
-            else
+            for (int i = 0; i < n; ++i)
             {
-                left[i] += 0.5f * (sampleL + sampleR) * gain;
+                // An LFO routed to PAN moves its own voice between the channels (balance law: the
+                // centre is unchanged, so a patch without that routing sounds exactly as before).
+                float sampleL = 0.0f, sampleR = 0.0f;
+                for (int v = 0; v < MAX_VOICES; ++v)
+                {
+                    if (i >= made[(size_t) v])
+                        continue;
+                    const float s = voiceOut[(size_t) v][(size_t) i];
+                    const float pan = voicePan[(size_t) v][(size_t) i];
+                    sampleL += pan > 0.0f ? s * (1.0f - pan) : s;
+                    sampleR += pan < 0.0f ? s * (1.0f + pan) : s;
+                }
+
+                if (right)
+                {
+                    left[offset + i] += sampleL * gain;
+                    right[offset + i] += sampleR * gain;
+                }
+                else
+                {
+                    left[offset + i] += 0.5f * (sampleL + sampleR) * gain;
+                }
             }
+            offset += n;
         }
 
         // Voices that are not sounding still keep their free-running LFOs in time, so FREE and
@@ -208,6 +320,23 @@ public:
             setStageCurve(id, value);
             return;
         }
+        // The router's cells: the free slots, LSHP and the slots shown at their own ids; the STRIP
+        // and XIN pages at 158-173 here (174-189 are this engine's stored LFO cells).
+        if (mod::Router::ownsSlotBlock(id) || PressureSlotParam::contains(id))
+        {
+            router.set(id, value);
+            return;
+        }
+        if (const int routerId = routerIdOf(id); routerId >= 0)
+        {
+            router.set(routerId, value);
+            return;
+        }
+        if (id == UnifiedParam::XIN || id == UnifiedParam::XIN_DEPTH)
+        {
+            setLegacyXin(id, value);
+            return;
+        }
         if (!EngineParamRange::contains(id) || id >= UnifiedParam::MAX_ID)
             return;
         if (id == UnifiedParam::MODE_A || id == UnifiedParam::MODE_B)
@@ -225,8 +354,19 @@ public:
         }
         if ((id == UnifiedParam::MODE_A || id == UnifiedParam::MODE_B) && flatParams[(size_t) id] != value)
             soundSwapped();
+        // The sound of the ARCH that is being left is kept BEFORE flatParams is overwritten
+        // (archIndex() is still the old slot here).
+        if (id == UnifiedParam::ARCH)
+        {
+            const int oldSlot = archIndex();
+            const int newSlot = juce::jlimit(0, ARCH_SLOTS - 1, (int) std::lround(value));
+            if (newSlot != oldSlot)
+                snapshotArch(oldSlot);
+        }
         flatParams[(size_t) id] = value;
         applyParameter(id, value);
+        // The set value of a cell the router can move (it keeps the set values of its destinations).
+        router.setBase(id, flatParams[(size_t) id]);
 
         // Page cells an LFO or the extra envelopes are routed to: the voices move them around
         // their set value, so they are told when it changes (and when an oscillator's kind, and
@@ -240,8 +380,16 @@ public:
 
     float getParameter(ParamId id) const override
     {
+        if (const int routerId = routerIdOf(id); routerId >= 0)
+            return router.get(routerId);
+        if (id == UnifiedParam::XIN)
+            return (float) legacyXin;
+        if (id == UnifiedParam::XIN_DEPTH)
+            return legacyXinDepth;
         if (id >= 0 && id < UnifiedParam::MAX_ID)
             return flatParams[(size_t) id];
+        if (mod::Router::ownsSlotBlock(id) || PressureSlotParam::contains(id))
+            return router.get(id);
         return stageCurves.get(id);     // 0 for anything else
     }
 
@@ -249,10 +397,154 @@ public:
     {
         if (const ParamSpec* spec = findSpec(id))
             return spec->label;
+        if (const int routerId = routerIdOf(id); routerId >= 0)
+            return mod::Router::name(routerId);
+        if (id == UnifiedParam::XIN)        return "XIN";       // (the old cells, from a stored sound: setLegacyXin)
+        if (id == UnifiedParam::XIN_DEPTH)  return "XDPT";
+        if (mod::Router::ownsSlotBlock(id))
+            return mod::Router::name(id);
         return "Param " + juce::String(id);
     }
 
+    // ---- The modulation router ----------------------------------------------------------------
+    // Ids: the STRIP page at 158-165 and the XIN page at 166-173 (the router's own 174-189 are
+    // this engine's stored LFO cells WHL / VEL / KTRK / PRES until format 3; PageIds); the free
+    // slots 700-763, LSHP 764-771 and 772 at the router's own ids.
+    static constexpr int STRIP_IDS = 158, XIN_IDS = 166;
+    static int routerIdOf(int id)
+    {
+        if (id >= STRIP_IDS && id < STRIP_IDS + 8) return id - STRIP_IDS + mod::Router::STRIP_BASE;
+        if (id >= XIN_IDS && id < XIN_IDS + 8)     return id - XIN_IDS + mod::Router::XIN_BASE;
+        return -1;
+    }
+
+    // What can be moved (UnifiedVoice::RouterDest): the LFOs' list as it was, index for index and in
+    // the same units, then PM RING SYNC (the track input's three ways in) and ETIM FTIM.
+    static const mod::DestTable& routerDests()
+    {
+        static const mod::DestTable table = []
+        {
+            using namespace mod;
+            DestTable t;
+            t.group();
+            t.input("PTCH", 0.0f, 1.0f, -8.0f, 8.0f, PerSample | Steps);   // octaves, not squared (12 semitones at depth 1)
+            t.input("CUT", 0.0f, 4.0f, -16.0f, 16.0f, PerSample);           // octaves
+            t.input("RESO", 0.0f, 0.5f, -1.0f, 1.0f);
+            t.input("MIX", 0.0f, 0.5f, -1.0f, 1.0f, PerSample);
+            t.input("AMP", 1.0f, 1.0f, 0.0f, 2.0f, PerSample).audioFloor(-2.0f);   // a gain; below 0: ring modulation
+            t.input("PW", 0.0f, 0.4f, -1.0f, 1.0f, PerSample);
+            t.input("XMOD", 0.0f, 1.0f, -1.0f, 1.0f, PerSample);
+            t.input("CUTB", 0.0f, 4.0f, -16.0f, 16.0f, PerSample);
+            t.input("PAN", 0.0f, 1.0f, -1.0f, 1.0f, PerSample);
+            t.input("LVL1", 1.0f, 1.0f, 0.0f, 2.0f, PerSample);
+            t.input("LVL2", 1.0f, 1.0f, 0.0f, 2.0f, PerSample);
+            t.input("LVL3", 1.0f, 1.0f, 0.0f, 2.0f, PerSample);
+            t.input("NOIS", 1.0f, 1.0f, 0.0f, 2.0f, PerSample);
+            t.input("FFM", 0.0f, 1.0f, -1.0f, 1.0f, PerSample);
+            t.input("PIT2", 0.0f, 1.0f, -8.0f, 8.0f, PerSample | Steps);   // octaves
+            static const char* const rates[4] = { "RAT1", "RAT2", "RAT3", "RAT4" };
+            static const char* const depths[4] = { "DPT1", "DPT2", "DPT3", "DPT4" };
+            for (int l = 0; l < 4; ++l) t.lfoCell(rates[l], l, false);
+            for (int l = 0; l < 4; ++l) t.lfoCell(depths[l], l, true);
+            jassert(t.size() == UnifiedVoice::RFirstParam);
+            for (int i = 0; i < UnifiedVoice::NUM_PARAM_DESTS; ++i)
+            {
+                const auto& p = UnifiedVoice::PARAM_DESTS[i];
+                if (p.group)
+                    t.group();
+                const int at = t.size();
+                if (at == UnifiedVoice::RSrcA1 || at == UnifiedVoice::RSrcA2 || at == UnifiedVoice::RSrcA3)
+                    t.input(p.label, 0.0f, 1.0f, -1.0f, 1.0f, PerSample);      // offsets (UnifiedVoice::movedSrcA)
+                else if (at == UnifiedVoice::RSrcB1 || at == UnifiedVoice::RSrcB2 || at == UnifiedVoice::RSrcB3)
+                    t.input(p.label, 0.0f, 1.0f, -1.0f, 1.0f);                 // offsets (UnifiedVoice::movedSrcB)
+                else
+                    t.add(cellSpec(p.id), p.label);
+                jassert(t.size() == at + 1);
+            }
+            jassert(t.size() == UnifiedVoice::RPm);
+            t.group();
+            t.input("PM", 0.0f, 1.0f, -1.0f, 1.0f, PerSample | mod::Phase);    // (a phase: U4-1 brings it in and lets it go without a step)
+            t.input("RING", 1.0f, 1.0f, 0.0f, 2.0f, PerSample).audioFloor(-2.0f);
+            t.input("SYNC", 0.0f, 1.0f, -1.0f, 1.0f, PerSample);
+            t.group();
+            t.envTimes();
+            jassert(t.size() == UnifiedVoice::NUM_ROUTER_DESTS);
+            // No DestTable strip defaults: the unified voice's STRIP page starts empty (OFF, 0,
+            // OFF, 0, OFF, 0, WVIB 0, VRAT 5.5 Hz) so that old projects without ids 158-165 keep
+            // the same sound. The architecture presets seed CUT +50 % and WVIB 0.25 when selected.
+            // Pad pressure until AT ROUTE says otherwise: the level (the voice's own path: x (1 + pressure)).
+            t.pressureRoute(0, UnifiedVoice::RAmp, 1.0f);
+            t.finish(4);
+            return t;
+        }();
+        return table;
+    }
+
+    // The spec of a page cell the router can move (the extra envelopes' cells are built by the
+    // screen: times 1 ms .. 10 s, the depth 0..1).
+    static ParamSpec cellSpec(int id)
+    {
+        if (const ParamSpec* spec = findSpec(id))
+            return *spec;
+        if (id >= ModParam::ENV_BASE && id < ModParam::ENV_BASE + ModParam::MAX_ENVS * ModParam::ENV_STRIDE)
+        {
+            const int cell = (id - ModParam::ENV_BASE) % ModParam::ENV_STRIDE;
+            if (cell == ModParam::ENV_ATK || cell == ModParam::ENV_DEC || cell == ModParam::ENV_REL)
+                return { "ENVT", id, 0.001f, 10.0f, 0.1f, ParamKind::Log, "s" };
+            return { "ENVL", id, 0.0f, 1.0f, cell == ModParam::ENV_DEPTH ? 1.0f : 0.7f, ParamKind::Linear };
+        }
+        jassertfalse;
+        return {};
+    }
+
+    // What an old pressure route (AftertouchRouter::Destination) is here, as a slot's DEST. The
+    // six the voice plays on its own path (LEVL, CUT, XMOD, PW, MIX and VIB: updatePressure, which
+    // P01 pins) and PAN, which is the router's.
+    int pressureDestOf(AftertouchRouter::Destination d) const override
+    {
+        using D = AftertouchRouter::Destination;
+        switch (d)
+        {
+            case D::Volume:         return UnifiedVoice::RAmp;
+            case D::FilterCutoff:   return UnifiedVoice::RCutoff;
+            case D::FMDepth:        return UnifiedVoice::RXmod;
+            case D::MacroTimbre:    return UnifiedVoice::RPw;
+            case D::WavePosition:   return UnifiedVoice::RMix;
+            case D::PanSpread:      return UnifiedVoice::RPan;
+            default:                return 0;
+        }
+    }
+    // The destinations of a pressure slot that the voice plays itself.
+    static mod::Mask ownPressureDests()
+    {
+        mod::Mask m;
+        for (int d : { (int) UnifiedVoice::RAmp, (int) UnifiedVoice::RCutoff, (int) UnifiedVoice::RXmod,
+                       (int) UnifiedVoice::RPw, (int) UnifiedVoice::RMix })
+            m.set(d);
+        return m;
+    }
+
+    const mod::Router& getRouter() const { return router; }
+    mod::Router& getRouter() { return router; }
+    mod::Router* modRouter() override { return &router; }
+    const mod::Router* modRouter() const override { return &router; }
+    // What a slot's SRC and VIA offer here (the router's list for four LFOs and ENV2 .. ENV5).
+    static int sourceCount() { return mod::SourceTable::standard(ModParam::MAX_LFOS, ModParam::MAX_ENVS).size(); }
+    // Where LFO l is aimed, whichever path it runs on (lfoIsClassic), as its DEST cell counts: a
+    // cell of an effect on the track (the router's, on either path) is LfoDest::Count + its number.
+    UnifiedVoice::LfoDest lfoDestination(int l) const
+    {
+        if (l < 0 || l >= ModParam::MAX_LFOS)
+            return UnifiedVoice::LfoDest::Off;
+        const int dest = router.lfo(l).dest, track = router.dests().trackCell();
+        if (dest >= track)
+            return (UnifiedVoice::LfoDest) ((int) UnifiedVoice::LfoDest::Count + dest - track);
+        return classicLfo[(size_t) l] ? voices[0].getLfoDest(l) : (UnifiedVoice::LfoDest) dest;
+    }
+    bool lfoOnClassicPath(int l) const { return l >= 0 && l < ModParam::MAX_LFOS && classicLfo[(size_t) l]; }
+
     int getParameterCount() const override { return UnifiedParam::MAX_ID; }
+    bool isRebuildParam(ParamId id) const override { return id == UnifiedParam::ARCH; }
 
     bool supportsModulation() const override { return true; }
     int getMasterParamId() const override { return UnifiedParam::ARCH; }
@@ -288,6 +580,13 @@ public:
                     p.numChoices = FilterSlot::modeCount(model);
                     p.maxVal = (float) (p.numChoices - 1);
                 }
+        // The router's pages: XIN, SLT1 .., LSHP, STRIP (the screen puts the LFO and envelope
+        // pages MOD, MOD2 and MENV after them; the LFO cells are this engine's own ids).
+        mod::Router::PageIds ids;
+        ids.strip = STRIP_IDS;
+        ids.xin = XIN_IDS;
+        ids.lfoPages = false;
+        router.appendPages(pages, ids);
         return pages;
     }
 
@@ -494,6 +793,15 @@ public:
         // The architecture's mod strip route (LFO cells on MOD / MOD2).
         for (auto& [id, value] : preset.wheelRoute)
             set(id, value);
+
+        // The STRIP page: CUT +50 %, WVIB 0.25 semitones (every ARCH preset gets these).
+        // The DestTable has NO strip defaults (old projects without ids 158-165 must keep their
+        // sound); the ARCH preset seeds the page when selected.  While an LFO in use has a WHL
+        // amount the strip goes to those LFOs instead (the router sees strip 0 in processBlock);
+        // the STRIP defaults are there for when the user clears WHL.
+        setParameter(STRIP_IDS + 0, (float) UnifiedVoice::RCutoff);   // DST1 = CUT
+        setParameter(STRIP_IDS + 1, 0.5f);                             // AMT1 = +50 %
+        setParameter(STRIP_IDS + (mod::Router::STRIP_VIBRATO - mod::Router::STRIP_BASE), 0.25f);
     }
 
     ArchitecturePresetId getCurrentPresetId() const { return currentPresetId; }
@@ -501,6 +809,59 @@ public:
     const ArchitecturePreset& getCurrentPreset() const
     {
         return getArchitecturePreset(currentPresetId);
+    }
+
+    // ---- ARCH memory for projects ---------------------------------------------------------------
+
+    // Capture the ARCH memory as a flat list for project storage. The format:
+    // [version, numSlots, then per slot: visited, numParams, (id, value) x numParams]
+    std::vector<float> captureArchMemory()
+    {
+        // Snapshot the current slot so the project has the latest state.
+        snapshotArch(archIndex());
+        std::vector<float> out;
+        out.push_back(1.0f);                                 // version
+        out.push_back((float) ARCH_SLOTS);
+        for (int s = 0; s < ARCH_SLOTS; ++s)
+        {
+            const auto& snap = archMemory[(size_t) s];
+            out.push_back(snap.visited ? 1.0f : 0.0f);
+            out.push_back((float) snap.params.size());
+            for (auto& [id, val] : snap.params)
+            {
+                out.push_back((float) id);
+                out.push_back(val);
+            }
+        }
+        return out;
+    }
+
+    // Restore ARCH memory from a flat list (graceful on empty or old projects).
+    void applyArchMemory(const std::vector<float>& v)
+    {
+        for (auto& s : archMemory) { s.visited = false; s.params.clear(); }
+        if (v.size() < 2 || (int) std::lround(v[0]) != 1)
+            return;
+        const int slots = juce::jlimit(0, ARCH_SLOTS, (int) std::lround(v[1]));
+        size_t at = 2;
+        for (int s = 0; s < slots && at + 1 < v.size(); ++s)
+        {
+            const bool visited = (int) std::lround(v[at++]) != 0;
+            const int count = (at < v.size()) ? juce::jlimit(0, 2048, (int) std::lround(v[at++])) : 0;
+            if (s < ARCH_SLOTS)
+            {
+                archMemory[(size_t) s].visited = visited;
+                archMemory[(size_t) s].params.clear();
+            }
+            for (int i = 0; i < count && at + 1 < v.size(); ++i)
+            {
+                const int id = (int) std::lround(v[at]);
+                const float val = v[at + 1];
+                at += 2;
+                if (s < ARCH_SLOTS && visited)
+                    archMemory[(size_t) s].params[id] = val;
+            }
+        }
     }
 
 private:
@@ -575,9 +936,31 @@ private:
             flatParams[(size_t) ModParam::envParamId(e, ModParam::ENV_REL)] = 0.3f;
             flatParams[(size_t) ModParam::envParamId(e, ModParam::ENV_DEPTH)] = 1.0f;
             flatParams[(size_t) ModParam::envParamId(e, ModParam::ENV_TARGET)] = 3.0f;
+            // (The router keeps the set value of every cell it can move, ATK2 .. REL5 among them:
+            // set here without setParameter, it would move them around its own default, and hand
+            // that default back when a slot lets go.)
+            for (int c : { ModParam::ENV_ATK, ModParam::ENV_DEC, ModParam::ENV_SUS, ModParam::ENV_REL, ModParam::ENV_DEPTH })
+                router.setBase(ModParam::envParamId(e, c), flatParams[(size_t) ModParam::envParamId(e, c)]);
         }
         applyModParameter(ModParam::ENV_COUNT, 0.0f);
         applyModParameter(ModParam::LFO_COUNT, 1.0f);
+
+        // No mod slot set, two shown, the custom shape a rising staircase; the STRIP and XIN pages
+        // at zero (old projects do not store ids 158-165, so initPatch must match what they expect;
+        // applyArchitecturePreset seeds the STRIP page with CUT +50 % and WVIB 0.25 for a new
+        // sound).
+        for (int id = ModSlotParam::BASE; id < ModSlotParam::END; ++id)
+            router.set(id, 0.0f);
+        for (int i = 0; i < LFO::USER_POINTS; ++i)
+            router.set(LfoShapeParam::BASE + i, LFO::defaultUserLevel(i));
+        router.set(ModSlotParam::COUNT, (float) mod::Router::DEFAULT_SHOWN);
+        for (int id = mod::Router::STRIP_BASE; id < mod::Router::XIN_END; ++id)
+            router.set(id, 0.0f);
+        router.set(mod::Router::STRIP_VIBRATO_RATE, mod::Router::DEFAULT_VIBRATO_RATE);
+        router.set(mod::Router::xinId(mod::Router::XinLowPass), 2000.0f);
+        router.set(mod::Router::xinId(mod::Router::XinHighPass), 200.0f);
+        legacyXin = 0;
+        legacyXinDepth = 0.5f;
     }
 
     bool isMono() const { return allocator.getMode() == VoiceMode::Mono; }
@@ -657,7 +1040,7 @@ private:
     void updatePressure()
     {
         const int count = juce::jmin(allocator.getVoiceCount(), (int) voices.size());
-        const float wheelVibrato = wheelIsRouted() ? 0.0f : modWheelNow * 0.5f;
+        const float wheelVibrato = wheelIsRouted() || stripPageUsed() ? 0.0f : modWheelNow * 0.5f;
         for (int i = 0; i < (int) voices.size(); ++i)
         {
             float pressure = 0.0f;
@@ -666,16 +1049,52 @@ private:
             else if (i < count)
                 pressure = allocator.getAftertouch(i);
 
-            AftertouchRouter::ModValues m;
+            // The pressure slots the voice plays itself (Router::pressureIsOwn: LEVL, CUT, XMOD,
+            // PW, MIX and VIB), summed exactly as AftertouchRouter::computeModulation summed the
+            // routes (P01 pins the arithmetic). Every other slot is the router's.
+            float volumeMod = 0.0f, cutoffMod = 0.0f, vibratoMod = 0.0f;
+            float timbreMod = 0.0f, wavePosMod = 0.0f, fmDepthMod = 0.0f;
             if (pressure > 0.0f)
-                m = (aftertouchRouter != nullptr ? *aftertouchRouter : allocator.getAftertouchRouter())
-                        .computeModulation(pressure);
+            {
+                for (int p = 0; p < mod::Router::NUM_PRESSURE; ++p)
+                {
+                    const auto slot = router.pressureSlot(p);
+                    if (! router.pressureIsOwn(p))
+                        continue;
+                    float mod;
+                    if (slot.bipolar)
+                        mod = (pressure * 2.0f - 1.0f) * slot.amount;
+                    else
+                        mod = pressure * slot.amount;
 
-            voices[(size_t) i].setPressureMods(m.volumeMod, m.cutoffMod, m.vibratoMod + wheelVibrato,
-                                               m.timbreMod, m.wavePosMod, m.fmDepthMod);
-            // The LFOs' own WHL / PRES amounts take the raw wheel and this voice's raw pressure.
+                    switch (slot.dest)
+                    {
+                        case UnifiedVoice::RAmp:    volumeMod += mod; break;
+                        case UnifiedVoice::RCutoff: cutoffMod += mod; break;
+                        case UnifiedVoice::RPw:     timbreMod += mod; break;
+                        case UnifiedVoice::RMix:    wavePosMod += mod; break;
+                        case UnifiedVoice::RXmod:   fmDepthMod += mod; break;
+                        default:                    vibratoMod += mod; break;      // (VIB: the only other one that is the voice's)
+                    }
+                }
+            }
+
+            voices[(size_t) i].setPressureMods(volumeMod, cutoffMod, vibratoMod + wheelVibrato,
+                                               timbreMod, wavePosMod, fmDepthMod);
+            // The LFOs' own WHL / PRES amounts take the raw wheel and this voice's raw pressure (and
+            // so does the router's PRES, mod::Voice::tick).
             voices[(size_t) i].setLfoPerformance(modWheelNow, pressure);
         }
+    }
+
+    // True while the STRIP page gives the strip something to do (a route with an amount, or WVIB):
+    // the built-in vibrato then steps aside, as it does for an LFO's WHL amount.
+    bool stripPageUsed() const
+    {
+        for (int r = 0; r < mod::Router::NUM_STRIP; ++r)
+            if (router.get(mod::Router::stripDestId(r)) != 0.0f && router.get(mod::Router::stripAmountId(r)) != 0.0f)
+                return true;
+        return router.get(mod::Router::STRIP_VIBRATO) > 0.0f;
     }
 
     void applyOscLevels()
@@ -703,7 +1122,110 @@ private:
         for (int l = 0; l < count; ++l)
             if (UnifiedVoice::lfoDestNeedsOsc2(voices[0].getLfoDest(l)))
                 return true;
-        return UnifiedVoice::lfoDestNeedsOsc2(voices[0].getEnvDest());
+        // (The router's slots and LFOs on XMOD / FFM: osc2ForRouter, as of the last block.)
+        return osc2ForRouter || UnifiedVoice::lfoDestNeedsOsc2(voices[0].getEnvDest());
+    }
+
+    // ---- The LFOs: the router's, or the classic path -----------------------------------------
+    // Every LFO cell goes to the router's LFO of the same number (setLfo: RATE, SHPE, TRIG, SYNC,
+    // DIV, PHAS, DLY, FADE, KTRK), and the LFO's DEST and DPTH are the router's LFO slot - unless
+    // the LFO has a WHL, VEL or PRES amount. Those add to the depth (depth + amount x source, held
+    // to -1..1, in the LFO itself), which the router cannot do: it multiplies an amount by a VIA,
+    // so "depth 0 plus the strip" (what every WheelRoute of a preset is, and P01's DuneDrone,
+    // pinned bit for bit with the strip up) has no slot. Such an LFO runs on the voice's own LFO
+    // bank and its own destinations, exactly as before (the classic path); the router's LFO of
+    // that number then has no depth and no destination (a slot may still read it as a source).
+    bool lfoIsClassic(int l) const
+    {
+        const int count = juce::jlimit(1, ModParam::MAX_LFOS, (int) flatParams[ModParam::LFO_COUNT]);
+        if (l < 0 || l >= count)
+            return false;
+        std::array<bool, ModParam::MAX_LFOS> classic {};
+        for (int k = 0; k < count; ++k)
+            for (int off : { ModParam::LFO_WHEEL, ModParam::LFO_VEL, ModParam::LFO_PRES })
+                if (flatParams[(size_t) ModParam::lfoExt2ParamId(k, off)] != 0.0f)
+                    classic[(size_t) k] = true;
+        // An LFO aimed at another's rate or depth (RAT1 .. DPT4) acts on that LFO on its own path:
+        // the classic path's RATn / DPTn move the voice's LFO bank, the router's move the router's
+        // LFOs. One of the two on the classic path takes the other there too, or the move would
+        // reach an LFO that is not heard (an LFO with WHL on CUT, another on its RAT1).
+        for (bool grew = true; grew;)
+        {
+            grew = false;
+            for (int k = 0; k < count; ++k)
+            {
+                const int d = (int) std::lround(flatParams[(size_t) ModParam::lfoParamId(k, ModParam::LFO_DEST)]);
+                if (d < (int) UnifiedVoice::LfoDest::Lfo1Rate || d > (int) UnifiedVoice::LfoDest::Lfo4Depth)
+                    continue;
+                const int t = (d - (int) UnifiedVoice::LfoDest::Lfo1Rate) % ModParam::MAX_LFOS;
+                if (t < count && classic[(size_t) k] != classic[(size_t) t])
+                {
+                    classic[(size_t) k] = classic[(size_t) t] = true;
+                    grew = true;
+                }
+            }
+        }
+        return classic[(size_t) l];
+    }
+
+    // Where LFO l's DEST and DPTH go: the voices' classic path or the router's slot.
+    void syncLfoRoute(int l)
+    {
+        const int count = juce::jlimit(1, ModParam::MAX_LFOS, (int) flatParams[ModParam::LFO_COUNT]);
+        const bool classic = lfoIsClassic(l);
+        const int stored = juce::jlimit(0, UnifiedVoice::NUM_LFO_CELL_DESTS - 1,
+                                        (int) std::lround(flatParams[(size_t) ModParam::lfoParamId(l, ModParam::LFO_DEST)]));
+        // A cell of an effect on the track (E4) is the router's to move, on either path: the LFO
+        // then plays the router's slot (its WHL / VEL / PRES amounts, which only the classic path
+        // adds to the depth, do not count on it).
+        const int trackDest = stored - (int) UnifiedVoice::LfoDest::Count;
+        const int dest = trackDest >= 0 ? 0 : stored;
+        const bool onRouter = (! classic || trackDest >= 0) && l < count;
+        router.setLfo(l, mod::Router::Depth, onRouter ? flatParams[(size_t) ModParam::lfoParamId(l, ModParam::LFO_DEPTH)] : 0.0f);
+        router.setLfo(l, mod::Router::DestCell, onRouter ? (float) (trackDest >= 0 ? router.trackCellIndex(trackDest) : dest) : 0.0f);
+        for (auto& v : voices)
+            v.setLfoDest(l, classic ? static_cast<UnifiedVoice::LfoDest>(dest) : UnifiedVoice::LfoDest::Off);
+        classicLfo[(size_t) l] = classic;
+        updateRoute(l);
+    }
+
+    // Every LFO's (one LFO's DEST or amount can move another between the paths: lfoIsClassic).
+    void syncLfoRoutes()
+    {
+        for (int l = 0; l < ModParam::MAX_LFOS; ++l)
+            syncLfoRoute(l);
+    }
+
+    // ---- The old XIN cell (148, XDPT 149) from a stored sound --------------------------------
+    // XIN is the XIN page now (the router's: any destination, the input raw or filtered); a stored
+    // XIN / XDPT becomes its first route, as the FM engine's did:
+    //   PM    the input on PM at XDPT (the same leaky sum, the same depth)
+    //   SYNC  the input on SYNC at SYNC_LEVEL / threshold(XDPT): the buffer crosses SYNC_LEVEL where
+    //         the input crossed the old threshold
+    //   RING  the input on RING at XDPT (a slot that brings the input to RING rings: ringDry)
+    // OFF takes the route away again. The cells keep what was stored.
+    void setLegacyXin(int id, float value)
+    {
+        if (id == UnifiedParam::XIN)
+            legacyXin = std::isfinite(value) ? juce::jlimit(0, (int) UnifiedVoice::NUM_XIN_MODES - 1, (int) std::lround(juce::jlimit(-1.0f, 100.0f, value))) : 0;
+        else
+            legacyXinDepth = std::isfinite(value) ? juce::jlimit(0.0f, 1.0f, value) : 0.0f;
+        const float d = legacyXinDepth;
+        int dest = 0;
+        float amount = d;
+        switch (legacyXin)
+        {
+            case UnifiedVoice::XinPm:   dest = UnifiedVoice::RPm; break;
+            case UnifiedVoice::XinRing: dest = UnifiedVoice::RRing; break;
+            case UnifiedVoice::XinSync:
+                dest = UnifiedVoice::RSync;
+                amount = d > 0.0f ? UnifiedVoice::SYNC_LEVEL / UnifiedVoice::xinSyncThreshold(d) : 0.0f;
+                break;
+            default: amount = 0.0f; break;
+        }
+        router.set(mod::Router::xinId(mod::Router::XinDest1), (float) dest);
+        router.set(mod::Router::xinId(mod::Router::XinFilter1), 0.0f);
+        router.set(mod::Router::xinId(mod::Router::XinAmount1), amount);
     }
 
     // ---- Page cells as LFO / envelope destinations (UnifiedVoice::PARAM_DESTS) ------------------
@@ -762,12 +1284,20 @@ private:
         }
     }
 
+    // An LFO's DEST as the voices' own path has it: OFF for a cell of an effect on the track (the router's).
+    int voiceLfoDest(int l) const
+    {
+        const int stored = (int) std::lround(flatParams[(size_t) ModParam::lfoParamId(l, ModParam::LFO_DEST)]);
+        return stored < (int) UnifiedVoice::LfoDest::Count ? stored : 0;
+    }
+
     // Source 0-3 = the LFOs (their DEST), 4 = the extra envelopes: tells every voice which page
     // cell the source moves, and puts a cell it has let go of back to its set value.
     void updateRoute(int source)
     {
+        // (An LFO on the router has no page cell of the classic path: the router moves it.)
         const int dest = source < ModParam::MAX_LFOS
-            ? (int) std::lround(flatParams[(size_t) ModParam::lfoParamId(source, ModParam::LFO_DEST)])
+            ? (classicLfo[(size_t) source] ? voiceLfoDest(source) : 0)
             : envDestIndex;
         const int id = UnifiedVoice::paramOfDest(dest);
         const int before = routeId[(size_t) source];
@@ -847,14 +1377,16 @@ private:
                 for (auto& v : voices)
                 {
                     v.getOsc(osc).waveform = w;
-                    v.getOsc(osc).a = flatParams[(size_t) srcA(osc)];
-                    v.getOsc(osc).b = flatParams[(size_t) srcB(osc)];
+                    v.setSrcCell(srcA(osc), flatParams[(size_t) srcA(osc)]);
+                    v.setSrcCell(srcB(osc), flatParams[(size_t) srcB(osc)]);
                 }
                 break;
             }
             // The cells that are simply one value in every voice: UnifiedVoice::setParam (which is
             // also what an LFO routed to the cell calls, for its own voice).
             case SRC_A1: case SRC_A2: case SRC_A3: case SRC_B1: case SRC_B2: case SRC_B3:
+                for (auto& v : voices) v.setSrcCell(id, value);     // (the set value: the router moves around it)
+                break;
             case TUNE3: case MIX_DRIVE: case NOISE_COLOR: case GLIDE: case DRIFT: case DRIFT_RATE:
             case FILTER_ENV: case FILTER_DRIVE: case MORPH: case RESONANCE_B: case BALANCE: case DRIVE_B:
             case B_TRACK: case KEYTRACK: case FILTER_VEL: case POLY_MOD: case VEL_SENS:
@@ -925,16 +1457,19 @@ private:
                 break;
 
             case ARCH:
-                if (iv <= 0)
-                {
+            {
+                const int newSlot = juce::jlimit(0, ARCH_SLOTS - 1, iv);
+                // The architecture's starting sound (so that every cell has a sensible value),
+                // then, where this ARCH was left earlier, the sound it was left with. (The sound
+                // being left now was kept in setParameter(), before ARCH itself changed.)
+                if (newSlot <= 0)
                     loadInitPatch();
-                }
                 else
-                {
                     applyArchitecturePreset(static_cast<ArchitecturePresetId>(
-                        juce::jlimit(0, (int) ArchitecturePresetId::Count - 1, iv - 1)));
-                }
+                        juce::jlimit(0, (int) ArchitecturePresetId::Count - 1, newSlot - 1)));
+                restoreArch(newSlot);       // (nothing for an ARCH never left)
                 break;
+            }
             case VOICE_MODE:
             {
                 auto m = static_cast<VoiceMode>(juce::jlimit(0, 3, iv));
@@ -1006,17 +1541,25 @@ private:
                         lfo.setTempo(tempoBpm);
                         lfo.setTempoSync(value > 0.5f);
                         break;
-                    case ModParam::LFO_DEST:
-                        v.setLfoDest(lfoIdx, static_cast<UnifiedVoice::LfoDest>(
-                            juce::jlimit(0, (int) UnifiedVoice::LfoDest::Count - 1, (int) std::lround(value))));
-                        break;
-                    default: break;
+                    default: break;     // (DEST: syncLfoRoute)
                 }
             }
-            if (param == ModParam::LFO_DEST)
+            switch (param)
             {
-                flatParams[(size_t) id] = (float) juce::jlimit(0, (int) UnifiedVoice::LfoDest::Count - 1, (int) std::lround(value));
-                updateRoute(lfoIdx);    // a page cell as the destination (or no longer)
+                case ModParam::LFO_RATE:  router.setLfo(lfoIdx, mod::Router::Rate, value); break;
+                case ModParam::LFO_SHAPE: router.setLfo(lfoIdx, mod::Router::Shape, value); break;
+                case ModParam::LFO_TRIG:
+                    router.setLfo(lfoIdx, mod::Router::Trigger,
+                                  (float) juce::jlimit(0, (int) LFO::TriggerMode::COUNT - 1, (int) std::lround(value)));
+                    break;
+                case ModParam::LFO_SYNC:  router.setLfo(lfoIdx, mod::Router::Sync, value); break;
+                default: break;
+            }
+            if (param == ModParam::LFO_DEST)
+                flatParams[(size_t) id] = (float) juce::jlimit(0, UnifiedVoice::NUM_LFO_CELL_DESTS - 1, (int) std::lround(value));
+            if (param == ModParam::LFO_DEST || param == ModParam::LFO_DEPTH)
+            {
+                syncLfoRoutes();        // the classic path or the router's slot; a page cell as the destination
                 applyOscLevels();       // oscillator 2 may now be needed (or no longer)
             }
             return;
@@ -1043,6 +1586,14 @@ private:
                     case ModParam::LFO_FADE:  lfo.setFadeTime(value); break;
                     default: break;
                 }
+            }
+            switch (param)
+            {
+                case ModParam::LFO_DIV:   router.setLfo(lfoIdx, mod::Router::Division, value); break;
+                case ModParam::LFO_PHASE: router.setLfo(lfoIdx, mod::Router::Phase, value); break;
+                case ModParam::LFO_DELAY: router.setLfo(lfoIdx, mod::Router::Delay, value); break;
+                case ModParam::LFO_FADE:  router.setLfo(lfoIdx, mod::Router::Fade, value); break;
+                default: break;
             }
             return;
         }
@@ -1110,6 +1661,13 @@ private:
                     default: break;
                 }
             }
+            if (param == ModParam::LFO_KTRK)
+                router.setLfo(lfoIdx, mod::Router::KeyTrack, amount);
+            else
+            {
+                syncLfoRoutes();        // an amount set or cleared moves the LFO between the paths
+                applyOscLevels();
+            }
             return;
         }
 
@@ -1125,6 +1683,8 @@ private:
                 while (bank.getActiveCount() > count)
                     bank.removeLFO();
             }
+            for (int l = 0; l < ModParam::MAX_LFOS; ++l)
+                syncLfoRoute(l);
             applyOscLevels();
             return;
         }
@@ -1159,6 +1719,7 @@ public:
     void setTempo(float bpm) override
     {
         tempoBpm = bpm;
+        router.setTempo(bpm);
         for (auto& v : voices)
             v.getLFOBank().setTempo(bpm);
     }
@@ -1173,14 +1734,74 @@ private:
     float modWheelNow = 0.0f;       // smoothed per block
     bool legato = false;
     int initialVoiceCount = 8;
+    // The old XIN / XDPT cells as a stored sound last gave them (setLegacyXin)
+    int legacyXin = UnifiedVoice::XinOff;
+    float legacyXinDepth = 0.5f;
 
     VoiceAllocator allocator;
     std::vector<UnifiedVoice> voices;
     std::array<float, UnifiedParam::MAX_ID> flatParams {};
     ArchitecturePresetId currentPresetId = ArchitecturePresetId::MonoVA;
+
+    // ---- Architecture memory: each ARCH keeps what was dialled in on it ---------------------------
+    // (Owner, 2026-11-14: switching away and back must lose nothing.) Index 0 = INIT, 1-3 = the
+    // three presets. An ARCH that was left comes back as it was left instead of as its starting
+    // sound. THE one memory: it is stored with the project (captureArchMemory / applyArchMemory),
+    // so a session that goes on and a project that is loaded again bring back the same things.
+    // (The PARAM screen had a second one, which kept more than this one did; this one keeps
+    // what that one kept.)
+    static constexpr int ARCH_SLOTS = 1 + (int) ArchitecturePresetId::Count;
+    struct ArchSnapshot { bool visited = false; std::map<int, float> params; };
+    std::array<ArchSnapshot, ARCH_SLOTS> archMemory {};
+
+    // The sound as it stands into an ARCH's slot: every cell of the engine but ARCH itself - the
+    // pages, the LFOs and envelopes, the router's (the slots, LSHP, STRIP, XIN, the pressure
+    // slots), the stage curves. (Message thread: ARCH is a rebuild cell, never a step lock.)
+    void snapshotArch(int slot)
+    {
+        if (slot < 0 || slot >= ARCH_SLOTS)
+            return;
+        auto& snap = archMemory[(size_t) slot];
+        snap.visited = true;
+        snap.params.clear();
+        for (int id = 0; id < EngineParamRange::END; ++id)
+            if (EngineParamRange::contains(id) && id != UnifiedParam::ARCH)
+                snap.params[id] = getParameter(id);
+    }
+
+    // An ARCH's slot back into the sound: every cell that is not what the slot holds. (A few
+    // passes: a cell such as an oscillator's kind sets others. A memory from a project saved
+    // before the slot held everything holds the pages and the LFOs' cells: the rest is then the
+    // architecture's starting sound, as it was when that project was saved.)
+    void restoreArch(int slot)
+    {
+        if (slot < 0 || slot >= ARCH_SLOTS || !archMemory[(size_t) slot].visited)
+            return;
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            bool changed = false;
+            for (auto& [id, val] : archMemory[(size_t) slot].params)
+                if (id != UnifiedParam::ARCH && getParameter(id) != val)
+                {
+                    setParameter(id, val);
+                    changed = true;
+                }
+            if (! changed)
+                break;
+        }
+    }
+
     // The page cell each modulation source (LFO 1-4, the extra envelopes) is routed to, -1 = none.
     std::array<int, UnifiedVoice::NUM_MOD_SOURCES> routeId { { -1, -1, -1, -1, -1 } };
     int envDestIndex = 0;       // the extra envelopes' destination as a UnifiedVoice::LfoDest index
+    // The modulation router (ModRouter.h): four LFOs, the four extra envelopes as ENV2 .. ENV5
+    mod::Router router { routerDests(), ModParam::MAX_LFOS, ModParam::MAX_ENVS };
+    std::array<bool, ModParam::MAX_LFOS> classicLfo {};     // the LFO runs the classic path (lfoIsClassic)
+    bool osc2ForRouter = false;                             // the router moves XMOD or FFM
+    bool inputHeard = false;                                // a route reads the track input, and there is one
+    // Each voice's samples of the sub-block and where it sits, before they are mixed
+    std::array<std::array<float, mod::Router::MAX_CHUNK>, MAX_VOICES> voiceOut {}, voicePan {};
+    std::array<int, MAX_VOICES> made {};
 
     std::array<int, MONO_STACK_SIZE> monoStack {};
     int monoStackCount = 0;

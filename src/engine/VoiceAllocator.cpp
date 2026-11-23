@@ -8,7 +8,23 @@ VoiceAllocator::VoiceAllocator(int maxVoices)
 void VoiceAllocator::setVoiceCount(int count)
 {
     voices.resize(count);
+    limit = count;
     allNotesOff();
+}
+
+void VoiceAllocator::setVoiceLimit(int newLimit)
+{
+    newLimit = juce::jlimit(1, juce::jmax(1, (int) voices.size()), newLimit);
+    for (int i = newLimit; i < limit; ++i)
+    {
+        if (voices[(size_t) i].active)
+        {
+            voices[(size_t) i].active = false;
+            if (onNoteOff)
+                onNoteOff(i, voices[(size_t) i]);
+        }
+    }
+    limit = newLimit;
 }
 
 void VoiceAllocator::setMode(VoiceMode newMode)
@@ -171,7 +187,7 @@ int VoiceAllocator::getActiveVoiceCount() const
 
 int VoiceAllocator::findFreeVoice() const
 {
-    for (int i = 0; i < (int) voices.size(); ++i)
+    for (int i = 0; i < limit; ++i)
     {
         if (!voices[i].active)
             return i;
@@ -183,7 +199,7 @@ int VoiceAllocator::findFreeVoice() const
 int VoiceAllocator::findQuietVoice() const
 {
     int tail = -1;
-    for (int i = 0; i < (int) voices.size(); ++i)
+    for (int i = 0; i < limit; ++i)
     {
         if (voices[i].active)
             continue;
@@ -200,7 +216,7 @@ int VoiceAllocator::findOldestVoice() const
     int oldest = 0;
     int oldestAge = voices[0].age;
 
-    for (int i = 1; i < (int) voices.size(); ++i)
+    for (int i = 1; i < limit; ++i)
     {
         if (voices[i].age < oldestAge)
         {
@@ -213,7 +229,7 @@ int VoiceAllocator::findOldestVoice() const
 
 int VoiceAllocator::findVoiceForNote(int note) const
 {
-    for (int i = 0; i < (int) voices.size(); ++i)
+    for (int i = 0; i < limit; ++i)
     {
         if (voices[i].note == note)
             return i;

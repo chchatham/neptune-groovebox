@@ -4,6 +4,15 @@ project(NeptuneGroovebox VERSION 0.9.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ccache, where it is installed: the worktrees of parallel agents then share compiled objects (JUCE's
+# above all). base_dir makes paths inside a checkout relative, so two checkouts give the same key.
+find_program(NEPTUNE_CCACHE ccache)
+if(NEPTUNE_CCACHE)
+    foreach(lang C CXX OBJC OBJCXX)
+        set(CMAKE_${lang}_COMPILER_LAUNCHER "${NEPTUNE_CCACHE}" "base_dir=${CMAKE_SOURCE_DIR}" "hash_dir=false")
+    endforeach()
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -62,6 +71,9 @@ target_sources(NeptuneGroovebox PRIVATE
     src/engine/FMEngine.h
     src/engine/MacroOscEngine.h
     src/engine/WavetableEngine.h
+    src/dsp/Wavetable.h
+    src/engine/VoiceFilterSection.h
+    src/engine/VoiceSpread.h
     src/engine/WaveSeqEngine.h
     src/engine/MIDITrack.h
     src/engine/ArchitecturePreset.h
@@ -81,7 +93,6 @@ target_sources(NeptuneGroovebox PRIVATE
     src/sequencer/SequencerCore.cpp
     src/dsp/Envelope.h
     src/dsp/LFO.h
-    src/dsp/ModMatrix.h
     src/dsp/filters/SVFilter.h
     src/dsp/filters/LadderFilter.h
     src/project/UndoHistory.h
@@ -93,8 +104,17 @@ target_sources(NeptuneGroovebox PRIVATE
     src/dsp/effects/ParametricEQ.h
     src/dsp/effects/Compressor.h
     src/dsp/effects/Limiter.h
+    src/dsp/effects/Detector.h
+    src/dsp/effects/EqBand.h
+    src/dsp/effects/CellEffect.h
     src/dsp/effects/EffectChain.h
     src/dsp/effects/SendBus.h
+    src/dsp/effects/FxLfo.h
+    src/dsp/effects/SweptFilter.h
+    src/dsp/effects/DirtEffect.h
+    src/dsp/effects/TalkEffect.h
+    src/dsp/TempoDivisions.h
+    src/dsp/effects/ModDelay.h
     src/dsp/effects/Chorus.h
     src/dsp/effects/Drive.h
     src/dsp/effects/Flanger.h
@@ -248,6 +268,12 @@ target_compile_definitions(NeptuneTests PRIVATE
     JUCE_USE_CURL=0
 )
 
+# Where the tests find their fixtures and the repository's files. Not __FILE__: under ccache's base_dir
+# that is a relative path, and a test then passes or fails by the folder it was started in. On the one
+# file only, so the JUCE objects of this target stay the same in every checkout (ccache shares them).
+set_source_files_properties(tests/main_test.cpp PROPERTIES
+    COMPILE_DEFINITIONS "NEPTUNE_TESTS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tests\"")
+
 # The drum breaks, when assets/breaks holds any (see the top of this file).
 if(TARGET NeptuneBreakData)
     target_link_libraries(NeptuneGroovebox PRIVATE NeptuneBreakData)
@@ -273,6 +299,28 @@ set(NEPTUNE_TEST_GROUPS
     "LFO Destinations|Wavetable Embed|Sampler Release"
     "Undo History|Effects More|Sampler Grain|Wavetable Keyframes|Wavetable Scan"
     "Perf FX"
+    # The unification's suites (2026-11-22: "everything-else" had grown to over five minutes alone)
+    "U4 Sampler"
+    "U4 FM|U4 Wavetable"
+    "U4 Wave Sequencer|Voice Body"
+    "Resonator"
+    "Effect Cores"
+    "Vocoder|XIN"
+    "P01 Keyboard|Master Chain|Router Sources"
+    "Mod Slots|Voice Filter Spread|Phase Osc|Mod Router"
+    "Send Chains"
+    "U4 Unified"
+    "U4 RSN"
+    "U4 Drum|Router Phase"
+    "U4 Macro"
+    "Effect Destinations"
+    # Out of "everything-else" (2026-11-22: it was 125 s alone and is in every merge run; about 40 s without these)
+    "One Network|Pinned On Cores"
+    "Track Input"
+    "Kick Points|Saturation"
+    # The preset suites of U6 (93 s together inside "everything-else", which had reached 148 s)
+    "Factory Multis|Fusion Presets"
+    "Preset Distinctness"
 )
 set(NEPTUNE_TEST_NAMED "Robustness")
 foreach(group IN LISTS NEPTUNE_TEST_GROUPS)

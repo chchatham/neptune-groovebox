@@ -218,8 +218,9 @@ public:
             engine.loadKit(kit808);
 
             expectEquals(engine.getKitName(), std::string("808"));
-            // Verify voice 0 was configured to AnalogKick
-            expectEquals(static_cast<int>(engine.getVoice(0).getType()), static_cast<int>(DrumSynthType::AnalogKick));
+            // Verify voice 0 was configured to AnalogKick ([KICKS] TYPE says so; the voice is the kick machine at that kick)
+            expectEquals((int) engine.getParameter(0 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE), static_cast<int>(DrumSynthType::AnalogKick));
+            expect(engine.getVoice(0).getType() == DrumSynthType::KickSynth);
         }
 
         beginTest("DrumEngine mixed kit: different types per slot");
@@ -240,8 +241,10 @@ public:
 
             engine.loadKit(mixed);
 
-            expectEquals(static_cast<int>(engine.getVoice(0).getType()), static_cast<int>(DrumSynthType::FMKick));
-            expectEquals(static_cast<int>(engine.getVoice(1).getType()), static_cast<int>(DrumSynthType::NoiseSnare));
+            expectEquals((int) engine.getParameter(0 * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE), static_cast<int>(DrumSynthType::FMKick));    // [KICKS]
+            expect(engine.getVoice(0).getType() == DrumSynthType::KickSynth);
+            // [FOLD] NoiseSnare is folded to Resonator in applyKitToVoices.
+            expectEquals(static_cast<int>(engine.getVoice(1).getType()), static_cast<int>(DrumSynthType::Resonator));
             expectEquals(static_cast<int>(engine.getVoice(2).getType()), static_cast<int>(DrumSynthType::Cymbal));
             expectEquals(static_cast<int>(engine.getVoice(3).getType()), static_cast<int>(DrumSynthType::SubBass));
         }

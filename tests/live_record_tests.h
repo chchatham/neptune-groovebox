@@ -624,7 +624,7 @@ public:
             }
         }
 
-        beginTest("A pinned pad screen stays pinned when recording ends (STEP is shown; the pads are still the pinned ones)");
+        beginTest("A pinned pad screen is unpinned when recording ends (STEP is shown; the pads go to STEP)");
         {
             Rig r("DRUMS", "STEP");
             Clock clock(r.seq);
@@ -638,7 +638,7 @@ public:
             clock.runTo(1.1); r.keyOn(60); r.keyOff(60);
             r.tap(PLAY);
             expectEquals(r.mgr.getActiveIndex(), 1);
-            expectEquals(r.mgr.getPinnedScreen(), 0);
+            expectEquals(r.mgr.getPinnedScreen(), -1, "recording end unpins the pad screen");
         }
 
         beginTest("Scale button: a message on every screen, a SCALE tag while it is on, keys snapped to the scale");
@@ -665,6 +665,7 @@ public:
             expectEquals(keys.log.joinIntoString(","), "on" + juce::String(root + 1) + ",off" + juce::String(root + 1));
             keys.log.clear();
 
+            // Scale toggles on release (the hold is for Scale + Up/Down page stepping).
             r.mgr.controlChangeReceived(1, SCALE, 127);
             r.mgr.controlChangeReceived(1, SCALE, 0);
             expect(r.mgr.isScaleLocked());
@@ -703,6 +704,7 @@ public:
             expectEquals(r.text(), juce::String("SCALE ON"));
             r.mgr.setActiveScreen(0);
             r.mgr.controlChangeReceived(1, SCALE, 127);
+            r.mgr.controlChangeReceived(1, SCALE, 0);
             expectEquals(r.text(), juce::String("SCALE LOCK OFF"));
 
             // The SCALE screen's LK cell (setScaleLocked) and the button are one state.
@@ -710,6 +712,7 @@ public:
             expect(r.mgr.isScaleLocked());
             expect(r.mgr.getNameBarTags().contains("SCALE"));
             r.mgr.controlChangeReceived(1, SCALE, 127);
+            r.mgr.controlChangeReceived(1, SCALE, 0);
             expect(!r.mgr.isScaleLocked());
             expectEquals(toggles, 6);
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DSPUtils.h"
+#include "TempoDivisions.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,6 +13,10 @@
 // Polarity. Each shape has a natural polarity, and the depth is signed:
 //   Sine, Triangle, Square, Saw, Random, SmoothRandom, RampDown
 //       bipolar, -1..+1 (they swing around the destination's set value);
+//   User, UserSmooth
+//       the track's own shape: eight levels (-1..1) a cycle, held for an eighth of the cycle each
+//       (USR) or joined by straight lines, the last back to the first (USRS). The levels belong
+//       to the owner (setUserShape); without them the shape is a rising staircase;
 //   ExpUp, ExpDown
 //       unipolar, 0..1. ExpDown starts at 1 and decays to 0, ExpUp is its
 //       mirror in time (0, slow at first, then up to 1). A one-shot ExpDown
@@ -64,6 +69,8 @@ public:
         RampDown,
         ExpUp,
         ExpDown,
+        User,           // the custom shape, stepped
+        UserSmooth,     // the custom shape, interpolated
         COUNT   // sentinel for shape cycling
     };
 
@@ -78,40 +85,42 @@ public:
         COUNT
     };
 
-    // Tempo-sync divisions, longest first (so a higher index is faster, like a higher rate).
-    // A bar is four beats. Stored in projects by index: only ever append.
-    static constexpr int NUM_DIVISIONS = 17;
+    // Tempo-sync divisions: the one table (dsp/TempoDivisions.h), read by name, in the order an
+    // LFO stores them. Stored in projects and presets by index, so the first seventeen keep the
+    // order they always had (longest first: a higher index is faster, like a higher rate) and the
+    // five an LFO gained from the table come after them, the fast ones first. A new division of
+    // the table is appended here too (`whole()` fails until it is).
+    static constexpr int NUM_DIVISIONS = tempo::COUNT;
     static constexpr int DEFAULT_DIVISION = 8;     // 1/4
+    static constexpr tempo::View<NUM_DIVISIONS> DIVISIONS { std::array<const char*, NUM_DIVISIONS> {
+        "8BAR", "4BAR", "2BAR", "1BAR", "1/2D", "1/2", "1/4D", "1/2T", "1/4",
+        "1/8D", "1/4T", "1/8", "1/16D", "1/8T", "1/16", "1/16T", "1/32",
+        "1/32T", "1/64", "1/128", "16BAR", "1/32D" } };
+    static_assert(DIVISIONS.whole(), "an LFO offers every division of the table");
 
-    static const char* const* divisionLabels()
-    {
-        static const char* const names[NUM_DIVISIONS] = {
-            "8BAR", "4BAR", "2BAR", "1BAR", "1/2D", "1/2", "1/4D", "1/2T", "1/4",
-            "1/8D", "1/4T", "1/8", "1/16D", "1/8T", "1/16", "1/16T", "1/32" };
-        return names;
-    }
+    static const char* const* divisionLabels() { return DIVISIONS.labels(); }
 
     // Length of one cycle in beats (quarter notes).
-    static float divisionBeats(int index)
-    {
-        static const float beats[NUM_DIVISIONS] = {
-            32.0f, 16.0f, 8.0f, 4.0f, 3.0f, 2.0f, 1.5f, 4.0f / 3.0f, 1.0f,
-            0.75f, 2.0f / 3.0f, 0.5f, 0.375f, 1.0f / 3.0f, 0.25f, 1.0f / 6.0f, 0.125f };
-        return beats[std::clamp(index, 0, NUM_DIVISIONS - 1)];
-    }
+    static float divisionBeats(int index) { return (float) DIVISIONS.beatsAt(index); }
 
-    static const char* divisionName(int index)
-    {
-        return divisionLabels()[std::clamp(index, 0, NUM_DIVISIONS - 1)];
-    }
+    static const char* divisionName(int index) { return DIVISIONS.labels()[std::clamp(index, 0, NUM_DIVISIONS - 1)]; }
 
     // Cell texts (up to four characters), in enum order.
     static const char* const* shapeLabels()
     {
         static const char* const names[(int) Shape::COUNT] = {
-            "SIN", "TRI", "SQR", "SAW", "RND", "SRND", "RAMP", "EXPU", "EXPD" };
+            "SIN", "TRI", "SQR", "SAW", "RND", "SRND", "RAMP", "EXPU", "EXPD", "USR", "USRS" };
         return names;
     }
+
+    // The custom shape: USER_POINTS levels, -1..1. `levels` stays the owner's (it may change them
+    // at any time); nullptr = the default staircase.
+    static constexpr int USER_POINTS = 8;
+    static float defaultUserLevel(int point)
+    {
+        return -1.0f + 2.0f * (float) std::clamp(point, 0, USER_POINTS - 1) / (float) (USER_POINTS - 1);
+    }
+    void setUserShape(const float* levels) { userShape = levels; }
 
     static const char* const* triggerLabels()
     {
@@ -208,6 +217,8 @@ public:
             case Shape::RampDown:     return "RMP";
             case Shape::ExpUp:        return "EXU";
             case Shape::ExpDown:      return "EXD";
+            case Shape::User:         return "USR";
+            case Shape::UserSmooth:   return "USS";
             default:                  return "---";
         }
     }
@@ -269,7 +280,41 @@ public:
             advance((double) (baseHz * rateScale) / sampleRate);
 
         const float raw = holding ? heldValue : shapeValue();
-        lastOutput = raw * gain * getEffectiveDepth();
+        lastShape = raw * gain;
+        lastOutput = lastShape * getEffectiveDepth();
+        return lastOutput;
+    }
+
+    // n samples in one step: what n calls of process() leave behind (the modulation router runs
+    // its LFOs once per sub-block). The fade-in is read at the last of the n samples.
+    float processBlock(int n)
+    {
+        if (!enabled || n <= 0)
+            return enabled ? lastOutput : 0.0f;
+
+        float gain = 1.0f;
+        bool waiting = false;
+        if (fading)
+        {
+            const double t = sinceTrigger + (double) (n - 1) / sampleRate;
+            sinceTrigger += (double) n / sampleRate;
+            if (t < delayTime)
+            {
+                gain = 0.0f;
+                waiting = triggerMode == TriggerMode::KeySync || oneShotArmed;
+            }
+            else if (t < delayTime + fadeTime)
+                gain = (float) ((t - delayTime) / fadeTime);
+            else
+                fading = false;
+        }
+
+        if (!stopped && !waiting)
+            advance((double) (baseHz * rateScale) * (double) n / sampleRate);
+
+        const float raw = holding ? heldValue : shapeValue();
+        lastShape = raw * gain;
+        lastOutput = lastShape * getEffectiveDepth();
         return lastOutput;
     }
 
@@ -282,14 +327,33 @@ public:
     }
 
     float getCurrentValue() const { return lastOutput; }
+    // The shape as of the last process(), with the fade-in but without the depth (what a mod slot
+    // takes from an LFO: its amount is the slot's own).
+    float getShapeOutput() const { return lastShape; }
 
     // Position in the cycle, 0..1 (1 = a finished one-shot), without the start-phase offset.
     double getPhase() const { return phase; }
+
+    // The shape a part of a cycle further on, as of the last process(): a second reader of the
+    // same LFO (the other side of a stereo effect, a rotor's level a quarter turn from its pitch).
+    // Without depth, fade or hold; the random shapes are the same wherever they are read.
+    float shapeAt(float cycles) const
+    {
+        double pos = phase + startPhase + (double) cycles;
+        pos -= std::floor(pos);
+        return shapeFor((pos >= 0.0 && pos < 1.0) ? (float) pos : 0.0f);
+    }
+
+    // Where the random shapes start their sequence (two LFOs with different seeds draw different values).
+    void setSeed(uint32_t seed) { random.state = seed; }
+    // Draw the random shapes' values now: after reset() they rest at 0 until the first cycle ends.
+    void drawRandom() { newCycle(); }
 
     void reset()
     {
         phase = 0.0;
         lastOutput = 0.0f;
+        lastShape = 0.0f;
         randomValue = 0.0f;
         prevRandom = 0.0f;
         nextRandom = 0.0f;
@@ -348,6 +412,11 @@ private:
         }
     }
 
+    float userLevel(int point) const
+    {
+        return userShape != nullptr ? std::clamp(userShape[point], -1.0f, 1.0f) : defaultUserLevel(point);
+    }
+
     // exp(-5 p) rescaled to run exactly from 1 (p = 0) to 0 (p = 1).
     static float expDecay(float p)
     {
@@ -362,8 +431,12 @@ private:
         double pos = phase + startPhase;
         if (stopped ? pos > 1.0 : pos >= 1.0)
             pos -= 1.0;
-        const float p = (float) pos;
+        return shapeFor((float) pos);
+    }
 
+    // The shape at position p of the cycle (0..1).
+    float shapeFor(float p) const
+    {
         switch (shape)
         {
             case Shape::Sine:         return std::sin(p * dsp::TWO_PI_F);
@@ -375,6 +448,14 @@ private:
             case Shape::ExpDown:      return expDecay(p);
             case Shape::Random:       return randomValue;
             case Shape::SmoothRandom: return prevRandom + (nextRandom - prevRandom) * (float) std::min(phase, 1.0);
+            case Shape::User:         return userLevel(std::min(USER_POINTS - 1, (int) (p * (float) USER_POINTS)));
+            case Shape::UserSmooth:
+            {
+                const float at = std::clamp(p, 0.0f, 1.0f) * (float) USER_POINTS;
+                const int i = std::min(USER_POINTS, (int) at);
+                const float a = userLevel(i % USER_POINTS), b = userLevel((i + 1) % USER_POINTS);
+                return a + (b - a) * (at - (float) i);
+            }
             default:                  return 0.0f;
         }
     }
@@ -413,6 +494,8 @@ private:
     bool fading = false;
 
     float lastOutput = 0.0f;
+    float lastShape = 0.0f;
+    const float* userShape = nullptr;
     float randomValue = 0.0f;
     float prevRandom = 0.0f;
     float nextRandom = 0.0f;

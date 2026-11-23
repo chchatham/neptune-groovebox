@@ -8,6 +8,7 @@
 #include "WaveSeqEngine.h"
 #include "DrumEngine.h"
 #include "SamplerEngine.h"
+#include "ResonatorEngine.h"
 #include "../sequencer/SequencerCore.h"
 #include "../arpeggiator/Arpeggiator.h"
 #include "../sequencer/PadRatchet.h"
@@ -29,6 +30,8 @@
 #include "../dsp/effects/Limiter.h"
 #include "../dsp/effects/FilterEffect.h"
 #include "../dsp/effects/TrackFx.h"
+#include "../dsp/effects/DirtEffect.h"
+#include "../dsp/effects/TalkEffect.h"
 #include "../dsp/effects/Ensemble.h"
 #include "../dsp/effects/AutoPan.h"
 #include "../dsp/effects/HallReverb.h"
@@ -45,6 +48,7 @@
 #include "../dsp/effects/LCRDelay.h"
 #include "../dsp/effects/MultiTapInsert.h"
 #include "../dsp/effects/SidechainInsert.h"
+#include "../dsp/effects/Vocoder.h"
 #include "PerfFx.h"
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <array>
@@ -85,6 +89,9 @@ enum class EffectType
     LCRDelayEffect,
     MultiTapEffect,
     SidechainEffect,
+    VocoderEffect,
+    DirtInsertEffect,
+    TalkInsertEffect,
     NumEffectTypes
 };
 
@@ -98,16 +105,45 @@ public:
     static constexpr int MAX_INSERTS_PER_TRACK = 8;
 
     static constexpr int MAX_TRACKS = 32;
+    // The master chain as a track for the insert functions and the insert parameter ids: the mix
+    // has an insert chain like any track (addInsertEffect, setInsertEffect, removeInsertEffect,
+    // getInsertEffectType, getInsertChain, and set / getTrackParameter with the ids of the slots:
+    // EFFECT_PARAM_BASE, INSERT_ON_BASE .. INSERT_DIV_BASE, INSERT_EXTRA_BASE). It has nothing
+    // else of a track: no engine, mixer, blocks, input or locks.
+    static constexpr int MASTER_TRACK = MAX_TRACKS;
+    // A send bus is addressed the same way: sendTrack(bus) names the bus's chain for the same
+    // functions and the same ids. Any insert type can sit on a send, several in a row; what the
+    // tracks send is run through the chain and what comes out is added to the mix (so an effect
+    // put on a send starts with its mix at 1: the wet sound alone, as the send reverb and delay
+    // always were; a send with no effect gives nothing).
+    static constexpr int SEND_TRACK_BASE = MASTER_TRACK + 1;
+    static constexpr int sendTrack(int bus) { return SEND_TRACK_BASE + bus; }
+    static constexpr bool isSendTrack(int trackIndex) { return trackIndex >= SEND_TRACK_BASE && trackIndex < SEND_TRACK_BASE + MAX_SENDS; }
+    // A chain without a track (the mix, a send): insert slots and nothing else of a track.
+    static constexpr bool isChainTrack(int trackIndex) { return trackIndex == MASTER_TRACK || isSendTrack(trackIndex); }
     static constexpr int MAX_ACTIVE_LOCKS = 16;
     // Track mixer parameters (volume, pan, send levels) are MixParam ids: applied here, never
     // forwarded to an engine.
     static constexpr int PARAM_SEND_BASE = MixParam::SEND_BASE;
     static constexpr int PARAM_SEND1 = MixParam::SEND_BASE;
     static constexpr int PARAM_SEND2 = MixParam::SEND_BASE + 1;
-    static constexpr int SEND_TYPE_PARAM_BASE = 150;  // 150 + busIdx = send bus type selector
+    static constexpr int SEND_TYPE_PARAM_BASE = 150;  // 150 + bus: the id of the TRACK page's BUS cells (a screen's cell, not a parameter here)
     static constexpr int EFFECT_PARAM_BASE = 200;  // 200 + slot*4 + paramIdx
 
     // MOD param IDs are in ModParam namespace (EngineBase.h)
+
+    // The track input's values on a new track (TrackInParam; SRC and MODE are 0 = OFF).
+    static constexpr float TRACK_IN_LEVEL = 1.0f;
+    static constexpr float TRACK_IN_ATTACK_MS = 5.0f;
+    static constexpr float TRACK_IN_RELEASE_MS = 150.0f;
+    static float trackInDefault(int id)
+    {
+        return id == TrackInParam::LEVEL ? TRACK_IN_LEVEL : id == TrackInParam::FOLLOW_ATK ? TRACK_IN_ATTACK_MS
+             : id == TrackInParam::FOLLOW_REL ? TRACK_IN_RELEASE_MS : 0.0f;
+    }
+    // The ids in use, for whoever stores or resets them.
+    static constexpr int TRACK_IN_IDS[5] = { TrackInParam::SRC, TrackInParam::LEVEL, TrackInParam::MODE,
+                                             TrackInParam::FOLLOW_ATK, TrackInParam::FOLLOW_REL };
 
     AudioEngine()
     {
@@ -115,7 +151,10 @@ public:
         {
             const int t = padTrack[(size_t) pad];
             if (auto* e = getEngine(t))
+            {
+                e->notePlayed((float) note);
                 e->noteOn(note, velocity, -1);
+            }
             padSounding[(size_t) pad] = note;
             const uint32_t serial = sequencer != nullptr ? sequencer->getRecordSerial() : 0u;
             if (onPadHit)
@@ -145,30 +184,13 @@ public:
             m.pan = 0.0f;
             for (auto& s : m.sends) s = 0.0f;
         }
-        // The master compressor starts neutral, as in a project without stored master settings
-        // (ProjectBridge). At the Compressor class's own -20 dB / 4:1 a single note was pulled
-        // down 7 dB within 20 ms of its onset, which was heard as a click on every loud note.
-        masterComp.setThreshold(0.0f);
-        masterComp.setRatio(1.0f);
+        for (auto& shape : trackShape)
+            for (int i = 0; i < LFO::USER_POINTS; ++i)
+                shape[(size_t) i] = LFO::defaultUserLevel(i);
+        buildDefaultMasterChain();
         perfFx.setCreator(&AudioEngine::createPerfEffect, &AudioEngine::perfWays, &structureMutex);
         sendBuses.resize(DEFAULT_NUM_SENDS);
-        sendBusTypes.resize(DEFAULT_NUM_SENDS, EffectType::ReverbEffect);
-
-        auto reverb = std::make_unique<Reverb>();
-        reverb->setDecay(0.6f);
-        reverb->setDamping(0.4f);
-        reverb->setMix(1.0f);
-        sendBuses[SEND_REVERB].getChain().addEffect(std::move(reverb));
-        sendBuses[SEND_REVERB].setSendLevel(1.0f);
-        sendBusTypes[SEND_REVERB] = EffectType::ReverbEffect;
-
-        auto delay = std::make_unique<Delay>();
-        delay->setTime(0.375f);
-        delay->setFeedback(0.35f);
-        delay->setMix(1.0f);
-        sendBuses[SEND_DELAY].getChain().addEffect(std::move(delay));
-        sendBuses[SEND_DELAY].setSendLevel(1.0f);
-        sendBusTypes[SEND_DELAY] = EffectType::DelayEffect;
+        buildDefaultSends();
     }
 
     static std::unique_ptr<EffectBase> createEffect(EffectType type)
@@ -205,6 +227,9 @@ public:
             case EffectType::LCRDelayEffect: return std::make_unique<LCRDelay>();
             case EffectType::MultiTapEffect: return std::make_unique<MultiTapInsert>();
             case EffectType::SidechainEffect: return std::make_unique<SidechainInsert>();
+            case EffectType::VocoderEffect: return std::make_unique<Vocoder>();
+            case EffectType::DirtInsertEffect: return std::make_unique<DirtInsert>();
+            case EffectType::TalkInsertEffect: return std::make_unique<TalkInsert>();
             case EffectType::NumEffectTypes:     break;
         }
         return nullptr;
@@ -244,6 +269,9 @@ public:
             case EffectType::LCRDelayEffect: return "LCR";
             case EffectType::MultiTapEffect: return "MTAP";
             case EffectType::SidechainEffect: return "DUCK";
+            case EffectType::VocoderEffect: return "VOC";
+            case EffectType::DirtInsertEffect: return "DIRT";
+            case EffectType::TalkInsertEffect: return "TALK";
             case EffectType::NumEffectTypes:    break;
         }
         return "---";
@@ -262,8 +290,11 @@ public:
             default: break;
         }
         const int type = kind - PerfFx::INSERT_BASE;
-        // (DUCK listens to another track: it has no place on a pad.)
-        if (type < 0 || type >= (int) EffectType::NumEffectTypes || type == (int) EffectType::SidechainEffect)
+        // (DUCK is CMP with other cells, and CMP is on the list with the same KEY choice; VOC is
+        // nothing without an input. A pad's effect is handed what its KEY cell names like any
+        // insert, so VOC on a pad is possible now: offered to the owner, not built.)
+        if (type < 0 || type >= (int) EffectType::NumEffectTypes || type == (int) EffectType::SidechainEffect
+            || type == (int) EffectType::VocoderEffect)
             return nullptr;
         return createEffect((EffectType) type);
     }
@@ -311,7 +342,7 @@ public:
         {
             std::vector<int> k { PerfFx::NONE, PerfFx::DUB, PerfFx::FRZ, PerfFx::RPT, PerfFx::STOP };
             for (int t = 0; t < (int) EffectType::NumEffectTypes; ++t)
-                if (t != (int) EffectType::SidechainEffect)
+                if (t != (int) EffectType::SidechainEffect && t != (int) EffectType::VocoderEffect)
                     k.push_back(PerfFx::INSERT_BASE + t);
             return k;
         }();
@@ -371,27 +402,27 @@ public:
     void addInsertEffect(int trackIndex, EffectType type)
     {
         const StructureLock lock(structureMutex);
-        ensureInsertChains(trackIndex);
-        if (trackInsertChains[(size_t) trackIndex].getEffectCount() >= MAX_INSERTS_PER_TRACK)
+        if (! isChainTrack(trackIndex))
+            ensureInsertChains(trackIndex);
+        auto* chain = getInsertChain(trackIndex);
+        if (chain == nullptr || chain->getEffectCount() >= MAX_INSERTS_PER_TRACK)
             return;
-        auto fx = createEffect(type);
+        auto fx = createSlotEffect(trackIndex, type);
         if (!fx) return;
         if (currentSampleRate > 0)
             fx->prepare(currentSampleRate, currentBlockSize);
-        trackInsertChains[(size_t) trackIndex].addEffect(std::move(fx));
-        insertTypes[(size_t) trackIndex].push_back(type);
+        chain->addEffect(std::move(fx), (int) type);
         declickTrack(trackIndex, false);
     }
 
     void removeInsertEffect(int trackIndex, int slot)
     {
         const StructureLock lock(structureMutex);
-        if (trackIndex < 0 || trackIndex >= (int) trackInsertChains.size())
+        auto* chain = getInsertChain(trackIndex);
+        if (chain == nullptr)
             return;
-        trackInsertChains[(size_t) trackIndex].removeEffect(slot);
+        chain->removeEffect(slot);
         declickTrack(trackIndex, false);
-        if (trackIndex < (int) insertTypes.size() && slot >= 0 && slot < (int) insertTypes[(size_t) trackIndex].size())
-            insertTypes[(size_t) trackIndex].erase(insertTypes[(size_t) trackIndex].begin() + slot);
     }
 
     // Put an effect of the given type into a slot: replaces what is there, or appends when the slot
@@ -399,19 +430,19 @@ public:
     void setInsertEffect(int trackIndex, int slot, EffectType type)
     {
         const StructureLock lock(structureMutex);
-        ensureInsertChains(trackIndex);
-        if (trackIndex < 0) return;
-        auto& chain = trackInsertChains[(size_t) trackIndex];
-        if (slot >= chain.getEffectCount())
+        if (! isChainTrack(trackIndex))
+            ensureInsertChains(trackIndex);
+        auto* chain = getInsertChain(trackIndex);
+        if (chain == nullptr) return;
+        if (slot >= chain->getEffectCount())
         {
             addInsertEffect(trackIndex, type);
             return;
         }
         if (slot < 0) return;
-        auto fx = createEffect(type);
+        auto fx = createSlotEffect(trackIndex, type);
         if (!fx) return;
-        chain.replaceEffect(slot, std::move(fx));
-        insertTypes[(size_t) trackIndex][(size_t) slot] = type;
+        chain->replaceEffect(slot, std::move(fx), (int) type);
         declickTrack(trackIndex, false);
     }
 
@@ -420,6 +451,8 @@ public:
     // instead of being heard as a click. engineToo: the jump is in the engine's own output.
     void declickTrack(int trackIndex, bool engineToo)
     {
+        if (isChainTrack(trackIndex))     // (a send's sound has no stage of its own: the output's)
+            masterDeclickArm.store(true, std::memory_order_relaxed);
         if (trackIndex < 0 || trackIndex >= MAX_TRACKS)
             return;
         trackDeclickArm[(size_t) trackIndex].store(true, std::memory_order_relaxed);
@@ -427,18 +460,25 @@ public:
             engineDeclickArm[(size_t) trackIndex].store(true, std::memory_order_relaxed);
     }
 
-    // Type of the effect in a slot; false when the slot is empty.
+    // Type of the effect in a slot; false when the slot is empty. (The chain knows what it holds:
+    // EffectChain::getKind, said when the effect was put in.)
     bool getInsertEffectType(int trackIndex, int slot, EffectType& typeOut) const
     {
-        if (trackIndex < 0 || trackIndex >= (int) insertTypes.size()) return false;
-        auto& types = insertTypes[(size_t) trackIndex];
-        if (slot < 0 || slot >= (int) types.size()) return false;
-        typeOut = types[(size_t) slot];
+        const auto* chain = getInsertChain(trackIndex);
+        const int kind = chain != nullptr ? chain->getKind(slot) : EffectChain::NO_KIND;
+        if (kind < 0 || kind >= (int) EffectType::NumEffectTypes) return false;
+        typeOut = static_cast<EffectType>(kind);
         return true;
     }
 
+    // A track's insert chain (null until the track has had an insert), with MASTER_TRACK the
+    // master chain, with sendTrack(bus) that send's chain (null: no such send).
     EffectChain* getInsertChain(int trackIndex)
     {
+        if (trackIndex == MASTER_TRACK)
+            return &masterChain;
+        if (isSendTrack(trackIndex))
+            return trackIndex - SEND_TRACK_BASE < (int) sendBuses.size() ? &sendBuses[(size_t) (trackIndex - SEND_TRACK_BASE)].getChain() : nullptr;
         if (trackIndex < 0 || trackIndex >= (int) trackInsertChains.size())
             return nullptr;
         return &trackInsertChains[(size_t) trackIndex];
@@ -446,9 +486,7 @@ public:
 
     const EffectChain* getInsertChain(int trackIndex) const
     {
-        if (trackIndex < 0 || trackIndex >= (int) trackInsertChains.size())
-            return nullptr;
-        return &trackInsertChains[(size_t) trackIndex];
+        return const_cast<AudioEngine*>(this)->getInsertChain(trackIndex);
     }
 
     // ---- Track parameters --------------------------------------------------------------------
@@ -479,6 +517,8 @@ public:
 
     float getTrackParameter(int trackIndex, int id) const
     {
+        if (isChainTrack(trackIndex))
+            return isInsertParam(id) ? getInsertParameter(trackIndex, id) : 0.0f;
         if (trackIndex < 0 || trackIndex >= MAX_TRACKS)
             return 0.0f;
 
@@ -490,41 +530,24 @@ public:
             return m.sends[(size_t) (id - MixParam::SEND_BASE)].load();
         }
 
+        // Ids 240-263 (the old TrackFx blocks) are no longer a fixed section: they read 0 for
+        // backward compat. Projects that stored them are loaded by the converter in ProjectBridge.
         if (TrackFxParam::isTrackFxParam(id))
-            return trackFx[(size_t) trackIndex] ? trackFx[(size_t) trackIndex]->get(id) : defaultTrackFx().get(id);
+            return 0.0f;
 
         if (isArpLockParam(id))
             return arpLockValues[(size_t) trackIndex][(size_t) (id - ARP_LOCK_BASE)];
 
-        if (isInsertSwitchParam(id))
+        if (TrackInParam::contains(id))
         {
-            const int kind = (id - INSERT_ON_BASE) / MAX_INSERTS_PER_TRACK;      // 0 on, 1 wet, 2 sync, 3 division
-            const int slot = (id - INSERT_ON_BASE) % MAX_INSERTS_PER_TRACK;
-            auto* chain = const_cast<EffectChain*>(getInsertChain(trackIndex));
-            auto* fx = (chain && slot < chain->getEffectCount()) ? chain->getEffect(slot) : nullptr;
-            if (fx == nullptr) return kind == 2 ? 0.0f : (kind == 3 ? (float) FxSync::DEFAULT_DIVISION : 1.0f);
-            if (kind == 2) return fx->isSynced() ? 1.0f : 0.0f;
-            if (kind == 3) return (float) fx->getSyncDivision();
-            return kind == 1 ? fx->getMix() : (fx->isEnabled() ? 1.0f : 0.0f);
+            const auto* value = trackIn[(size_t) trackIndex].valueOf(id);
+            return value != nullptr ? value->load(std::memory_order_relaxed) : 0.0f;
         }
 
-        if (isInsertExtraParam(id))
-        {
-            const int offset = id - INSERT_EXTRA_BASE, slot = offset / EffectBase::MAX_EXTRAS;
-            auto* chain = const_cast<EffectChain*>(getInsertChain(trackIndex));
-            auto* fx = (chain && slot < chain->getEffectCount()) ? chain->getEffect(slot) : nullptr;
-            return fx ? fx->getExtra(offset % EffectBase::MAX_EXTRAS) : 0.0f;
-        }
-
-        if (id >= EFFECT_PARAM_BASE && id < EngineParamRange::THIRD_BASE)     // 400 up is the engine's third block
-        {
-            int offset = id - EFFECT_PARAM_BASE;
-            auto* chain = getInsertChain(trackIndex);
-            if (chain && offset / 4 < chain->getEffectCount())
-                if (auto* fx = const_cast<EffectChain*>(chain)->getEffect(offset / 4))
-                    return fx->getUserParameter(offset % 4);
+        if (isInsertParam(id))
+            return getInsertParameter(trackIndex, id);
+        if (id >= EFFECT_PARAM_BASE && id < EngineParamRange::THIRD_BASE)     // (the rest of the block: nobody's; 400 up is the engine's third block)
             return 0.0f;
-        }
 
         if (auto* e = getEngine(trackIndex))
             return e->getParameter(id);
@@ -551,8 +574,15 @@ public:
         }
         count = kept;
 
+        const auto* engine = getEngine(trackIndex);
         for (auto& [id, value] : step.paramLocks)
         {
+            // A cell whose change rebuilds data (a sample swap, a re-cut table) is no lock: the
+            // screen offers none (ParamPageScreen::canLock), and a pattern that holds one all the
+            // same (a file, an older build) does not rebuild tables on the audio thread.
+            if (engine != nullptr && EngineParamRange::contains(id) && engine->isRebuildParam(id))
+                continue;
+
             bool known = false;
             for (int i = 0; i < count; ++i)
                 known = known || locks[(size_t) i].id == id;
@@ -703,18 +733,22 @@ public:
     }
 
     // The track's effect blocks, for display; null until the track has an engine.
-    const TrackFx* getTrackFx(int trackIndex) const
-    {
-        return (trackIndex >= 0 && trackIndex < MAX_TRACKS) ? trackFx[(size_t) trackIndex].get() : nullptr;
-    }
 
-    // ================= Pad pressure routing: one router per track =================================
-    // Each engine reads its own track's router per voice. AT ROUTE edits the selected track's.
+    // ================= Pad pressure routing ========================================================
+    // A track's pressure routes are cells of its engine's router (PressureSlotParam, ids 773-784;
+    // ModRouter.h: THE PRESSURE SLOTS). They are part of the track's sound: set through
+    // setTrackParameter like any cell (AT ROUTE does), captured with the sound, and an engine is
+    // made with its defaults in them (the level on the synths, EXC on the resonator, DEC on a drum
+    // kit, nothing on the sampler), so nothing here has to seed or copy them.
+    // What follows is the routes as they were BEFORE the slots had cells - one AftertouchRouter a
+    // track, a Destination and a depth a route - for the projects that store them so, and for
+    // reading the slots that way.
     using PressureDest = AftertouchRouter::Destination;
     struct PressureDestInfo { PressureDest dest; const char* label; };
 
-    // The destinations an engine type really responds to (OFF not included), with the labels its
-    // own pages use. Returns how many.
+    // The destinations AT ROUTE offered each engine then (OFF not included), with the labels the
+    // engine's own pages use: a stored route outside this list was, and is, loaded as OFF.
+    // Returns how many.
     static int pressureDestinations(EngineType type, const PressureDestInfo*& list)
     {
         using D = PressureDest;
@@ -722,7 +756,9 @@ public:
                                                     { D::MacroTimbre, "PW" }, { D::WavePosition, "MIX" }, { D::FMDepth, "XMOD" } };
         static const PressureDestInfo fm[]      = { { D::Volume, "LEVL" }, { D::FilterCutoff, "CUT" }, { D::FMDepth, "FM" } };
         static const PressureDestInfo macro[]   = { { D::Volume, "LEVL" }, { D::FilterCutoff, "CUT" }, { D::Vibrato, "VIB" },
-                                                    { D::MacroTimbre, "TIMB" }, { D::WavePosition, "MORP" } };
+                                                    { D::MacroTimbre, "TIMB" }, { D::WavePosition, "MORP" }, { D::Excite, "BOW" } };
+        static const PressureDestInfo resonator[] = { { D::Excite, "EXC" }, { D::Volume, "LEVL" }, { D::FilterCutoff, "CUT" },
+                                                      { D::Vibrato, "VIB" } };
         static const PressureDestInfo table[]   = { { D::Volume, "LEVL" }, { D::FilterCutoff, "CUT" }, { D::Vibrato, "VIB" },
                                                     { D::WavePosition, "POS" } };
         static const PressureDestInfo waveSeq[] = { { D::Volume, "LEVL" }, { D::FilterCutoff, "CUT" } };
@@ -733,11 +769,12 @@ public:
         {
             case EngineType::UnifiedVoice: list = unified; return 6;
             case EngineType::FM:           list = fm;      return 3;
-            case EngineType::MacroOsc:     list = macro;   return 5;
+            case EngineType::MacroOsc:     list = macro;   return 6;
             case EngineType::Wavetable:    list = table;   return 4;
             case EngineType::WaveSeq:      list = waveSeq; return 2;
             case EngineType::Drum:         list = drum;    return 7;
-            case EngineType::Sampler:                                   // no pressure response
+            case EngineType::Resonator:    list = resonator; return 4;
+            case EngineType::Sampler:                                   // had no route then
             case EngineType::MIDITrack:                                 // sent on as poly pressure
             default:                       list = nullptr; return 0;
         }
@@ -753,7 +790,7 @@ public:
         return false;
     }
 
-    // How many routes a track of this engine has: a drum kit has one destination for all its pads.
+    // How many routes a track of this engine had then: a drum kit one destination for all its pads.
     static int pressureRouteCount(EngineType type)
     {
         const PressureDestInfo* list = nullptr;
@@ -761,26 +798,27 @@ public:
         return type == EngineType::Drum ? 1 : AftertouchRouter::MAX_ROUTES;
     }
 
-    // What a new track of this engine does with pressure: level on the synths (as before the
-    // routers were per track), decay on a drum kit, nothing where the engine has no response.
+    // How many pressure slots AT ROUTE shows for a track of this engine now: a drum kit has one
+    // (it goes to every pad), a MIDI track none (its pressure is sent on as poly pressure).
+    static int pressureSlotCount(EngineType type)
+    {
+        return type == EngineType::MIDITrack ? 0 : (type == EngineType::Drum ? 1 : (int) mod::Router::NUM_PRESSURE);
+    }
+
+    // What a new track of this engine does with pressure, as routes: the level on the synths,
+    // decay on a drum kit, the exciter on the resonator, nothing where the engine had no response.
+    // (The engines are made so: DestTable::pressureRoute in each engine's table.)
     static AftertouchRouter defaultPressureRouter(EngineType type)
     {
         AftertouchRouter r;
         r.clear();
         if (type == EngineType::Drum)
             r.setRoute(0, { PressureDest::DrumDecay, 1.0f, false });
+        else if (type == EngineType::Resonator)
+            r.setRoute(0, { PressureDest::Excite, 1.0f, false });
         else if (pressureRouteCount(type) > 0)
             r.setRoute(0, { PressureDest::Volume, 1.0f, false });
         return r;
-    }
-
-    AftertouchRouter& getPressureRouter(int trackIndex)
-    {
-        return trackRouters[(size_t) juce::jlimit(0, MAX_TRACKS - 1, trackIndex)];
-    }
-    const AftertouchRouter& getPressureRouter(int trackIndex) const
-    {
-        return trackRouters[(size_t) juce::jlimit(0, MAX_TRACKS - 1, trackIndex)];
     }
 
     EngineType getEngineTypeOf(int trackIndex) const
@@ -789,37 +827,74 @@ public:
         return e != nullptr ? e->getType() : EngineType::UnifiedVoice;
     }
 
-    // Set one route of a track. A destination the track's engine does not respond to becomes OFF.
+    // One pressure slot of a track, by its cells (dest: a value of the slot's DEST).
+    void setPressureSlot(int trackIndex, int slot, int dest, float amount, bool bipolar)
+    {
+        if (trackIndex < 0 || trackIndex >= MAX_TRACKS || slot < 0 || slot >= mod::Router::NUM_PRESSURE) return;
+        setTrackParameter(trackIndex, PressureSlotParam::id(slot, PressureSlotParam::DEST_OFFSET), (float) dest);
+        setTrackParameter(trackIndex, PressureSlotParam::id(slot, PressureSlotParam::AMT_OFFSET), amount);
+        setTrackParameter(trackIndex, PressureSlotParam::id(slot, PressureSlotParam::BIPOLAR_OFFSET), bipolar ? 1.0f : 0.0f);
+    }
+
+    // An old route into a track's slot. A destination AT ROUTE did not offer the track's engine
+    // then becomes OFF, as it did; the rest is what the engine says the Destination is
+    // (EngineBase::pressureDestOf).
     void setPressureRoute(int trackIndex, int routeIndex, AftertouchRouter::Route route)
     {
         if (trackIndex < 0 || trackIndex >= MAX_TRACKS) return;
-        if (!pressureDestinationValid(getEngineTypeOf(trackIndex), route.dest))
+        auto* e = getEngine(trackIndex);
+        if (e == nullptr || e->modRouter() == nullptr) return;
+        const auto type = e->getType();
+        // (a drum kit had one route: what a file holds beyond it never played)
+        if (! pressureDestinationValid(type, route.dest) || routeIndex >= juce::jmax(1, pressureRouteCount(type)))
             route.dest = PressureDest::Off;
-        auto& router = trackRouters[(size_t) trackIndex];
-        router.setRoute(routeIndex, route);
-        router.setRouteCount(AftertouchRouter::MAX_ROUTES);
-        pushDrumPressure(trackIndex);
+        e->setPressureRoute(routeIndex, route);
     }
 
-    // Replace all of a track's routes (project load, restoring a sound).
+    // All of a track's old routes (a project stored before the slots had cells).
     void setPressureRouter(int trackIndex, const AftertouchRouter& routes)
     {
-        if (trackIndex < 0 || trackIndex >= MAX_TRACKS) return;
         for (int i = 0; i < AftertouchRouter::MAX_ROUTES; ++i)
-        {
-            auto r = routes.effectiveRoute(i);
-            if (!pressureDestinationValid(getEngineTypeOf(trackIndex), r.dest))
-                r.dest = PressureDest::Off;
-            trackRouters[(size_t) trackIndex].setRoute(i, r);
-        }
-        trackRouters[(size_t) trackIndex].setRouteCount(AftertouchRouter::MAX_ROUTES);
-        pushDrumPressure(trackIndex);
+            setPressureRoute(trackIndex, i, routes.effectiveRoute(i));
     }
 
+    // The slots read as old routes: for the list a project still carries beside the cells, and for
+    // whoever asks "what does pressure do here" in those words. A slot aimed at something no
+    // Destination names (RESO, an effect's cell) reads OFF: the cells are the truth.
+    AftertouchRouter getPressureRouter(int trackIndex) const
+    {
+        AftertouchRouter out;
+        out.clear();
+        auto* e = getEngine(trackIndex);
+        const auto* r = e != nullptr ? e->modRouter() : nullptr;
+        if (r == nullptr) return out;
+        const auto type = e->getType();
+        for (int i = 0; i < AftertouchRouter::MAX_ROUTES; ++i)
+        {
+            const auto slot = r->pressureSlot(i);
+            auto dest = e->pressureDestAsRoute(slot.dest, [type](PressureDest d) { return pressureDestinationValid(type, d); });
+            if (dest == PressureDest::Off)
+                dest = e->pressureDestAsRoute(slot.dest);
+            if (dest != PressureDest::Off)
+                out.setRoute(i, { dest, slot.amount, slot.bipolar });
+        }
+        return out;
+    }
+
+    // The slots as the track's engine is made with them.
     void resetPressureRouter(int trackIndex)
     {
         if (trackIndex < 0 || trackIndex >= MAX_TRACKS) return;
-        trackRouters[(size_t) trackIndex] = defaultPressureRouter(getEngineTypeOf(trackIndex));
+        auto* e = getEngine(trackIndex);
+        const auto* r = e != nullptr ? e->modRouter() : nullptr;
+        if (r == nullptr) return;
+        for (int p = 0; p < mod::Router::NUM_PRESSURE; ++p)
+        {
+            const auto def = r->dests().pressureDefault(p);
+            e->setParameter(PressureSlotParam::id(p, PressureSlotParam::DEST_OFFSET), (float) def.dest);
+            e->setParameter(PressureSlotParam::id(p, PressureSlotParam::AMT_OFFSET), def.amount);
+            e->setParameter(PressureSlotParam::id(p, PressureSlotParam::BIPOLAR_OFFSET), 0.0f);
+        }
     }
 
     // ---- Recorded pressure -> parameter locks -------------------------------------------------------
@@ -850,11 +925,38 @@ public:
         return false;
     }
 
-    // Turns the pressure recorded on a step into parameter locks, through the track's routes as
-    // they are now: on each step the note spans, each routed cell is locked to where the lane's
-    // mean pressure over that step would hold it (the route's depth is how far towards the cell's
-    // top, or bottom when negative, full pressure goes). Steps without a trig become lock trigs:
-    // a trig with no note. Several notes on a synth step share the cells, so their lanes are
+    // The same for a pressure slot's DEST as it stands (a value of the slot's list): the cell an
+    // old route to it locked, or else the page cell the destination itself is (a slot aimed at
+    // RESO, at a macro's cell ...). False: nothing of it is a cell (VIB, EXC, PAN on a synth, an
+    // effect's cell).
+    bool pressureLockCellOf(int trackIndex, int slotDest, int note, ParamSpec& cell) const
+    {
+        auto* e = getEngine(trackIndex);
+        const auto* r = e != nullptr ? e->modRouter() : nullptr;
+        if (r == nullptr || slotDest <= 0) return false;
+        const auto type = e->getType();
+        const auto route = e->pressureDestAsRoute(slotDest, [type](PressureDest d) { return pressureDestinationValid(type, d); });
+        if (route != PressureDest::Off && pressureLockCell(trackIndex, route, note, cell))
+            return true;
+        // (also where the route's label is not the cell's: the macro oscillator names TIMB by its model)
+        if (type == EngineType::Drum || slotDest >= r->dests().size())
+            return false;       // (a kit's cells are a pad's own: only the seven above are known by pad)
+        const int id = r->dests()[slotDest].id;
+        if (id < 0 || e->isRebuildParam(id)) return false;
+        for (auto& page : e->getParamPages())
+            if (const auto* spec = page.find(id); spec != nullptr && spec->isValid() && ! spec->isDiscrete())
+            {
+                cell = *spec;
+                return true;
+            }
+        return false;
+    }
+
+    // Turns the pressure recorded on a step into parameter locks, through the track's pressure
+    // slots as they are now: on each step the note spans, each routed cell is locked to where the
+    // lane's mean pressure over that step would hold it (the slot's amount is how far towards the
+    // cell's top, or bottom when negative, full pressure goes). Steps without a trig become lock
+    // trigs: a trig with no note. Several notes on a synth step share the cells, so their lanes are
     // averaged; drum pads have their own cells. The lanes are then removed. Nothing is changed
     // when no route can be locked. Not the audio thread.
     struct PressureBake { int routes = 0, locked = 0, steps = 0; };
@@ -866,14 +968,16 @@ public:
         if (!source.hasPressure()) return result;
 
         const auto type = getEngineTypeOf(trackIndex);
-        const auto& router = getPressureRouter(trackIndex);
+        auto* engine = getEngine(trackIndex);
+        const auto* slots = engine != nullptr ? engine->modRouter() : nullptr;
+        if (slots == nullptr) return result;
         const int span = juce::jlimit(1, track.length, (int) std::ceil(source.length - 0.001f));
         const bool drum = type == EngineType::Drum;
 
-        for (int r = 0; r < pressureRouteCount(type); ++r)
+        for (int r = 0; r < pressureSlotCount(type); ++r)
         {
-            const auto route = router.effectiveRoute(r);
-            if (route.dest == PressureDest::Off || route.depth == 0.0f) continue;
+            const auto route = slots->pressureSlot(r);
+            if (route.dest <= 0 || route.amount == 0.0f) continue;
             ++result.routes;
             bool locked = false;
             // One pass per cell: a drum pad's own, or the one all the synth's notes share.
@@ -881,7 +985,7 @@ public:
             {
                 if (source.notes[first].lane.empty()) continue;
                 ParamSpec cell;
-                if (!pressureLockCell(trackIndex, route.dest, source.notes[first].pitch, cell)) { if (drum) continue; break; }
+                if (!pressureLockCellOf(trackIndex, route.dest, source.notes[first].pitch, cell)) { if (drum) continue; break; }
                 locked = true;
                 const auto stored = track.soundParams.find(cell.id);
                 const float base = cell.clamp(stored != track.soundParams.end() ? stored->second
@@ -901,7 +1005,7 @@ public:
                             if (drum) break;
                         }
                     mean = juce::jlimit(0.0f, 1.0f, mean / (float) juce::jmax(1, lanes) * source.pressureScale);
-                    const float mod = juce::jlimit(-1.0f, 1.0f, (route.bipolar ? mean * 2.0f - 1.0f : mean) * route.depth);
+                    const float mod = juce::jlimit(-1.0f, 1.0f, (route.bipolar ? mean * 2.0f - 1.0f : mean) * route.amount);
                     const float norm = mod >= 0.0f ? baseNorm + mod * (1.0f - baseNorm) : baseNorm + mod * baseNorm;
                     auto& target = track.getStep(stepIndex + k);
                     target.paramLocks[cell.id] = cell.fromNorm(norm);
@@ -922,34 +1026,6 @@ public:
             source.clearPressureLanes();
         }
         return result;
-    }
-
-    // Legacy: one router for the whole instrument (what the app passed before the routers were per
-    // track). It is no longer read by any engine. While it is set, a later change to it is copied
-    // to every track whose engine uses a router (drum kits keep their own), so code that still
-    // edits the one router keeps working. New code uses the per-track functions above.
-    void setAftertouchRouter(const AftertouchRouter* router)
-    {
-        legacyRouter = router;
-        if (router != nullptr)
-            legacySnapshot = *router;
-    }
-
-    // The legacy router was set to something that is already in the tracks (a project load).
-    void adoptLegacyRouter()
-    {
-        if (legacyRouter != nullptr)
-            legacySnapshot = *legacyRouter;
-    }
-
-    void syncLegacyRouter()
-    {
-        if (legacyRouter == nullptr || legacyRouter->sameRoutesAs(legacySnapshot))
-            return;
-        legacySnapshot = *legacyRouter;
-        for (int t = 0; t < (int) engines.size() && t < MAX_TRACKS; ++t)
-            if (engines[(size_t) t] && engines[(size_t) t]->getType() != EngineType::Drum)
-                setPressureRouter(t, legacySnapshot);
     }
 
     // The sequencer's recorded pad pressure goes to the note's voice like a live pad's (the app
@@ -1057,20 +1133,98 @@ public:
     // INSERT_EXTRA_BASE + slot * 4 + n: the effect's cells beyond its four (EffectBase::getExtraSpec; TRK FX page FX2).
     static constexpr int INSERT_EXTRA_BASE = 312;
     static bool isInsertExtraParam(int id) { return id >= INSERT_EXTRA_BASE && id < INSERT_EXTRA_BASE + MAX_INSERTS_PER_TRACK * EffectBase::MAX_EXTRAS; }
+    // Any id of an insert slot (its four cells, its switches, its extra cells): what a chain without a track answers to.
+    static bool isInsertParam(int id)
+    {
+        return isInsertSwitchParam(id) || isInsertExtraParam(id)
+            || (id >= EFFECT_PARAM_BASE && id < EFFECT_PARAM_BASE + MAX_INSERTS_PER_TRACK * 4);
+    }
+
+    // ---- Who listens to whom ------------------------------------------------------------------
+    // The stored parameter id that holds the KEY / SRC choice for a given effect type in a given
+    // insert slot, or -1 if the type has no KEY cell. Used by MultiPreset to remap every keyed
+    // effect (CMP's KEY, DUCK's SRC, TRNS's KEY, WAH's KEY, every LFO effect's KEY, and
+    // FilterEffect's KEY), not only DUCK's SRC.
+    static int effectKeyParamId(EffectType type, int slot)
+    {
+        // Cache: computed once per effect type, stored as the cell index (0-7) or -1.
+        static std::array<int, (size_t) EffectType::NumEffectTypes> cache;
+        static bool cached = false;
+        if (! cached)
+        {
+            cache.fill(-1);
+            for (int t = 0; t < (int) EffectType::NumEffectTypes; ++t)
+            {
+                auto fx = createEffect((EffectType) t);
+                if (! fx) continue;
+                // Check the main cells (0-3) and the extras (4-7) for a keyNames() spec.
+                for (int c = 0; c < 4; ++c)
+                {
+                    auto spec = fx->getParamSpec(c);
+                    if (spec.isValid() && spec.choices == dyn::keyNames())
+                    { cache[(size_t) t] = c; break; }
+                }
+                if (cache[(size_t) t] < 0)
+                {
+                    for (int c = 0; c < EffectBase::MAX_EXTRAS; ++c)
+                    {
+                        auto spec = fx->getExtraSpec(c);
+                        if (spec.isValid() && spec.choices == dyn::keyNames())
+                        { cache[(size_t) t] = 4 + c; break; }
+                    }
+                }
+            }
+            cached = true;
+        }
+        const int cell = cache[(size_t) type];
+        if (cell < 0 || slot < 0 || slot >= MAX_INSERTS_PER_TRACK) return -1;
+        return cell < 4 ? EFFECT_PARAM_BASE + slot * 4 + cell
+                        : INSERT_EXTRA_BASE + slot * 4 + (cell - 4);
+    }
+
+    // All tracks listened to by ANYTHING: every track's IN source and the keySource() of every
+    // insert, plus the master chain's, every send bus's and every PERF pad's. A bitmask (bit t set
+    // = track t is listened to): the full trackFeeds mask. MIDI tracks are excluded: a muted MIDI
+    // track sends its notes to an instrument outside, which no fader here could shut. Audio thread.
+    uint32_t allListenedTo() const
+    {
+        uint32_t mask = 0;
+        auto mark = [&](int src, int self)
+        {
+            if (src >= 0 && src != self && src < MAX_TRACKS && src < (int) engines.size() && engines[(size_t) src]
+                && engines[(size_t) src]->getType() != EngineType::MIDITrack)
+                mask |= (1u << (uint32_t) src);
+        };
+        for (int t = 0; t < (int) engines.size() && t < MAX_TRACKS; ++t)
+        {
+            if (! engines[(size_t) t]) continue;
+            mark(trackInputSource(t), t);
+            if (t < (int) trackInsertChains.size())
+            {
+                auto& chain = trackInsertChains[(size_t) t];
+                for (int i = 0; i < chain.getEffectCount(); ++i)
+                    mark(chain.getEffect(i)->keySource(), t);
+            }
+        }
+        auto keyFeeds = [&mark](const EffectChain& chain, int self)
+        {
+            for (int i = 0; i < chain.getEffectCount(); ++i)
+                mark(chain.getEffect(i)->keySource(), self);
+        };
+        keyFeeds(masterChain, -1);
+        for (auto& bus : sendBuses)
+            keyFeeds(bus.getChain(), -1);
+        perfFx.eachKeyTrack(mark);
+        return mask;
+    }
 
     void addEngine(int trackIndex, std::shared_ptr<EngineBase> engine)
     {
         const StructureLock lock(structureMutex);
         if (trackIndex >= (int) engines.size())
             engines.resize((size_t) trackIndex + 1);
-        if (trackIndex >= 0 && trackIndex < MAX_TRACKS)
-            ensureTrackFx(trackIndex);
-        if (engine && trackIndex >= 0 && trackIndex < MAX_TRACKS)
-        {
-            trackRouters[(size_t) trackIndex] = defaultPressureRouter(engine->getType());
-            engine->setAftertouchRouter(&trackRouters[(size_t) trackIndex]);
-        }
         engines[(size_t) trackIndex] = std::move(engine);
+        adoptUserShape(trackIndex);
     }
 
     EngineBase* getEngine(int trackIndex) const
@@ -1098,6 +1252,8 @@ public:
                 return std::make_shared<DrumEngine>();
             case EngineType::MIDITrack:
                 return std::make_shared<MIDITrackEngine>();
+            case EngineType::Resonator:
+                return std::make_shared<ResonatorEngine>(maxVoices);
             case EngineType::UnifiedVoice:
             default:
                 return std::make_shared<UnifiedVoiceEngine>(maxVoices);
@@ -1119,14 +1275,8 @@ public:
         auto newEngine = createEngine(type);
         if (currentSampleRate > 0)
             newEngine->prepareToPlay(currentSampleRate, currentBlockSize);
-        if (trackIndex < MAX_TRACKS)
-        {
-            // A different engine starts from its own default routing; the same engine rebuilt
-            // (a preset load) keeps the track's routes.
-            if (!current || current->getType() != type)
-                trackRouters[(size_t) trackIndex] = defaultPressureRouter(type);
-            newEngine->setAftertouchRouter(&trackRouters[(size_t) trackIndex]);
-        }
+        // (A new engine has its own default pressure routes in its slots: they are part of the
+        // sound, and whoever loads one sets them with the rest of its parameters.)
         newEngine->setTempo(lastTempo);
 
         // The audio thread may still be inside the old engine: keep it alive for a while.
@@ -1137,6 +1287,7 @@ public:
                 retiredEngines.erase(retiredEngines.begin());
         }
         engines[(size_t) trackIndex] = std::move(newEngine);
+        adoptUserShape(trackIndex);
         declickTrack(trackIndex, true);
 
         // The old engine's stored parameters mean nothing to the new one (every engine has its
@@ -1159,7 +1310,8 @@ public:
 
     // PRESET audition: a fresh engine of `type` takes the track and the engine that was there is
     // handed back, silenced but otherwise untouched, to be returned with unparkEngine. Unlike
-    // setEngineType nothing stored is changed: the caller owns Track::soundParams and the routes.
+    // setEngineType nothing stored is changed: the caller owns Track::soundParams. (The pressure
+    // routes are the engines' own cells: the fresh one has its defaults, the parked one keeps its.)
     std::shared_ptr<EngineBase> parkEngine(int trackIndex, EngineType type)
     {
         const StructureLock lock(structureMutex);
@@ -1170,16 +1322,12 @@ public:
         if (currentSampleRate > 0)
             fresh->prepareToPlay(currentSampleRate, currentBlockSize);
         if (trackIndex < MAX_TRACKS)
-        {
-            if (!parked || parked->getType() != type)
-                trackRouters[(size_t) trackIndex] = defaultPressureRouter(type);
-            fresh->setAftertouchRouter(&trackRouters[(size_t) trackIndex]);
             activeLockCount[(size_t) trackIndex] = 0;
-        }
         fresh->setTempo(lastTempo);
         if (parked)
             parked->allNotesOff();
         engines[(size_t) trackIndex] = std::move(fresh);
+        adoptUserShape(trackIndex);
         declickTrack(trackIndex, true);
         return parked;
     }
@@ -1199,76 +1347,87 @@ public:
                 retiredEngines.erase(retiredEngines.begin());
         }
         if (trackIndex < MAX_TRACKS)
-        {
-            parked->setAftertouchRouter(&trackRouters[(size_t) trackIndex]);
             activeLockCount[(size_t) trackIndex] = 0;
-        }
         parked->setTempo(lastTempo);
         parked->allNotesOff();
         engines[(size_t) trackIndex] = std::move(parked);
+        adoptUserShape(trackIndex);
         declickTrack(trackIndex, true);
     }
 
     int getSendCount() const { return (int) sendBuses.size(); }
 
+    // One more send bus with one effect on it (-1: there are MAX_SENDS already), and one taken
+    // away. What is on a bus is its chain's: add / set / removeInsertEffect with sendTrack(bus).
     int addSendBus(EffectType type)
     {
+        const StructureLock lock(structureMutex);
         if ((int) sendBuses.size() >= MAX_SENDS) return -1;
         sendBuses.emplace_back();
-        sendBusTypes.push_back(type);
         int idx = (int) sendBuses.size() - 1;
-        auto fx = createEffect(type);
-        if (fx)
-        {
-            fx->setMix(1.0f);
-            if (currentSampleRate > 0)
-                fx->prepare(currentSampleRate, currentBlockSize);
-            sendBuses[idx].getChain().addEffect(std::move(fx));
-        }
-        sendBuses[idx].setSendLevel(1.0f);
+        sendBuses[(size_t) idx].setSendLevel(1.0f);
         if (currentSampleRate > 0)
-            sendBuses[idx].prepare(currentSampleRate, currentBlockSize);
+            sendBuses[(size_t) idx].prepare(currentSampleRate, currentBlockSize);
+        addInsertEffect(sendTrack(idx), type);
         return idx;
     }
 
     void removeSendBus(int index)
     {
-        if (index < 0 || index >= (int) sendBuses.size()) return;
-        sendBuses.erase(sendBuses.begin() + index);
-        sendBusTypes.erase(sendBusTypes.begin() + index);
-    }
-
-    void setSendBusEffect(int index, EffectType type)
-    {
         const StructureLock lock(structureMutex);
         if (index < 0 || index >= (int) sendBuses.size()) return;
-        auto& bus = sendBuses[index];
-        while (bus.getChain().getEffectCount() > 0)
-            bus.getChain().removeEffect(0);
-        auto fx = createEffect(type);
-        if (fx)
-        {
-            fx->setMix(1.0f);
-            if (currentSampleRate > 0)
-                fx->prepare(currentSampleRate, currentBlockSize);
-            bus.getChain().addEffect(std::move(fx));
-        }
-        sendBusTypes[index] = type;
+        sendBuses.erase(sendBuses.begin() + index);
+        declickTrack(sendTrack(index), false);
     }
 
-    EffectType getSendBusType(int index) const
+    // The type of a send's first effect (what the TRACK page's BUS cells show and choose); a send
+    // with nothing on it: `none`.
+    EffectType getSendBusType(int index, EffectType none = EffectType::ReverbEffect) const
     {
-        if (index < 0 || index >= (int) sendBusTypes.size())
-            return EffectType::ReverbEffect;
-        return sendBusTypes[index];
+        EffectType type = none;
+        getInsertEffectType(sendTrack(index), 0, type);
+        return type;
     }
+
+    // The sends as a new project has them: two, a reverb (DCAY 0.6, DAMP 0.4) and a delay
+    // (0.375 s, FDBK 0.35), each alone on its bus with its mix at 1.
+    void resetSendBuses()
+    {
+        const StructureLock lock(structureMutex);
+        sendBuses.resize(DEFAULT_NUM_SENDS);
+        buildDefaultSends();
+        for (auto& bus : sendBuses)
+            if (currentSampleRate > 0)
+                bus.prepare(currentSampleRate, currentBlockSize);
+        declickTrack(sendTrack(0), false);
+    }
+    // The type a new project's send holds (a file from before the sends stored their chains names
+    // one type a bus: that type here means the bus as a new project has it).
+    static EffectType defaultSendType(int bus) { return bus == SEND_DELAY ? EffectType::DelayEffect : EffectType::ReverbEffect; }
 
     SendBus& getSendBus(int index) { return sendBuses[index]; }
     const SendBus& getSendBus(int index) const { return sendBuses[index]; }
 
-    ParametricEQ& getMasterEQ() { return masterEQ; }
-    Compressor& getMasterComp() { return masterComp; }
-    Limiter& getMasterLimiter() { return masterLimiter; }
+    // The first effect of a type in the master chain (the MASTR page's EQ, CMP and LMT are
+    // these), and its slot; null / -1 when the chain holds none.
+    int getMasterSlot(EffectType type) const
+    {
+        for (int i = 0; i < masterChain.getEffectCount(); ++i)
+            if (masterChain.getKind(i) == (int) type) return i;
+        return -1;
+    }
+    EffectBase* getMasterEffect(EffectType type)
+    {
+        const int slot = getMasterSlot(type);
+        return slot >= 0 ? masterChain.getEffect(slot) : nullptr;
+    }
+    // The master chain as a new project has it: EQ (flat), CMP (0 dB, 1:1: nothing), LMT.
+    void resetMasterChain()
+    {
+        const StructureLock lock(structureMutex);
+        buildDefaultMasterChain();
+        declickTrack(MASTER_TRACK, false);
+    }
 
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override
     {
@@ -1296,13 +1455,25 @@ public:
         metronome.prepare(currentSampleRate);
         trackTapL.assign((size_t) MAX_TRACKS, std::vector<float>((size_t) currentBlockSize, 0.0f));
         trackTapR.assign((size_t) MAX_TRACKS, std::vector<float>((size_t) currentBlockSize, 0.0f));
+        for (int t = 0; t < MAX_TRACKS; ++t)
+        {
+            tapLeft[(size_t) t] = trackTapL[(size_t) t].data();
+            tapRight[(size_t) t] = trackTapR[(size_t) t].data();
+        }
         scratchR.resize((size_t) currentBlockSize, 0.0f);
+        trackInL.assign((size_t) MAX_TRACKS, std::vector<float>((size_t) currentBlockSize, 0.0f));
+        trackInR.assign((size_t) MAX_TRACKS, std::vector<float>((size_t) currentBlockSize, 0.0f));
+        for (auto& in : trackIn)
+        {
+            in.follower.reset();
+            in.setRate = 0.0f;          // the follower's times are made again for this sample rate
+            in.lastSource = -1;
+            in.lastLevel = in.lastMix = in.lastRing = 0.0f;
+        }
 
         for (auto& chain : trackInsertChains)
             chain.prepare(currentSampleRate, currentBlockSize);
-
-        for (auto& fx : trackFx)
-            if (fx) fx->prepare(currentSampleRate, currentBlockSize);
+        masterChain.prepare(currentSampleRate, currentBlockSize);
 
         for (auto& bus : sendBuses)
             bus.prepare(currentSampleRate, currentBlockSize);
@@ -1310,10 +1481,6 @@ public:
             const StructureLock lock(structureMutex);
             perfFx.prepare(currentSampleRate, currentBlockSize);
         }
-
-        masterEQ.setSampleRate(currentSampleRate);
-        masterComp.setSampleRate(currentSampleRate);
-        masterLimiter.setSampleRate(currentSampleRate);
 
         for (auto& pair : engineDeclick)
             for (auto& d : pair) d.setSampleRate(currentSampleRate);
@@ -1420,8 +1587,6 @@ public:
             skippedBlocks.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        syncLegacyRouter();
-
         // Shift + Play asked for silence: every note is let go and every effect's memory is emptied
         // (send buses, inserts), here on the audio thread, between two blocks.
         if (silenceRequested.exchange(false, std::memory_order_relaxed))
@@ -1454,6 +1619,15 @@ public:
         if (midiClock && sequencer)
             followExternalClock();
 
+        // Which tracks anything listens to (track input, keyed inserts on any chain or PERF pad).
+        // Such a track goes on playing while muted; its fader is shut instead (below), so it feeds.
+        const uint32_t listenMask = allListenedTo();
+        for (int t = 0; t < MAX_TRACKS; ++t)
+            trackFeeds[(size_t) t] = (listenMask & (1u << (uint32_t) t)) != 0;
+        if (sequencer)
+            for (int t = 0; t < MAX_TRACKS; ++t)
+                sequencer->setTrackFeeds(t, trackFeeds[(size_t) t]);
+
         if (sequencer)
         {
             const float tempo = sequencer->getTempo();
@@ -1483,6 +1657,18 @@ public:
         for (auto& bus : sendBuses)
             bus.clearBuffer();
 
+        // What an effect may listen to beside its own sound (EffectBase::keySource): any track's
+        // sound after its inserts. The mix and the sends are handed this; a track's inserts and
+        // its PERF pads the same with the track's input and the track's own number.
+        KeyFeed masterKeys;
+        if ((int) trackTapL.size() >= MAX_TRACKS && (int) trackTapL[0].size() >= numSamples)
+        {
+            masterKeys.tapLeft = tapLeft.data();
+            masterKeys.tapRight = tapRight.data();
+            masterKeys.taps = MAX_TRACKS;
+            masterKeys.frames = numSamples;
+        }
+
         for (int t = 0; t < (int) engines.size(); ++t)
         {
             auto& e = engines[(size_t) t];
@@ -1494,6 +1680,11 @@ public:
             float* scratch[2] = { scratchL.data(), scratchR.data() };
             juce::AudioBuffer<float> trackBuf(scratch, 2, numSamples);
             trackMidi.clear();
+
+            // The track's input: its source's sound (after that track's inserts, before its fader:
+            // this block's from a lower-numbered track, the block before's from a higher one).
+            const TrackInput in = t < MAX_TRACKS ? readTrackInput(t, numSamples) : TrackInput();
+            e->setAudioInput(in.view);
             e->processBlock(trackBuf, trackMidi);
 
             if (t < MAX_TRACKS)
@@ -1512,51 +1703,49 @@ public:
             // The last line: a number that is not one (a voice gone wrong) must not get into the
             // memories of the effects, the sends or the speakers. The block is dropped and the
             // engine's notes are let go. Counted, so that it is seen (getNonFiniteBlocks).
-            if (! blockIsFinite(scratchL.data(), scratchR.data(), numSamples))
+            if (droppedUnlessFinite(scratchL.data(), scratchR.data(), numSamples))
             {
-                std::fill(scratchL.begin(), scratchL.begin() + numSamples, 0.0f);
-                std::fill(scratchR.begin(), scratchR.begin() + numSamples, 0.0f);
                 e->allNotesOff();
-                nonFiniteBlocks.fetch_add(1, std::memory_order_relaxed);
                 nonFiniteTrack.store(t, std::memory_order_relaxed);
             }
 
             if (!trackMidi.isEmpty() && midiOutput)
                 midiOutput->sendBlockOfMessagesNow(trackMidi);
 
-            // The track's own effect blocks (DIRT, TALK, MODFX), then its insert slots.
-            if (t < MAX_TRACKS && trackFx[(size_t) t])
-                trackFx[(size_t) t]->process(scratchL.data(), scratchR.data(), numSamples);
+            // MODE of the input: RING multiplies what the engine made by it, MIX adds it. Both
+            // before the track's effects, so the track is a bus for its source.
+            if (t < MAX_TRACKS)
+                mixTrackInput(t, in, scratchL.data(), scratchR.data(), numSamples);
 
-            if (t < (int) trackInsertChains.size()
-                && trackInsertChains[(size_t) t].getEffectCount() > 0)
+            // What the engine's router does to the cells of the track's effects (E4), before they run.
+            if (t < MAX_TRACKS)
+                moveTrackEffects(t, *e);
+
+            // What an effect on this track may listen to (EffectBase::keySource): the track's
+            // input, or a track's sound after its inserts (this block's from a lower-numbered
+            // track, the block before's from a higher one).
+            KeyFeed keys = masterKeys;
+            keys.inLeft = in.view.left;
+            keys.inRight = in.view.right;
+            keys.inFrames = in.view.frames;
+            keys.self = t;
+
+            bool worked = false;
+            if (t < (int) trackInsertChains.size() && trackInsertChains[(size_t) t].getEffectCount() > 0)
             {
-                // A DUCK effect listening to another track gets that track's latest block (this
-                // block for a lower-numbered track, the previous one otherwise).
                 auto& chain = trackInsertChains[(size_t) t];
-                const float bpm = sequencer ? sequencer->getTempo() : 120.0f;
-                for (int i = 0; i < chain.getEffectCount(); ++i)
-                    if (auto* fx = chain.getEffect(i))
-                        fx->setTempo(bpm);      // synced times and rates follow tempo changes
-                for (int i = 0; i < chain.getEffectCount(); ++i)
-                    if (auto* duck = dynamic_cast<SidechainInsert*>(chain.getEffect(i)))
-                    {
-                        const int src = duck->getSidechainTrack();
-                        if (src >= 0 && src < (int) trackTapL.size() && src != t
-                            && (int) trackTapL[(size_t) src].size() >= numSamples)
-                            duck->setSidechainBuffers(trackTapL[(size_t) src].data(), trackTapR[(size_t) src].data());
-                    }
-                chain.processStereo(scratchL.data(), scratchR.data(), numSamples);
+                prepareChainBlock(chain, sequencer ? sequencer->getTempo() : 120.0f, e->getLastNoteHz());
+                chain.processStereo(scratchL.data(), scratchR.data(), numSamples, &keys);
+                worked = true;
+            }
 
-                // An insert effect gone wrong: its block is dropped and the chain's memory emptied.
-                if (! blockIsFinite(scratchL.data(), scratchR.data(), numSamples))
-                {
-                    std::fill(scratchL.begin(), scratchL.begin() + numSamples, 0.0f);
-                    std::fill(scratchR.begin(), scratchR.begin() + numSamples, 0.0f);
-                    chain.reset();
-                    nonFiniteBlocks.fetch_add(1, std::memory_order_relaxed);
-                    nonFiniteTrack.store(t + 1000, std::memory_order_relaxed);
-                }
+            // A block or an insert gone wrong: the block is dropped and the chain's memory emptied
+            // before it can reach the tap that other tracks listen to, the sends or the sum.
+            if (worked && droppedUnlessFinite(scratchL.data(), scratchR.data(), numSamples))
+            {
+                if (t < (int) trackInsertChains.size())
+                    trackInsertChains[(size_t) t].reset();
+                nonFiniteTrack.store(t + 1000, std::memory_order_relaxed);
             }
             if (t < (int) trackTapL.size() && (int) trackTapL[(size_t) t].size() >= numSamples)
             {
@@ -1579,7 +1768,10 @@ public:
             if (t < MAX_TRACKS)
             {
                 auto& m = trackMix[(size_t) t];
-                const float vol = m.volume.load();
+                // A track that another listens to plays on while muted (it still feeds): here is
+                // where it falls silent, after the tap its listeners take.
+                const bool shut = trackFeeds[(size_t) t] && sequencer != nullptr && ! sequencer->isTrackAudible(t);
+                const float vol = shut ? 0.0f : m.volume.load();
                 const float pan = juce::jlimit(-1.0f, 1.0f, m.pan.load());
                 const float targetL = vol * (pan > 0.0f ? 1.0f - pan : 1.0f);
                 const float targetR = vol * (pan < 0.0f ? 1.0f + pan : 1.0f);
@@ -1611,27 +1803,40 @@ public:
             }
 
             // The PERF pads that act on this track: after its fader and its sends.
-            perfFx.process(t, scratchL.data(), scratchR.data(), numSamples);
+            perfFx.process(t, scratchL.data(), scratchR.data(), numSamples, &keys);
 
             juce::FloatVectorOperations::add(mainL, scratchL.data(), numSamples);
             juce::FloatVectorOperations::add(mainR, scratchR.data(), numSamples);
         }
 
-        for (auto& bus : sendBuses)
+        // The mix and the sends have no input of their own; what an effect on them listens to is
+        // a track's sound of this block (a compressor keyed from the kick: the whole mix ducks
+        // under it). A send's chain is an insert chain run on what the tracks sent; a send with
+        // nothing on it adds nothing (not a second copy of the dry sound).
+        for (size_t b = 0; b < sendBuses.size(); ++b)
         {
-            bus.process();
+            auto& bus = sendBuses[b];
+            if (bus.getChain().getEffectCount() == 0)
+                continue;
+            prepareChainBlock(bus.getChain(), sequencer ? sequencer->getTempo() : 120.0f, 0.0f);
+            bus.process(&masterKeys, numSamples);       // (the samples played, not the prepared length)
+            // A send gone wrong is dropped on its own bus, its chain emptied: the tracks play on,
+            // and nothing of it reaches the sum or stays in the chain's memory.
+            if (droppedUnlessFinite(bus.left(), bus.right(), juce::jmin(numSamples, bus.frames())))
+            {
+                bus.getChain().reset();
+                nonFiniteTrack.store(2000 + (int) b, std::memory_order_relaxed);
+            }
             bus.mixInto(mainL, mainR, numSamples);
         }
 
-        // The PERF pads that act on the whole mix: before the master EQ, compressor and limiter.
-        perfFx.process(PerfFx::ON_MASTER, mainL, mainR, numSamples);
+        // The PERF pads that act on the whole mix: before the master chain.
+        perfFx.process(PerfFx::ON_MASTER, mainL, mainR, numSamples, &masterKeys);
 
-        for (int i = 0; i < numSamples; ++i)
-        {
-            masterEQ.process(mainL[i], mainR[i]);
-            masterComp.process(mainL[i], mainR[i]);
-            masterLimiter.process(mainL[i], mainR[i]);
-        }
+        // The master chain: an insert chain like a track's, a block at a time (as a new project
+        // has it: EQ, compressor, limiter).
+        prepareChainBlock(masterChain, sequencer ? sequencer->getTempo() : 120.0f, 0.0f);
+        masterChain.processStereo(mainL, mainR, numSamples, &masterKeys);
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -1641,16 +1846,11 @@ public:
 
         // The same last line for the sum (a send or the master section gone wrong): silence, and
         // the master section's memory emptied.
-        if (! blockIsFinite(mainL, mainR, numSamples))
+        if (droppedUnlessFinite(mainL, mainR, numSamples))
         {
-            juce::FloatVectorOperations::clear(mainL, numSamples);
-            juce::FloatVectorOperations::clear(mainR, numSamples);
-            masterEQ.reset();
-            masterComp.reset();
-            masterLimiter.reset();
+            masterChain.reset();
             for (auto& bus : sendBuses)
                 bus.getChain().reset();
-            nonFiniteBlocks.fetch_add(1, std::memory_order_relaxed);
         }
 
         if (silenceSamplesLeft > 0)
@@ -1664,7 +1864,7 @@ public:
 
         // Where the output was shut (above) or a block was skipped (a rebuild), the jump to and
         // from silence is carried off over 2 ms. Costs nothing while neither happens.
-        if (masterSkipped)
+        if (masterDeclickArm.exchange(false, std::memory_order_relaxed) || masterSkipped)
         {
             masterSkipped = false;
             for (auto& d : masterDeclick)
@@ -1718,30 +1918,38 @@ public:
     // 3 high gain (EQ); 4 threshold, 5 ratio, 6 make-up (compressor); 7 ceiling (limiter).
     static constexpr int NUM_MASTER_PARAMS = 8;
 
-    void setMasterParam(int index, float value)
+    // Each is a cell of the first EQ, CMP or LMT in the master chain (a view of the chain: the
+    // same cells are reached with setTrackParameter(MASTER_TRACK, EFFECT_PARAM_BASE + ...)); a
+    // chain without that effect has no such value.
+    // What each is at rest: a project without stored values, or a chain without the effect.
+    static constexpr float MASTER_DEFAULTS[NUM_MASTER_PARAMS] = { 0, 0, 1000, 0, 0, 1, 0, -0.3f };
+    struct MasterCell { EffectType type; int cell; };
+    static MasterCell masterCell(int index)
     {
         switch (index)
         {
-            case 0: case 1: case 2: case 3: masterEQ.setParameter(index, value); break;
-            case 4: masterComp.setThreshold(value); break;
-            case 5: masterComp.setRatio(value); break;
-            case 6: masterComp.setMakeupGain(value); break;
-            case 7: masterLimiter.setCeiling(value); break;
-            default: break;
+            case 0: case 1: case 2: case 3: return { EffectType::EQEffect, index };
+            case 4: return { EffectType::CompressorEffect, 0 };     // THR
+            case 5: return { EffectType::CompressorEffect, 1 };     // RATI
+            case 6: return { EffectType::CompressorEffect, 3 };     // MAKE
+            case 7: return { EffectType::LimiterEffect, 0 };        // CEIL
+            default: return { EffectType::NumEffectTypes, 0 };
         }
+    }
+
+    void setMasterParam(int index, float value)
+    {
+        const MasterCell c = masterCell(index);
+        if (auto* fx = getMasterEffect(c.type))
+            fx->setParameter(c.cell, value);
     }
 
     float getMasterParam(int index) const
     {
-        switch (index)
-        {
-            case 0: case 1: case 2: case 3: return masterEQ.getParameter(index);
-            case 4: return masterComp.getThreshold();
-            case 5: return masterComp.getRatio();
-            case 6: return masterComp.getMakeupGain();
-            case 7: return masterLimiter.getCeiling();
-            default: return 0.0f;
-        }
+        const MasterCell c = masterCell(index);
+        if (auto* fx = const_cast<AudioEngine*>(this)->getMasterEffect(c.type))
+            return fx->getParameter(c.cell);
+        return index >= 0 && index < NUM_MASTER_PARAMS ? MASTER_DEFAULTS[index] : 0.0f;
     }
 
     void setMasterLevel(float level) { if (std::isfinite(level)) masterLevel = juce::jlimit(0.0f, 1.0f, level); }   // (MVOL is 0..1; a file may hold anything)
@@ -1800,6 +2008,8 @@ private:
     {
         if (trackIndex < 0 || RangeParam::isRangeParam(id))
             return;     // range ends are data for the parameter screen, not sound parameters
+        if (isChainTrack(trackIndex) && ! isInsertParam(id))
+            return;     // the master chain and the sends have insert slots and nothing else of a track
 
         // Not a number, or infinite (a damaged file, a lock made from one): no parameter has such a
         // value, and jlimit / std::clamp would hand a NaN on to the mixer or an engine.
@@ -1818,25 +2028,14 @@ private:
             return;
         }
 
+        // Ids 240-263 (the old TrackFx blocks) are no longer a fixed section: ignored.
         if (TrackFxParam::isTrackFxParam(id))
-        {
-            if (trackIndex < MAX_TRACKS)
-                ensureTrackFx(trackIndex).set(id, value);
             return;
-        }
 
-        if (isInsertSwitchParam(id))
+        // An insert slot's cell, switch or extra cell: of the track's chain, the mix's or a send's.
+        if (isInsertParam(id))
         {
-            const int kind = (id - INSERT_ON_BASE) / MAX_INSERTS_PER_TRACK;
-            const int slot = (id - INSERT_ON_BASE) % MAX_INSERTS_PER_TRACK;
-            auto* chain = getInsertChain(trackIndex);
-            if (auto* fx = (chain && slot < chain->getEffectCount()) ? chain->getEffect(slot) : nullptr)
-            {
-                if (kind == 0)      fx->setEnabled(value > 0.5f);
-                else if (kind == 1) fx->setMix(juce::jlimit(0.0f, 1.0f, value));
-                else if (kind == 2) { fx->setTempo(sequencer ? sequencer->getTempo() : 120.0f); fx->setSync(value > 0.5f); }
-                else                fx->setSyncDivision((int) std::lround(value));
-            }
+            setInsertParameter(trackIndex, id, value);
             return;
         }
 
@@ -1855,54 +2054,402 @@ private:
             return;
         }
 
-        if (isInsertExtraParam(id))
+        // The track's input (TRK FX page IN): kept here, read by the audio callback.
+        if (TrackInParam::contains(id))
         {
-            const int offset = id - INSERT_EXTRA_BASE, slot = offset / EffectBase::MAX_EXTRAS;
-            auto* chain = getInsertChain(trackIndex);
-            if (auto* fx = (chain && slot < chain->getEffectCount()) ? chain->getEffect(slot) : nullptr)
-                fx->setExtra(offset % EffectBase::MAX_EXTRAS, value);
-            return;
-        }
-
-        if (id >= EFFECT_PARAM_BASE && id < EngineParamRange::THIRD_BASE)     // 400 up is the engine's third block
-        {
-            int offset = id - EFFECT_PARAM_BASE;
-            auto* chain = getInsertChain(trackIndex);
-            if (chain && offset / 4 < chain->getEffectCount())
-                if (auto* fx = chain->getEffect(offset / 4))
-                    fx->setUserParameter(offset % 4, value);
+            if (trackIndex >= MAX_TRACKS) return;
+            if (auto* stored = trackIn[(size_t) trackIndex].valueOf(id))
+                stored->store(TrackIn::held(id, value), std::memory_order_relaxed);
             return;
         }
 
         if (! EngineParamRange::contains(id))
-            return;   // send bus types are global and changed through setSendBusEffect
+            return;   // (nobody's: the rest of the effect block, a screen's own cell)
 
         if (auto* e = getEngine(trackIndex))
-            e->setParameter(id, value);
-    }
-
-    // Created (and prepared) on the message thread when a track first gets an engine or an
-    // effect-block parameter.
-    TrackFx& ensureTrackFx(int trackIndex)
-    {
-        auto& fx = trackFx[(size_t) trackIndex];
-        if (!fx)
         {
-            auto created = std::make_unique<TrackFx>();
-            created->prepare(currentSampleRate > 0 ? currentSampleRate : 44100.0,
-                             currentBlockSize > 0 ? currentBlockSize : 2048);
-            fx = std::move(created);
+            e->setParameter(id, value);
+            // A level of the track's custom LFO shape: the effects on the track play the same one.
+            if (id >= LfoShapeParam::BASE && id < LfoShapeParam::END && trackIndex < MAX_TRACKS && trackHasShape[(size_t) trackIndex])
+            {
+                trackShape[(size_t) trackIndex][(size_t) (id - LfoShapeParam::BASE)] = juce::jlimit(-1.0f, 1.0f, e->getParameter(id));
+                if (auto* chain = getInsertChain(trackIndex))
+                    for (int s = 0; s < chain->getEffectCount(); ++s)
+                        chain->getEffect(s)->setUserShape(trackShape[(size_t) trackIndex].data());
+            }
         }
-        return *fx;
     }
 
-    static const TrackFx& defaultTrackFx()
+    // ---- An insert slot's ids, on any chain ----------------------------------------------------
+    // The one place where the ids of a slot (isInsertParam) reach an effect: its four cells
+    // (EFFECT_PARAM_BASE + slot * 4 + n), ON / WET / SYNC / division (INSERT_ON_BASE ..), its cells
+    // beyond four (INSERT_EXTRA_BASE + slot * 4 + n). The chain is a track's, the mix's or a send's.
+    struct SlotId { int slot, part, cell; };        // part 0 cells, 1 ON, 2 WET, 3 SYNC, 4 division, 5 extras
+    static SlotId slotIdOf(int id)
     {
-        static const TrackFx defaults;
-        return defaults;
+        if (isInsertSwitchParam(id))
+            return { (id - INSERT_ON_BASE) % MAX_INSERTS_PER_TRACK, 1 + (id - INSERT_ON_BASE) / MAX_INSERTS_PER_TRACK, 0 };
+        if (isInsertExtraParam(id))
+            return { (id - INSERT_EXTRA_BASE) / EffectBase::MAX_EXTRAS, 5, (id - INSERT_EXTRA_BASE) % EffectBase::MAX_EXTRAS };
+        return { (id - EFFECT_PARAM_BASE) / 4, 0, (id - EFFECT_PARAM_BASE) % 4 };
     }
 
-    std::array<std::unique_ptr<TrackFx>, MAX_TRACKS> trackFx;
+    void setInsertParameter(int trackIndex, int id, float value)
+    {
+        const SlotId at = slotIdOf(id);
+        auto* chain = getInsertChain(trackIndex);
+        auto* fx = chain != nullptr ? chain->getEffect(at.slot) : nullptr;
+        if (fx == nullptr)
+            return;
+        switch (at.part)
+        {
+            case 0:  fx->setUserParameter(at.cell, value); break;
+            case 1:  fx->setEnabled(value > 0.5f); break;
+            case 2:  fx->setMix(juce::jlimit(0.0f, 1.0f, value)); break;
+            case 3:  fx->setTempo(sequencer ? sequencer->getTempo() : 120.0f); fx->setSync(value > 0.5f); break;
+            case 4:  fx->setSyncDivision((int) std::lround(value)); break;
+            default: fx->setExtra(at.cell, value); break;
+        }
+    }
+
+    float getInsertParameter(int trackIndex, int id) const
+    {
+        const SlotId at = slotIdOf(id);
+        const auto* chain = getInsertChain(trackIndex);
+        const auto* fx = chain != nullptr ? chain->getEffect(at.slot) : nullptr;
+        if (fx == nullptr)      // an empty slot reads as a new effect would: on, all of it, not synced
+            return at.part == 1 || at.part == 2 ? 1.0f : (at.part == 4 ? (float) FxSync::DEFAULT_DIVISION : 0.0f);
+        switch (at.part)
+        {
+            case 0:  return fx->getUserParameter(at.cell);
+            case 1:  return fx->isEnabled() ? 1.0f : 0.0f;
+            case 2:  return fx->getMix();
+            case 3:  return fx->isSynced() ? 1.0f : 0.0f;
+            case 4:  return (float) fx->getSyncDivision();
+            default: return fx->getExtra(at.cell);
+        }
+    }
+
+    // An effect for a slot of a chain, from the one factory. On a track it plays the track's
+    // custom LFO shape; on a send its mix starts at 1 (the bus gives the wet sound alone).
+    std::unique_ptr<EffectBase> createSlotEffect(int trackIndex, EffectType type) const
+    {
+        auto fx = createEffect(type);
+        if (fx == nullptr)
+            return fx;
+        fx->setUserShape(userShapeOf(trackIndex));
+        if (isSendTrack(trackIndex))
+            fx->setMix(1.0f);
+        return fx;
+    }
+
+    // The sends as a new project has them (resetSendBuses; the constructor).
+    void buildDefaultSends()
+    {
+        for (auto& bus : sendBuses)
+        {
+            while (bus.getChain().getEffectCount() > 0)
+                bus.getChain().removeEffect(0);
+            bus.setSendLevel(1.0f);
+        }
+
+        auto reverb = std::make_unique<Reverb>();
+        reverb->setDecay(0.6f);
+        reverb->setDamping(0.4f);
+        reverb->setMix(1.0f);
+        sendBuses[SEND_REVERB].getChain().addEffect(std::move(reverb), (int) EffectType::ReverbEffect);
+
+        auto delay = std::make_unique<Delay>();
+        delay->setTime(0.375f);
+        delay->setFeedback(0.35f);
+        delay->setMix(1.0f);
+        sendBuses[SEND_DELAY].getChain().addEffect(std::move(delay), (int) EffectType::DelayEffect);
+    }
+
+    // ---- What a chain's effects are told before a block (audio thread) -----------------------
+    // Tempo for synced times and rates, and the pitch of the note the track played last (VOC's
+    // TUNE follows it; 0 = none: the master chain).
+    static void prepareChainBlock(EffectChain& chain, float bpm, float noteHz)
+    {
+        for (int i = 0; i < chain.getEffectCount(); ++i)
+            if (auto* fx = chain.getEffect(i))
+            {
+                fx->setTempo(bpm);
+                fx->setPitch(noteHz);
+            }
+    }
+
+    // ---- The track's effect cells as destinations of its engine's router (E4, audio thread) ----
+    // A slot of the track's router (an LFO's DEST, a STRIP or XIN route, a free slot) may be aimed
+    // at a cell of an effect on the track (mod::TrackDest: the eight insert slots' cells and WET).
+    // After the engine's block the router holds one offset per such cell (Router::trackOffset: a
+    // share of the cell's range, -1 .. 1); here it is handed to EffectBase::modulateCell, once a
+    // block, before the effects run.
+    // (mod::TrackDest still lists eight more after them, CH.R .. RO.D: the cells of the MODFX
+    // block there once was. Nothing receives them - a slot aimed at one moves nothing - and they
+    // stay in the lists until a stored DEST can be read without them: design debt.)
+    // The effects glide to it (the chain's own mix reads the moved WET through wetWanted()).
+    //   Let go, exactly once (offset 0): a cell no slot is aimed at any more (the slot was aimed
+    //   elsewhere or emptied, the engine was exchanged for one whose slots are not, a project was
+    //   applied); and an effect that is another one than the slot held when the offsets were given
+    //   (exchanged, put in, or moved up because the one before it was taken out) is let go of
+    //   whole when it is first met, so none carries an offset to a place nobody aims at.
+    // A track with no slot on an effect cell, and none still held: one call and two tests.
+    // (Sends and the master chain have no router: nothing moves their cells.)
+    struct TrackMoves
+    {
+        mod::Mask held;         // the cells an offset was given to and not yet let go
+        std::array<const EffectBase*, MAX_INSERTS_PER_TRACK> insert {};     // who was in each slot then (compared, never read through)
+    };
+    static_assert(mod::TrackDest::SLOTS == MAX_INSERTS_PER_TRACK, "an insert slot a group of destinations");
+    static_assert(mod::TrackDest::CELLS == 4 + EffectBase::MAX_EXTRAS && mod::TrackDest::WET_CELL == EffectBase::WET_CELL,
+                  "a track destination's cell is modulateCell's");
+
+    void moveTrackEffects(int t, const EngineBase& engine)
+    {
+        using namespace mod;
+        auto& moves = trackMoves[(size_t) t];
+        const Router* router = engine.modRouter();
+        if ((router == nullptr || ! router->trackDests().any()) && ! moves.held.any())
+            return;
+        const Mask used = router != nullptr ? router->trackDests() : Mask();
+
+        EffectChain* chain = t < (int) trackInsertChains.size() ? &trackInsertChains[(size_t) t] : nullptr;
+        for (int slot = 0; slot < TrackDest::SLOTS; ++slot)
+        {
+            EffectBase* fx = chain != nullptr ? chain->getEffect(slot) : nullptr;
+            if (fx != moves.insert[(size_t) slot])
+            {
+                moves.insert[(size_t) slot] = fx;
+                for (int cell = 0; cell < TrackDest::PER_SLOT; ++cell)
+                {
+                    if (fx != nullptr)
+                        fx->modulateCell(cell, 0.0f);
+                    moves.held.clear(TrackDest::ofInsert(slot, cell));
+                }
+            }
+            if (fx == nullptr)
+                continue;
+            for (int cell = 0; cell < TrackDest::PER_SLOT; ++cell)
+            {
+                const int d = TrackDest::ofInsert(slot, cell);
+                if (used.test(d))
+                {
+                    fx->modulateCell(cell, router->trackOffset(d));
+                    moves.held.set(d);
+                }
+                else if (moves.held.test(d))
+                {
+                    fx->modulateCell(cell, 0.0f);
+                    moves.held.clear(d);
+                }
+            }
+        }
+    }
+    std::array<TrackMoves, MAX_TRACKS> trackMoves;
+
+public:
+    // What the display shows for a DEST that is a cell of an effect on the track (mod::TrackDest):
+    // the slot's number and the cell's own label for the effect that is in the slot now ("1TIME",
+    // "2:MIX", "1:WET"), or "1:--" where there is nothing to move (an empty slot, no such cell, a
+    // list or a count, an effect that takes no modulation there). Anything else (the list's own
+    // names): empty. Message thread (read as the screens read an insert's cells: without the
+    // structure lock, which a screen that draws thirty times a second must not take from the audio thread).
+    juce::String trackDestText(int trackIndex, int d) const
+    {
+        if (! mod::TrackDest::isInsert(d))
+            return {};
+        const int slot = mod::TrackDest::slot(d), cell = mod::TrackDest::cell(d);
+        const juce::String number(slot + 1);
+        const auto* chain = getInsertChain(trackIndex);
+        const auto* fx = chain != nullptr ? chain->getEffect(slot) : nullptr;
+        if (fx == nullptr || ! fx->takesModulation(cell))
+            return number + ":--";
+        const juce::String label(cell == EffectBase::WET_CELL ? "WET" : (cell < 4 ? fx->getParamSpec(cell) : fx->getExtraSpec(cell - 4)).label);
+        return number + (label.length() < 4 ? ":" : "") + label;
+    }
+    // The track destination a DEST cell's value stands for (-1: none): `spec` is the cell.
+    int trackDestOfCell(int trackIndex, const ParamSpec& spec, float value) const
+    {
+        const auto* e = getEngine(trackIndex);
+        const mod::Router* router = e != nullptr ? e->modRouter() : nullptr;
+        if (router == nullptr || spec.choices == nullptr)
+            return -1;
+        const int v = (int) std::lround(value);
+        const int first = spec.choices == router->dests().cellLabels() ? router->dests().trackCell()
+                        : spec.choices == router->dests().slotLabels() ? router->dests().trackSlotChoice()
+                        : spec.choices == UnifiedVoice::lfoDestCellLabels() ? (int) UnifiedVoice::LfoDest::Count : -1;
+        return first >= 0 && v >= first && v < first + mod::TrackDest::COUNT ? v - first : -1;
+    }
+
+private:
+
+    // ---- The track's custom LFO shape, for the effects on it -----------------------------------
+    // The eight levels (LfoShapeParam) live in the track's engine; the effects on the track read
+    // this copy, which outlives a change of engine. An engine without the shape: the rising
+    // staircase. The master chain has no track: null (the staircase).
+    const float* userShapeOf(int trackIndex) const
+    {
+        return trackIndex >= 0 && trackIndex < MAX_TRACKS ? trackShape[(size_t) trackIndex].data() : nullptr;
+    }
+
+    // The track has an engine (another one, or the same again): the copy is made anew from it.
+    // Message thread, under the structure lock.
+    void adoptUserShape(int trackIndex)
+    {
+        if (trackIndex < 0 || trackIndex >= MAX_TRACKS)
+            return;
+        auto* e = getEngine(trackIndex);
+        bool has = false;
+        if (e != nullptr)
+            for (const auto& page : e->getParamPages())
+                for (const auto& spec : page.params)
+                    has = has || spec.id == LfoShapeParam::BASE;
+        trackHasShape[(size_t) trackIndex] = has;
+        for (int i = 0; i < LFO::USER_POINTS; ++i)
+            trackShape[(size_t) trackIndex][(size_t) i] = has ? juce::jlimit(-1.0f, 1.0f, e->getParameter(LfoShapeParam::BASE + i))
+                                                              : LFO::defaultUserLevel(i);
+        // Propagate the custom shape to every insert in the track's chain (TALK uses it for USR/USRS).
+        if (auto* chain = getInsertChain(trackIndex))
+            for (int s = 0; s < chain->getEffectCount(); ++s)
+                chain->getEffect(s)->setUserShape(trackShape[(size_t) trackIndex].data());
+    }
+
+    // The master chain as a new project has it. The compressor starts neutral (0 dB, 1:1), as in
+    // a project without stored master settings (ProjectBridge): at the Compressor class's own
+    // -20 dB / 4:1 a single note was pulled down 7 dB within 20 ms of its onset, which was heard
+    // as a click on every loud note.
+    void buildDefaultMasterChain()
+    {
+        auto& chain = masterChain;
+        while (chain.getEffectCount() > 0)
+            chain.removeEffect(0);
+        for (EffectType type : { EffectType::EQEffect, EffectType::CompressorEffect, EffectType::LimiterEffect })
+        {
+            auto fx = createEffect(type);
+            if (type == EffectType::CompressorEffect)
+            {
+                fx->setParameter(0, 0.0f);      // THR
+                fx->setParameter(1, 1.0f);      // RATI
+            }
+            if (currentSampleRate > 0)
+                fx->prepare(currentSampleRate, currentBlockSize);
+            chain.addEffect(std::move(fx), (int) type);
+        }
+    }
+
+    // ---- Track input (audio thread) ----------------------------------------------------------
+    // The track a track listens to: -1 when SRC is OFF, the track itself, or a track without an engine.
+    int trackInputSource(int t) const
+    {
+        const int src = (int) trackIn[(size_t) t].source.load(std::memory_order_relaxed) - 1;
+        if (src < 0 || src == t || src >= MAX_TRACKS || src >= (int) engines.size() || ! engines[(size_t) src])
+            return -1;
+        return src;
+    }
+
+    struct TrackInput
+    {
+        AudioInput view;            // a default one = no input
+        float mode = 0.0f;
+    };
+
+    // Fills the track's input buffers for this block (the source's tap times LEVL, held inside
+    // +-1 by the soft limiter, which is what keeps a feedback pair bounded) and runs the follower.
+    TrackInput readTrackInput(int t, int numSamples)
+    {
+        TrackInput result;
+        auto& in = trackIn[(size_t) t];
+        result.mode = in.mode.load(std::memory_order_relaxed);
+        const int src = trackInputSource(t);
+        if (src < 0 || src >= (int) trackTapL.size() || (int) trackTapL[(size_t) src].size() < numSamples
+            || t >= (int) trackInL.size() || (int) trackInL[(size_t) t].size() < numSamples)
+        {
+            in.follower.reset();
+            in.lastSource = -1;
+            in.lastLevel = 0.0f;
+            return result;
+        }
+
+        const float attack = in.attackMs.load(std::memory_order_relaxed), release = in.releaseMs.load(std::memory_order_relaxed);
+        if (attack != in.setAttack || release != in.setRelease || (float) currentSampleRate != in.setRate)
+        {
+            in.setAttack = attack;
+            in.setRelease = release;
+            in.setRate = (float) currentSampleRate;
+            in.follower.setTimes(currentSampleRate > 0.0 ? currentSampleRate : 44100.0, attack, release);
+        }
+
+        // Another source than in the block before comes up from nothing over this block.
+        if (src != in.lastSource)
+            in.lastLevel = 0.0f;
+        in.lastSource = src;
+
+        const float level = in.level.load(std::memory_order_relaxed);
+        float g = in.lastLevel;
+        const float step = (level - g) / (float) numSamples;
+        in.lastLevel = level;
+
+        const float* tapL = trackTapL[(size_t) src].data();
+        const float* tapR = trackTapR[(size_t) src].data();
+        float* outL = trackInL[(size_t) t].data();
+        float* outR = trackInR[(size_t) t].data();
+        result.view.envelope = juce::jlimit(0.0f, 1.0f, in.follower.env);     // as the block starts
+        for (int i = 0; i < numSamples; ++i)
+        {
+            g += step;
+            // A sample of the tap that is not a number (NaN, infinite) is silence here: it must
+            // reach neither the engine, the follower nor a MIX loop (x - x is 0 only for a number).
+            const float tl = tapL[i], tr = tapR[i];
+            const float l = fxb::softSat(tl - tl == 0.0f ? tl * g : 0.0f), r = fxb::softSat(tr - tr == 0.0f ? tr * g : 0.0f);
+            outL[i] = l;
+            outR[i] = r;
+            in.follower.process(std::max(std::abs(l), std::abs(r)));
+        }
+        result.view.left = outL;
+        result.view.right = outR;
+        result.view.frames = numSamples;
+        return result;
+    }
+
+    // MODE: how much of RING and of MIX there is moves across the block, so a change of MODE (a
+    // step lock, the knob) is not a jump. Nothing is done while both are and stay at nothing.
+    void mixTrackInput(int t, const TrackInput& input, float* left, float* right, int numSamples)
+    {
+        auto& in = trackIn[(size_t) t];
+        const bool has = input.view.connected();
+        const float mixTo = (has && input.mode == 1.0f) ? 1.0f : 0.0f;
+        const float ringTo = (has && input.mode == 2.0f) ? 1.0f : 0.0f;
+        float mix = in.lastMix, ring = in.lastRing;
+        in.lastMix = mixTo;
+        in.lastRing = ringTo;
+        if (mix == 0.0f && ring == 0.0f && mixTo == 0.0f && ringTo == 0.0f)
+            return;
+        if (! has)
+        {
+            // The input went away: the engine's own sound comes back over this block.
+            const float ringStep = -ring / (float) numSamples;
+            for (int i = 0; i < numSamples && ring > 0.0f; ++i)
+            {
+                ring += ringStep;
+                const float keep = 1.0f - juce::jmax(0.0f, ring);
+                left[i] *= keep;
+                right[i] *= keep;
+            }
+            return;
+        }
+        const float mixStep = (mixTo - mix) / (float) numSamples, ringStep = (ringTo - ring) / (float) numSamples;
+        const float* inL = input.view.left;
+        const float* inR = input.view.right;
+        for (int i = 0; i < numSamples; ++i)
+        {
+            mix += mixStep;
+            ring += ringStep;
+            left[i] = left[i] * (1.0f - ring + ring * inL[i]) + mix * inL[i];
+            right[i] = right[i] * (1.0f - ring + ring * inR[i]) + mix * inR[i];
+        }
+    }
+
     PerfFxRack perfFx;
     juce::MidiBuffer trackMidi;         // a MIDI track's messages for one block (kept: no allocation in the callback)
     std::array<Arpeggiator*, MAX_TRACKS> trackArps {};
@@ -1929,38 +2476,56 @@ private:
     };
     struct ActiveLock { int id = -1; float base = 0.0f; };
 
+    // A track's input (TrackInParam): the values are written by whoever sets parameters and read
+    // once a block by the audio thread; the rest is the audio thread's.
+    struct TrackIn
+    {
+        std::atomic<float> source { 0.0f };         // 0 = none, n = track n
+        std::atomic<float> level { TRACK_IN_LEVEL };
+        std::atomic<float> mode { 0.0f };           // 0 OFF, 1 MIX, 2 RING
+        std::atomic<float> attackMs { TRACK_IN_ATTACK_MS };
+        std::atomic<float> releaseMs { TRACK_IN_RELEASE_MS };
+
+        fxb::EnvelopeFollower follower;
+        float setAttack = -1.0f, setRelease = -1.0f, setRate = 0.0f;    // what the follower's times were made from
+        int lastSource = -1;                        // the source of the block before (-1 = none)
+        float lastLevel = 0.0f, lastMix = 0.0f, lastRing = 0.0f;       // ramped across a block, like the fader
+
+        std::atomic<float>* valueOf(int id)
+        {
+            switch (id)
+            {
+                case TrackInParam::SRC:        return &source;
+                case TrackInParam::LEVEL:      return &level;
+                case TrackInParam::MODE:       return &mode;
+                case TrackInParam::FOLLOW_ATK: return &attackMs;
+                case TrackInParam::FOLLOW_REL: return &releaseMs;
+                default:                       return nullptr;      // 349-359: not in use
+            }
+        }
+        const std::atomic<float>* valueOf(int id) const { return const_cast<TrackIn*>(this)->valueOf(id); }
+
+        // Any finite value brought to what the cell can hold.
+        static float held(int id, float value)
+        {
+            switch (id)
+            {
+                case TrackInParam::SRC:        return (float) juce::jlimit(0, (int) MAX_TRACKS, (int) std::lround(value));
+                case TrackInParam::LEVEL:      return juce::jlimit(0.0f, 1.0f, value);
+                case TrackInParam::MODE:       return (float) juce::jlimit(0, 2, (int) std::lround(value));
+                case TrackInParam::FOLLOW_ATK: return juce::jlimit(1.0f, 200.0f, value);
+                case TrackInParam::FOLLOW_REL: return juce::jlimit(10.0f, 2000.0f, value);
+                default:                       return value;
+            }
+        }
+    };
+    std::array<TrackIn, MAX_TRACKS> trackIn;
+    std::vector<std::vector<float>> trackInL, trackInR;       // each track's input for one block (sized in prepare)
+    std::array<bool, MAX_TRACKS> trackFeeds {};               // audio thread: another track listens to this one
+
     std::array<TrackMix, MAX_TRACKS> trackMix;
     std::array<std::array<ActiveLock, MAX_ACTIVE_LOCKS>, MAX_TRACKS> activeLocks {};
     std::array<int, MAX_TRACKS> activeLockCount {};
-    std::array<AftertouchRouter, MAX_TRACKS> trackRouters;
-    const AftertouchRouter* legacyRouter = nullptr;
-    AftertouchRouter legacySnapshot;
-
-    // A drum kit has its pressure destination inside its voices: route 1 of the track's router
-    // goes to every pad.
-    void pushDrumPressure(int trackIndex)
-    {
-        auto* drum = dynamic_cast<DrumEngine*>(getEngine(trackIndex));
-        if (drum == nullptr) return;
-        const auto route = trackRouters[(size_t) trackIndex].effectiveRoute(0);
-        DrumATDest dest = DrumATDest::Off;
-        switch (route.dest)
-        {
-            case PressureDest::DrumPitch:    dest = DrumATDest::Pitch; break;
-            case PressureDest::DrumDecay:    dest = DrumATDest::Decay; break;
-            case PressureDest::FilterCutoff: dest = DrumATDest::Filter; break;
-            case PressureDest::Volume:       dest = DrumATDest::Level; break;
-            case PressureDest::DrumDrive:    dest = DrumATDest::Drive; break;
-            case PressureDest::DrumSnap:     dest = DrumATDest::Snap; break;
-            case PressureDest::PanSpread:    dest = DrumATDest::Pan; break;
-            default: break;
-        }
-        for (int slot = 0; slot < DrumEngine::NUM_VOICES; ++slot)
-        {
-            drum->setSlotAftertouchDest(slot, dest);
-            drum->setSlotAftertouchDepth(slot, juce::jlimit(0.0f, 1.0f, route.depth));
-        }
-    }
     std::vector<std::shared_ptr<EngineBase>> retiredEngines;
     float lastTempo = 120.0f;
 
@@ -1971,7 +2536,6 @@ private:
         {
             size_t oldSize = trackInsertChains.size();
             trackInsertChains.resize((size_t) trackIndex + 1);
-            insertTypes.resize((size_t) trackIndex + 1);
             if (currentSampleRate > 0)
             {
                 for (size_t i = oldSize; i < trackInsertChains.size(); ++i)
@@ -1988,7 +2552,7 @@ private:
     juce::MidiOutput* midiOutput = nullptr;
     std::vector<std::shared_ptr<EngineBase>> engines;
     std::vector<EffectChain> trackInsertChains;
-    std::vector<std::vector<EffectType>> insertTypes;
+    EffectChain masterChain;                    // the insert chain of the mix (MASTER_TRACK)
     float masterLevel = 0.8f;
     std::array<Motion, MAX_MOTIONS> motions;
     double currentSampleRate = 0.0;
@@ -2008,7 +2572,12 @@ private:
     std::array<std::array<dsp::BlockDeclick, 2>, MAX_TRACKS> engineDeclick, trackDeclick;
     std::array<std::atomic<bool>, MAX_TRACKS> engineDeclickArm {}, trackDeclickArm {};
     std::array<dsp::BlockDeclick, 2> masterDeclick;
+    std::atomic<bool> masterDeclickArm { false };
     bool masterSkipped = false;         // audio thread only
+
+    // Each track's custom LFO shape as its effects read it (adoptUserShape).
+    std::array<std::array<float, LFO::USER_POINTS>, MAX_TRACKS> trackShape {};
+    std::array<bool, MAX_TRACKS> trackHasShape {};
 
     // Audio thread: every note off, every insert chain and send bus emptied.
     void silenceNow()
@@ -2017,6 +2586,7 @@ private:
             if (e) e->allNotesOff();
         for (auto& chain : trackInsertChains)
             chain.reset();
+        masterChain.reset();
         for (auto& bus : sendBuses)
             bus.getChain().reset();
         perfFx.silence();
@@ -2030,7 +2600,7 @@ public:
     // It stays 0 while everything is right: the robustness tests fail on any other value.
     int getNonFiniteBlocks() const { return nonFiniteBlocks.load(std::memory_order_relaxed) + perfFx.getNonFiniteCount(); }
     // Where the last one came from: a track's engine (the track), its insert effects (1000 + the
-    // track), or -1.
+    // track), a send's chain (2000 + the bus), or -1.
     int getNonFiniteTrack() const { return nonFiniteTrack.load(std::memory_order_relaxed); }
     static bool blockIsFinite(const float* left, const float* right, int numSamples)
     {
@@ -2041,14 +2611,24 @@ public:
         return sum == 0.0f;
     }
 private:
+    // The guard itself, for the four places it stands (after an engine, after a track's effects,
+    // after a send's chain, on the sum): a block that holds a number that is not one is made silence and counted. True:
+    // it was dropped, and the caller empties what made it.
+    bool droppedUnlessFinite(float* left, float* right, int numSamples)
+    {
+        if (blockIsFinite(left, right, numSamples))
+            return false;
+        std::fill(left, left + numSamples, 0.0f);
+        std::fill(right, right + numSamples, 0.0f);
+        nonFiniteBlocks.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
     std::vector<float> scratchL;
     std::vector<std::vector<float>> trackTapL, trackTapR;     // each track's output after its inserts (sidechain sources)
     std::vector<float> scratchR;
 
-    std::vector<SendBus> sendBuses;
-    std::vector<EffectType> sendBusTypes;
-
-    ParametricEQ masterEQ;
-    Compressor masterComp;
-    Limiter masterLimiter;
+    std::vector<SendBus> sendBuses;             // each one's chain is the insert chain of sendTrack(bus)
+    // The tracks' sounds by track, as a KeyFeed wants them (set in prepare).
+    std::array<const float*, MAX_TRACKS> tapLeft {}, tapRight {};
 };

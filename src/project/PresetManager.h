@@ -2,6 +2,11 @@
 
 #include "Preset.h"
 #include "FactoryPresets.h"
+#include "presets/FusionPresets.h"
+#include "presets/ResonatorPresets.h"
+#include "presets/ResonatorKits.h"
+#include "MultiPreset.h"
+#include "FactoryMultis.h"
 #include "../sequencer/Track.h"
 #include "../engine/SampleBank.h"
 #include <cmath>
@@ -16,6 +21,19 @@ public:
     {
         loadFactoryPresets();
         FactoryPresets::registerAll(*this);
+        // Fusion presets (the unification's demonstration sounds, U6).
+        for (auto& preset : FusionPresets::getAll())
+            addPreset(preset);
+        // Resonator engine presets: the three morph presets, the drum sounds as keys presets,
+        // and the slot / LFO presets (U1 / U2b, registered here at U6).
+        for (auto& preset : resonatorPresets())
+            addPreset(preset);
+        // The four kits of resonator drums (U2b: toms that open into gongs, brushes, one body
+        // every way of playing it, claves that are bells on some steps).
+        for (auto& preset : resonatorKits())
+            addPreset(preset);
+        for (auto& multi : FactoryMultis::getAll())
+            multis.push_back(multi);
     }
 
     int getPresetCount() const { return (int) presets.size(); }
@@ -75,6 +93,52 @@ public:
 
     static constexpr int MAX_NAME_LENGTH = 15;
 
+    // ---- Multi presets (MultiPreset.h): a list of their own, shown only under the category MULT.
+    // A multi and a single preset may share a name (their files differ: <name>.multi.json).
+    int getMultiCount() const { return (int) multis.size(); }
+    const MultiPreset& getMulti(int index) const { return multis[(size_t) index]; }
+
+    void addMulti(const MultiPreset& m)
+    {
+        if (m.isValid())
+            multis.push_back(m);
+    }
+
+    void removeMulti(int index)
+    {
+        if (index >= 0 && index < (int) multis.size() && !multis[(size_t) index].isFactory)
+            multis.erase(multis.begin() + index);
+    }
+
+    // Index of the user multi with this name, or -1.
+    int findUserMulti(const juce::String& name) const
+    {
+        for (int i = 0; i < (int) multis.size(); ++i)
+            if (!multis[(size_t) i].isFactory && multis[(size_t) i].name == name)
+                return i;
+        return -1;
+    }
+
+    bool isMultiNameTaken(const juce::String& name) const
+    {
+        for (auto& m : multis)
+            if (m.name.equalsIgnoreCase(name))
+                return true;
+        return false;
+    }
+
+    // Renames a user multi; false for a factory multi, an empty name or a name another multi has.
+    bool renameMulti(int index, const juce::String& typed)
+    {
+        const auto name = cleanName(typed);
+        if (index < 0 || index >= (int) multis.size() || multis[(size_t) index].isFactory)
+            return false;
+        if (name.isEmpty() || isMultiNameTaken(name))
+            return false;
+        multis[(size_t) index].name = name;
+        return true;
+    }
+
     std::vector<int> getFilteredIndices(EngineType type) const
     {
         std::vector<int> result;
@@ -125,12 +189,15 @@ public:
         return e != nullptr ? juce::String(e->name) : juce::String();
     }
 
-    // The preset's parameters with its sample found by name: the stored place may be another
-    // sample's since files were added. A factory preset means the factory break of that name even
-    // if a file of the user's is called the same. No such sample: the stored place is kept.
+    // The preset's parameters as a track takes them. Its sample is found by name: the stored
+    // place may be another sample's since files were added. A factory preset means the factory
+    // break of that name even if a file of the user's is called the same. No such sample: the
+    // stored place is kept. And a preset of before the DIRT / TALK / MODFX blocks became insert
+    // effects has them as the first slots of its chain, as a project of then has
+    // (ProjectBridge::convertTrackFxParams: nothing changes in a sound without such a block).
     static ParamMap soundOf(const Preset& preset)
     {
-        ParamMap params = preset.soundParams;
+        ParamMap params = ProjectBridge::convertTrackFxParams(preset.soundParams);
         if (preset.sampleName.isEmpty() || ! usesSample(preset.engineType))
             return params;
         auto& bank = SampleBank::get();
@@ -163,8 +230,18 @@ public:
     bool loadFromFile(const juce::File& file)
     {
         if (!file.existsAsFile()) return false;
-        auto json = file.loadFileAsString();
-        auto preset = Preset::fromJSON(json);
+        // What the file holds decides what it is, not what it is called: a multi preset has a list
+        // of members and is never loaded as a single preset (nor a single preset as a multi).
+        const auto parsed = juce::JSON::parse(file.loadFileAsString());
+        if (MultiPreset::isMultiVar(parsed))
+        {
+            auto multi = MultiPreset::fromVar(parsed);
+            multi.isFactory = false;        // (the built-in ones are not files)
+            if (!multi.isValid()) return false;
+            multis.push_back(std::move(multi));
+            return true;
+        }
+        auto preset = Preset::fromVar(parsed);
         if (preset.name.isEmpty()) return false;
         presets.push_back(preset);
         return true;
@@ -183,18 +260,37 @@ public:
         for (auto& p : presets)
         {
             if (p.isFactory) continue;
-            auto file = dir.getChildFile(sanitizeFilename(p.name) + ".json");
+            auto file = dir.getChildFile(singleFileName(p.name));
             file.replaceWithText(p.toJSON());
         }
+        for (auto& m : multis)
+            if (!m.isFactory)
+                dir.getChildFile(multiFileName(m.name)).replaceWithText(m.toJSON());
+    }
+
+    // The file a user preset / a user multi is written to. A single preset whose name ends in
+    // ".multi" does not get a multi's file name (it would overwrite the multi of that name).
+    static juce::String singleFileName(const juce::String& name)
+    {
+        auto base = sanitizeFilename(name);
+        if (base.endsWithIgnoreCase(".multi"))
+            base = base.dropLastCharacters(6) + "_multi";
+        return base + ".json";
+    }
+    static juce::String multiFileName(const juce::String& name)
+    {
+        return sanitizeFilename(name) + MultiPreset::fileSuffix();
     }
 
     static juce::StringArray getCategories()
     {
-        return {"ALL", "INIT", "BASS", "PAD", "LEAD", "KEYS", "FX", "PERC", "KIT"};
+        // (MULT lists the multi presets and nothing else; a new category goes at the end)
+        return {"ALL", "INIT", "BASS", "PAD", "LEAD", "KEYS", "FX", "PERC", "KIT", MultiPreset::categoryName()};
     }
 
 private:
     std::vector<Preset> presets;
+    std::vector<MultiPreset> multis;
 
     static juce::String sanitizeFilename(const juce::String& name)
     {
@@ -254,9 +350,24 @@ private:
             {60, 0.0f}, {61, 0.9f}
         });
 
-        // Drum presets
-        addFactory("808 Kit", "KIT", EngineType::Drum, {});
-        addFactory("Perc Kit", "KIT", EngineType::Drum, {});
+        // Drum presets — each kit sets the voice parameters that differ from the engine's defaults.
+        // Voice param ids: voice * 8 + { TUNE=0, DECAY=1, TONE=2, DRIVE=3, SNAP=4, LEVEL=5, PAN=6, TYPE=7 }.
+        addFactory("808 Kit", "KIT", EngineType::Drum, {
+            // Kick (pad 8): deeper, longer
+            {8*8+0, 42.0f}, {8*8+1, 0.7f}, {8*8+2, 0.5f},
+            // Snare (pad 12): brighter, longer decay
+            {12*8+1, 0.5f}, {12*8+2, 0.7f},
+            // Hats: slightly brighter tone
+            {14*8+2, 0.6f}, {15*8+2, 0.5f}
+        });
+        addFactory("Perc Kit", "KIT", EngineType::Drum, {
+            // Kick (pad 8): tighter, shorter
+            {8*8+0, 55.0f}, {8*8+1, 0.3f}, {8*8+4, 0.5f},
+            // Clap (pad 13): shorter, more snap
+            {13*8+1, 0.2f}, {13*8+4, 0.8f},
+            // Tom (pad 11): higher, longer ring
+            {11*8+1, 0.6f}
+        });
 
         // MacroOsc presets
         addFactory("Init MO", "INIT", EngineType::MacroOsc, {});

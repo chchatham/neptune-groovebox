@@ -1,241 +1,135 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "../DSPUtils.h"
-#include <array>
-#include <cmath>
-#include <algorithm>
+#include "ModDelay.h"
 
-// Leslie rotary speaker simulation.
-// Models the horn (high-frequency) and drum (low-frequency) rotors with
-// a crossover filter separating the bands. Each rotor has amplitude modulation
-// (doppler) and frequency modulation (pitch wobble) at slow/fast speeds.
-// Includes spin-up/spin-down acceleration behavior.
-// All buffers pre-allocated. No heap on audio thread.
-class RotarySpeaker : public EffectBase
+// Rotary speaker: a horn for the highs and a drum for the lows, split by a one-pole crossover.
+// The cabinet has one loudspeaker, so the middle of the input goes in. Each rotor is one voice of
+// the modulated delay (ModDelay.h): the delay swings as the rotor comes and goes (the pitch
+// wobble) and the level follows a quarter turn later, opposite on the two sides (loudest as it
+// faces you): the stereo picture is the rotors', not the input's.
+//
+// SPD   slow (chorale: horn 0.8 Hz, drum 0.4 Hz) to fast (the rates below), any place between
+// HORN  the horn's fast rate, DRUM the drum's
+// ACCL  how quickly the rotors reach a new speed: 2 s to 0.1 s for the horn, the drum three times
+//       as slow (it is the heavier one)
+// On the second page: SHPE (the rotors' motion: SIN is a rotor, anything else is not, on purpose),
+// DPTH (how far the pitch wobbles: 50 is the cabinet as it was) and XOVR (the crossover).
+class RotarySpeaker : public CellEffect
 {
 public:
-    ParamSpec getParamSpec(int index) const override
-    {
-        using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "SPD", 0, 0, 1, 0 };
-            case 1: return { "HORN", 1, 5, 10, 6.7f, K::Linear, "Hz" };
-            case 2: return { "DRUM", 2, 0.5f, 2, 1.0f, K::Linear, "Hz" };
-            case 3: return { "ACCL", 3, 0, 1, 0.5f };
-            default: return {};
-        }
-    }
-
     enum Param
     {
         Speed = 0,      // 0 = slow (chorale), 1 = fast (tremolo)
         HornRate,       // fast horn rate: 5 - 10 Hz
         DrumRate,       // fast drum rate: 0.5 - 2 Hz
-        Acceleration,   // 0 - 1 (spin-up speed)
-        CrossoverFreq,  // 500 - 2000 Hz
-        Mix             // 0 - 1
+        Acceleration    // 0 - 1 (spin-up speed)
     };
+    enum Extra { Shape = 0, Doppler, Crossover };
 
-    void prepare(double sr, int /*maxBlockSize*/) override
+    RotarySpeaker() { seed(); }
+
+    void setUserShape(const float* levels) override
     {
-        sampleRate = sr;
-        maxDelaySamples = (int)(0.005 * sr) + 1; // 5ms max for doppler
-        if (maxDelaySamples > MAX_DELAY_SAMPLES)
-            maxDelaySamples = MAX_DELAY_SAMPLES;
-        recalcCrossover();
-        recalcAccelCoeff();
-        reset();
+        horn.setUserShape(levels);
+        drum.setUserShape(levels);
     }
 
-    void reset() override
+protected:
+    const ParamSpec* cells() const override
     {
-        hornDelayL.fill(0.0f);
-        hornDelayR.fill(0.0f);
-        drumDelayL.fill(0.0f);
-        drumDelayR.fill(0.0f);
-        hornWritePos = 0;
-        drumWritePos = 0;
-        hornPhase = 0.0;
-        drumPhase = 0.0;
-        currentHornRate = SLOW_HORN_RATE;
-        currentDrumRate = SLOW_DRUM_RATE;
-        crossLpL = 0.0f;
-        crossLpR = 0.0f;
-        crossHpL = 0.0f;
-        crossHpR = 0.0f;
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "SPD", 0, 0, 1, 0 },
+            { "HORN", 1, 5, 10, 6.7f, K::Linear, "Hz" },
+            { "DRUM", 2, 0.5f, 2, 1.0f, K::Linear, "Hz" },
+            { "ACCL", 3, 0, 1, 0.5f },
+            fxm::Lfo::shapeSpec("SHPE", Shape),
+            { "DPTH", Doppler, 0, 1, 0.5f },
+            { "XOVR", Crossover, 500.0f, 2000.0f, 800.0f, K::Log, "Hz" },
+            {} };
+        return c;
     }
 
-    void process(float& left, float& right) override
+    void prepareCore() override
     {
-        if (!enabled) return;
-
-        float dryL = left;
-        float dryR = right;
-
-        // Smooth speed transitions (acceleration / deceleration)
-        float targetHornRate = (speed > 0.5f) ? hornFastRate : SLOW_HORN_RATE;
-        float targetDrumRate = (speed > 0.5f) ? drumFastRate : SLOW_DRUM_RATE;
-        currentHornRate += cachedAccelCoeff * (targetHornRate - currentHornRate);
-        currentDrumRate += cachedAccelCoeff * (targetDrumRate - currentDrumRate);
-
-        // Crossover: one-pole LP/HP split
-        crossLpL += cachedCrossCoeff * (left - crossLpL);
-        crossLpR += cachedCrossCoeff * (right - crossLpR);
-        float lowL = crossLpL;
-        float lowR = crossLpR;
-        float highL = left - lowL;
-        float highR = right - lowR;
-
-        // --- Horn rotor (high frequencies) ---
-        hornPhase += currentHornRate / sampleRate;
-        if (hornPhase >= 1.0) hornPhase -= 1.0;
-        float hornAngle = (float)hornPhase * dsp::TWO_PI_F;
-        float hornSin = std::sin(hornAngle);
-        float hornCos = std::cos(hornAngle);
-
-        // Doppler delay modulation for horn
-        float hornDelayMs = 0.002f + hornSin * 0.001f; // 1-3ms
-        float hornDelaySamples = (float)(hornDelayMs * sampleRate);
-        hornDelaySamples = std::clamp(hornDelaySamples, 1.0f, (float)(maxDelaySamples - 1));
-
-        hornDelayL[(size_t)hornWritePos] = highL;
-        hornDelayR[(size_t)hornWritePos] = highR;
-
-        float hornWetL = readInterp(hornDelayL, hornWritePos, hornDelaySamples);
-        float hornWetR = readInterp(hornDelayR, hornWritePos, hornDelaySamples);
-        hornWritePos = (hornWritePos + 1) % maxDelaySamples;
-
-        // Amplitude modulation from horn rotation (stereo: L and R are opposite lobes)
-        float hornAmpL = 0.7f + 0.3f * hornCos;
-        float hornAmpR = 0.7f - 0.3f * hornCos;
-        hornWetL *= hornAmpL;
-        hornWetR *= hornAmpR;
-
-        // --- Drum rotor (low frequencies) ---
-        drumPhase += currentDrumRate / sampleRate;
-        if (drumPhase >= 1.0) drumPhase -= 1.0;
-        float drumAngle = (float)drumPhase * dsp::TWO_PI_F;
-        float drumSin = std::sin(drumAngle);
-        float drumCos = std::cos(drumAngle);
-
-        // Doppler delay modulation for drum (slower, broader)
-        float drumDelayMs = 0.003f + drumSin * 0.0015f;
-        float drumDelaySamples = (float)(drumDelayMs * sampleRate);
-        drumDelaySamples = std::clamp(drumDelaySamples, 1.0f, (float)(maxDelaySamples - 1));
-
-        drumDelayL[(size_t)drumWritePos] = lowL;
-        drumDelayR[(size_t)drumWritePos] = lowR;
-
-        float drumWetL = readInterp(drumDelayL, drumWritePos, drumDelaySamples);
-        float drumWetR = readInterp(drumDelayR, drumWritePos, drumDelaySamples);
-        drumWritePos = (drumWritePos + 1) % maxDelaySamples;
-
-        // Amplitude modulation from drum rotation
-        float drumAmpL = 0.8f + 0.2f * drumCos;
-        float drumAmpR = 0.8f - 0.2f * drumCos;
-        drumWetL *= drumAmpL;
-        drumWetR *= drumAmpR;
-
-        // Recombine bands
-        float wetL = hornWetL + drumWetL;
-        float wetR = hornWetR + drumWetR;
-
-        left  = dryL * (1.0f - mix) + wetL * mix;
-        right = dryR * (1.0f - mix) + wetR * mix;
-    }
-
-    void setParameter(int id, float value) override
-    {
-        switch (id)
+        for (auto* rotor : { &horn, &drum })
         {
-            case Speed:         speed         = std::clamp(value, 0.0f, 1.0f);     break;
-            case HornRate:      hornFastRate  = std::clamp(value, 5.0f, 10.0f);    break;
-            case DrumRate:      drumFastRate  = std::clamp(value, 0.5f, 2.0f);     break;
-            case Acceleration:
-                acceleration  = std::clamp(value, 0.0f, 1.0f);
-                recalcAccelCoeff();
-                break;
-            case CrossoverFreq:
-                crossoverFreq = std::clamp(value, 500.0f, 2000.0f);
-                recalcCrossover();
-                break;
-            case Mix:           mix           = std::clamp(value, 0.0f, 1.0f);     break;
+            rotor->setVoices(1);
+            rotor->setRange(0.0f, 0.007f);
+            rotor->prepare(sampleRate, 0.008, true);
         }
+        horn.setLevelFollow(0.3f);
+        drum.setLevelFollow(0.2f);
     }
 
-    float getParameter(int id) const override
+    void resetCore() override
     {
-        switch (id)
+        horn.reset();
+        drum.reset();
+        hornNow = hornGoal;
+        drumNow = drumGoal;
+        cross = 0.0f;
+        crossNow = crossCoeff;
+    }
+
+    void configure(const float* v) override
+    {
+        const float speed = v[Speed], depth = v[4 + Doppler], sr = (float) sampleRate;
+        hornGoal = SLOW_HORN_RATE * std::pow(v[HornRate] / SLOW_HORN_RATE, speed);
+        drumGoal = SLOW_DRUM_RATE * std::pow(v[DrumRate] / SLOW_DRUM_RATE, speed);
+        const float seconds = 2.0f * std::pow(0.05f, v[Acceleration]);
+        hornAccel = 1.0f - std::exp(-1.0f / (seconds * sr));
+        drumAccel = 1.0f - std::exp(-1.0f / (3.0f * seconds * sr));
+        horn.setDelay(0.0f, 0.002f, 0.002f * depth);
+        drum.setDelay(0.0f, 0.003f, 0.003f * depth);
+        crossCoeff = 1.0f - std::exp(-dsp::TWO_PI_F * v[4 + Crossover] / sr);
+        const int shape = (int) v[4 + Shape];
+        horn.setShape(shape);
+        drum.setShape(shape);
+    }
+
+    // Every look: the rotors run up or down to their speed, a turned XOVR arrives over a few milliseconds.
+    void controlCore() override
+    {
+        hornNow += std::min(1.0f, hornAccel * (float) CONTROL) * (hornGoal - hornNow);
+        drumNow += std::min(1.0f, drumAccel * (float) CONTROL) * (drumGoal - drumNow);
+        horn.setRate(hornNow);
+        drum.setRate(drumNow);
+        crossNow += 0.25f * (crossCoeff - crossNow);
+    }
+
+    void runCore(float* l, float* r, int n, float mixFrom, float mixTo) override
+    {
+        float lowL[CONTROL], lowR[CONTROL], highL[CONTROL], highR[CONTROL];
+        const float coeff = crossNow;
+        float low = cross;
+        for (int i = 0; i < n; ++i)
         {
-            case Speed:         return speed;
-            case HornRate:      return hornFastRate;
-            case DrumRate:      return drumFastRate;
-            case Acceleration:  return acceleration;
-            case CrossoverFreq: return crossoverFreq;
-            case Mix:           return mix;
-            default:            return 0.0f;
+            const float mid = 0.5f * (l[i] + r[i]);
+            low = fxb::flushDenormal(low + coeff * (mid - low));
+            lowL[i] = lowR[i] = low;
+            highL[i] = highR[i] = mid - low;
+        }
+        cross = low;
+        horn.process(highL, highR, n);
+        drum.process(lowL, lowR, n);
+
+        // (Each sample from the start of the run, not from the one before: several at once.)
+        const float slope = (mixTo - mixFrom) / (float) n;
+        for (int i = 0; i < n; ++i)
+        {
+            const float m = mixFrom + slope * (float) (i + 1);
+            l[i] = l[i] * (1.0f - m) + (highL[i] + lowL[i]) * m;
+            r[i] = r[i] * (1.0f - m) + (highR[i] + lowR[i]) * m;
         }
     }
 
 private:
-    static constexpr int MAX_DELAY_SAMPLES = 1024;
     static constexpr float SLOW_HORN_RATE = 0.8f;  // chorale horn speed
     static constexpr float SLOW_DRUM_RATE = 0.4f;  // chorale drum speed
 
-    float speed         = 0.0f;     // 0 = slow, 1 = fast
-    float hornFastRate  = 7.0f;     // Hz
-    float drumFastRate  = 1.0f;     // Hz
-    float acceleration  = 0.5f;
-    float crossoverFreq = 800.0f;
-
-    float currentHornRate = SLOW_HORN_RATE;
-    float currentDrumRate = SLOW_DRUM_RATE;
-
-    double hornPhase = 0.0;
-    double drumPhase = 0.0;
-
-    // Crossover filter state
-    float crossLpL = 0.0f;
-    float crossLpR = 0.0f;
-    float crossHpL = 0.0f;
-    float crossHpR = 0.0f;
-    float cachedCrossCoeff = 0.5f;
-    float cachedAccelCoeff = 0.1f;
-
-    int maxDelaySamples = MAX_DELAY_SAMPLES;
-    int hornWritePos = 0;
-    int drumWritePos = 0;
-
-    std::array<float, MAX_DELAY_SAMPLES> hornDelayL {};
-    std::array<float, MAX_DELAY_SAMPLES> hornDelayR {};
-    std::array<float, MAX_DELAY_SAMPLES> drumDelayL {};
-    std::array<float, MAX_DELAY_SAMPLES> drumDelayR {};
-
-    float readInterp(const std::array<float, MAX_DELAY_SAMPLES>& buf, int wp, float delaySamples) const
-    {
-        float readPosF = (float)wp - delaySamples;
-        if (readPosF < 0.0f) readPosF += (float)maxDelaySamples;
-        int idx0 = (int)readPosF;
-        int idx1 = idx0 + 1;
-        float frac = readPosF - (float)idx0;
-        if (idx0 >= maxDelaySamples) idx0 -= maxDelaySamples;
-        if (idx1 >= maxDelaySamples) idx1 -= maxDelaySamples;
-        if (idx0 < 0) idx0 += maxDelaySamples;
-        if (idx1 < 0) idx1 += maxDelaySamples;
-        return buf[(size_t)idx0] * (1.0f - frac) + buf[(size_t)idx1] * frac;
-    }
-
-    void recalcCrossover()
-    {
-        if (sampleRate > 0.0)
-            cachedCrossCoeff = 1.0f - std::exp(-dsp::TWO_PI_F * crossoverFreq / (float)sampleRate);
-    }
-
-    void recalcAccelCoeff()
-    {
-        if (sampleRate > 0.0)
-            cachedAccelCoeff = 1.0f - std::exp(-acceleration * 10.0f / (float)sampleRate);
-    }
+    moddelay::Core horn, drum;
+    float hornGoal = SLOW_HORN_RATE, drumGoal = SLOW_DRUM_RATE, hornNow = SLOW_HORN_RATE, drumNow = SLOW_DRUM_RATE;
+    float hornAccel = 0.001f, drumAccel = 0.001f;
+    float cross = 0.0f, crossCoeff = 0.1f, crossNow = 0.1f;
 };

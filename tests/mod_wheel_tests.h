@@ -200,6 +200,7 @@ public:
         static const std::vector<std::pair<EngineType, const char*>> list = {
             { EngineType::UnifiedVoice, "Unified voice" }, { EngineType::FM, "FM" },
             { EngineType::MacroOsc, "Macro oscillator" }, { EngineType::Wavetable, "Wavetable" },
+            { EngineType::Resonator, "Resonator" },
             { EngineType::WaveSeq, "Wave sequencer" }, { EngineType::Sampler, "Sampler" },
             { EngineType::Drum, "Drums" } };
         return list;

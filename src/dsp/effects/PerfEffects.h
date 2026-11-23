@@ -2,10 +2,13 @@
 
 #include "EffectBase.h"
 #include "FxBlocks.h"
+#include "DelayCore.h"
+#include "ReverbParts.h"
 #include "../Saturation.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 // The effects that exist only on the PERF screen's pads (src/engine/PerfFx.h): they are played,
@@ -21,24 +24,18 @@ struct PerfGesture
 
 namespace perffx
 {
-// Linear below full scale, bent above it, never beyond +-2: a loop that passes through it loses
-// nothing while it is in range (a held freeze stays) and cannot run away.
-inline float ceiling(float x)
-{
-    const float a = std::abs(x);
-    if (a <= 1.0f) return x;
-    return std::copysign(1.0f + fxb::softSat(a - 1.0f), x);
-}
+// Linear below full scale, bent above it, never beyond +-2 (dly::ceiling, DelayCore.h).
+inline float ceiling(float x) { return dly::ceiling(x); }
 }
 
 // -------------------------------------------------------------------------------------------
-// DUB: the echo of a dub mixing desk: a tape echo with its feedback ridden by hand. A tape-style
-// line (the structure of TapeDelay.h: Hermite read at a gliding position, so a moved TIME bends
-// the pitch of what is in the loop, with the transport's wow and flutter on top) whose repeats
-// pass a band filter and the tape each time round.
+// DUB: the echo of a dub mixing desk: a tape echo with its feedback ridden by hand. A setting of
+// dly::Core (DelayCore.h): a tape-style line (Hermite read at a gliding position, so a moved TIME
+// bends the pitch of what is in the loop, with the transport's wow and flutter on top) whose
+// repeats pass a band filter and the tape each time round.
 //
-// The tape (TapeStage) is the usual model of a recording stage, three things a plain saturator
-// does not do:
+// The tape (dly::TapeStage) is the usual model of a recording stage, three things a plain
+// saturator does not do:
 //  - record pre-emphasis, saturation, playback de-emphasis: flat while the level is low, but the
 //    top of the spectrum reaches the saturation first, so a hot repeat comes back duller and
 //    squashed and the next one more so (tape's level-dependent treble loss);
@@ -51,132 +48,58 @@ inline float ceiling(float x)
 // TONE  where the loop's band sits, 150 Hz .. 5 kHz: every repeat is narrowed towards it
 // DRIV  how hard the tape is hit: more squash, more harmonics, more treble lost per repeat, and
 //       a less steady transport
-// SAT   (PERF's MORE page) the tape's saturation curve: any of src/dsp/Saturation.h, FAST to start with
+// PERF's MORE page:
+// SAT   the tape's saturation curve: any of src/dsp/Saturation.h, FAST to start with
+// HEAD  1..4 playback heads, evenly spaced up to TIME (the last one feeds back)
+// WIDE  the right side's heads sit up to 20 ms later than the left's
+// READ  FWD, REV (each stretch of TIME comes back backwards), OCT+ / 5TH+ / OCT- (every repeat higher or lower)
 // -------------------------------------------------------------------------------------------
-class DubDelay : public EffectBase
+class DubDelay : public dly::Family
 {
 public:
     enum Param { Time = 0, Feedback, Tone, DriveAmt };
+    enum Extra { Sat = 0, Head, Wide, Read };
     static constexpr float MIN_TIME = 0.02f, MAX_TIME = 1.5f;
+    static constexpr int MAX_HEADS = 4;
 
-    DubDelay() { mix = 1.0f; curve.set(sat::Fast, TapeStage::BIAS); prepare(44100.0, 0); }
+    DubDelay() { seed(); }
 
-    ParamSpec getParamSpec(int index) const override
+protected:
+    const ParamSpec* cells() const override
     {
-        switch (index)
-        {
-            case 0: return { "TIME", 0, MIN_TIME, MAX_TIME, 0.375f, ParamKind::Log, "s" };
-            case 1: return { "FDBK", 1, 0, 1, 0.55f };
-            case 2: return { "TONE", 2, 0, 1, 0.5f };
-            case 3: return { "DRIV", 3, 0, 1, 0.3f };
-            default: return {};
-        }
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "TIME", 0, MIN_TIME, MAX_TIME, 0.375f, K::Log, "s" },
+            { "FDBK", 1, 0, 1, 0.55f },
+            { "TONE", 2, 0, 1, 0.5f },
+            { "DRIV", 3, 0, 1, 0.3f },
+            { "SAT", 0, 0, (float) (sat::Count - 1), (float) sat::Fast, K::Choice, "", sat::names(), sat::Count },
+            { "HEAD", 1, 1, (float) MAX_HEADS, 1, K::Int },
+            { "WIDE", 2, 0, 1, 0 },
+            { "READ", 3, 0, (float) (dly::read::Count - 1), 0, K::Choice, "", dly::read::names(), dly::read::Count } };
+        return c;
     }
-
-    ParamSpec getExtraSpec(int index) const override
+    dly::Core::Setup setup() const override
     {
-        if (index != 0) return {};
-        return { "SAT", 0, 0, (float) (sat::Count - 1), (float) sat::Fast, ParamKind::Choice, "", sat::names(), sat::Count };
+        dly::Core::Setup s;
+        s.emphasis = s.makeup = true;       // what is heard is brought back up by sqrt(drive): the tape holds near 1 / drive
+        return s;
     }
-    void setExtra(int index, float value) override
+    float lineSeconds() const override { return dly::roomFor(MAX_TIME, MAX_TIME); }
+
+    void configure(const float* v) override
     {
-        if (index == 0 && std::isfinite(value)) curve.set((int) std::lround(value), TapeStage::BIAS);
-    }
-    float getExtra(int index) const override { return index == 0 ? (float) curve.curve : 0.0f; }
-
-    void setParameter(int id, float value) override
-    {
-        if (! std::isfinite(value)) return;
-        switch (id)
-        {
-            case Time:     timeSec = std::clamp(value, MIN_TIME, MAX_TIME); break;
-            case Feedback: feedback = std::clamp(value, 0.0f, 1.0f); break;
-            case Tone:     tone = std::clamp(value, 0.0f, 1.0f); break;
-            case DriveAmt: driveAmt = std::clamp(value, 0.0f, 1.0f); break;
-            default: break;
-        }
-    }
-
-    float getParameter(int id) const override
-    {
-        switch (id)
-        {
-            case Time:     return timeSec;
-            case Feedback: return feedback;
-            case Tone:     return tone;
-            case DriveAmt: return driveAmt;
-            default:       return 0.0f;
-        }
-    }
-
-    void prepare(double sr, int) override
-    {
-        sampleRate = sr;
-        const int maxSamples = (int) ((double) MAX_TIME * 1.02 * sr) + 16;
-        lineL.prepare(maxSamples);
-        lineR.prepare(maxSamples);
-        timeSmooth.setTime(sr, 80.0f);
-        toneSmooth.setTime(sr, 20.0f);
-        fbSmooth.setTime(sr, 10.0f);
-        driveSmooth.setTime(sr, 10.0f);
-        tapeL.prepare(sr);
-        tapeR.prepare(sr);
-        appliedTone = -1.0f;
-        reset();
-    }
-
-    void reset() override
-    {
-        lineL.clear();
-        lineR.clear();
-        for (auto* f : { &lpL, &lpR, &hpL, &hpR })
-            f->reset();
-        tapeL.reset();
-        tapeR.reset();
-        transport.reset();
-        timeSmooth.snap(timeSec);
-        toneSmooth.snap(tone);
-        fbSmooth.snap(feedback);
-        driveSmooth.snap(driveAmt);
-        toneCount = 0;
-    }
-
-    void process(float& left, float& right) override
-    {
-        // The band follows TONE a little at a time (its two corners are set every 16 samples).
-        const float t = toneSmooth.next(tone);
-        if (--toneCount <= 0)
-        {
-            toneCount = 16;
-            if (t != appliedTone)
-            {
-                appliedTone = t;
-                const float centre = 150.0f * std::pow(5000.0f / 150.0f, t);
-                for (auto* f : { &lpL, &lpR }) f->setCutoff(sampleRate, centre * 2.2f);
-                for (auto* f : { &hpL, &hpR }) f->setCutoff(sampleRate, centre / 2.2f);
-            }
-        }
-
-        const float driven = driveSmooth.next(driveAmt);
-        const float drive = 1.0f + 7.0f * driven;
-
+        const float time = v[Time], driven = v[DriveAmt];
+        dly::heads(core, time, (int) std::lround(v[4 + Head]), MAX_HEADS);
+        core.setFeedback(v[Feedback] * MAX_LOOP_GAIN * BAND_MAKEUP);
+        core.setWide(v[4 + Wide] * dly::MAX_WIDE);
         // The transport: slow wow and faster flutter move the head a little, more when driven.
-        const float unsteady = (0.35f + 0.65f * driven) * transport.next(sampleRate);
-
-        const float d = timeSmooth.next(timeSec) * (float) sampleRate * (1.0f + unsteady);
-        const float wetL = hpL.highPass(lpL.lowPass(lineL.readHermite(d)));
-        const float wetR = hpR.highPass(lpR.lowPass(lineR.readHermite(d)));
-
-        const float loopGain = fbSmooth.next(feedback) * MAX_LOOP_GAIN * BAND_MAKEUP;
-        // What goes onto the tape: unity gain for small signals, held near +-1 / drive (which is
-        // what holds a loop gain above 1). What is heard is brought back up by sqrt(drive).
-        const sat::Biased tape = curve;
-        lineL.write(fxb::flushDenormal(tapeL.record(left + wetL * loopGain, drive, tape)));
-        lineR.write(fxb::flushDenormal(tapeR.record(right + wetR * loopGain, drive, tape)));
-
-        const float makeup = std::sqrt(drive);
-        left = wetL * makeup;
-        right = wetR * makeup;
+        core.setTransport(0.35f + 0.65f * driven);
+        const float centre = 150.0f * std::pow(5000.0f / 150.0f, v[Tone]);
+        core.setFilter(centre * 2.2f, centre / 2.2f);
+        core.setDrive(1.0f, 1.0f + 7.0f * driven);
+        core.setCurve((int) std::lround(v[4 + Sat]), dly::TapeStage::BIAS);
+        setRead(v[4 + Read], time);
     }
 
 private:
@@ -184,104 +107,36 @@ private:
     // The band's two corners sit a factor 2.2 either side of its centre, where they pass 0.829 together:
     // made up for, so that FDBK means the same wherever TONE is.
     static constexpr float BAND_MAKEUP = 1.0f / 0.829f;
-    // The tape's record stage, one per channel: the treble above EMPHASIS_HZ is recorded
-    // (1 + EMPHASIS) times hotter and played back as much quieter; BIAS is the offset that makes the
-    // saturation lopsided. Silence in gives silence out exactly; the offset the lopsided curve leaves
-    // on a loud signal is taken out by the loop's high-pass before it is heard or fed back.
-    struct TapeStage
-    {
-        static constexpr float EMPHASIS_HZ = 3000.0f, EMPHASIS = 2.0f, BIAS = 0.25f;
-
-        void prepare(double sr)
-        {
-            pre.setCutoff(sr, EMPHASIS_HZ);
-            de.setCutoff(sr, EMPHASIS_HZ / (1.0f + EMPHASIS));      // the corner that undoes the pre-emphasis
-        }
-
-        void reset() { pre.reset(); de.reset(); }
-
-        // `curve` is the chosen saturation worked at BIAS; dividing by its slope there keeps a quiet
-        // sound at unity whatever the curve.
-        float record(float x, float drive, const sat::Biased& curve)
-        {
-            const float hot = x + EMPHASIS * pre.highPass(x);
-            const float taped = curve(hot * drive) / (drive * curve.slope);
-            return taped - (EMPHASIS / (1.0f + EMPHASIS)) * de.highPass(taped);
-        }
-
-        fxb::OnePole pre, de;
-    };
-
-    float timeSec = 0.375f, feedback = 0.55f, tone = 0.5f, driveAmt = 0.3f;
-    float appliedTone = -1.0f;
-    int toneCount = 0;
-    fxb::DelayLine lineL, lineR;
-    fxb::OnePole lpL, lpR, hpL, hpR;
-    TapeStage tapeL, tapeR;
-    sat::Biased curve;             // SAT, worked at the tape's BIAS
-    fxb::TapeTransport transport;
-    fxb::Smoother timeSmooth, toneSmooth, fbSmooth, driveSmooth;
 };
 
 // -------------------------------------------------------------------------------------------
-// FRZ: catch a moment and hold it. A feedback delay network (Stautner & Puckette / Jot: eight
-// delay lines mixed through a Hadamard matrix, which loses nothing) fed through three allpass
-// diffusers. While the pad is down the network takes what it is given for GRAB, then shuts its
-// input and holds what it has (loop gain 1). Let go, it dies away in DEC.
-// In the loop each line can be read by a pair of moving taps (the delay-line pitch shifter: two
-// Hann-windowed heads half a grain apart) an octave up: SHIM is how much of that is fed back
-// while the pad is down, SPRL how much once it is let go - the held sound climbs away, octave
-// on octave, into a low-pass that takes it out at the top.
+// FRZ: catch a moment and hold it. rvb::setting::field() of the one reverb network (ReverbParts.h):
+// eight delay lines mixed through a Hadamard matrix, which loses nothing, fed through three allpass
+// diffusers.
+// While the pad is down the field takes what it is given for GRAB, then shuts its input and
+// holds what it has (loop gain 1). Let go, it dies away in DEC.
+// In the loop each line can be read by a pair of moving heads (dly::Heads, the delay-line pitch
+// shifter) at an interval: SHIM is how much of that is fed back while the pad is down, SPRL how
+// much once it is let go - the held sound climbs away, octave on octave, into a low-pass that
+// takes it out at the top.
 //
-// GRAB  how long the input stays open after the press
-// SHIM  octave-up feedback while held
-// SPRL  octave-up feedback after the release: the spiral away
+// GRAB  how long the input stays open after the press (it can follow the tempo: SYNC)
+// SHIM  shifted feedback while held
+// SPRL  shifted feedback after the release: the spiral away
 // DEC   time to die away after the release
+// PERF's MORE page:
+// MODE  the interval of SHIM and SPRL (the reverbs' list): OCT+ as it always was, 5TH+, O+5, OCT-
+//       (it sinks away), REV (what is held is turned round, a stretch at a time), SUB
+// DAMP  the low-pass what is shifted passes each time round: 5 kHz as it always was, down to 500 Hz
 // -------------------------------------------------------------------------------------------
-class FreezeReverb : public EffectBase, public PerfGesture
+class FreezeReverb : public CellEffect, public PerfGesture
 {
 public:
     enum Param { Grab = 0, Shimmer, Spiral, Decay };
+    enum Extra { Mode = 0, Damp };
     static constexpr int LINES = 8;
 
-    FreezeReverb() { mix = 1.0f; prepare(44100.0, 0); }
-
-    ParamSpec getParamSpec(int index) const override
-    {
-        switch (index)
-        {
-            case 0: return { "GRAB", 0, 0.02f, 2.0f, 0.25f, ParamKind::Log, "s" };
-            case 1: return { "SHIM", 1, 0, 1, 0.0f };
-            case 2: return { "SPRL", 2, 0, 1, 0.5f };
-            case 3: return { "DEC", 3, 0.2f, 20.0f, 3.0f, ParamKind::Log, "s" };
-            default: return {};
-        }
-    }
-
-    void setParameter(int id, float value) override
-    {
-        if (! std::isfinite(value)) return;
-        switch (id)
-        {
-            case Grab:    grabSec = std::clamp(value, 0.02f, 2.0f); break;
-            case Shimmer: shimmer = std::clamp(value, 0.0f, 1.0f); break;
-            case Spiral:  spiral = std::clamp(value, 0.0f, 1.0f); break;
-            case Decay:   decaySec = std::clamp(value, 0.2f, 20.0f); releaseGain = releaseGainFor(decaySec); break;
-            default: break;
-        }
-    }
-
-    float getParameter(int id) const override
-    {
-        switch (id)
-        {
-            case Grab:    return grabSec;
-            case Shimmer: return shimmer;
-            case Spiral:  return spiral;
-            case Decay:   return decaySec;
-            default:      return 0.0f;
-        }
-    }
+    FreezeReverb() { mix = 1.0f; seed(); }
 
     void padGate(bool down) override
     {
@@ -289,140 +144,87 @@ public:
         if (down) grabLeft = (int) (grabSec * (float) sampleRate);
     }
 
-    void prepare(double sr, int) override
+protected:
+    const ParamSpec* cells() const override
     {
-        sampleRate = sr;
-        // Line lengths in milliseconds: no two share a factor once in samples (near enough), 53 - 113 ms.
-        static const float ms[LINES] = { 53.3f, 61.7f, 68.9f, 77.3f, 85.1f, 93.7f, 103.1f, 112.9f };
-        for (int i = 0; i < LINES; ++i)
-        {
-            // (Whole samples: a read between two samples would dull a held sound a little every time round.)
-            length[(size_t) i] = std::floor((float) ((double) ms[i] * 0.001 * sr));
-            line[(size_t) i].prepare((int) length[(size_t) i] + 8);
-            damp[(size_t) i].setCutoff(sr, 5000.0f);
-        }
-        static const float apMs[3] = { 4.7f, 8.3f, 12.1f };
-        for (int i = 0; i < 3; ++i)
-        {
-            apLen[(size_t) i] = (float) ((double) apMs[i] * 0.001 * sr);
-            ap[(size_t) i].prepare((int) apLen[(size_t) i] + 8);
-        }
-        grain = (float) (0.030 * sr);
-        inHp.setCutoff(sr, 25.0f);
-        gateSmooth.setTime(sr, 15.0f);
-        shareSmooth.setTime(sr, 30.0f);
-        gainSmooth.setTime(sr, 30.0f);
-        reset();
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            ParamSpec { "GRAB", 0, 0.02f, 2.0f, 0.25f, K::Log, "s" }.timed(),
+            { "SHIM", 1, 0, 1, 0.0f },
+            { "SPRL", 2, 0, 1, 0.5f },
+            { "DEC", 3, 0.2f, 20.0f, 3.0f, K::Log, "s" },
+            { "MODE", Mode, 0, (float) (rvb::shift::Hold - 1), 0, K::Choice, "", rvb::shift::names(), rvb::shift::Hold },
+            { "DAMP", Damp, 0, 1, 0 },
+            {}, {} };
+        return c;
     }
 
-    void reset() override
+    void prepareCore() override { field.prepare(sampleRate, rvb::setting::field()); }
+    void resetCore() override
     {
-        for (auto& l : line) l.clear();
-        for (auto& a : ap) a.clear();
-        for (auto& d : damp) d.reset();
-        inHp.reset();
-        gateSmooth.snap(0.0f);
-        shareSmooth.snap(0.0f);
-        gainSmooth.snap(1.0f);
-        grainPhase = 0.0f;
+        aimField();
+        field.reset();
         grabLeft = 0;
     }
 
-    void process(float& left, float& right) override
+    void configure(const float* v) override
     {
-        // The input: open for GRAB after the press, then shut.
-        const bool open = held && grabLeft > 0;
-        if (grabLeft > 0) --grabLeft;
-        float in = inHp.highPass((left + right) * 0.5f) * gateSmooth.next(open ? 1.0f : 0.0f);
-        for (int i = 0; i < 3; ++i)
-        {
-            // Schroeder allpass: v = x + g d, y = d - g v.
-            const float d = ap[(size_t) i].readLinear(apLen[(size_t) i]);
-            const float v = in + 0.6f * d;
-            ap[(size_t) i].write(fxb::flushDenormal(v));
-            in = d - 0.6f * v;
-        }
+        grabSec = v[Grab];
+        shimmer = v[Shimmer];
+        spiral = v[Spiral];
+        releaseDecay = v[Decay];
+        speed = rvb::shift::speedOf((int) v[4 + Mode]);
+        field.setTone(5000.0f * std::pow(0.1f, v[4 + Damp]));
+        aimField();
+    }
 
-        // Held: nothing is lost. Let go: it dies away in DEC.
-        const float loopGain = gainSmooth.next(held ? 1.0f : releaseGain);
-        const float share = shareSmooth.next(held ? shimmer : spiral);
+    void controlCore() override
+    {
+        aimField();
+        field.control();
+    }
 
-        // The two heads of the octave-up read: they move towards the write point at one sample a
-        // sample (ratio 2), each faded by a Hann window, half a grain apart.
-        grainPhase += 1.0f / grain;
-        if (grainPhase >= 1.0f) grainPhase -= 1.0f;
-        float phase2 = grainPhase + 0.5f;
-        if (phase2 >= 1.0f) phase2 -= 1.0f;
-        const bool climbing = share > 1.0e-4f;
-        const float win1 = climbing ? 0.5f - 0.5f * std::cos(grainPhase * dsp::TWO_PI_F) : 0.0f;
-        const float win2 = 1.0f - win1;
-
-        std::array<float, LINES> out;
-        for (int i = 0; i < LINES; ++i)
-        {
-            const float len = length[(size_t) i];
-            float v = line[(size_t) i].readLinear(len);
-            if (climbing)
-            {
-                const float up = line[(size_t) i].readLinear(len - grainPhase * grain) * win1
-                               + line[(size_t) i].readLinear(len - phase2 * grain) * win2;
-                v += share * (damp[(size_t) i].lowPass(up) - v);
-            }
-            out[(size_t) i] = v;
-        }
-
-        // Hadamard, 8 x 8, scaled to keep the energy (three butterfly passes).
-        std::array<float, LINES> m = out;
-        for (int span = 1; span < LINES; span <<= 1)
-            for (int i = 0; i < LINES; i += span << 1)
-                for (int j = i; j < i + span; ++j)
-                {
-                    const float a = m[(size_t) j], b = m[(size_t) (j + span)];
-                    m[(size_t) j] = a + b;
-                    m[(size_t) (j + span)] = a - b;
-                }
-        static constexpr float NORM = 0.35355339f;      // 1 / sqrt(8)
-        for (int i = 0; i < LINES; ++i)
-            line[(size_t) i].write(fxb::flushDenormal(perffx::ceiling(in * NORM + m[(size_t) i] * NORM * loopGain)));
-
-        left  = (out[0] - out[2] + out[4] - out[6]) * 0.5f;
-        right = (out[1] - out[3] + out[5] - out[7]) * 0.5f;
+    void runCore(float* left, float* right, int n, float mixFrom, float mixTo) override
+    {
+        if (grabLeft > 0) grabLeft -= n;
+        field.run(left, right, n, mixFrom, mixTo);
     }
 
 private:
-    // Let go: -60 dB in DEC (the mean line is 82 ms).
-    static float releaseGainFor(float decay) { return std::exp(-6.908f * 0.082f / decay); }
+    // The input: open for GRAB after the press, then shut. Held: nothing is lost. Let go: it dies away in DEC.
+    void aimField()
+    {
+        field.setFeed(held && grabLeft > 0 ? 1.0f : 0.0f);
+        field.setDecay(held ? std::numeric_limits<float>::infinity() : releaseDecay);
+        field.setShimmer(held ? shimmer : spiral, speed);
+    }
 
-    float grabSec = 0.25f, shimmer = 0.0f, spiral = 0.5f, decaySec = 3.0f;
-    float releaseGain = releaseGainFor(3.0f);
+    rvb::Net field;
+    float grabSec = 0.25f, shimmer = 0.0f, spiral = 0.5f, releaseDecay = 3.0f, speed = 2.0f;
     bool held = false;
     int grabLeft = 0;
-    float grain = 1323.0f, grainPhase = 0.0f;
-    std::array<fxb::DelayLine, LINES> line;
-    std::array<float, LINES> length {};
-    std::array<fxb::OnePole, LINES> damp;
-    std::array<fxb::DelayLine, 3> ap;
-    std::array<float, 3> apLen {};
-    fxb::OnePole inHp;
-    fxb::Smoother gateSmooth, shareSmooth, gainSmooth;
 };
 
 // -------------------------------------------------------------------------------------------
-// RPT: beat repeat. From the press on, the sound is recorded; the first slice is heard as it
-// is played, and from then on that slice comes round again and again. The slice's length is a
-// division of the tempo, read at the start of every repeat, so a division changed under the
-// finger (pressure) takes over on the next one.
+// RPT: beat repeat. A setting of dly::Core: a line that records from the press on, and one head
+// on it that the effect puts back to the start of the recording at every slice and runs at a
+// speed (the core's tape speed). The first slice is heard as it is played, and from then on that
+// slice comes round again and again. The slice's length is a division of the tempo, read at the
+// start of every repeat, so a division changed under the finger (pressure) takes over on the
+// next one. (Any delay repeats what it holds with READ at HOLD: that one is the loop shut, this
+// one the recording played again.)
 //
 // DIV   the slice: 1/4 .. 1/64
 // DCAY  every repeat quieter than the last
 // PTCH  every repeat this many semitones away from the last (played faster or slower)
 // GATE  how much of each slice sounds
 // -------------------------------------------------------------------------------------------
-class BeatRepeat : public EffectBase, public PerfGesture
+class BeatRepeat : public dly::Family, public PerfGesture
 {
 public:
     enum Param { Division = 0, DecayAmt, Pitch, Gate };
     static constexpr int NUM_DIVS = 7;
+    static constexpr float RECORD_SECONDS = 3.05f;      // a quarter note at 20 BPM is three seconds
     static const char* const* divNames()
     {
         static const char* const n[NUM_DIVS] = { "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/64" };
@@ -434,95 +236,96 @@ public:
         return b[std::clamp(index, 0, NUM_DIVS - 1)];
     }
 
-    BeatRepeat() { mix = 1.0f; prepare(44100.0, 0); }
-
-    ParamSpec getParamSpec(int index) const override
-    {
-        switch (index)
-        {
-            case 0: return { "DIV", 0, 0, NUM_DIVS - 1, 3, ParamKind::Choice, "", divNames(), NUM_DIVS };
-            case 1: return { "DCAY", 1, 0, 1, 0.0f };
-            case 2: return { "PTCH", 2, -12, 12, 0, ParamKind::Int, "st" };
-            case 3: return { "GATE", 3, 0.1f, 1, 1.0f };
-            default: return {};
-        }
-    }
-
-    void setParameter(int id, float value) override
-    {
-        if (! std::isfinite(value)) return;
-        switch (id)
-        {
-            case Division: division = std::clamp((int) std::lround(value), 0, NUM_DIVS - 1); break;
-            case DecayAmt: decayAmt = std::clamp(value, 0.0f, 1.0f); break;
-            case Pitch:    pitch = std::clamp(std::round(value), -12.0f, 12.0f); break;
-            case Gate:     gate = std::clamp(value, 0.1f, 1.0f); break;
-            default: break;
-        }
-    }
-
-    float getParameter(int id) const override
-    {
-        switch (id)
-        {
-            case Division: return (float) division;
-            case DecayAmt: return decayAmt;
-            case Pitch:    return pitch;
-            case Gate:     return gate;
-            default:       return 0.0f;
-        }
-    }
+    BeatRepeat() { mix = 1.0f; seed(); }
 
     void padGate(bool down) override { if (down) restart(); }
 
-    void prepare(double sr, int) override
+protected:
+    const ParamSpec* cells() const override
     {
-        sampleRate = sr;
-        // A quarter note at 20 BPM is three seconds.
-        capacity = (int) (3.05 * sr);
-        bufL.assign((size_t) capacity, 0.0f);
-        bufR.assign((size_t) capacity, 0.0f);
-        reset();
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "DIV", 0, 0, NUM_DIVS - 1, 3, K::Choice, "", divNames(), NUM_DIVS },
+            { "DCAY", 1, 0, 1, 0.0f },
+            { "PTCH", 2, -12, 12, 0, K::Int, "st" },
+            { "GATE", 3, 0.1f, 1, 1.0f },
+            {}, {}, {}, {} };
+        return c;
+    }
+    dly::Core::Setup setup() const override
+    {
+        dly::Core::Setup s;
+        s.hermite = false;          // (a straight line between two samples, as the repeat always read)
+        s.filterInput = false;      // (nothing stands before the line: what is recorded is the sound)
+        return s;
+    }
+    float lineSeconds() const override { return RECORD_SECONDS + 0.05f; }
+
+    void prepareCore() override
+    {
+        dly::Family::prepareCore();
+        capacity = (int) (RECORD_SECONDS * sampleRate);
+    }
+    void resetCore() override
+    {
+        dly::Family::resetCore();
+        restart();
     }
 
-    void reset() override { restart(); }
-
-    void process(float& left, float& right) override
+    void configure(const float* v) override
     {
-        // Recording goes on until the buffer is full (it holds the longest slice at any tempo).
-        if (recorded < capacity)
-        {
-            bufL[(size_t) recorded] = left;
-            bufR[(size_t) recorded] = right;
-            ++recorded;
-        }
-        if (posInSlice >= sliceLen)
-            nextSlice();
+        division = (int) v[Division];
+        decayAmt = v[DecayAmt];
+        pitch = v[Pitch];
+        gate = v[Gate];
+        core.setTapCount(1);
+        core.setTap(0, 0.0f, 1.0f, 1.0f, 0.0f);     // (the head itself: as near the newest sample as a head can be)
+        core.silenceTapsFrom(1);
+        core.setFeedback(0.0f);
+        core.setTransport(0.0f);
+        core.setDrive(0.0f, 1.0f);
+    }
 
-        const int fade = std::max(1, std::min((int) (0.002 * sampleRate), sliceLen / 4));
-        const int sounding = std::max(2 * fade, (int) ((float) sliceLen * gate));
-        float g = level;
-        if (posInSlice < fade)                  g *= (float) posInSlice / (float) fade;
-        else if (posInSlice >= sounding)        g = 0.0f;
-        else if (posInSlice >= sounding - fade) g *= (float) (sounding - posInSlice) / (float) fade;
+    bool coasting() const override { return false; }    // (the slices are counted in runCore)
 
-        if (repeat == 0)
+    // What is heard is the head alone (the pad mixes it: PerfFx.h).
+    void runCore(float* left, float* right, int n, float, float) override
+    {
+        while (n > 0)
         {
-            // The first time through is the sound itself (its start is not faded: it is already playing).
-            if (posInSlice < fade) g = level;
-            left *= g;
-            right *= g;
+            if (posInSlice >= sliceLen)
+                nextSlice();
+            int m = std::min(n, sliceLen - posInSlice);
+            if (recorded < capacity) m = std::min(m, capacity - recorded);      // (the line stands from its last sample on, exactly)
+
+            // The first time through is the sound itself, to the sample (the line takes it down as it
+            // passes; its start is not faded: it is already playing). After that, the head.
+            const float wet = repeat == 0 ? 0.0f : 1.0f;
+            core.run(left, right, m, wet, wet);
+
+            const int fade = std::max(1, std::min((int) (0.002 * sampleRate), sliceLen / 4));
+            const int sounding = std::max(2 * fade, (int) ((float) sliceLen * gate));
+            for (int i = 0; i < m; ++i)
+            {
+                const int pos = posInSlice + i;
+                float g = level;
+                if (pos < fade)                  g = repeat == 0 ? level : g * (float) pos / (float) fade;
+                else if (pos >= sounding)        g = 0.0f;
+                else if (pos >= sounding - fade) g *= (float) (sounding - pos) / (float) fade;
+                left[i] *= g;
+                right[i] *= g;
+            }
+
+            // Recording goes on until the line is full (it holds the longest slice at any tempo); then it stands.
+            if (recorded < capacity)
+            {
+                recorded = std::min(capacity, recorded + m);
+                if (recorded >= capacity) core.setRecording(false);
+            }
+            posInSlice += m;
+            left += m; right += m;
+            n -= m;
         }
-        else
-        {
-            const double at = std::min((double) posInSlice * rate, (double) (recorded - 2));
-            const int i = std::max(0, (int) at);
-            const float f = (float) (at - (double) i);
-            const int j = std::min(i + 1, capacity - 1);
-            left  = (bufL[(size_t) i] + f * (bufL[(size_t) j] - bufL[(size_t) i])) * g;
-            right = (bufR[(size_t) i] + f * (bufR[(size_t) j] - bufR[(size_t) i])) * g;
-        }
-        ++posInSlice;
     }
 
 private:
@@ -534,6 +337,9 @@ private:
         sliceLen = 0;
         level = 1.0f;
         rate = 1.0;
+        core.setRecording(true);
+        core.setLag(0.0f);
+        core.setTape(1.0f);
     }
 
     void nextSlice()
@@ -543,104 +349,122 @@ private:
         const float bpm = getTempo();
         const double samples = divBeats(division) * 60.0 / (double) (bpm > 1.0f && std::isfinite(bpm) ? bpm : 120.0f) * sampleRate;
         sliceLen = std::clamp((int) std::lround(samples), 16, capacity - 2);
-        // A repeat can only play what has been recorded by now.
+        // A repeat can only play what has been recorded by now (this sample with the rest).
+        const int there = std::min(capacity, recorded + 1);
         if (repeat > 0)
-            sliceLen = std::min(sliceLen, std::max(16, recorded - 1));
+            sliceLen = std::min(sliceLen, std::max(16, there - 1));
         level = repeat <= 0 ? 1.0f : std::pow(1.0f - 0.5f * decayAmt, (float) repeat);
         // Played faster, a slice would run past what was recorded: held to four octaves either way.
         rate = repeat <= 0 ? 1.0 : std::pow(2.0, std::clamp((double) pitch * (double) repeat, -48.0, 48.0) / 12.0);
         if (rate > 1.0)
-            rate = std::min(rate, (double) std::max(16, recorded - 2) / (double) sliceLen);
+            rate = std::min(rate, (double) std::max(16, there - 2) / (double) sliceLen);
+        // The head: back at the start of the recording (in the dark: the slice begins at nothing),
+        // at the repeat's speed. (Its tap is HEAD samples behind the newest already.)
+        if (repeat > 0)
+        {
+            core.setLag((float) recorded - HEAD);
+            core.setTape((float) rate);
+        }
     }
+
+    static constexpr float HEAD = 2.0f;     // the core's shortest tap, in samples
 
     int division = 3;
     float decayAmt = 0.0f, pitch = 0.0f, gate = 1.0f;
-    std::vector<float> bufL, bufR;
     int capacity = 0, recorded = 0, repeat = -1, posInSlice = 0, sliceLen = 0;
     float level = 1.0f;
     double rate = 1.0;
 };
 
 // -------------------------------------------------------------------------------------------
-// STOP: the tape stops. From the press the sound is recorded and played back from a head that
-// slows to a standstill over TIME: the pitch falls away and the sound with it. Letting go
-// brings the live sound back (the pad's own fade).
+// STOP: the tape stops. A setting of dly::Core: one head as near the newest sample as a head can
+// be, and the core's tape speed taken down to a standstill over TIME: the head falls behind,
+// the pitch falls away and the sound with it. Letting go brings the live sound back (the pad's
+// own fade). (Any delay's echoes stop this way with READ at STOP.)
 //
 // TIME  how long the tape takes to stop
 // CURV  the way it slows: 0 evenly, 1 quickly at first with a long last turn
 // -------------------------------------------------------------------------------------------
-class TapeStop : public EffectBase, public PerfGesture
+class TapeStop : public dly::Family, public PerfGesture
 {
 public:
     enum Param { Time = 0, Curve };
     static constexpr float MIN_TIME = 0.05f, MAX_TIME = 4.0f;
 
-    TapeStop() { mix = 1.0f; prepare(44100.0, 0); }
-
-    ParamSpec getParamSpec(int index) const override
-    {
-        switch (index)
-        {
-            case 0: return { "TIME", 0, MIN_TIME, MAX_TIME, 0.5f, ParamKind::Log, "s" };
-            case 1: return { "CURV", 1, 0, 1, 0.3f };
-            default: return {};
-        }
-    }
-
-    void setParameter(int id, float value) override
-    {
-        if (! std::isfinite(value)) return;
-        if (id == Time)  timeSec = std::clamp(value, MIN_TIME, MAX_TIME);
-        if (id == Curve) curve = std::clamp(value, 0.0f, 1.0f);
-    }
-
-    float getParameter(int id) const override { return id == Time ? timeSec : (id == Curve ? curve : 0.0f); }
+    TapeStop() { mix = 1.0f; seed(); }
 
     void padGate(bool down) override { if (down) restart(); }
 
-    void prepare(double sr, int) override
+protected:
+    const ParamSpec* cells() const override
     {
-        sampleRate = sr;
-        // The tape slows at least as fast as a straight line over the longest TIME, so the head never
-        // gets past half of that: what would be recorded beyond it is never played.
-        capacity = (int) ((double) MAX_TIME * 0.5 * 1.05 * sr) + 16;
-        bufL.assign((size_t) capacity, 0.0f);
-        bufR.assign((size_t) capacity, 0.0f);
-        reset();
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "TIME", 0, MIN_TIME, MAX_TIME, 0.5f, K::Log, "s" },
+            { "CURV", 1, 0, 1, 0.3f },
+            {}, {}, {}, {}, {}, {} };
+        return c;
+    }
+    dly::Core::Setup setup() const override
+    {
+        dly::Core::Setup s;
+        s.hermite = false;
+        s.filterInput = false;
+        return s;
+    }
+    // (The head falls behind by at most the whole of TIME, and stands from there.)
+    float lineSeconds() const override { return MAX_TIME * 1.02f; }
+
+    void resetCore() override
+    {
+        dly::Family::resetCore();
+        restart();
     }
 
-    void reset() override { restart(); }
-
-    void process(float& left, float& right) override
+    void configure(const float* v) override
     {
-        if (written < capacity)
-        {
-            bufL[(size_t) written] = left;
-            bufR[(size_t) written] = right;
-            ++written;
-        }
-        // How far the tape has slowed: 1 at the press, 0 once TIME has passed.
-        const float t = std::min(1.0f, (float) elapsed / std::max(1.0f, timeSec * (float) sampleRate));
-        const float straight = 1.0f - t;
-        const float speed = straight * (1.0f - curve) + straight * straight * straight * curve;
-        ++elapsed;
+        timeSec = v[Time];
+        curve = v[Curve];
+        core.setTapCount(1);
+        core.setTap(0, 0.0f, 1.0f, 1.0f, 0.0f);
+        core.silenceTapsFrom(1);
+        core.setFeedback(0.0f);
+        core.setTransport(0.0f);
+        core.setDrive(0.0f, 1.0f);
+        core.setTapeFades(true);
+    }
 
-        const double at = std::min(head, (double) (written - 2));
-        const int i = std::max(0, (int) at);
-        const float f = (float) (at - (double) i);
-        const int j = std::min(i + 1, capacity - 1);
-        // A stopped tape gives nothing (the last sample is not held as an offset).
-        const float g = std::min(1.0f, speed * 12.0f);
-        left  = (bufL[(size_t) i] + f * (bufL[(size_t) j] - bufL[(size_t) i])) * g;
-        right = (bufR[(size_t) i] + f * (bufR[(size_t) j] - bufR[(size_t) i])) * g;
-        head += (double) speed;
+    bool coasting() const override { return false; }    // (the speed is set at every look)
+
+    // Every look: the speed the tape is to have a look further on (straight lines between).
+    void controlCore() override
+    {
+        core.setTape(speedAt(elapsed + CONTROL), (float) CONTROL / (float) sampleRate);
+        core.control();
+    }
+
+    void runCore(float* left, float* right, int n, float, float) override
+    {
+        core.run(left, right, n, 1.0f, 1.0f);
+        elapsed += n;
     }
 
 private:
-    void restart() { written = 0; elapsed = 0; head = 0.0; }
+    // How far the tape has slowed: 1 at the press, 0 once TIME has passed.
+    float speedAt(int samples) const
+    {
+        const float t = std::min(1.0f, (float) samples / std::max(1.0f, timeSec * (float) sampleRate));
+        const float straight = 1.0f - t;
+        return straight * (1.0f - curve) + straight * straight * straight * curve;
+    }
+
+    void restart()
+    {
+        elapsed = 0;
+        core.setLag(0.0f);
+        core.setTape(1.0f);
+    }
 
     float timeSec = 0.5f, curve = 0.3f;
-    std::vector<float> bufL, bufR;
-    int capacity = 0, written = 0, elapsed = 0;
-    double head = 0.0;
+    int elapsed = 0;
 };

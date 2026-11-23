@@ -3,7 +3,10 @@
 #include "EngineBase.h"
 #include "VoiceAllocator.h"
 #include "VoiceFilterSection.h"
-#include "EngineLfoSection.h"
+#include "VoiceBodySection.h"
+#include "VoiceSpread.h"
+#include "AmpEnvelopeSection.h"
+#include "ModRouter.h"
 #include "../dsp/Envelope.h"
 #include "../dsp/EnvelopeChain.h"
 #include "../dsp/DSPUtils.h"
@@ -23,7 +26,13 @@
 // and two more (harmonics, morph), whose meaning also belongs to the model - every one of the four
 // is heard in every model (the "Dead Controls" tests). The third is neutral at 0.5 and the fourth
 // at 0 wherever the model had no use for it before, so those values are the sound as it was.
-// Amplitude is shaped by a built-in ADSR envelope.
+// Amplitude is shaped by a built-in ADSR envelope (and its chain: AmpEnvelopeSection.h).
+// Then, off until its MIX is raised, BODY (VoiceBodySection.h): the voice's sound as the exciter of
+// a string, tube, plate, bar or bell tuned to the note; the voice is alive while its model sounds or
+// its body rings. Each note takes its share of the per-note spread (VoiceSpread.h, the ANLG page),
+// and every random a note draws - the router's RAND .., the models' noise - comes from the voice's
+// one generator (stream spread::Model for the models): the same SEED and the same notes in the same
+// order give the same render.
 // All DSP is audio-thread safe: no heap allocation, no mutex.
 // ---------------------------------------------------------------------------
 
@@ -43,33 +52,45 @@ public:
         Count
     };
 
-    // LFO destinations (EngineLfoSection), in the order of the DEST cell. The four macros are
-    // moved by +-1 around their knobs (clamped to 0..1).
+    // The destinations the voice reads by name: indices of the engine's table (MacroOscEngine::
+    // lfoDests), in the order of the DEST cells. The four macros are page cells (moved by +-1
+    // around their knobs, held to 0..1).
     enum LfoDest
     {
         LfoOff = 0,
-        LfoPitch,       // +-12 semitones, depth squared
-        LfoAmp,         // gain 0..2
-        LfoPan,         // +-1
-        LfoCutoff,      // +-4 octaves
+        LfoPitch,       // per sample: a frequency ratio (+-12 semitones, amount squared)
+        LfoAmp,         // per sample: a gain, 0..4 (an audio-rate slot may take it to -4)
+        LfoPan,         // per sample: +-1
+        LfoCutoff,      // per sample: octaves (+-4 at full depth)
         LfoResonance,   // +-0.5
-        LfoTimbre,
+        LfoTimbre,      // per sample, like the three after it
         LfoColor,
         LfoHarmonics,
         LfoMorph,
-        NumLfoDests
+        NumLfoDests,
+        LfoEnvTime = 27,    // ETIM: the amp envelope's time (and its chain's), a factor
+        LfoFilterTime,      // FTIM: the filter envelope's time, a factor
+        LfoBody,            // BMIX .. BKTK: BODY's eight cells (page cells, control rate)
+        LfoBow = LfoBody + VoiceBody::NumCells     // hidden (the pressure route BOW): the bow's energy, 0..1
+    };
+
+    // The voice's own sources, in the order the engine publishes them (MacroOscEngine::sources).
+    enum Published
+    {
+        PubOsc = 0      // OSC: the model's output before the filter, at audio rate
     };
 
     void setSampleRate(double sr)
     {
         sampleRate = sr;
-        ampEnv.setSampleRate(sr);
-        envChain.setSampleRate(sr);
+        env.setSampleRate(sr);
         filter.setSampleRate(sr);
-        lfos.setSampleRate(sr);
+        body.setSampleRate(sr);
+        mods.prepare(sr);
         declick.setSampleRate(sr);
         gainDeclick.setSampleRate(sr);
         levelStep = (float) (1.0 / (0.004 * sr));
+        bowLagK = (float) (1.0 - std::exp(-1.0 / (BOW_ENERGY_LAG * std::max(sr, 1.0))));
         shaper.setSampleRate(sr);
         // The string's line is as long as the lowest pitch needs at this rate: sized here, never
         // while playing.
@@ -117,23 +138,65 @@ public:
         resetModelState();
     }
 
-    void noteOn()
+    // `own`: what this note takes of the per-note spread (VoiceSpread, the ANLG page): with every
+    // amount at 0 it is nothing, and the note is sample for sample what it was without the page.
+    // The voice's generator has been advanced to this note (VoiceSpread::next): the router's
+    // randoms (RAND, RND2 ..) and the models' noise are draws of it, so SEED repeats them.
+    void noteOn(const mod::Router& router, const VoiceSpread::Note& own = {})
     {
+        // (A voice whose model has ended but whose body still rings is heard: it glides to its new
+        // place too. U4-MACRO review.)
+        const bool wasActive = isActive();
         if (active)
         {
             declick.arm();      // struck again while sounding: the restart must not jump,
             gainDeclick.arm();  // nor the step to the new velocity
         }
-        else
-            lfos.snapSlews();
-        // An LFO on a page cell is read before the first sample (the engine sets the cell then).
-        if (lfos.keyed()) lfos.noteOnAndSample(); else lfos.noteOn();
-        filter.noteOn(currentNote, currentVelocity, active);
-        ampEnv.noteOn();
-        if (envChainEnabled)
-            envChain.noteOn();
+        // (Whatever is routed is read before the note's first sample: mod::Voice::tick.)
+        mods.noteOn(router, currentNote, currentVelocity, generator);
+        // EVAR: this note's envelopes (amp, the chain's stages, the filter's) are all longer or
+        // shorter by the same factor (times the router's ETIM / FTIM).
+        if (own.timeScale != envScale)
+        {
+            envScale = own.timeScale;
+            env.setTimeScale(envTime * envScale);
+            filter.setEnvTimeScale(filterTime * envScale);
+        }
+        filter.noteOn(currentNote, currentVelocity, active, own.cutoffOctaves);
+        env.noteOn();
+        body.noteOn(currentNote);
+        // SLOP, WVAR, PHAS, PVAR, LVAR.
+        if (own.semitones != spreadSemis)
+        {
+            spreadSemis = own.semitones;
+            setPitchOffset(pitchSemis);
+        }
+        if (own.wave * SPREAD_TIMBRE != spreadTimbre)
+        {
+            spreadTimbre = own.wave * SPREAD_TIMBRE;
+            timbre = juce::jlimit(0.0f, 1.0f, timbreSet + spreadTimbre);
+        }
+        // (A voice struck again while it sounds is carried to its new place: the declicks above
+        // work on the voice's one signal, before it is placed.)
+        spreadPan = own.pan;
+        if (! wasActive)
+            spreadPanNow = spreadPan;
+        spreadGain = own.gain;
+        if (own.phaseAmount > 0.0f)
+        {
+            phase = (double) own.phase(0);
+            modPhase = (double) own.phase(1);
+            for (int i = 0; i < MAX_SAWS; ++i)
+                sawPhases[(size_t) i] = (double) own.phase(2 + i);
+        }
+        // The models' noise: the dust's clicks, the string's burst, the whisper and the drum blend.
+        dustSeed = modelSeed(0);
+        noiseState = modelSeed(2) | 1u;
         active = true;
         struck = true;
+        // The bow is the model's own until this note's pad is pressed (setExcite).
+        bowPressed = false;
+        bowEnergy = 1.0f;
 
         // Karplus-Strong: fill delay line with filtered noise burst on note-on
         if (model == Model::PluckedString)
@@ -146,47 +209,165 @@ public:
 
     void noteOff()
     {
-        ampEnv.noteOff();
-        if (envChainEnabled)
-            envChain.noteOff();
+        env.noteOff();
         filter.noteOff();
     }
 
-    bool isActive() const { return active; }
+    // The model sounds, or the body it went through still rings.
+    bool isActive() const { return active || body.ringing(); }
 
-    float process()
+    // The per-note generator's seed (the engine: its SEED and this voice's number).
+    void seedRandom(uint32_t engineSeed, int voice) { generator.seed(engineSeed, voice); }
+    spread::Generator& getGenerator() { return generator; }
+
+    // One sub-block of n samples, added to left / right. pressure: this voice's pad; bowIsRouted:
+    // a slot is aimed at the bow's energy; setCell(voice, dest, value) sets a page cell of this
+    // voice (a control-rate destination of the router).
+    template <typename SetCell>
+    void render(const mod::Router& router, float* left, float* right, int n, float pressure, bool bowIsRouted, const SetCell& setCell)
     {
-        if (!active)
-            return 0.0f;
+        const bool moved = mods.tick(router, n, env.level(), filter.getEnvelope().getCurrentLevel(), pressure);
+        setExcite(bowIsRouted, pressure, mods.moved(LfoBow) ? mods.value(LfoBow) : 0.0f);
+        // OSC, the voice's own source: kept and handed over only while a slot reads it. (The
+        // router has taken what the last sub-block made; the slots hear these samples in the next.)
+        float* tap = nullptr;
+        if (router.wants(PubOsc))
+        {
+            tap = oscOut.data();
+            std::fill(tap, tap + n, 0.0f);
+            mods.publishAudio(PubOsc, tap, n);
+            oscTapped = true;
+        }
+        else if (oscTapped)
+        {
+            mods.publishAudio(PubOsc, nullptr, 0);
+            oscTapped = false;
+        }
+        // The note's own place (PVAR): the voice is placed only where it has one.
+        const bool placed = spreadPan != 0.0f || spreadPanNow != 0.0f;
+        if (! moved)
+        {
+            // Nothing moves this voice: the oscillator as it is without any modulation.
+            if (cutMoved)
+            {
+                filter.setLfoOctaves(0.0f);
+                cutMoved = false;
+            }
+            if (placed)
+            {
+                for (int i = 0; i < n && isActive(); ++i)
+                {
+                    const float s = process(1.0f);
+                    if (tap) tap[i] = lastOsc;
+                    place(s, 0.0f, left[i], right[i]);
+                }
+                return;
+            }
+            for (int i = 0; i < n && isActive(); ++i)
+            {
+                const float s = process(1.0f);
+                if (tap) tap[i] = lastOsc;
+                left[i] += s;
+                right[i] += s;
+            }
+            return;
+        }
 
-        // LFOs: the macros and the pitch are moved for this sample only (the set values stay).
-        const bool lfoOn = lfos.anyOn();
+        mods.forEachControl([&](int dest, float value) { setControl(dest, value, setCell); });
+        const float* pitch = mods.buffer(LfoPitch);
+        const float* amp = mods.buffer(LfoAmp);
+        const float* pan = mods.buffer(LfoPan);
+        const float* cutoff = mods.buffer(LfoCutoff);
+        const float* macro[4] = { mods.buffer(LfoTimbre), mods.buffer(LfoColor), mods.buffer(LfoHarmonics), mods.buffer(LfoMorph) };
+        if (cutoff == nullptr && cutMoved)
+            filter.setLfoOctaves(0.0f);
+        cutMoved = cutoff != nullptr;
+
+        if (! (pitch || pan || cutoff || macro[0] || macro[1] || macro[2] || macro[3] || placed))
+        {
+            // The level alone (a pad's pressure on the volume), or only cells set above.
+            for (int i = 0; i < n && isActive(); ++i)
+            {
+                const float s = process(amp ? amp[i] : 1.0f);
+                if (tap) tap[i] = lastOsc;
+                left[i] += s;
+                right[i] += s;
+            }
+            return;
+        }
+
+        // The macros and the pitch are moved for these samples only (the set values stay).
         const float setTimbre = timbre, setColor = color, setHarmonics = harmonics, setMorph = morph;
         const double setFrequency = baseFrequency;
-        if (lfoOn)
+        for (int i = 0; i < n && isActive(); ++i)
         {
-            lfos.tick();
-            lfoApplied = true;
-            timbre = juce::jlimit(0.0f, 1.0f, timbre + lfos.amount(LfoTimbre));
-            color = juce::jlimit(0.0f, 1.0f, color + lfos.amount(LfoColor));
-            harmonics = juce::jlimit(0.0f, 1.0f, harmonics + lfos.amount(LfoHarmonics));
-            morph = juce::jlimit(0.0f, 1.0f, morph + lfos.amount(LfoMorph));
-            const float semis = lfos.pitchSemitones(LfoPitch);
-            if (semis != 0.0f)
-                baseFrequency *= (double) std::exp2(semis / 12.0f);
-            filter.setLfoOctaves(lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES);
-            filter.setResonanceMod(lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE);
-            lfoGain = lfos.gain(LfoAmp);
-            lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.panAmount(LfoPan));
+            if (macro[0]) timbre = spreadTimbre == 0.0f ? macro[0][i] : juce::jlimit(0.0f, 1.0f, macro[0][i] + spreadTimbre);
+            if (macro[1]) color = macro[1][i];
+            if (macro[2]) harmonics = macro[2][i];
+            if (macro[3]) morph = macro[3][i];
+            if (pitch)    baseFrequency = setFrequency * (double) pitch[i];
+            if (cutoff)   filter.setLfoOctaves(cutoff[i]);
+            const float s = process(amp ? amp[i] : 1.0f);
+            if (tap) tap[i] = lastOsc;
+            // PAN moves its own voice between the channels (balance law: the centre is unchanged).
+            const float p = pan ? pan[i] : 0.0f;
+            if (placed)
+            {
+                place(s, p, left[i], right[i]);
+                continue;
+            }
+            left[i] += p > 0.0f ? s * (1.0f - p) : s;
+            right[i] += p < 0.0f ? s * (1.0f + p) : s;
         }
-        else if (lfoApplied)
+        timbre = setTimbre;
+        color = setColor;
+        harmonics = setHarmonics;
+        morph = setMorph;
+        baseFrequency = setFrequency;
+    }
+
+    // A control-rate destination of the router: the resonance, or one of this voice's page cells.
+    template <typename SetCell>
+    void setControl(int dest, float value, const SetCell& setCell)
+    {
+        if (dest == LfoResonance)
+            filter.setResonanceMod(value);
+        else if (dest == LfoEnvTime)
+            setEnvTimeScale(value);
+        else if (dest == LfoFilterTime)
         {
-            filter.setLfoOctaves(0.0f);
-            filter.setResonanceMod(0.0f);
-            lfoGain = 1.0f;
-            lfoPan = 0.0f;
-            lfos.snapSlews();
-            lfoApplied = false;
+            filterTime = value;
+            filter.setEnvTimeScale(filterTime * envScale);
+        }
+        else if (dest != LfoBow)
+            setCell(*this, dest, value);
+    }
+
+    // ETIM: every stage time of the amp envelope, and of the chain's stages, times this (and the
+    // note's EVAR). Under a sounding note the running stage goes on from where it is
+    // (Envelope::setTimeScale).
+    void setEnvTimeScale(float scale)
+    {
+        envTime = scale;
+        env.setTimeScale(envTime * envScale);
+    }
+
+    // One sample of the voice: the model, then its body where BODY is on. amp: the gain the
+    // router has for the level (1 = none).
+    float process(float amp)
+    {
+        if (! body.engaged())
+            return processSample(amp);          // exactly as without the body
+        return body.process(active ? processSample(amp) : 0.0f, active);
+    }
+
+    // One sample of the model through the filter, the declicks and the envelope.
+    float processSample(float amp)
+    {
+        if (!active)
+        {
+            lastOsc = 0.0f;
+            return 0.0f;
         }
 
         float sample = 0.0f;
@@ -204,56 +385,30 @@ public:
             default:                      sample = 0.0f;                    break;
         }
 
-        if (lfoOn)
-        {
-            timbre = setTimbre;
-            color = setColor;
-            harmonics = setHarmonics;
-            morph = setMorph;
-            baseFrequency = setFrequency;
-        }
-
+        lastOsc = sample;       // (the source OSC: the model as it is, before the filter)
         sample = filter.process(declick.process(sample));
 
-        float env;
-        if (envChainEnabled && envChain.getStageCount() > 0)
-        {
-            env = envChain.process();
-            // Also advance the basic ampEnv to keep it in sync for noteOff
-            ampEnv.process();
-            if (!envChain.isActive() && !ampEnv.isActive())
-                active = false;
-        }
-        else
-        {
-            env = ampEnv.process();
-            if (!ampEnv.isActive())
-                active = false;
-        }
+        const float envLevel = env.process(active);
 
-        // LEVL and pressure's share of the level are moved to over a few milliseconds under a
-        // sounding note (a jump would be a click); the first sample of a note takes them as they stand.
+        // LEVL is moved to over a few milliseconds under a sounding note (a jump would be a
+        // click); the first sample of a note takes it as it stands.
         if (struck)
         {
             struck = false;
             levelNow = level;
-            gainModNow = gainMod;
         }
-        else
-        {
-            if (levelNow != level)     levelNow = dsp::towards(levelNow, level, levelStep);
-            if (gainModNow != gainMod) gainModNow = dsp::towards(gainModNow, gainMod, 2.0f * levelStep);
-        }
-        return gainDeclick.process(sample * env * currentVelocity * levelNow * gainModNow * lfoGain);
+        else if (levelNow != level)
+            levelNow = dsp::towards(levelNow, level, levelStep);
+        return gainDeclick.process(sample * envLevel * currentVelocity * levelNow * amp * spreadGain);
     }
 
     void reset()
     {
         declick.reset();
         gainDeclick.reset();
-        ampEnv.reset();
-        envChain.reset();
+        env.reset();
         filter.reset();
+        body.reset();
         active = false;
         phase = 0.0;
         modPhase = 0.0;
@@ -265,29 +420,56 @@ public:
     // --- Parameter setters (called from engine on param change) ---
     void setModel(Model m)          { model = m; }
     Model getModel() const          { return model; }
-    void setTimbre(float v)         { timbre = juce::jlimit(0.0f, 1.0f, v); }
+    void setTimbre(float v)
+    {
+        timbreSet = juce::jlimit(0.0f, 1.0f, v);
+        timbre = spreadTimbre == 0.0f ? timbreSet : juce::jlimit(0.0f, 1.0f, timbreSet + spreadTimbre);
+    }
     void setColor(float v)          { color = juce::jlimit(0.0f, 1.0f, v); }
     void setHarmonics(float v)      { harmonics = juce::jlimit(0.0f, 1.0f, v); }
     void setMorph(float v)          { morph = juce::jlimit(0.0f, 1.0f, v); }
     void setDetune(float v)         { detune = v; } // in cents
     void setLevel(float v)          { level = juce::jlimit(0.0f, 1.0f, v); }
-    void setGainMod(float g)        { gainMod = g; }      // pressure -> volume
-    // Tuning, fine tune, bend and vibrato together, in semitones.
+    // Pad pressure as the bow's energy (the pressure route BOW; the bowed string only). Once a
+    // sub-block: is there such a route, this voice's pressure, and what the route makes of it. A
+    // voice that has had pressure is bowed by it from then on - 0 lifts the bow and the string
+    // rings out - until its next note. Without the route, or from the keys (no pressure ever
+    // comes), the bow is the model's own, exactly as before. The same rule as the resonator's EXC.
+    void setExcite(bool routed, float pressure, float routedEnergy)
+    {
+        bowRouted = routed;
+        if (routed && pressure > 0.0f)
+            bowPressed = true;
+        bowTarget = std::isfinite(routedEnergy) ? juce::jlimit(0.0f, 1.0f, routedEnergy) : 0.0f;
+    }
+    float getBowEnergy() const      { return bowEnergy; }  // 1 = the model's own bow
+    // Tuning, fine tune and bend together, in semitones (the note's SLOP is added here; the body
+    // follows all of it).
     void setPitchOffset(float semitones)
     {
-        pitchRatio = std::exp2(semitones / 12.0f);
+        pitchSemis = semitones;
+        const float s = semitones + spreadSemis;
+        pitchRatio = std::exp2(s / 12.0f);
         baseFrequency = noteFrequency * (double) pitchRatio;
+        body.setPitchOffset(s);
     }
-    Envelope& getAmpEnvelope()      { return ampEnv; }
+    Envelope& getAmpEnvelope()      { return env.envelope(); }
     VoiceFilter& getFilter()        { return filter; }
-    VoiceLfos& getLfos()            { return lfos; }
-    // -1..1 from LFOs routed to the pan (as of the last processed sample); the engine places the voice.
-    float getLfoPan() const         { return lfoPan; }
+    mod::Voice& getMod()            { return mods; }
+    VoiceBody& getBody()            { return body; }
+    float getPan() const            { return spreadPanNow; }      // PVAR's place, as it stands
+    float getNoteGain() const       { return spreadGain; }        // LVAR's, 1 = none
+    float getNoteTimbreOffset() const { return spreadTimbre; }    // WVAR's
+    float getTimbre() const         { return timbre; }            // TIMBRE as the voice plays it (the cell and WVAR)
+    double getFrequency() const     { return baseFrequency; }
+    // The models' noise seeds as this note drew them (a test's question).
+    uint32_t getDustSeed() const    { return dustSeed; }
+    uint32_t getNoiseSeed() const   { return noiseState; }
 
-    // --- EnvelopeChain support ---
-    void setEnvelopeChainEnabled(bool enabled) { envChainEnabled = enabled; }
-    bool isEnvelopeChainEnabled() const        { return envChainEnabled; }
-    EnvelopeChain& getEnvelopeChain()          { return envChain; }
+    // --- The amp envelope's chain (AmpEnvelopeSection) ---
+    AmpEnvelope& getAmpEnvelopeSection()       { return env; }
+    bool isEnvelopeChainEnabled() const        { return env.isChained(); }
+    EnvelopeChain& getEnvelopeChain()          { return env.chain(); }
 
 private:
     // ===================================================================
@@ -510,9 +692,14 @@ private:
 
         int numHarmonics = 1 + (int)(harmonics * 31.0f);
 
-        // The partials' levels and ratios change only when a macro does.
-        if (timbre != harmTimbre || color != harmColor || morph != harmMorph)
+        // The partials' levels and ratios change only when a macro does, and under a macro that
+        // moves all the time (an LFO, the input) no more often than every eighth sample: 32
+        // powers a sample was most of this model's cost under modulation.
+        if (harmWait > 0)
+            --harmWait;
+        else if (timbre != harmTimbre || color != harmColor || morph != harmMorph)
         {
+            harmWait = HARM_REFRESH - 1;
             harmTimbre = timbre;
             harmColor = color;
             harmMorph = morph;
@@ -684,6 +871,14 @@ private:
     // color   = bow position along the string
     // harmonics = damping of the string (the low-pass in the loop)
     // morph   = bow speed
+    //
+    // Pad pressure as the bow's energy e (setExcite; 1 = the bow as the cells set it, which is
+    // what full pressure gives and what a voice without pressure always has): the bow's speed is
+    // SPD x e; below e = 1 the bow also presses less (PRES falls by up to half its range) and the
+    // string is damped more (towards a dull 0.9), so more pressure is louder and brighter; under
+    // an eighth the bow lets go of the string (its force, and the damping it added, fade to
+    // nothing at 0) and the string rings out by itself. e follows the pressure with a lag of 15 ms. The values were chosen by
+    // measurement: level and brightness both rise with e from 0.15 to 1 at the default cells.
     // ===================================================================
     float processBowedString()
     {
@@ -695,7 +890,29 @@ private:
         const int pairs = (int) delayLine.size() / 2;
         if (delayWritePos >= pairs)                     // (the model was changed under a sounding note)
             delayWritePos = 0;
-        const float dampCoeff = 0.03f + harmonics * harmonics * 0.88f;     // the bridge's low-pass
+        float dampCoeff = 0.03f + harmonics * harmonics * 0.88f;           // the bridge's low-pass
+        float bowVelocity = BOW_SPEED_MIN + morph * BOW_SPEED_RANGE;
+        float slope = 5.0f - 4.0f * timbre;
+        float bowForce01 = 1.0f;
+        // Pressure as the bow's energy: only for a voice whose pad has been pressed with a BOW
+        // route (or that is on its way back from there); every other voice skips this whole.
+        const float energyTarget = bowRouted && bowPressed ? bowTarget : 1.0f;
+        const bool bowed = bowEnergy != energyTarget || energyTarget != 1.0f;
+        if (bowed)
+        {
+            bowEnergy += (energyTarget - bowEnergy) * bowLagK;
+            if (std::abs(energyTarget - bowEnergy) < BOW_ENERGY_SNAP)
+                bowEnergy = energyTarget;
+            const float e = bowEnergy, short01 = 1.0f - e;
+            bowForce01 = std::min(1.0f, e * BOW_LIFT);
+            bowVelocity *= e;
+            slope = 5.0f - 4.0f * juce::jlimit(0.0f, 1.0f, timbre - BOW_ENERGY_PRESSURE * short01);
+            // (The damping is the bow's weight on the string: it goes as the bow lets go, and
+            // the string rings out as bright and as long as the DAMP cell has it.)
+            if (dampCoeff < BOW_SOFT_DAMP)
+                dampCoeff += (BOW_SOFT_DAMP - dampCoeff) * BOW_ENERGY_DAMP * short01 * bowForce01;
+        }
+        bowForce = bowForce01;
         // One period is both parts and what the low-pass holds back.
         const float period = stringDelay(sampleRate, baseFrequency, pairs) - dampCoeff / (1.0f - dampCoeff);
         const float total = juce::jlimit(2.0f, (float) (pairs - 2), period);
@@ -710,12 +927,10 @@ private:
 
         // The bow: its speed (SPD) against the string's. Friction falls off steeply once they
         // differ; more pressure (PRES) holds on over a wider difference.
-        const float bowVelocity = BOW_SPEED_MIN + morph * BOW_SPEED_RANGE;
         const float difference = bowVelocity - stringVelocity;
-        const float slope = 5.0f - 4.0f * timbre;
         const float x = std::abs(difference * slope) + 0.75f;
         const float grip = juce::jlimit(0.01f, 0.98f, 1.0f / (x * x * x * x));
-        const float pushed = difference * grip;
+        const float pushed = bowed ? difference * grip * bowForce01 : difference * grip;
 
         const size_t at = (size_t) (2 * delayWritePos);
         delayLine[at] = fromBridge + pushed;            // towards the nut
@@ -817,8 +1032,8 @@ private:
         clearString();
         int burstLen = (int) stringDelay(sampleRate, baseFrequency, (int) delayLine.size());
 
-        // Use a simple PRNG seeded from the note for deterministic-ish results
-        uint32_t seed = (uint32_t)(currentNote * 7919 + 12345);
+        // The burst's noise: this note's draw of the voice's generator (stream spread::Model).
+        uint32_t seed = modelSeed(1);
 
         // Fill noise burst one full period behind the write position so the
         // first read in processPluckedString() finds the excitation burst.
@@ -856,8 +1071,27 @@ private:
             fs = { 0.0f, 0.0f };
         fmFeedback[0] = fmFeedback[1] = 0.0f;
         harmStretched = false;
+        harmWait = 0;
         shaperOn = false;
-        noiseState = (uint32_t) (currentNote * 7919 + 4711) | 1u;      // the same note, the same noise
+    }
+
+    // A 32-bit seed for one of the models' noises (k: 0 the dust, 1 the string's burst, 2 the
+    // whisper and the drum blend): this note's draws of the voice's generator, stream Model.
+    uint32_t modelSeed(int k) const
+    {
+        const auto a = (uint32_t) (generator.unipolar(spread::Model, 2 * k) * 16777216.0f);
+        const auto b = (uint32_t) (generator.unipolar(spread::Model, 2 * k + 1) * 16777216.0f);
+        return a ^ (b << 8);
+    }
+
+    // Places one sample by PVAR (gliding to a new note's place) and PAN p: balance law.
+    void place(float s, float p, float& left, float& right)
+    {
+        if (spreadPanNow != spreadPan)
+            spreadPanNow = dsp::towards(spreadPanNow, spreadPan, levelStep);
+        const float q = juce::jlimit(-1.0f, 1.0f, p + spreadPanNow);
+        left += q > 0.0f ? s * (1.0f - q) : s;
+        right += q < 0.0f ? s * (1.0f + q) : s;
     }
 
     // --- Constants ---
@@ -868,17 +1102,26 @@ private:
     static constexpr float FORMANT_GAIN = 14.0f;
     static constexpr float HARM_STRETCH = 0.012f;       // stiffness B at the top of the macro
     static constexpr float RING_MAX_GAIN = 8.0f;
+public:
+    static constexpr float SPREAD_TIMBRE = 0.5f;        // WVAR at 1: TIMBRE up to half its range either way
+private:
     static constexpr float BOW_BRIDGE_GAIN = 0.95f;      // what the bridge gives back
     static constexpr float BOW_SPEED_MIN = 0.05f, BOW_SPEED_RANGE = 0.2f;
     static constexpr float BOW_OUTPUT_GAIN = 2.0f;       // the string moves little: up to the other models' level
+    // Pressure as the bow's energy (processBowedString)
+    static constexpr double BOW_ENERGY_LAG = 0.015;      // seconds: how the energy follows the pressure
+    static constexpr float BOW_ENERGY_PRESSURE = 0.5f;   // how much of PRES is taken away as the energy falls to 0
+    static constexpr float BOW_ENERGY_SNAP = 5.0e-4f;    // the energy has arrived (a float stops short of 1 by up to 1e-4)
+    static constexpr float BOW_SOFT_DAMP = 0.9f;         // the loop's low-pass under the lightest bow ...
+    static constexpr float BOW_ENERGY_DAMP = 0.9f;       // ... and how far towards it the damping goes
+    static constexpr float BOW_LIFT = 8.0f;              // under 1 / 8 of the energy the bow's hold on the string fades out
 
     // --- State ---
     double sampleRate = 44100.0;
     double baseFrequency = 440.0;
     double noteFrequency = 440.0;
     float pitchRatio = 1.0f;
-    float gainMod = 1.0f;
-    float levelNow = 0.8f, gainModNow = 1.0f, levelStep = 0.005f;
+    float levelNow = 0.8f, levelStep = 0.005f;
     bool struck = true;
     int currentNote = 60;
     float currentVelocity = 1.0f;
@@ -886,28 +1129,37 @@ private:
 
     // Parameters
     Model model = Model::VirtualAnalog;
-    float timbre = 0.5f;
+    float timbre = 0.5f, timbreSet = 0.5f;
     float color = 0.5f;
     float harmonics = 0.5f;
     float morph = 0.0f;
     float detune = 0.0f; // cents
     float level = 0.8f;
 
-    // Envelope
-    Envelope ampEnv;
+    // Envelope (and its chain)
+    AmpEnvelope env;
     dsp::Declick declick;       // on the oscillator, before the filter (whose state smears a jump)
     dsp::Declick gainDeclick;   // on the output
-    EnvelopeChain envChain;
-    bool envChainEnabled = false;
+    float envTime = 1.0f, filterTime = 1.0f;    // the router's ETIM and FTIM
+
+    // The per-note spread (VoiceSpread): this voice's generator, and what its present note took
+    spread::Generator generator;
+    float envScale = 1.0f, spreadSemis = 0.0f, pitchSemis = 0.0f, spreadTimbre = 0.0f;
+    float spreadPan = 0.0f, spreadPanNow = 0.0f, spreadGain = 1.0f;
+
+    // BODY: last, after the amp envelope (it rings on when the model has stopped)
+    VoiceBody body;
 
     // Filter (after the model, before the amp envelope)
     VoiceFilter filter;
 
-    // LFOs
-    VoiceLfos lfos;
-    bool lfoApplied = false;
-    float lfoGain = 1.0f;
-    float lfoPan = 0.0f;
+    // This voice's side of the modulation router
+    mod::Voice mods;
+    bool cutMoved = false;      // the filter holds a cutoff offset from the router
+    // The source OSC: the model's last sample, and those of the sub-block while a slot reads it
+    float lastOsc = 0.0f;
+    bool oscTapped = false;
+    std::array<float, mod::Router::MAX_CHUNK> oscOut {};
 
     // Oscillator phases
     double phase = 0.0;
@@ -922,7 +1174,12 @@ private:
 
     // Bowed string state
     float bowFilterState = 0.0f;
-    float bowForce = 0.0f;
+    float bowForce = 0.0f;          // the bow's hold on the string, 0 (lifted) .. 1, as of the last sample
+    // Pad pressure as the bow's energy (setExcite)
+    bool bowRouted = false, bowPressed = false;
+    float bowTarget = 0.0f;         // what the pressure route asks for, 0..1
+    float bowEnergy = 1.0f;         // what the bow has: 1 = the model's own
+    float bowLagK = 0.0015f;
 
     // Formant bandpass states
     std::array<BandpassState, 3> formantState = {};
@@ -937,6 +1194,8 @@ private:
     // Harmonic model: levels and ratios (recomputed when a macro changes), stretched phases
     std::array<float, MAX_HARMONICS> harmLevel = {}, harmRatio = {}, harmPhase = {};
     float harmTimbre = -1.0f, harmColor = -1.0f, harmMorph = -1.0f;
+    static constexpr int HARM_REFRESH = 8;
+    int harmWait = 0;
     bool harmStretched = false;
 
     // The wavefolder's offset remover and the dust's resonator (one model at a time)
@@ -962,6 +1221,11 @@ private:
 //   5 = Decay       (amp envelope decay time in seconds)
 //   6 = Level       (output level 0-1)
 //   7 = Detune      (detuning in cents)
+//   125-132 ANLG (VoiceSpread), 133-148 BODY (VoiceBodySection, two pages), 100-115 the filter; the rest of
+//   the pages and the router's ids below (Param).
+// PLCK, DUST and BOW stay (U4-MACRO, 2026-11-22): against the nearest BODY settings a search found,
+// every factory preset of the three measured LOST ("U4 Macro", .ralph/atlas/U4-MACRO/): by the
+// owner's rule they stay as they are until the owner has heard them.
 // ---------------------------------------------------------------------------
 
 class MacroOscEngine : public EngineBase
@@ -986,18 +1250,32 @@ public:
         AmpRelease      = 14,
         TuneParam       = 15,  // semitones
         BendRangeParam  = 16,  // semitones
-        FilterBase      = 100  // 100-115: the per-voice filter (VoiceFilterSection offsets)
+        VoiceCountParam = 17,  // VOX: polyphony 1..16 (default 8)
+        FilterBase      = 100, // 100-115: the per-voice filter (VoiceFilterSection offsets)
+        SpreadBase      = 125, // 125-132: the per-note spread (VoiceSpread offsets; the ANLG page)
+        BodyBase        = 133  // 133-148: BODY (VoiceBodySection cells, two pages)
+        // 158-189 and 700-772 are the modulation router's (mod::Router: LFO1, LFO2, STRIP, XIN,
+        // the slots, the custom LFO shape): everything that moves this engine's sound goes
+        // through it, the pad's pressure routes and the track input at audio rate included.
     };
 
+    static constexpr int MAX_VOICES = 16;
+
     explicit MacroOscEngine(int maxVoices = 8)
-        : allocator(maxVoices)
+        : allocator(MAX_VOICES)
     {
-        voices.resize((size_t)maxVoices);
+        voices.resize((size_t) MAX_VOICES);
+
+        envSection.prepareVoices(AmpEnvelopeSection::each(voices));
+        seedSpread();
 
         allocator.setNoteOnCallback([this](int voiceIdx, const Voice& v)
         {
-            voices[(size_t)voiceIdx].setNote(v.note, v.velocity);
-            voices[(size_t)voiceIdx].noteOn();
+            auto& voice = voices[(size_t) voiceIdx];
+            voice.setNote(v.note, v.velocity);
+            // (The spread first: it advances the voice's generator to this note, and the router's
+            // randoms and the models' noise are draws of it.)
+            voice.noteOn(router, spreadSection.next(voice.getGenerator()));
         });
 
         allocator.setNoteOffCallback([this](int voiceIdx, const Voice& /*v*/)
@@ -1012,61 +1290,108 @@ public:
         for (auto& page : getParamPages())
             for (auto& p : page.params)
                 if (p.isValid())
-                    setParameter(p.id, p.defaultVal);
+                    setParameter(p.id, p.id == VoiceCountParam ? (float) maxVoices : p.defaultVal);
         filterSection.applyAll(VoiceFilterSection::each(voices));
-        lfoSection.applyAll(EngineLfoSection::each(voices));
     }
 
-    // The LFO destinations: the original nine, then the other continuous cells of the pages
-    // (level, the amp envelope, the filter) and the other LFO. One list per model, because the
-    // four macros carry the names they have in each model; they differ in nothing else.
-    // Not offered: MODL, CHAN, STGS, COMB (choices and counts), TUNE, FINE and BEND (PTCH is the
-    // pitch), and what the filter leaves out.
-    static const LfoDestList& lfoDests(int model)
+    // What can be moved (the modulation router's table): the original nine (pitch, level, pan,
+    // cutoff, resonance as inputs of the voice; the four macros, which are page cells), then the
+    // other continuous cells of the pages (level, the amp envelope, the filter), LRAT / LDPT, the
+    // two envelope times ETIM / FTIM, and hidden, for the pressure route only, the bow's energy.
+    // One table per model, because the four macros carry the names they have in each model; they
+    // differ in nothing else.
+    // Per sample (so the track input reaches them at audio rate): PTCH, AMP, PAN, CUT and the
+    // four macros. Not offered: MODL, CHAN, STGS, COMB, VOX (choices and counts), TUNE, FINE
+    // and BEND (PTCH is the pitch), and what the filter leaves out.
+    static const mod::DestTable& lfoDests(int model)
     {
-        static const std::array<LfoDestList, 8> lists = []
+        static const std::array<mod::DestTable, 8> tables = []
         {
-            std::array<LfoDestList, 8> all;
+            std::array<mod::DestTable, 8> all;
             for (int m = 0; m < 8; ++m)
             {
                 const ParamPages p = pagesFor(m);
-                LfoDestList l(lfoDestLabels(m), MacroOscVoice::NumLfoDests);
-                l.group();
-                l.add(p, LevelParam);
-                l.add(p, AmpAttack);
-                l.add(p, AmpDecay);
-                l.add(p, AmpSustain);
-                l.add(p, AmpRelease);
-                VoiceFilterSection::addLfoDests(l, p, FilterBase, "FMOR");
-                l.addCross();
+                mod::DestTable& t = all[(size_t) m];
+                t.group();
+                t.input("PTCH", 1.0f, 1.0f, 1.0f / 1024.0f, 1024.0f, mod::Pitch);      // a ratio: one octave x the amount squared
+                t.input("AMP", 1.0f, 1.0f, 0.0f, 4.0f, mod::PerSample).audioFloor(-4.0f);  // (below 0: ring modulation)
+                t.input("PAN", 0.0f, 1.0f, -1.0f, 1.0f, mod::PerSample);
+                t.input("CUT", 0.0f, 4.0f, -16.0f, 16.0f, mod::PerSample);              // octaves
+                t.input("RESO", 0.0f, 0.5f, -1.0f, 1.0f);
+                for (int id : { (int) TimbreParam, (int) ColorParam, (int) HarmonicsParam, (int) MorphParam })
+                    t.add(p, id, nullptr, mod::PerSample);
+                t.group();
+                t.add(p, LevelParam);
+                t.add(p, AmpAttack);
+                t.add(p, AmpDecay);
+                t.add(p, AmpSustain);
+                t.add(p, AmpRelease);
+                VoiceFilterSection::addLfoDests(t, p, FilterBase, "FMOR");
+                t.addCross();
+                // The envelopes' times (after what was there before: a stored DEST keeps its meaning).
+                t.group();
+                t.envTimes();
+                jassert(t.ampTime() == MacroOscVoice::LfoEnvTime && t.filterTime() == MacroOscVoice::LfoFilterTime);
+                // BODY's eight cells (a new group at the end: a stored DEST keeps its meaning).
+                t.group();
+                for (int c = 0; c < (int) VoiceBody::NumCells; ++c)
+                    t.add(p, BodyBase + c, VoiceBodySection::destLabel(c));
+                jassert(t.indexOfLabel("BMIX") == MacroOscVoice::LfoBody);
+                // (The bow follows the pad as it is: it has a lag of its own.)
+                t.hidden("BOW", 0.0f, 1.0f, 0.0f, 1.0f, mod::Steps);
+                jassert(t.indexOfLabel("BOW") == MacroOscVoice::LfoBow);
                 // The mod strip until the STRIP page says otherwise: the fourth macro to its top,
                 // the first a little higher, and a quarter-tone of vibrato.
-                l.stripRoute(0, MacroOscVoice::LfoMorph, 1.0f);
-                l.stripRoute(1, MacroOscVoice::LfoTimbre, 0.3f);
-                l.stripVibrato(0.25f);
-                all[(size_t) m] = l;
+                t.stripRoute(0, MacroOscVoice::LfoMorph, 1.0f);
+                t.stripRoute(1, MacroOscVoice::LfoTimbre, 0.3f);
+                t.stripVibrato(0.25f);
+                // Pad pressure until AT ROUTE says otherwise: the level, a gain of 1 + pressure.
+                t.pressureRoute(0, "AMP", 1.0f);
+                t.finish(2);
             }
             return all;
         }();
-        static const bool registered = [] { for (auto& l : lists) l.registerGroups(); return true; }();
+        static const bool registered = [] { for (auto& t : tables) t.registerGroups(); return true; }();
         juce::ignoreUnused(registered);
-        return lists[(size_t) juce::jlimit(0, 7, model)];
+        return tables[(size_t) juce::jlimit(0, 7, model)];
     }
 
-    // The names of the original destinations in each model.
-    static const char* const* lfoDestLabels(int model)
+    // What a slot can read here beside the router's own sources: the list SRC and VIA show.
+    //   OSC   the model's output before the filter, at audio rate (MacroOscVoice::PubOsc): on CUT
+    //         it is filter FM by the voice's own oscillator, on AMP it squares the wave, on PAN it
+    //         spreads the partials, on PTCH and the macros it is feedback (one sub-block late).
+    static const mod::SourceTable& sources()
     {
-        static const char* const labels[8][MacroOscVoice::NumLfoDests] = {
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "SAWS", "SPRD", "HARM", "MORP" },   // virtual analog
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "INDX", "RATI", "DETN", "FDBK" },   // 2-op FM
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "FOLD", "SHPE", "BIAS", "CHEB" },   // wavefolder
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "VOWL", "SHFT", "Q",    "MORP" },   // formant
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "TILT", "EVOD", "NUM",  "STRC" },   // harmonic
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "DAMP", "PICK", "FDBK", "MORP" },   // plucked string
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "DENS", "COLR", "RING", "MIX"  },   // particle noise
-            { "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "PRES", "POS",  "DAMP", "SPD"  } }; // bowed string
-        return labels[juce::jlimit(0, 7, model)];
+        static const mod::SourceTable table = []
+        {
+            mod::SourceTable t(2);
+            t.publish("OSC", mod::AudioRate);
+            return t;
+        }();
+        static const bool registered = [] { table.registerGroups(); return true; }();
+        juce::ignoreUnused(registered);
+        return table;
     }
+
+    // What an old pressure route (AftertouchRouter::Destination) is here, as a slot's DEST.
+    int pressureDestOf(AftertouchRouter::Destination d) const override
+    {
+        using D = AftertouchRouter::Destination;
+        switch (d)
+        {
+            case D::Volume:         return MacroOscVoice::LfoAmp;
+            case D::FilterCutoff:   return MacroOscVoice::LfoCutoff;
+            case D::FMDepth:        return MacroOscVoice::LfoTimbre;
+            case D::MacroTimbre:    return MacroOscVoice::LfoTimbre;
+            case D::WavePosition:   return MacroOscVoice::LfoMorph;
+            case D::PanSpread:      return MacroOscVoice::LfoPan;
+            case D::Excite:         return MacroOscVoice::LfoBow;
+            default:                return 0;
+        }
+    }
+
+    mod::Router* modRouter() override { return &router; }
+    const mod::Router* modRouter() const override { return &router; }
 
     // MACRO (the model and its four macros, tuning, level) and AMP (envelope and envelope chain).
     // The macro cells are named after what they do in the selected model.
@@ -1079,11 +1404,11 @@ public:
 
         ParamPages out = pagesFor(m);
         filterSection.updateModeCell(out);
-        lfoSection.appendPages(out, lfoDests(m).labels());
+        router.appendPages(out);        // XIN, SLT1 .., LSHP, STRIP, LFO1, LFO2
         return out;
     }
 
-    // The pages of model m without the two LFO pages.
+    // The pages of model m without the modulation router's.
     static ParamPages pagesFor(int m)
     {
         static const char* const models[] = { "VA", "FM", "FOLD", "FORM", "HARM", "PLCK", "DUST", "BOW" };
@@ -1103,6 +1428,7 @@ public:
         m = juce::jlimit(0, 7, m);
 
         ParamPages out(2);
+        out.reserve(8);
         out[0].name = "MACRO"; out[0].section = "SRC";
         out[0].params = {{
             { "MODL", ModelParam, 0, 7, 0, C, "", models, 8 },
@@ -1123,11 +1449,16 @@ public:
             { "STGS", EnvChainStages, 1, 4, 2, I },
             { "COMB", EnvChainCombine, 0, 1, 0, C, "", combine, 2 },
             { "BEND", BendRangeParam, 0, 24, 2, I, "st" } }};
+        // ANLG (the per-note spread) beside the source, as on the wavetable engine.
+        out.insert(out.begin() + 1, VoiceSpread::makePage(SpreadBase));
+        // VOICE: polyphony. Before the filter pages (before STRIP / LFO pages).
+        out.push_back({ "VOICE", "VOX", {{ { "VOX", VoiceCountParam, 1, MAX_VOICES, 8, I }, {}, {}, {}, {}, {}, {}, {} }} });
         VoiceFilterSection::appendPages(out, FilterBase);
+        VoiceBodySection::appendPage(out, BodyBase);
         return out;
     }
 
-    void setTempo(float bpm) override { lfoSection.setTempo(bpm, EngineLfoSection::each(voices)); }
+    void setTempo(float bpm) override { router.setTempo(bpm); }
     void pitchBend(float amount) override { bend = juce::jlimit(-1.0f, 1.0f, amount); }
     void modWheel(float value) override { wheel = juce::jlimit(0.0f, 1.0f, value); }
 
@@ -1137,6 +1468,7 @@ public:
     void prepareToPlay(double sr, int /*samplesPerBlock*/) override
     {
         sampleRate = sr;
+        router.prepare(sr);
         for (auto& v : voices)
             v.setSampleRate(sr);
     }
@@ -1147,64 +1479,60 @@ public:
         auto* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer(1) : nullptr;
         int numSamples = buffer.getNumSamples();
 
-        // Once per block: tuning, bend and vibrato, and each voice's pressure (timbre, volume).
-        // The mod strip: the routes of the STRIP page (by default the fourth macro, the first a
-        // little, and vibrato), and the cutoff by the filter's WHL amount.
+        // Once per block: tuning and bend, the strip (the cutoff by the filter's WHL amount; its
+        // routes are the router's), the track's pressure routes and the track input.
         wheelNow = smoothWheel(wheelNow, wheel, numSamples, sampleRate);
-        lfoSection.stripBlock(wheelNow, numSamples, sampleRate, EngineLfoSection::each(voices),
-                              [this](int key) { setParameter(key, getParameter(key)); });
-        vibratoPhase += 5.5 * numSamples / sampleRate;
-        vibratoPhase -= std::floor(vibratoPhase);
-        const float vib = std::sin((float) vibratoPhase * dsp::TWO_PI_F);
         const float basePitch = tune + fine / 100.0f + bend * bendRange;
-        for (int v = 0; v < (int) voices.size(); ++v)
+        const float wheelOctaves = filterSection.externalOctaves(wheelNow, 0.0f);
+        for (auto& voice : voices)
         {
-            float pressure = v < allocator.getVoiceCount() ? allocator.getAftertouch(v) : 0.0f;
-            AftertouchRouter::ModValues m;
-            if (pressure > 0.0f)
-                m = (aftertouchRouter ? *aftertouchRouter : allocator.getAftertouchRouter()).computeModulation(pressure);
-            auto& voice = voices[(size_t) v];
-            voice.setTimbre(baseTimbre + m.timbreMod + m.fmDepthMod);
-            voice.setMorph(baseMorph + m.wavePosMod);
-            voice.setGainMod(juce::jlimit(0.0f, 2.0f, 1.0f + m.volumeMod));
-            voice.setPitchOffset(basePitch + vib * m.vibratoMod);
-            voice.getFilter().setExternalOctaves(filterSection.externalOctaves(wheelNow, m.cutoffMod));
+            voice.setPitchOffset(basePitch);
+            voice.getFilter().setExternalOctaves(wheelOctaves);
         }
-
-        for (int i = 0; i < numSamples; ++i)
+        router.beginBlock(audioInput.left, audioInput.right, audioInput.connected() ? audioInput.frames : 0,
+                          audioInput.envelope, wheelNow, sampleRate);
+        // The pressure route BOW: pad pressure is the bow's energy on the bowed string.
+        const bool bowRouted = router.routed(MacroOscVoice::LfoBow);
+        const auto setCell = [this](MacroOscVoice& voice, int dest, float value)
         {
-            // An LFO routed to PAN moves its own voice between the channels (balance law: the
-            // centre is unchanged, so a sound without that routing is exactly as before).
-            float sampleL = 0.0f, sampleR = 0.0f;
-            for (auto& voice : voices)
+            applyVoiceParam(voice, router.dests()[dest].id, value);
+        };
+
+        // Sub-blocks: the router's control rate. Inside one the voices are rendered one after
+        // the other (they share the router's per-sample buffers).
+        for (int offset = 0; offset < numSamples;)
+        {
+            const int n = router.beginChunk(offset, numSamples);
+            std::fill(mixL.begin(), mixL.begin() + n, 0.0f);
+            std::fill(mixR.begin(), mixR.begin() + n, 0.0f);
+            for (int v = 0; v < (int) voices.size(); ++v)
             {
+                auto& voice = voices[(size_t) v];
                 if (! voice.isActive())
+                {
+                    // Its LFOs keep time; a cell it was left holding goes back to its set value.
+                    if (voice.getMod().idle(router, n))
+                        voice.getMod().restore(router, [&](int dest, float value) { voice.setControl(dest, value, setCell); });
                     continue;
-                // LFOs on page cells: this voice's own value of each (as of its last sample).
-                if (voice.getLfos().keyed())
-                    voice.getLfos().forEachKeyed([&voice](int key, float value) { applyVoiceParam(voice, key, value); });
-                const float s = voice.process();
-                const float pan = voice.getLfoPan();
-                sampleL += pan > 0.0f ? s * (1.0f - pan) : s;
-                sampleR += pan < 0.0f ? s * (1.0f + pan) : s;
+                }
+                const float pressure = v < allocator.getVoiceCount() ? allocator.getAftertouch(v) : 0.0f;
+                voice.render(router, mixL.data(), mixR.data(), n, pressure, bowRouted, setCell);
             }
-
-            sampleL *= masterLevel;
-            sampleR *= masterLevel;
-
-            if (right)
+            for (int i = 0; i < n; ++i)
             {
-                left[i] += sampleL;
-                right[i] += sampleR;
+                const float sampleL = mixL[(size_t) i] * masterLevel, sampleR = mixR[(size_t) i] * masterLevel;
+                if (right)
+                {
+                    left[offset + i] += sampleL;
+                    right[offset + i] += sampleR;
+                }
+                else
+                {
+                    left[offset + i] += 0.5f * (sampleL + sampleR);
+                }
             }
-            else
-            {
-                left[i] += 0.5f * (sampleL + sampleR);
-            }
+            offset += n;
         }
-
-        lfoSection.endBlock(numSamples, EngineLfoSection::each(voices));
-        lfoSection.afterLetGo([this](int key) { setParameter(key, getParameter(key)); });
     }
 
     void releaseResources() override
@@ -1259,27 +1587,45 @@ private:
             stageCurves.applyTo(p, 0);
             v.getAmpEnvelope().setParams(p);
         }
-        refreshChainStages();
+        envSection.refresh(AmpEnvelopeSection::each(voices));
     }
 
 public:
     void setParameter(ParamId id, float value) override
     {
+        if (id == VoiceCountParam)
+        {
+            // (The allocator keeps to it: no more than VOX voices are given notes, and a lowered
+            // VOX releases the voices past it - they ring out.)
+            const int n = juce::jlimit(1, MAX_VOICES, (int) std::lround(value));
+            params[id] = (float) n;
+            allocator.setVoiceLimit(n);
+            return;
+        }
+        if (bodySection.owns(id))
+        {
+            bodySection.set(id, value, VoiceBodySection::each(voices));
+            router.setBase(id, bodySection.get(id));
+            return;
+        }
+        if (spreadSection.owns(id))
+        {
+            spreadSection.set(id, value);
+            if (spreadSection.reseeds(id))
+                seedSpread();
+            return;
+        }
         if (filterSection.owns(id))
         {
             if (filterSection.swaps(id, value))
                 soundSwapped();
             filterSection.set(id, value, VoiceFilterSection::each(voices));
-            lfoSection.baseChanged(id, filterSection.get(id), EngineLfoSection::each(voices));
+            router.setBase(id, filterSection.get(id));
             return;
         }
-        if (lfoSection.owns(id))
+        if (mod::Router::owns(id))
         {
-            // A cell an LFO has let go of goes back to its set value on every voice.
-            const int released = lfoSection.set(id, value, EngineLfoSection::each(voices),
-                                                [this](int key) { return getParameter(key); });
-            if (released >= 0)
-                setParameter(released, getParameter(released));
+            router.set(id, value);
             return;
         }
         if (StageCurveParam::owns(id))
@@ -1294,15 +1640,21 @@ public:
         if (id == DecayParam) params[AmpDecay] = value;
         if (id == AmpDecay) params[DecayParam] = value;
         applyParameter(id, value);
-        lfoSection.baseChanged(id == DecayParam ? (int) AmpDecay : id, value, EngineLfoSection::each(voices));
+        router.setBase(id == DecayParam ? (int) AmpDecay : id, value);
+        if (id == ModelParam)
+            router.setTable(lfoDests((int) value));     // the macros' names in this model
     }
 
     float getParameter(ParamId id) const override
     {
+        if (bodySection.owns(id))
+            return bodySection.get(id);
+        if (spreadSection.owns(id))
+            return spreadSection.get(id);
         if (filterSection.owns(id))
             return filterSection.get(id);
-        if (lfoSection.owns(id))
-            return lfoSection.get(id);
+        if (mod::Router::owns(id))
+            return router.get(id);
         if (StageCurveParam::owns(id))
             return stageCurves.get(id);
         auto it = params.find(id);
@@ -1311,10 +1663,14 @@ public:
 
     juce::String getParameterName(ParamId id) const override
     {
+        if (bodySection.owns(id))
+            return VoiceBodySection::name(id - BodyBase);
+        if (spreadSection.owns(id))
+            return VoiceSpread::name(id - SpreadBase);
         if (filterSection.owns(id))
             return VoiceFilterSection::name(id - FilterBase);
-        if (EngineLfoSection::owns(id))
-            return EngineLfoSection::name(id);
+        if (mod::Router::owns(id))
+            return mod::Router::name(id);
         switch (id)
         {
             case TuneParam:       return "Tune";
@@ -1344,10 +1700,15 @@ public:
     VoiceAllocator& getAllocator() { return allocator; }
 
 private:
-    // One voice's own value of a page cell: what an LFO routed to that cell sets, sample by
-    // sample. Envelope times act on the stage that is running (the chain's stages are copies).
+    // One voice's own value of a page cell: what a slot routed to that cell sets, once a
+    // sub-block. Envelope times act on the stage that is running (the chain's stages are copies).
     static void applyVoiceParam(MacroOscVoice& voice, ParamId id, float value)
     {
+        if (VoiceBodySection::ownsId(id, BodyBase))
+        {
+            VoiceBodySection::applyTo(voice.getBody(), id - BodyBase, value);
+            return;
+        }
         if (id >= FilterBase)
         {
             VoiceFilterSection::applyTo(voice.getFilter(), id - FilterBase, value);
@@ -1358,21 +1719,8 @@ private:
             voice.setLevel(value);
             return;
         }
-        auto setEnvelope = [id, value](Envelope& e)
-        {
-            switch (id)
-            {
-                case AmpAttack:  e.setAttack(value); break;
-                case AmpDecay:   e.setDecay(value); break;
-                case AmpSustain: e.setSustain(value); break;
-                case AmpRelease: e.setRelease(value); break;
-                default: break;
-            }
-        };
-        setEnvelope(voice.getAmpEnvelope());
-        auto& chain = voice.getEnvelopeChain();
-        for (int s = 0; s < chain.getStageCount(); ++s)
-            setEnvelope(chain.getEnvelopeMut(s));
+        if (id >= AmpAttack && id <= AmpRelease)
+            voice.getAmpEnvelopeSection().setCell(id - AmpAttack, value);
     }
 
     void applyParameter(ParamId id, float value)
@@ -1387,7 +1735,6 @@ private:
                 break;
             }
             case TimbreParam:
-                baseTimbre = value;
                 for (auto& v : voices) v.setTimbre(value);
                 break;
             case TuneParam:       tune = value; break;
@@ -1399,17 +1746,10 @@ private:
                 for (auto& v : voices) v.setHarmonics(value);
                 break;
             case MorphParam:
-                baseMorph = value;
                 for (auto& v : voices) v.setMorph(value);
                 break;
             case DecayParam:
-                for (auto& v : voices)
-                {
-                    auto p = v.getAmpEnvelope().getParams();
-                    p.decay = value;
-                    v.getAmpEnvelope().setParams(p);
-                }
-                refreshChainStages();
+                envSection.setCell(AmpEnvelope::Decay, value, AmpEnvelopeSection::each(voices));
                 break;
             case LevelParam:
                 for (auto& v : voices) v.setLevel(value);
@@ -1419,137 +1759,43 @@ private:
                 for (auto& v : voices) v.setDetune(value);
                 break;
             case EnvChainMode:
-            {
-                int modeVal = juce::jlimit(0, 2, (int)value);
-                if (modeVal == 0)
-                {
-                    // Off: use single ADSR
-                    for (auto& v : voices)
-                        v.setEnvelopeChainEnabled(false);
-                }
-                else
-                {
-                    auto chainMode = (modeVal == 1)
-                        ? EnvelopeChain::ChainMode::Series
-                        : EnvelopeChain::ChainMode::Parallel;
-                    for (auto& v : voices)
-                    {
-                        v.setEnvelopeChainEnabled(true);
-                        v.getEnvelopeChain().setMode(chainMode);
-                    }
-                    // A chain needs stages: build them from the current envelope if there are none.
-                    if (voices.empty() || voices[0].getEnvelopeChain().getStageCount() == 0)
-                        rebuildEnvelopeChains(juce::jmax(1, envChainStageCount));
-                }
+                envSection.setMode((int) value, AmpEnvelopeSection::each(voices), sampleRate);
                 break;
-            }
             case EnvChainStages:
-            {
-                int stages = juce::jlimit(1, 4, (int)value);
-                rebuildEnvelopeChains(stages);
+                envSection.setStages((int) value, AmpEnvelopeSection::each(voices), sampleRate);
                 break;
-            }
             case EnvChainCombine:
-            {
-                auto cm = ((int)value == 0)
-                    ? EnvelopeChain::CombineMode::Sum
-                    : EnvelopeChain::CombineMode::Max;
-                for (auto& v : voices)
-                    v.getEnvelopeChain().setCombineMode(cm);
+                envSection.setCombine((int) value, AmpEnvelopeSection::each(voices));
                 break;
-            }
             case AmpAttack:
-                for (auto& v : voices)
-                {
-                    auto p = v.getAmpEnvelope().getParams();
-                    p.attack = value;
-                    v.getAmpEnvelope().setParams(p);
-                }
-                refreshChainStages();
-                break;
             case AmpDecay:
-                for (auto& v : voices)
-                {
-                    auto p = v.getAmpEnvelope().getParams();
-                    p.decay = value;
-                    v.getAmpEnvelope().setParams(p);
-                }
-                refreshChainStages();
-                break;
             case AmpSustain:
-                for (auto& v : voices)
-                {
-                    auto p = v.getAmpEnvelope().getParams();
-                    p.sustain = value;
-                    v.getAmpEnvelope().setParams(p);
-                }
-                refreshChainStages();
-                break;
             case AmpRelease:
-                for (auto& v : voices)
-                {
-                    auto p = v.getAmpEnvelope().getParams();
-                    p.release = value;
-                    v.getAmpEnvelope().setParams(p);
-                }
-                refreshChainStages();
+                envSection.setCell(id - AmpAttack, value, AmpEnvelopeSection::each(voices));
                 break;
             default:
                 break;
         }
     }
 
-    // Rebuild envelope chains for all voices with the given number of stages.
-    // Uses the current amp envelope params as the template for each stage.
-    // Called from applyParameter (not audio thread — param changes are UI-thread).
-    void rebuildEnvelopeChains(int stages)
+    // The per-note spread, the router's randoms and the models' noise: every voice's generator
+    // starts again from the engine's SEED and its own number.
+    void seedSpread()
     {
-        envChainStageCount = stages;
-        for (auto& v : voices)
-        {
-            auto& chain = v.getEnvelopeChain();
-            chain.reset();
-            // Clear and rebuild: EnvelopeChain uses a fixed-size array,
-            // so we create a fresh chain object and copy the mode settings.
-            auto savedMode = chain.getMode();
-            auto savedCombine = chain.getCombineMode();
-
-            // We need to reconstruct — EnvelopeChain has no removeEnvelope,
-            // so we create a new one and copy settings.
-            EnvelopeChain newChain;
-            newChain.setSampleRate(sampleRate);
-            newChain.setMode(savedMode);
-            newChain.setCombineMode(savedCombine);
-
-            auto envParams = v.getAmpEnvelope().getParams();
-            for (int s = 0; s < stages; ++s)
-                newChain.addEnvelope(envParams);
-
-            v.getEnvelopeChain() = newChain;
-        }
-    }
-
-    // Chain stages are copies of the amp envelope: keep them in step with it.
-    void refreshChainStages()
-    {
-        for (auto& v : voices)
-        {
-            auto& chain = v.getEnvelopeChain();
-            auto p = v.getAmpEnvelope().getParams();
-            for (int s = 0; s < chain.getStageCount(); ++s)
-                chain.getEnvelopeMut(s).setParams(p);
-        }
+        for (size_t v = 0; v < voices.size(); ++v)
+            voices[v].seedRandom(spreadSection.seed(), (int) v);
     }
 
     double sampleRate = 44100.0;
     float masterLevel = 0.8f;
-    float baseTimbre = 0.5f, baseMorph = 0.0f;
     float tune = 0.0f, fine = 0.0f, bend = 0.0f, bendRange = 2.0f, wheel = 0.0f;
     float wheelNow = 0.0f;                              // the strip, smoothed per block
-    double vibratoPhase = 0.0;
-    int envChainStageCount = 2;
+    AmpEnvelopeSection envSection;                      // CHAN STGS COMB: the chain's plumbing (stages 1 .. 4)
+    VoiceSpread spreadSection { SpreadBase };
+    VoiceBodySection bodySection { BodyBase };
     VoiceFilterSection filterSection { FilterBase };
-    EngineLfoSection lfoSection { lfoDests(0) };
+    mod::Router router { lfoDests(0), 2, 0, &sources() };
+    std::array<float, mod::Router::MAX_CHUNK> mixL {}, mixR {};
     VoiceAllocator allocator;
     std::vector<MacroOscVoice> voices;
     ParamMap params;

@@ -5,9 +5,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <map>
 #include "ParamSpec.h"
 #include "AftertouchRouter.h"
+
+namespace mod { class Router; }
 
 using ParamId = int;
 using ParamMap = std::map<ParamId, float>;
@@ -21,7 +24,23 @@ enum class EngineType
     WaveSeq,
     Sampler,
     Drum,
-    MIDITrack
+    MIDITrack,
+    Resonator
+};
+// How many engine types there are. The numbers are stored in projects and presets: a new type is
+// added at the end.
+static constexpr int ENGINE_TYPE_COUNT = 9;
+
+// The track's input for this block (another track's sound, TrackInParam), valid only during
+// processBlock. `envelope` is the input's follower value (0..1) at the start of the block;
+// `right` may equal `left`.
+struct AudioInput
+{
+    const float* left = nullptr;
+    const float* right = nullptr;
+    int frames = 0;
+    float envelope = 0.0f;
+    bool connected() const { return left != nullptr && frames > 0; }
 };
 
 // Modulation parameter ids (LFOs and extra envelopes) of engines that support the MOD pages.
@@ -145,10 +164,47 @@ public:
     // True when the engine implements the ModParam ids (LFOs / extra envelopes), i.e. the MOD page.
     virtual bool supportsModulation() const { return false; }
 
-    // Pressure routing shared by the whole instrument (edited on the AT ROUTE screen).
-    void setAftertouchRouter(const AftertouchRouter* router) { aftertouchRouter = router; }
+    // The engine's modulation router (ModRouter.h); nullptr: the engine has none (a MIDI track).
+    // The one way to it, for the screens (AT ROUTE, the pressure slots' cells) and for what its
+    // slots do outside the engine: the cells of the effects on the engine's track are destinations
+    // of it (mod::TrackDest), and the AudioEngine reads Router::trackDests() / trackOffset() after
+    // each processBlock.
+    virtual mod::Router* modRouter() { return nullptr; }
+    virtual const mod::Router* modRouter() const { return nullptr; }
+
+    // ---- Pad pressure as it was stored before the pressure slots had cells -----------------------
+    // The pressure routes are cells of the engine's router (PressureSlotParam, ModRouter.h: THE
+    // PRESSURE SLOTS) and new code sets those. What follows reads and writes them as the routes
+    // older projects hold (AftertouchRouter::Destination, a depth, bipolar).
+    // What a Destination is on this engine, as a value of a pressure slot's DEST (0: nothing
+    // here): what the engine's PressureMap said, so an old route does what it did. Vibrato is VIB
+    // on every engine with a router and is not asked for here.
+    virtual int pressureDestOf(AftertouchRouter::Destination) const { return 0; }
+    // What an engine did with pressure when nobody had handed it routes (setAftertouchRouter(nullptr)):
+    // the voice allocator's own router, the level at depth 1.
+    virtual AftertouchRouter legacyPressureRoutes() const { return AftertouchRouter(); }
+    // Loads routes into the slots (nullptr: legacyPressureRoutes). Nothing is kept of the router
+    // it is given. (The bodies are in ModRouter.h, which every engine with a router includes.)
+    inline void setAftertouchRouter(const AftertouchRouter* router);
+    inline void setPressureRoute(int index, const AftertouchRouter::Route& route);
+    // A slot's DEST as a Destination (Off: none says it); `allowed` leaves some out.
+    inline AftertouchRouter::Destination pressureDestAsRoute(int dest, const std::function<bool(AftertouchRouter::Destination)>& allowed = nullptr) const;
+
+    // The track's input for the next processBlock (a default AudioInput = none).
+    void setAudioInput(const AudioInput& in) { audioInput = in; }
 
     virtual float getCpuLoad() const { return 0.0f; }
+
+    // The pitch of the note played last, in Hz (0 = none yet): what an effect on the track tunes
+    // itself to (EffectBase::setPitch: VOC's TUNE). An engine reports each note it starts with
+    // notePlayed() (as a note number, which may be fractional: a glide's end, a bent note); the
+    // AudioEngine reports the notes it starts itself (pads, arps, the ratchet).
+    void notePlayed(float note)
+    {
+        if (std::isfinite(note))
+            lastNoteHz.store(440.0f * std::exp2((juce::jlimit(-24.0f, 160.0f, note) - 69.0f) / 12.0f), std::memory_order_relaxed);
+    }
+    float getLastNoteHz() const { return lastNoteHz.load(std::memory_order_relaxed); }
 
     // What the engine did to its sound between two blocks that would be heard as a click, since the
     // last call (0 = nothing): the track it plays on carries the jump off over 2 ms (AudioEngine).
@@ -163,6 +219,9 @@ protected:
     // algorithm ...): the jump from the old sound to the new is carried off.
     void soundSwapped() { if (jump.load(std::memory_order_relaxed) != SoundCut) jump.store(SoundSwapped, std::memory_order_relaxed); }
 
+    AudioInput audioInput;
+    // Only the reference engines of tests/old/ read this (block by block, as every engine once
+    // did); an engine with a router has the routes in its pressure slots (setAftertouchRouter).
     const AftertouchRouter* aftertouchRouter = nullptr;
 
     // The strip arrives in 7-bit steps; an engine that routes it to something heard at that
@@ -179,5 +238,6 @@ protected:
 private:
     float modWheelPosition = 0.0f;
     std::atomic<int> jump { NoJump };
+    std::atomic<float> lastNoteHz { 0.0f };
 
 };

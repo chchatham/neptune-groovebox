@@ -918,6 +918,38 @@ public:
             expectEquals(page.notes[6], 11);
             expectEquals(page.notes[7], 12);
         }
+
+        beginTest("Scale pads follow the key latch: released pad keeps sounding, new chord releases");
+        {
+            CustomScaleManager mgr;
+            CustomScaleScreen screen(mgr);
+            bool latchOn = true;
+            int releaseCount = 0;
+            screen.setLatchState([&] { return latchOn; }, [&] { return releaseCount; });
+            std::vector<int> ons, offs;
+            screen.setNoteCallback([&](int n, int) { ons.push_back(n); });
+            screen.setNoteOffCallback([&](int n) { offs.push_back(n); });
+
+            // Press and release a pad with latch on: note stays.
+            screen.onPadPress(0, 100);
+            expectEquals((int) ons.size(), 1);
+            screen.onPadRelease(0);
+            expectEquals((int) offs.size(), 0, "latch keeps the note sounding");
+            expect(screen.latchIsWaiting(), "latched pads waiting for service");
+
+            // A new chord (simulated by incrementing the release count) releases latched pads.
+            ++releaseCount;
+            screen.serviceScaleLatch();
+            expectEquals((int) offs.size(), 1, "new chord releases the latched pad");
+            expect(!screen.latchIsWaiting());
+
+            // With latch off, a pad release sends the note-off immediately.
+            latchOn = false;
+            ons.clear(); offs.clear();
+            screen.onPadPress(1, 100);
+            screen.onPadRelease(1);
+            expectEquals((int) offs.size(), 1, "without latch, pad release sends note-off");
+        }
     }
 };
 

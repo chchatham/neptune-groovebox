@@ -77,6 +77,19 @@ public:
     // True when the track should sound: soloed, or not muted while no other track is soloed.
     bool isTrackAudible(int trackIndex) const;
 
+    // Another track listens to this one (its track input, TrackInParam): it goes on playing while
+    // muted or soloed out, and the AudioEngine shuts its fader instead. Set by the AudioEngine.
+    void setTrackFeeds(int trackIndex, bool feeds)
+    {
+        if (trackIndex >= 0 && trackIndex < MAX_TRACKS)
+            trackFeeds[(size_t) trackIndex].store(feeds, std::memory_order_relaxed);
+    }
+    bool trackPlays(int trackIndex) const
+    {
+        return isTrackAudible(trackIndex)
+            || (trackIndex >= 0 && trackIndex < MAX_TRACKS && trackFeeds[(size_t) trackIndex].load(std::memory_order_relaxed));
+    }
+
     // Switching recording on starts a new take: getLastRecordedTrack() / getFirstRecordedStep()
     // then report what was recorded since.
     void setRecording(bool rec)
@@ -164,6 +177,12 @@ public:
     void addListener(Listener* l) { listeners.add(l); }
     void removeListener(Listener* l) { listeners.remove(l); }
 
+    // The structure lock from AudioEngine: takes the lock that the audio thread only tries. Anything
+    // that reallocates step vectors or pushes notes into them holds it, so the audio thread skips
+    // one block (silent, faded by the declick) while the edit runs.
+    using StructureLock = std::function<void(const std::function<void()>&)>;
+    void setStructureLock(StructureLock fn) { structureLock = std::move(fn); }
+
     using TrigCallback = std::function<void(int trackIndex, const Step& step)>;
     void setTrigCallback(TrigCallback cb) { onTrig = std::move(cb); }
 
@@ -222,7 +241,56 @@ public:
     void serviceLanePool();
     int getReadyLaneBuffers() const;
 
+    // ---- PERF pad moves: recording and playback ---------------------------------------------------
+    //
+    // RECORDING. While recording + playing, the MIDI thread calls recordPerfMove() for every press,
+    // pressure and release on a PERF pad (some 75 pressure messages a second for each pad held).
+    // It takes no lock: the move goes into a ring of fixed size (one writer at a time: the pads'
+    // handlers run under the screens' lock; one reader, the audio thread), and processBlock moves
+    // what the ring holds into the active pattern's MoveLane, stamped with the musical time of the
+    // block's first sample (track 1's step position). So a move is in the lane one block after it
+    // was played, and it is first played back the next time round. REC FREE keeps that time;
+    // REC QUANT rounds it to the nearest step. A ring that is full (the audio has stood still for
+    // hundreds of messages) loses the move and counts it (getPerfMovesLost).
+    //
+    // PLAYBACK. processBlock fires, in time order, the moves between track 1's step position at
+    // the block's first sample and where the block leaves it: the lane has no clock of its own,
+    // so it is in step with the track after a pattern change, a change of speed or length, and
+    // whenever the first move was recorded. A finger on a pad during playback wins:
+    // `perfPadLive[pad]` is true while a finger holds it, and playback moves for that pad are
+    // skipped. A pad the lane holds down is let go when the pattern changes and on stop.
+    //
+    // MEMORY. The lane is pre-allocated (MoveLane::MAX_MOVES) and the ring is a member; no
+    // allocation on the audio thread.
+    using PerfMoveCallback = std::function<void(const PerfFx::Move& move)>;
+    void setPerfMoveCallback(PerfMoveCallback cb) { onPerfMove = std::move(cb); }
+
+    void recordPerfMove(const PerfFx::Move& move);
+    int getPerfMovesLost() const { return perfMovesLost.load(std::memory_order_relaxed); }
+
+    // Mark a pad as live-held (a finger is on it, playback defers).
+    void setPerfPadLive(int absPad, bool live)
+    {
+        if (absPad >= 0 && absPad < MAX_PERF_PADS)
+            perfPadLive[(size_t) absPad].store(live, std::memory_order_relaxed);
+    }
+    // Clear the lane of the active pattern.
+    void clearPerfMoves() { withStructure([this] { patterns[activePattern].perfMoves.clear(); }); }
+    // The lane of the active pattern put back as it was stored (MoveLane::toFlat): an undo.
+    void applyPerfMoves(const std::vector<float>& flat)
+    {
+        withStructure([this, &flat] { patterns[activePattern].perfMoves.fromFlat(flat); });
+    }
+
 private:
+    // Work that changes what the audio thread reads (step vectors, a lane of moves): under the
+    // structure lock where one was given (setStructureLock), else as it is.
+    void withStructure(const std::function<void()>& work)
+    {
+        if (structureLock) structureLock(work);
+        else               work();
+    }
+
     void beginPlaying();
     int processCountIn(int numSamples, double samplesPerBeat);
     void addBeatTick(int sample, bool accent, bool countIn)
@@ -267,6 +335,7 @@ private:
     std::atomic<bool> fillLatch { false };
     static constexpr int MAX_TRACKS = 64;
     std::array<std::atomic<bool>, MAX_TRACKS> trackFillFlags {};
+    std::array<std::atomic<bool>, MAX_TRACKS> trackFeeds {};
 
     // The take being recorded, and the step a note was just played into (so the sequencer does not
     // play it a second time in the pass it was recorded in). NEXT_STEP marks "the step after the
@@ -358,5 +427,27 @@ private:
     TrigCallback onTrig;
     NoteOffCallback onNoteOff;
     PressureCallback onLanePressure;
+    PerfMoveCallback onPerfMove;
+    StructureLock structureLock;
     juce::ListenerList<Listener> listeners;
+
+    // ---- PERF pad moves ---------------------------------------------------------------------------
+    static constexpr int MAX_PERF_PADS = PerfFxRack::TOTAL_PADS;
+    std::array<std::atomic<bool>, MAX_PERF_PADS> perfPadLive {};
+    // Which pads playback currently holds down (so we release them on stop), and the pattern
+    // whose lane pressed them.
+    std::array<bool, MAX_PERF_PADS> perfPlaybackDown {};
+    int perfLanePattern = 0;
+
+    // The moves played and not yet in the lane: written by recordPerfMove (MIDI thread), read
+    // by processBlock (audio thread). The two counters run on; their difference is what waits.
+    static constexpr uint32_t PERF_RING = 1024;         // a power of two
+    std::array<PerfFx::Move, PERF_RING> perfRing {};
+    std::atomic<uint32_t> perfRingWritten { 0 }, perfRingRead { 0 };
+    std::atomic<int> perfMovesLost { 0 };
+
+    double perfPosition() const;            // track 1's place in the pattern, in steps
+    void takePerfMoves(double stepPos);     // the ring into the lane
+    void playPerfMoves(float from, float to, bool toTheEnd);
+    void releasePerfPlayback();             // release all pads held by playback
 };

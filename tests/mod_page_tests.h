@@ -153,21 +153,29 @@ public:
             auto page = rig.screen->getCurrentPage();
             expectEquals(page.params[4].numChoices, (int) LFO::Shape::COUNT);
             expectEquals(page.params[5].numChoices, (int) LFO::TriggerMode::COUNT);
-            expectEquals(page.params[7].numChoices, (int) UnifiedVoice::LfoDest::Count);
+            // (The voice's own list, then the cells of the track's effects: E4.)
+            expectEquals(page.params[7].numChoices, (int) UnifiedVoice::LfoDest::Count + mod::TrackDest::COUNT);
             rig.screen->onEncoderChange(4, 30);
-            expect(rig.engine().getVoice(0).getLFOBank().getLFO(0).getShape() == LFO::Shape::ExpDown);
-            expectEquals(cellText(rig, 4), juce::String("EXPD"));
+            expect(rig.engine().getVoice(0).getLFOBank().getLFO(0).getShape() == LFO::Shape::UserSmooth);
+            expectEquals(cellText(rig, 4), juce::String("USRS"));
             rig.screen->onEncoderChange(5, 30);
             expect(rig.engine().getVoice(0).getLFOBank().getLFO(0).getTriggerMode() == LFO::TriggerMode::Hold);
             expectEquals(cellText(rig, 5), juce::String("HOLD"));
             // 23 clicks: the last of the original destinations; the page cells follow them.
             rig.screen->onEncoderChange(7, 23);
-            expect(rig.engine().getVoice(0).getLfoDest(0) == UnifiedVoice::LfoDest::Lfo4Depth);
+            expect(rig.engine().lfoDestination(0) == UnifiedVoice::LfoDest::Lfo4Depth);
             expectEquals(cellText(rig, 7), juce::String("DPT4"));
+            rig.screen->onEncoderChange(7, (int) UnifiedVoice::LfoDest::Count - 1 - 23);
+            expectEquals((int) rig.engine().lfoDestination(0), (int) UnifiedVoice::LfoDest::Count - 1);
+            expectEquals(cellText(rig, 7), juce::String(UnifiedVoice::lfoDestLabels()[(int) UnifiedVoice::LfoDest::Count - 1]));
+            // ... and after the voice's own, the cells of the track's effects, to the list's end.
+            rig.screen->onEncoderChange(7, 1);
+            expectEquals((int) rig.engine().lfoDestination(0), (int) UnifiedVoice::LfoDest::Count);
+            expectEquals(cellText(rig, 7), juce::String("1:C1"));
             for (int turn = 0; turn < 4; ++turn)
                 rig.screen->onEncoderChange(7, 30);
-            expectEquals((int) rig.engine().getVoice(0).getLfoDest(0), (int) UnifiedVoice::LfoDest::Count - 1);
-            expectEquals(cellText(rig, 7), juce::String(UnifiedVoice::lfoDestLabels()[(int) UnifiedVoice::LfoDest::Count - 1]));
+            expectEquals((int) rig.engine().lfoDestination(0), (int) UnifiedVoice::LfoDest::Count + mod::TrackDest::COUNT - 1);
+            expectEquals(cellText(rig, 7), juce::String("RO.D"));
             // Every label fits a cell.
             for (int i = 0; i < (int) UnifiedVoice::LfoDest::Count; ++i)
                 expect(juce::String(UnifiedVoice::lfoDestLabels()[i]).length() <= 4);
@@ -208,7 +216,7 @@ public:
             expect(rig.engine().getVoice(0).getLFOBank().getLFO(0).getShape() == LFO::Shape::Square);
 
             rig.screen->onEncoderChange(7, 2);           // DEST two steps: OFF -> CUT
-            expect(rig.engine().getVoice(0).getLfoDest(0) == UnifiedVoice::LfoDest::Cutoff);
+            expect(rig.engine().lfoDestination(0) == UnifiedVoice::LfoDest::Cutoff);
         }
 
         beginTest("PW is heard on every waveform, differently below and above 50, and 50 leaves each as it was");

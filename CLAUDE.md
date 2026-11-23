@@ -48,7 +48,8 @@ src/
 │   └── PadRatchet.h        — hold-to-ratchet pads
 ├── engine/
 │   ├── EngineBase.h, ParamSpec.h — engine interface; parameter specs, pages and shared id ranges
-│   ├── AudioEngine.h       — audio callback, track mixer, parameter entry point, step locks, effects, sends, pads/arps
+│   ├── AudioEngine.h       — audio callback, track mixer, parameter entry point, step locks, effects, sends, pads/arps,
+│   │                         the track input (a track hears another: TRK FX page IN)
 │   ├── VoiceAllocator      — polyphonic voice management
 │   ├── UnifiedVoice.h, UnifiedVoiceEngine.h, ArchitecturePreset.h — configurable voice architecture
 │   ├── FMEngine.h, FMVoice.h, FMOperator.h — 6-operator FM
@@ -61,21 +62,29 @@ src/
 │   ├── DrumEngine.h, DrumVoice.h, DrumLane.h — drum kit; one drum's hits among a step's notes (STEP's drum lanes)
 │   ├── CymbalMachine.h     — the cymbal machine (drum type CSYN): oscillator bank or 48 ringing modes; its CYM page
 │   ├── MIDITrack.h         — external MIDI output track
-│   ├── VoiceFilterSection.h, EngineLfoSection.h — per-voice filter; two LFOs, their destination lists and the
-│   │                         STRIP page, shared by the non-unified engines
-│   ├── AftertouchRouter.h  — pad-pressure routes, one set per track
+│   ├── ResonatorEngine.h   — the resonator, RSN: a body and an exciter in latent spaces (`dsp/Resonator.h`, `dsp/ModeBank.h`); also the kit's resonator drum
+│   ├── ModRouter.h         — THE modulation router of every engine: LFOs, strip, track input, free slots, pad-pressure slots, the
+│   │                         80 effect destinations; `mod::NamedList` (stored positions by name). Read its header block first
+│   ├── VoiceBodySection.h, VoiceSpread.h — the BODY stage after a voice (pages BODY, BDY2); the seeded per-note spread (ANLG)
+│   ├── VoiceFilterSection.h — the dual per-voice filter of every engine (A / B, ROUT, BAL, FFM)
+│   ├── EngineLfoSection.h, EngineModSection.h — what is left of the pre-router LFO and slot code (the unified voice's classic
+│   │                         LFO path, pinned by P01, and old reference engines under tests/old)
+│   ├── AftertouchRouter.h  — the OLD pad-pressure route type, kept for loading older files and old reference engines; the routes
+│   │                         are router slots now (ids 773-784, `PressureSlotParam`; the AT ROUTE screen edits them)
 │   ├── ModStripFollower.h  — every track keeps the value the mod strip last gave it
 │   ├── PerfFx.h            — PERF: effects played from the pads (what each pad holds, press / pressure / latch,
 │   │                         the audio: per-track after the fader, MSTR before the master chain)
-│   └── SendBusManager.h — not used by the app yet
 ├── dsp/
 │   ├── filters/            — SVF, SEM, ladder, diode, comb; FilterSlot.h offers them by type and mode
-│   ├── effects/            — EffectBase.h, EffectChain.h, TrackFx.h (DIRT / TALK / MODFX blocks), FxBlocks.h (shared
-│   │                         building blocks), one header per effect; PerfEffects.h = the PERF pads' own (dub echo, freeze,
+│   ├── effects/            — EffectBase.h, CellEffect.h (an effect of eight cells), EffectChain.h (inserts, sends and the master
+│   │                         are chains; ONE dry / wet mix), the shared cores (DelayCore.h, ReverbParts.h = one reverb network,
+│   │                         ModDelay.h, Detector.h, FxLfo.h), SendBus.h, DirtEffect.h / TalkEffect.h (insert types; the fixed
+│   │                         DIRT / TALK / MODFX blocks of TrackFx.h are gone, old projects load them into insert slots),
+│   │                         one header per effect (Vocoder.h = VOC, fed by the track's input); PerfEffects.h = the PERF pads' own (dub echo, freeze,
 │   │                         beat repeat, tape stop: not insert types)
 │   ├── WaveTables.h, WaveMorph.h — the wavetable engine's built-in tables; key-frame morph algorithms and their FFT
 │   ├── Saturation.h        — the saturation curves: one list shared by the waveshaper, DIRT, the amp and the dub echo
-│   └── Envelope.h, EnvelopeChain.h, LFO.h, ModMatrix.h, DSPUtils.h
+│   └── Envelope.h, EnvelopeChain.h, LFO.h, DSPUtils.h
 ├── arpeggiator/            — Arpeggiator.h (one per track), VariationMacros.h, MutateSystem.h, RhythmCapture.h
 ├── ui/
 │   ├── ScreenManager       — `Screen` base class; the control grammar (modifiers, hold layers, copy / clear / paste,
@@ -86,6 +95,7 @@ src/
 │   ├── EnvelopeCurve.h     — the envelope picture, drawn from the real Envelope class
 │   ├── ScreenAudit.h       — turns every knob on every page, holds every help key, checks the display
 │   ├── SaveBox.h           — the Mac's window that asks for a saved preset's or project's name (Save / Cancel)
+│   ├── ProjectSlots.h, ProjectBrowser.h — the project slots' load / save / name logic; the Mac's Projects window
 │   ├── TurnNotice.h        — a knob with nothing to act on says why in the name bar
 │   ├── UiClock.h           — the screens' clock (the audit can move it on)
 │   ├── screens/            — Home (TRACKS), StepView, ParamPage (PARAM, and `ParamCellScreen`, the base it shares
@@ -97,8 +107,12 @@ src/
 │                             (the panel picture is laid out from PanelDimensions.h and wears PanelOverlay.h: the
 │                             same numbers and words as docs/overlay/overlay.html)
 ├── project/
-│   ├── Project.h, ProjectManager.h, ProjectBridge.h — project files; capture / apply of the whole live state
+│   ├── Project.h, ProjectManager.h, ProjectBridge.h — project files (format version 3); capture / apply of the whole live state
+│   ├── StoredLists.h       — every stored position in a list, by NAME; the lists as they were, for loading version 2 files
+│   ├── presets/            — PresetRoutes.h (a preset names its routes), FusionPresets.h, ResonatorPresets.h, ResonatorKits.h
 │   ├── Preset.h, PresetManager.h, FactoryPresets.h — sound presets
+│   ├── MultiPreset.h, FactoryMultis.h — several connected tracks as one preset (category MULT), loaded into the
+│   │                         earliest empty tracks; what "empty" means
 │   ├── CymbalPresets.h     — the cymbal machine's ten ready-made sounds and the two factory kits made of them
 │   ├── TrackPresetNames.h  — the preset each track's sound came from (what the save box offers); stored with the track
 │   ├── UndoHistory.h       — 15 levels of undo / redo; ScreenManager fills and applies it
@@ -175,8 +189,11 @@ Arpeggiator settings live in the per-track `Arpeggiator` objects, insert chains,
 - **Platform:** macOS (Apple Silicon + Intel)
 - **Controller:** Novation Launchkey Mini 25 MK4, USB-C, bus powered, running Neptune firmware NPF
 - **Build:** `cmake --build build` is Debug, for the tests. The app runs from the optimised build: `cmake --build build-release` → `build-release/NeptuneGroovebox_artefacts/Release/Neptune Groovebox.app`
-- **Test commands:** `cmake --build build --target NeptuneTests && (cd build && ctest -j 12)` (about 90 s: one binary,
-  `build/NeptuneTests_artefacts/Debug/NeptuneTests`, run as eleven tests side by side). One suite: `NEPTUNE_TEST_ONLY="<part of its name>"` on the binary
+- **Test commands:** `cmake --build build --target NeptuneTests && (cd build && ctest -j 12)` (about 3 min: one binary,
+  `build/NeptuneTests_artefacts/Debug/NeptuneTests`, run as twenty tests side by side). One suite: `NEPTUNE_TEST_ONLY="<part of its name>"` on the binary.
+  **Agents working in parallel** build and test through the machine gate instead, so they queue for the cores rather
+  than slow each other: `python3 tools/gate.py build build NeptuneTests NeptuneGroovebox`, `python3 tools/gate.py suite build "<name>" ...`,
+  `python3 tools/gate.py full build`; `python3 tools/gate.py stats` sums the time each worktree waited
 - **Everything else** (lag pass, manual build, screen dump, bench): `.ralph/progress.md` → How to run
 - **Screen audit:** `python3 tools/screen_audit.py [--photos]` (device connected, app not running) → `.ralph/screen-audit/report.txt`
 - **Reference docs:** Novation MK4 Programmer's Reference Guide (`.ralph/launchkey_mk4_programmers_reference.pdf`: Novation's, git-ignored; download it from Novation)
@@ -193,3 +210,4 @@ Arpeggiator settings live in the per-track `Arpeggiator` objects, insert chains,
 9. **Licensing awareness.** The project is AGPL-3.0. Check the licence of anything before linking it; Airwindows (MIT) preferred for effects.
 10. **Hardware abstraction.** A controller-profile layer so other controllers can be added later without changing the core.
 11. **Firmware is fair game.** The Launchkey MK4 firmware may be analyzed and modified to reclaim intercepted gestures and extend the controller's capabilities. The hardware was purchased specifically for this level of customization.
+12. **Few machines, powerful primitives.** Parsimony in the number of machines and of bespoke screens; variety comes from combining shared primitives (one resonator and exciter, one mode bank, one modulation router, one oscillator, shared effect cores) and is shown in presets. A new sound is a point or a preset, a new capability a latent / source / destination every host gets; everything must still run polyphonically in real time on several tracks. Parsimony never buys a loss of timbre: what the instrument could do before is kept reachable and shown so against reference renders before old code goes. The owner's words and what follows: `.ralph/spec-unify.md` → The aim.

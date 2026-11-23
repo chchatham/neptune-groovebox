@@ -30,6 +30,14 @@ public:
 
     void setVoiceCount(int count);
     int getVoiceCount() const { return (int) voices.size(); }
+
+    // VOX: how many of the voices notes are given to, 1 .. getVoiceCount() (all of them until
+    // set; setVoiceCount sets it back to all). Every search for a voice stays within the first
+    // `limit`, so no more than that many ever sound once the tails of a lowered limit have rung
+    // out: at the limit a new note takes the oldest voice, a note struck again its own. Lowering
+    // it releases the held voices past the new limit (a note-off: they ring out, they are not cut).
+    void setVoiceLimit(int limit);
+    int getVoiceLimit() const { return limit; }
     void setMode(VoiceMode mode);
     VoiceMode getMode() const { return mode; }
 
@@ -67,6 +75,7 @@ private:
     int findVoiceForNote(int note) const;
 
     std::vector<Voice> voices;
+    int limit = 0;              // the voices notes are given to: 0 .. limit - 1
     VoiceMode mode = VoiceMode::Poly;
     int ageCounter = 0;
 

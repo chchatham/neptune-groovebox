@@ -1,7 +1,13 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// The three effect blocks every track has, each with its own 8-knob page:
+// REFERENCE CODE. The app no longer runs these blocks: DIRT and TALK are insert types
+// (DirtEffect.h, TalkEffect.h), MODFX's four are the inserts CHR, FLG, PHS and ROT, and a
+// stored sound that used a block is given those inserts when it is loaded (ProjectBridge).
+// What the app still takes from this file is TrackFxParam, the ids the blocks were stored
+// under. The classes are kept for the tests that compare the inserts with them.
+//
+// What they were: the three effect blocks every track had, each with its own 8-knob page:
 //
 //   DIRT    drive / distortion type / bit crusher / sample-rate reducer and a
 //           filtered, tuned feedback path, all in one
@@ -10,13 +16,13 @@
 //   MODFX   chorus, flanger, phaser and rotary speaker side by side, two knobs
 //           each (rate / depth); an effect whose depth is 0 is off
 //
-// They run in that order after the track's engine and before its insert slots.
-// A block with everything at zero costs nothing. Parameter ids are
-// TrackFxParam::*_BASE + cell index, so every cell can be locked per step.
+// They ran in that order after the track's engine and before its insert slots.
+// A block with everything at zero cost nothing. Parameter ids were
+// TrackFxParam::*_BASE + cell index, so every cell could be locked per step.
 //
 // The blocks are built from the project's existing effect classes (Waveshaper,
-// RateReducer, Chorus, Flanger, Phaser, RotarySpeaker) and filters (CombFilter,
-// SVFilter); nothing here is new low-level DSP.
+// RateReducer, Chorus, Flanger, Phaser, RotarySpeaker), the comb filter and the
+// swept filter (SweptFilter.h); nothing here is new low-level DSP.
 // -----------------------------------------------------------------------------
 
 #include "Waveshaper.h"
@@ -25,8 +31,8 @@
 #include "Flanger.h"
 #include "Phaser.h"
 #include "RotarySpeaker.h"
+#include "SweptFilter.h"
 #include "../filters/CombFilter.h"
-#include "../filters/SVFilter.h"
 #include "../../engine/ParamSpec.h"
 #include <array>
 
@@ -155,10 +161,10 @@ private:
 };
 
 // ---- TALK ---------------------------------------------------------------------
-// Three parallel band-pass filters placed on the first three formants of a vowel. The vowel
-// position moves continuously through A - E - I - O - U; it can be set by hand, swept by an LFO
-// and pushed by the level of the playing, so the sound "talks". Formant frequencies and relative
-// levels are standard phonetics values for a male voice (as tabulated e.g. in the Csound manual).
+// A setting of the swept filter (SweptFilter.h): its vowel filter, three parallel band-pass
+// filters placed on the first three formants of a vowel. The vowel position moves continuously
+// through A - E - I - O - U; it can be set by hand, swept by the effects' LFO and pushed by the
+// level of the playing (the shared detector), so the sound "talks".
 class TalkBlock
 {
 public:
@@ -192,19 +198,23 @@ public:
     {
         for (auto& spec : page().params)
             values[(size_t) (spec.id - TrackFxParam::TALK_BASE)] = spec.defaultVal;
+        prepare(44100.0, 0);
     }
 
     void prepare(double sr, int /*blockSize*/)
     {
-        sampleRate = sr;
-        for (auto& ch : filters)
-            for (auto& f : ch)
-            {
-                f.setSampleRate(sr);
-                f.setMode(SVFilter::Mode::BandPass);
-                f.reset();
-            }
-        updateCountdown = 0;
+        swp::Core::Voicing v;
+        v.law = swp::Core::Place;
+        v.slots = false;                // (the vowels alone: no room is taken for the filter set)
+        v.baseMs = v.resoMs = v.depthMs = v.amountMs = 0.0f;      // (the cells act at the next step, as they always did)
+        v.attackMs = 5.0f;
+        v.releaseMs = 150.0f;
+        v.envGain = 3.0f;
+        v.meanLevel = true;             // (the mean of the two sides, as TALK always listened)
+        core.prepare(CellEffect::goodRate(sr), v);
+        core.setFilter(swp::filt::Vowel, 0);
+        apply();
+        core.reset();
     }
 
     void set(int cell, float v)
@@ -217,96 +227,36 @@ public:
     bool isActive() const { return values[Mix] > 0.0f; }
 
     // Where the vowel is right now (0..1), including LFO and envelope, for display.
-    float currentPosition() const { return position; }
+    float currentPosition() const { return core.currentPlace(); }
+
+    // The track's custom LFO shape, and the LFO's shape (a cell for it has no room on the page).
+    void setUserShape(const float* levels) { core.setUserShape(levels); }
+    void setLfoShape(int shape) { lfoShape = shape; }
 
     void process(float* left, float* right, int numSamples)
     {
         if (!isActive())
             return;
-
+        apply();
         const float mix = values[Mix];
-        const float biteGain = 1.0f + values[Bite] * 6.0f;
-        const float attack = 1.0f - std::exp(-1.0f / (0.005f * (float) sampleRate));
-        const float release = 1.0f - std::exp(-1.0f / (0.150f * (float) sampleRate));
-
-        for (int i = 0; i < numSamples; ++i)
-        {
-            const float inL = left[i], inR = right[i];
-
-            // Envelope follower on the input level.
-            float level = 0.5f * (std::abs(inL) + std::abs(inR));
-            envelope += (level > envelope ? attack : release) * (level - envelope);
-
-            if (--updateCountdown <= 0)
-            {
-                updateCountdown = UPDATE_INTERVAL;
-                lfoPhase += (double) values[LfoRate] * UPDATE_INTERVAL / sampleRate;
-                lfoPhase -= std::floor(lfoPhase);
-                float lfo = std::sin((float) lfoPhase * 6.2831853f);
-                position = juce::jlimit(0.0f, 1.0f, values[Vowel]
-                                                    + 0.5f * values[LfoDepth] * lfo
-                                                    + values[Env] * juce::jmin(1.0f, envelope * 3.0f));
-                updateFormants();
-            }
-
-            // A little saturation first gives the formants harmonics to pick out.
-            float xL = dsp::fastTanh(inL * biteGain);
-            float xR = dsp::fastTanh(inR * biteGain);
-
-            float outL = 0.0f, outR = 0.0f;
-            for (int f = 0; f < 3; ++f)
-            {
-                outL += filters[0][(size_t) f].process(xL) * gains[(size_t) f];
-                outR += filters[1][(size_t) f].process(xR) * gains[(size_t) f];
-            }
-
-            left[i] = inL + mix * (outL * MAKEUP - inL);
-            right[i] = inR + mix * (outR * MAKEUP - inR);
-        }
+        core.run(left, right, numSamples, left, right, mix, mix);
     }
 
 private:
-    static constexpr int UPDATE_INTERVAL = 16;
-    static constexpr float MAKEUP = 2.0f;
-
-    void updateFormants()
+    // The cells into the core (audio thread: the values are plain numbers a knob or a step lock writes).
+    void apply()
     {
-        //                               F1      F2      F3       levels (F2, F3 lifted for clarity)
-        static const float table[5][6] = { { 650.0f, 1080.0f, 2650.0f, 1.0f, 0.70f, 0.50f },    // A
-                                           { 400.0f, 1700.0f, 2600.0f, 1.0f, 0.45f, 0.40f },    // E
-                                           { 290.0f, 1870.0f, 2800.0f, 1.0f, 0.40f, 0.30f },    // I
-                                           { 400.0f,  800.0f, 2600.0f, 1.0f, 0.55f, 0.35f },    // O
-                                           { 350.0f,  600.0f, 2700.0f, 1.0f, 0.35f, 0.30f } };  // U
-        float p = position * 4.0f;
-        int a = juce::jlimit(0, 3, (int) p);
-        float t = p - (float) a;
-        const float shift = std::exp2(values[Shift]);
-        const float q = 3.0f + values[Reso] * values[Reso] * 27.0f;
-
-        for (int f = 0; f < 3; ++f)
-        {
-            // Frequencies move on a log scale between neighbouring vowels.
-            float hz = table[a][f] * std::pow(table[a + 1][f] / table[a][f], t) * shift;
-            float amp = table[a][f + 3] + t * (table[a + 1][f + 3] - table[a][f + 3]);
-            for (auto& ch : filters)
-            {
-                ch[(size_t) f].setResonance(q);
-                ch[(size_t) f].setCutoff(juce::jlimit(60.0f, (float) (sampleRate * 0.45), hz));
-            }
-            // The band output peaks at Q: bring it back to the formant's level, with a little extra
-            // loudness as the bands narrow.
-            gains[(size_t) f] = amp / q * (1.0f + values[Reso]);
-        }
+        core.setBase(values[Vowel]);
+        core.setShift(values[Shift]);
+        core.setResonance(values[Reso]);
+        core.setLfo(values[LfoRate], lfoShape, 0.5f * values[LfoDepth], 0.0f);
+        core.setEnvelope(values[Env]);
+        core.setBite(1.0f + values[Bite] * 6.0f);
     }
 
     std::array<float, NumCells> values {};
-    std::array<std::array<SVFilter, 3>, 2> filters;
-    std::array<float, 3> gains { 1.0f, 0.5f, 0.3f };
-    double sampleRate = 44100.0;
-    double lfoPhase = 0.0;
-    float envelope = 0.0f;
-    float position = 0.0f;
-    int updateCountdown = 0;
+    swp::Core core;
+    int lfoShape = 0;
 };
 
 // ---- MODFX --------------------------------------------------------------------
@@ -315,34 +265,51 @@ class ModFxBlock
 public:
     enum Cell { ChorusRate = 0, ChorusDepth, FlangerRate, FlangerDepth, PhaserRate, PhaserDepth, RotarySpeed, RotaryDepth, NumCells };
 
+    // The eight cells (no text is built here: played() reads them on the audio thread).
+    static ParamSpec spec(int cell)
+    {
+        const int b = TrackFxParam::MODFX_BASE;
+        const auto G = ParamKind::Log;
+        switch (cell)
+        {
+            case ChorusRate:   return { "CH.R", b + ChorusRate, 0.1f, 5, 0.8f, G, "Hz" };
+            case ChorusDepth:  return { "CH.D", b + ChorusDepth, 0, 1, 0 };
+            case FlangerRate:  return { "FL.R", b + FlangerRate, 0.1f, 5, 0.3f, G, "Hz" };
+            case FlangerDepth: return { "FL.D", b + FlangerDepth, 0, 1, 0 };
+            case PhaserRate:   return { "PH.R", b + PhaserRate, 0.1f, 5, 0.5f, G, "Hz" };
+            case PhaserDepth:  return { "PH.D", b + PhaserDepth, 0, 1, 0 };
+            case RotarySpeed:  return { "RO.S", b + RotarySpeed, 0, 1, 0 };        // slow .. fast
+            case RotaryDepth:  return { "RO.D", b + RotaryDepth, 0, 1, 0 };
+            default:           return {};
+        }
+    }
+
     static ParamPage page()
     {
         ParamPage p;
         p.name = "MODFX";
         p.section = "FX";
-        const int b = TrackFxParam::MODFX_BASE;
-        auto G = ParamKind::Log;
-        p.params = {{
-            { "CH.R", b + ChorusRate, 0.1f, 5, 0.8f, G, "Hz" },
-            { "CH.D", b + ChorusDepth, 0, 1, 0 },
-            { "FL.R", b + FlangerRate, 0.1f, 5, 0.3f, G, "Hz" },
-            { "FL.D", b + FlangerDepth, 0, 1, 0 },
-            { "PH.R", b + PhaserRate, 0.1f, 5, 0.5f, G, "Hz" },
-            { "PH.D", b + PhaserDepth, 0, 1, 0 },
-            { "RO.S", b + RotarySpeed, 0, 1, 0 },        // slow .. fast
-            { "RO.D", b + RotaryDepth, 0, 1, 0 } }};
+        for (int cell = 0; cell < NumCells; ++cell)
+            p.params[(size_t) cell] = spec(cell);
         return p;
     }
 
+    // A ninth value, the LFO shape of all four (dsp/LFO.h): set(ShapeCell, index). The page's eight
+    // cells are taken, so no knob reaches it yet; its id would be MODFX_BASE + ShapeCell.
+    static constexpr int ShapeCell = NumCells;
+    static ParamSpec shapeSpec() { return fxm::Lfo::shapeSpec("SHPE", TrackFxParam::MODFX_BASE + ShapeCell); }
+
     ModFxBlock()
     {
-        for (auto& spec : page().params)
-            values[(size_t) (spec.id - TrackFxParam::MODFX_BASE)] = spec.defaultVal;
+        for (int cell = 0; cell < NumCells; ++cell)
+            values[(size_t) cell] = spec(cell).defaultVal;
         apply();
     }
 
     void prepare(double sr, int blockSize)
     {
+        restSamples = (int) (0.05 * CellEffect::goodRate(sr));
+        rest = {};
         chorus.prepare(sr, blockSize);
         flanger.prepare(sr, blockSize);
         phaser.prepare(sr, blockSize);
@@ -352,23 +319,59 @@ public:
 
     void set(int cell, float v)
     {
-        if (cell < 0 || cell >= NumCells) return;
-        values[(size_t) cell] = page().params[(size_t) cell].clamp(v);
+        if (cell == ShapeCell && std::isfinite(v))
+            shape = (int) fxm::Lfo::shapeOf((int) std::lround(std::clamp(v, 0.0f, 100.0f)));
+        else if (cell >= 0 && cell < NumCells)
+            values[(size_t) cell] = spec(cell).clamp(v);
+        else
+            return;
         apply();
     }
-    float get(int cell) const { return (cell >= 0 && cell < NumCells) ? values[(size_t) cell] : 0.0f; }
+    float get(int cell) const
+    {
+        return cell == ShapeCell ? (float) shape : (cell >= 0 && cell < NumCells) ? values[(size_t) cell] : 0.0f;
+    }
+
+    // A cell moved from outside while it sounds: EffectBase::modulateCell's contract and
+    // CellEffect's arithmetic (a share of the cell's range, added along its curve, staying until
+    // set again). What the block's cells set are cells of its four effects, which glide.
+    void modulateCell(int cell, float offset)
+    {
+        if (cell < 0 || cell >= NumCells) return;
+        offset = CellEffect::offsetOf(offset);
+        if (offset == offsets[(size_t) cell]) return;
+        offsets[(size_t) cell] = offset;
+        apply();
+    }
+    float getModulation(int cell) const { return (cell >= 0 && cell < NumCells) ? offsets[(size_t) cell] : 0.0f; }
+
+    // What a cell plays: the knob and its offset.
+    float played(int cell) const
+    {
+        const float offset = offsets[(size_t) cell];
+        return offset == 0.0f ? values[(size_t) cell] : CellEffect::moved(spec(cell), values[(size_t) cell], offset);
+    }
+
+    // The track's custom LFO shape (what USR and USRS play); null = the rising staircase.
+    void setUserShape(const float* levels)
+    {
+        chorus.setUserShape(levels);
+        flanger.setUserShape(levels);
+        phaser.setUserShape(levels);
+        rotary.setUserShape(levels);
+    }
 
     bool isActive() const
     {
-        return values[ChorusDepth] > 0.0f || values[FlangerDepth] > 0.0f || values[PhaserDepth] > 0.0f || values[RotaryDepth] > 0.0f;
+        return on[0] || on[1] || on[2] || on[3] || rest[0] > 0 || rest[1] > 0 || rest[2] > 0 || rest[3] > 0;
     }
 
     void process(float* left, float* right, int numSamples)
     {
-        if (values[PhaserDepth] > 0.0f)  phaser.processBlock(left, right, numSamples);
-        if (values[FlangerDepth] > 0.0f) flanger.processBlock(left, right, numSamples);
-        if (values[ChorusDepth] > 0.0f)  chorus.processBlock(left, right, numSamples);
-        if (values[RotaryDepth] > 0.0f)  rotary.processBlock(left, right, numSamples);
+        run(phaser, 2, left, right, numSamples);
+        run(flanger, 1, left, right, numSamples);
+        run(chorus, 0, left, right, numSamples);
+        run(rotary, 3, left, right, numSamples);
     }
 
 private:
@@ -376,27 +379,52 @@ private:
     // deepens the modulation.
     static float wetFor(float depth) { return 0.5f * juce::jmin(1.0f, depth * 4.0f); }
 
+    // An effect whose depth has come down to nothing (a knob, a lock, an offset from outside) runs
+    // on for a moment: its mix is glided, and stopping at once would cut the rest of the glide off.
+    void run(EffectBase& fx, int which, float* left, float* right, int numSamples)
+    {
+        if (on[(size_t) which])             rest[(size_t) which] = restSamples;
+        else if (rest[(size_t) which] <= 0) return;
+        else                                rest[(size_t) which] -= numSamples;
+        fx.processBlock(left, right, numSamples);
+    }
+
     void apply()
     {
-        chorus.setParameter(Chorus::Rate, values[ChorusRate]);
-        chorus.setParameter(Chorus::Depth, values[ChorusDepth]);
-        chorus.setParameter(Chorus::Mix, wetFor(values[ChorusDepth]));
+        const float chorusDepth = played(ChorusDepth), flangerDepth = played(FlangerDepth), phaserDepth = played(PhaserDepth),
+                    rotaryDepth = played(RotaryDepth);
+        on = { chorusDepth > 0.0f, flangerDepth > 0.0f, phaserDepth > 0.0f, rotaryDepth > 0.0f };
 
-        flanger.setParameter(Flanger::Rate, values[FlangerRate]);
-        flanger.setParameter(Flanger::Depth, values[FlangerDepth]);
+        chorus.setParameter(Chorus::Rate, played(ChorusRate));
+        chorus.setParameter(Chorus::Depth, chorusDepth);
+        chorus.setParameter(Chorus::Voices, 3.0f);
+        chorus.setParameter(Chorus::Mix, wetFor(chorusDepth));
+        chorus.setExtra(Chorus::Shape, (float) shape);
+
+        flanger.setParameter(Flanger::Rate, played(FlangerRate));
+        flanger.setParameter(Flanger::Depth, flangerDepth);
         flanger.setParameter(Flanger::Feedback, 0.6f);
-        flanger.setParameter(Flanger::Mix, wetFor(values[FlangerDepth]));
+        flanger.setParameter(Flanger::Mix, wetFor(flangerDepth));
+        flanger.setExtra(Flanger::Shape, (float) shape);
 
-        phaser.setParameter(Phaser::Rate, values[PhaserRate]);
-        phaser.setParameter(Phaser::Depth, values[PhaserDepth]);
+        phaser.setParameter(Phaser::Rate, played(PhaserRate));
+        phaser.setParameter(Phaser::Depth, phaserDepth);
         phaser.setParameter(Phaser::Feedback, 0.5f);
-        phaser.setParameter(Phaser::Mix, wetFor(values[PhaserDepth]));
+        phaser.setParameter(Phaser::Stages, 6.0f);
+        phaser.setMix(wetFor(phaserDepth));
+        phaser.setExtra(Phaser::Shape, (float) shape);
 
-        rotary.setParameter(RotarySpeaker::Speed, values[RotarySpeed]);
-        rotary.setParameter(RotarySpeaker::Mix, values[RotaryDepth]);
+        rotary.setParameter(RotarySpeaker::Speed, played(RotarySpeed));
+        rotary.setMix(rotaryDepth);
+        rotary.setExtra(RotarySpeaker::Shape, (float) shape);
     }
 
     std::array<float, NumCells> values {};
+    std::array<float, NumCells> offsets {};
+    std::array<bool, 4> on { false, false, false, false };
+    std::array<int, 4> rest {};         // samples an effect still runs after its depth reached nothing
+    int restSamples = 2400;
+    int shape = 0;
     Chorus chorus;
     Flanger flanger;
     Phaser phaser;

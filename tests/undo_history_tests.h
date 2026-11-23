@@ -160,9 +160,7 @@ public:
                 URig r;
                 // Effects on tracks 1 and 3, so that clearing and pasting them changes something.
                 r.audio.addInsertEffect(0, static_cast<EffectType>(1));
-                r.set(0, TrackFxParam::DIRT_BASE + DirtBlock::Drive, 0.6f);
                 r.audio.addInsertEffect(2, static_cast<EffectType>(3));
-                r.set(2, TrackFxParam::MODFX_BASE + 1, 0.4f);
                 r.mgr.setActiveScreen(c.screen);
 
                 // Something to paste: copied from somewhere that differs from where it lands.
@@ -338,18 +336,17 @@ public:
         beginTest("TRK FX: clear resets the effects - blocks, insert slots, arp locks - and nothing else");
         {
             URig r;
-            const int drive = TrackFxParam::DIRT_BASE + DirtBlock::Drive;
-            r.set(0, drive, 0.7f);
-            r.set(0, TrackFxParam::TALK_BASE + 1, 0.5f);
-            r.set(0, TrackFxParam::MODFX_BASE + 1, 0.35f);
+            // (TrackFx block params 240-263 are dead; do not set them in soundParams or they
+            //  trigger convertTrackFxParams on paste/apply.)
+            const int fxCell = AudioEngine::EFFECT_PARAM_BASE;   // insert slot 0, cell 0
             r.audio.addInsertEffect(0, static_cast<EffectType>(0));
             r.audio.addInsertEffect(0, static_cast<EffectType>(2));
             const auto spec = r.audio.getInsertChain(0)->getEffect(0)->getParamSpec(0);
             const float insertValue = spec.minVal + (spec.maxVal - spec.minVal) * 0.25f;
-            r.set(0, AudioEngine::EFFECT_PARAM_BASE, insertValue);
+            r.set(0, fxCell, insertValue);
             r.set(0, AudioEngine::ARP_LOCK_BASE + 0, 0.5f);
             r.set(0, AudioEngine::ARP_LOCK_BASE + 2, 3.0f);
-            r.track(0).soundParams[RangeParam::LO_BASE + drive] = 0.1f;             // a pressure range on an effect
+            r.track(0).soundParams[RangeParam::LO_BASE + fxCell] = 0.1f;            // a pressure range on an effect
             r.track(0).soundParams[RangeParam::HI_BASE + r.moved.id] = r.moved.maxVal;   // and one on the engine
             r.set(0, MixParam::PAN, -0.25f);
             r.set(0, MixParam::SEND_BASE, 0.3f);
@@ -364,14 +361,13 @@ public:
             r.edit(PLAY);
             expectEquals(r.text(), juce::String("CLEAR T1 FX"));
 
-            const TrackFx defaults;
+            // TrackFx params (240-263) are no longer a fixed section: they always read 0.
             for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
-                expectEquals(r.audio.getTrackParameter(0, id), defaults.get(id), "block cell " + juce::String(id));
-            expectEquals(r.audio.getTrackParameter(0, drive), 0.0f, "DIRT is off");
+                expectEquals(r.audio.getTrackParameter(0, id), 0.0f, "old block param " + juce::String(id));
             expectEquals(r.audio.getInsertChain(0)->getEffectCount(), 0, "no insert slots");
             expect(r.audio.getTrackParameter(0, AudioEngine::ARP_LOCK_BASE + 0) < 0.0f, "arp gate lock off");
             expect(r.audio.getTrackParameter(0, AudioEngine::ARP_LOCK_BASE + 2) < 0.5f, "arp ratchet lock off");
-            expectEquals((int) r.track(0).soundParams.count(RangeParam::LO_BASE + drive), 0, "its pressure range went with it");
+            expectEquals((int) r.track(0).soundParams.count(RangeParam::LO_BASE + fxCell), 0, "its pressure range went with it");
 
             expectEquals((int) r.track(0).soundParams.count(RangeParam::HI_BASE + r.moved.id), 1, "the engine's range stays");
             expectWithinAbsoluteError(r.audio.getTrackParameter(0, r.moved.id), r.movedValue, 1.0e-5f, "the engine stays");
@@ -405,8 +401,7 @@ public:
             expectEquals(r.audio.getInsertChain(2)->getEffectCount(), 2);
             EffectType type;
             expect(r.audio.getInsertEffectType(2, 1, type) && type == static_cast<EffectType>(2));
-            expectWithinAbsoluteError(r.audio.getTrackParameter(2, drive), 0.7f, 1.0e-6f);
-            expectWithinAbsoluteError(r.audio.getTrackParameter(2, AudioEngine::EFFECT_PARAM_BASE), insertValue, 1.0e-4f);
+            expectWithinAbsoluteError(r.audio.getTrackParameter(2, fxCell), insertValue, 1.0e-4f);
             expectWithinAbsoluteError(r.audio.getTrackParameter(2, MixParam::VOLUME), 0.55f, 1.0e-6f, "the mixer is not pasted");
             expectWithinAbsoluteError(r.audio.getTrackParameter(2, r.moved.id), engineValue, 1.0e-5f, "nor the engine");
 
@@ -416,7 +411,6 @@ public:
             expectEquals(r.card(Key::Func, 0).lines[1].text, juce::String("PLAY RESET T1 ENGINE"));
             r.edit(PLAY);
             expectWithinAbsoluteError(r.audio.getTrackParameter(0, r.moved.id), r.movedDefault, 1.0e-4f);
-            expectWithinAbsoluteError(r.audio.getTrackParameter(0, drive), 0.7f, 1.0e-6f);
             expectEquals(r.audio.getInsertChain(0)->getEffectCount(), 2);
         }
 
@@ -538,8 +532,8 @@ public:
         {
             URig r;
             r.mgr.setActiveScreen(TRKFX);
-            r.pageKey(5);
-            expectEquals(r.mgr.getActiveScreen()->getPageIndex(), 5);
+            r.pageKey(2);     // FX is page key 2 (TRACK=0, ARPLK=1, FX=2)
+            expectEquals(r.mgr.getActiveScreen()->getPageIndex(), 2);
             r.turn(1, 2);                                   // TYPE: an effect into slot 1
             expectEquals(r.audio.getInsertChain(0)->getEffectCount(), 1);
             EffectType first;

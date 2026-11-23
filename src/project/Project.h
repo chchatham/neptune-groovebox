@@ -4,7 +4,9 @@
 #include "../sequencer/SongMode.h"
 #include "../controller/CustomScaleManager.h"
 #include "../engine/AftertouchRouter.h"
+#include "../engine/ModRouter.h"
 #include "Preset.h"
+#include "StoredLists.h"
 #include <juce_core/juce_core.h>
 #include <array>
 #include <vector>
@@ -18,6 +20,29 @@
 //
 // JSON uses juce::var / juce::JSON for zero-dependency serialization.
 // ---------------------------------------------------------------------------
+
+// A list of numbers in a file (an ARCH memory, recorded PERF moves, the chord pads, the PERF pads,
+// the roll, an arpeggiator, the master section, a chord set): a JSON array of them, and back. What
+// is no array reads as an empty list.
+inline juce::var floatsToVar(const std::vector<float>& values)
+{
+    juce::Array<juce::var> array;
+    for (float v : values)
+        array.add((double) v);
+    return array;
+}
+
+inline std::vector<float> floatsFromVar(const juce::var& stored)
+{
+    std::vector<float> values;
+    if (auto* array = stored.getArray())
+    {
+        values.reserve((size_t) array->size());
+        for (auto& v : *array)
+            values.push_back((float) (double) v);
+    }
+    return values;
+}
 
 // ---------------------------------------------------------------------------
 // ArpData — serializable per-track arpeggiator settings.
@@ -174,16 +199,35 @@ struct AftertouchRouteData
 // SendBusData — serializable send bus configuration.
 // ---------------------------------------------------------------------------
 
+// The bus's chain is stored as a track's insert slots are, with the same ids (ProjectBridge:
+// 232 + slot the type + 1, 200 + slot * 4 + n the cells, 280.. ON / WET / SYNC / division,
+// 312 + slot * 4 + n the cells beyond four). A file from before that ("chain" absent) names one
+// effect type a bus and nothing else; `effectType` is still written (the first slot's type) for
+// a build that reads only that.
 struct SendBusData
 {
     int effectType = 6;       // EffectType cast to int (default ReverbEffect)
     float sendLevel = 1.0f;
+    bool hasChain = false;    // `chain` was stored (it may be empty: a send with nothing on it)
+    ParamMap chain;
 
     juce::var toVar() const
     {
         auto* obj = new juce::DynamicObject();
         obj->setProperty("type", effectType);
         obj->setProperty("level", (double) sendLevel);
+        if (hasChain)
+        {
+            juce::Array<juce::var> cells;
+            for (auto& [id, val] : chain)
+            {
+                auto* p = new juce::DynamicObject();
+                p->setProperty("id", id);
+                p->setProperty("v", (double) val);
+                cells.add(juce::var(p));
+            }
+            obj->setProperty("chain", cells);
+        }
         return juce::var(obj);
     }
 
@@ -194,6 +238,13 @@ struct SendBusData
         {
             d.effectType = (int) obj->getProperty("type");
             d.sendLevel = (float)(double) obj->getProperty("level");
+            if (auto* cells = obj->getProperty("chain").getArray())
+            {
+                d.hasChain = true;
+                for (auto& cell : *cells)
+                    if (auto* c = cell.getDynamicObject())
+                        d.chain[(int) c->getProperty("id")] = (float)(double) c->getProperty("v");
+            }
         }
         return d;
     }
@@ -221,6 +272,10 @@ struct TrackData
 
     // Per-track arpeggiator settings
     ArpData arpSettings;
+
+    // Architecture memory for unified-voice tracks: each ARCH slot's tweaked params.
+    // Empty for non-unified-voice tracks and projects saved before this field existed.
+    std::vector<float> archMemory;
 
     // Steps serialized inline
     struct StepData
@@ -265,7 +320,7 @@ struct TrackData
             }
         }
 
-        juce::var toVar() const
+        juce::var toVar(int engineTypeInt = -1) const
         {
             auto* obj = new juce::DynamicObject();
             obj->setProperty("trig", trig);
@@ -305,6 +360,9 @@ struct TrackData
                     auto* lo = new juce::DynamicObject();
                     lo->setProperty("id", id);
                     lo->setProperty("v", (double) val);
+                    // (a lock on a cell that is a position in a list: by the entry's name too)
+                    if (const char* entry = engineTypeInt >= 0 ? stored::nameOf(engineTypeInt, id, val) : nullptr)
+                        lo->setProperty("n", juce::String(entry));
                     locksArr.add(juce::var(lo));
                 }
                 obj->setProperty("locks", locksArr);
@@ -316,7 +374,10 @@ struct TrackData
             return juce::var(obj);
         }
 
-        static StepData fromVar(const juce::var& v)
+        // version: the file's (3: a lock's name decides; before: the numbers are read as they are
+        // here, and whoever knows the track's sound translates them: stored::old::locks).
+        // lost: names their lists no longer have (nullptr: not collected).
+        static StepData fromVar(const juce::var& v, int version = 2, int engineTypeInt = -1, juce::StringArray* lost = nullptr)
         {
             StepData s;
             if (auto* obj = v.getDynamicObject())
@@ -358,6 +419,11 @@ struct TrackData
                         {
                             int id = (int) lo->getProperty("id");
                             float val = (float)(double) lo->getProperty("v");
+                            if (version >= 3 && engineTypeInt >= 0)
+                            {
+                                juce::StringArray unused;
+                                val = stored::loaded(engineTypeInt, id, val, lo->getProperty("n"), lost != nullptr ? *lost : unused);
+                            }
                             s.paramLocks[id] = val;
                         }
                     }
@@ -394,31 +460,79 @@ struct TrackData
         if (presetName.isNotEmpty())
             obj->setProperty("preset", presetName);
 
-        // Sound params
+        // Sound params (format 3: named-list cells carry an "n" field with the entry's label)
         juce::Array<juce::var> paramsArr;
         for (auto& [id, val] : soundParams)
         {
             auto* p = new juce::DynamicObject();
             p->setProperty("id", id);
             p->setProperty("v", (double) val);
+            if (const char* entry = stored::nameOf((int) engineType, id, val))
+                p->setProperty("n", juce::String(entry));
             paramsArr.add(juce::var(p));
         }
         obj->setProperty("params", paramsArr);
 
-        // Steps (only serialize active region)
+        // Steps (only serialize active region; format 3: step locks carry names too)
         juce::Array<juce::var> stepsArr;
         for (auto& s : steps)
-            stepsArr.add(s.toVar());
+            stepsArr.add(s.toVar((int) engineType));
         obj->setProperty("steps", stepsArr);
 
         // Arp settings
         obj->setProperty("arp", arpSettings.toVar());
 
+        // Architecture memory (unified-voice tracks only; absent in older projects)
+        if (!archMemory.empty())
+        {
+            obj->setProperty("archMem", floatsToVar(archMemory));
+
+            // The positions among them, by name (a slot's LFO DEST, shape, filter type ...).
+            juce::Array<juce::var> names;
+            auto memory = archMemory;
+            forEachArchCell(memory, [&](int slot, int id, float& value)
+            {
+                if (const char* entry = stored::nameOf((int) engineType, id, value))
+                {
+                    auto* n = new juce::DynamicObject();
+                    n->setProperty("slot", slot);
+                    n->setProperty("id", id);
+                    n->setProperty("n", juce::String(entry));
+                    names.add(juce::var(n));
+                }
+            });
+            if (! names.isEmpty())
+                obj->setProperty("archNames", names);
+        }
+
         return juce::var(obj);
     }
 
-    static TrackData fromVar(const juce::var& v)
+    // The cells of an ARCH memory (UnifiedVoiceEngine::captureArchMemory: version, slots, then a
+    // slot: visited, count, count x (id, value)), each handed over to be read or changed.
+    template <typename Fn>
+    static void forEachArchCell(std::vector<float>& memory, Fn&& fn)
     {
+        if (memory.size() < 2 || (int) std::lround(memory[0]) != 1)
+            return;
+        const int slots = juce::jlimit(0, 64, (int) std::lround(juce::jlimit(0.0f, 64.0f, memory[1])));
+        size_t at = 2;
+        for (int s = 0; s < slots && at + 1 < memory.size(); ++s)
+        {
+            ++at;                                                           // visited
+            const float stored = at < memory.size() ? memory[at++] : 0.0f;
+            const int count = std::isfinite(stored) ? juce::jlimit(0, 2048, (int) std::lround(juce::jlimit(0.0f, 2048.0f, stored))) : 0;
+            for (int i = 0; i < count && at + 1 < memory.size(); ++i, at += 2)
+                if (std::isfinite(memory[at]))
+                    fn(s, (int) std::lround(juce::jlimit(-1.0f, 1.0e6f, memory[at])), memory[at + 1]);
+        }
+    }
+
+    // lost: names their lists no longer have.
+    static TrackData fromVar(const juce::var& v, int version = 2, juce::StringArray* lost = nullptr)
+    {
+        juce::StringArray unused;
+        juce::StringArray& notes = lost != nullptr ? *lost : unused;
         TrackData t;
         if (auto* obj = v.getDynamicObject())
         {
@@ -441,6 +555,8 @@ struct TrackData
                 for (auto& n : *names)
                     t.keySamples.add(n.toString());
 
+            const int engineTypeInt = (int) t.engineType;
+
             if (auto* paramsArr = obj->getProperty("params").getArray())
             {
                 for (auto& pv : *paramsArr)
@@ -449,6 +565,10 @@ struct TrackData
                     {
                         int id = (int) po->getProperty("id");
                         float val = (float)(double) po->getProperty("v");
+                        // Format 3: a position is the entry its name says (StoredLists.h). A file of
+                        // before is translated as a whole, once every track is read (ProjectData).
+                        if (version >= 3)
+                            val = stored::loaded(engineTypeInt, id, val, po->getProperty("n"), notes);
                         t.soundParams[id] = val;
                     }
                 }
@@ -457,13 +577,30 @@ struct TrackData
             if (auto* stepsArr = obj->getProperty("steps").getArray())
             {
                 for (auto& sv : *stepsArr)
-                    t.steps.push_back(StepData::fromVar(sv));
+                    t.steps.push_back(StepData::fromVar(sv, version, engineTypeInt, &notes));
             }
 
             // Arp settings (graceful default if missing from older files)
             auto arpVar = obj->getProperty("arp");
             if (arpVar.getDynamicObject() != nullptr)
                 t.arpSettings = ArpData::fromVar(arpVar);
+
+            // Architecture memory (absent in older projects)
+            if (obj->getProperty("archMem").isArray())
+            {
+                t.archMemory = floatsFromVar(obj->getProperty("archMem"));
+                if (auto* names = obj->getProperty("archNames").getArray())
+                    for (auto& nv : *names)
+                        if (auto* n = nv.getDynamicObject())
+                        {
+                            const int slot = (int) n->getProperty("slot"), id = (int) n->getProperty("id");
+                            forEachArchCell(t.archMemory, [&](int s, int cell, float& value)
+                            {
+                                if (s == slot && cell == id)
+                                    value = stored::loaded(engineTypeInt, id, value, n->getProperty("n"), notes);
+                            });
+                        }
+            }
         }
         return t;
     }
@@ -473,6 +610,7 @@ struct PatternData
 {
     std::vector<TrackData> tracks;
     float swing = 0.0f;
+    std::vector<float> perfMoves;       // PerfFx::MoveLane::toFlat(); empty = none recorded
 
     juce::var toVar() const
     {
@@ -484,10 +622,13 @@ struct PatternData
             tracksArr.add(t.toVar());
         obj->setProperty("tracks", tracksArr);
 
+        if (! perfMoves.empty())
+            obj->setProperty("perfMoves", floatsToVar(perfMoves));
+
         return juce::var(obj);
     }
 
-    static PatternData fromVar(const juce::var& v)
+    static PatternData fromVar(const juce::var& v, int version = 2, juce::StringArray* lost = nullptr)
     {
         PatternData p;
         if (auto* obj = v.getDynamicObject())
@@ -497,8 +638,9 @@ struct PatternData
             if (auto* tracksArr = obj->getProperty("tracks").getArray())
             {
                 for (auto& tv : *tracksArr)
-                    p.tracks.push_back(TrackData::fromVar(tv));
+                    p.tracks.push_back(TrackData::fromVar(tv, version, lost));
             }
+            p.perfMoves = floatsFromVar(obj->getProperty("perfMoves"));
         }
         return p;
     }
@@ -595,8 +737,17 @@ struct ProjectData
     // compressor threshold / ratio / make-up, limiter ceiling. Empty = defaults.
     std::vector<float> master;
 
-    // Version for forward compatibility
-    static constexpr int FORMAT_VERSION = 2;
+    // The file's version. 3: a cell (a sound's, a step lock's, an ARCH memory's) that is a position
+    // in a list carries the entry's name ("n") beside its number, and the name decides on load, so
+    // a list that grows in its middle moves no saved route (StoredLists.h says which cells).
+    // 1 and 2 hold numbers only: fromVar translates them from the layout each track's ids tell
+    // (stored::old; StoredListHistory.h), which for a file of a published build changes no router
+    // position and puts a drum kit's pads back on the types they were saved with.
+    static constexpr int FORMAT_VERSION = 3;
+
+    // Not stored - what reading the file found: names it holds that their lists no longer have
+    // (each once; fromVar has written them to the app's log).
+    juce::StringArray lost;
 
     juce::var toVar() const
     {
@@ -610,22 +761,12 @@ struct ProjectData
         root->setProperty("sampleFolder", sampleFolder);
         root->setProperty("masterLevel", (double) masterLevel);
         if (!roll.empty())
-        {
-            juce::Array<juce::var> rollArr;
-            for (float v : roll)
-                rollArr.add((double) v);
-            root->setProperty("roll", rollArr);
-        }
+            root->setProperty("roll", floatsToVar(roll));
         if (!arps.empty())
         {
             juce::Array<juce::var> allArps;
             for (auto& one : arps)
-            {
-                juce::Array<juce::var> arpArr;
-                for (float v : one)
-                    arpArr.add((double) v);
-                allArps.add(arpArr);
-            }
+                allArps.add(floatsToVar(one));
             root->setProperty("arps", allArps);
         }
         if (keyboard.split >= 0)
@@ -633,12 +774,7 @@ struct ProjectData
         if (keyboard.octave != KeyboardSetup::UNKNOWN)
             root->setProperty("keyboardOctave", keyboard.octave);
         if (!master.empty())
-        {
-            juce::Array<juce::var> masterArr;
-            for (float v : master)
-                masterArr.add((double) v);
-            root->setProperty("master", masterArr);
-        }
+            root->setProperty("master", floatsToVar(master));
 
         // Patterns
         juce::Array<juce::var> patternsArr;
@@ -650,19 +786,9 @@ struct ProjectData
         root->setProperty("song", song.toVar());
 
         if (!chordPads.empty())
-        {
-            juce::Array<juce::var> chordArr;
-            for (float v : chordPads)
-                chordArr.add((double) v);
-            root->setProperty("chordPads", chordArr);
-        }
+            root->setProperty("chordPads", floatsToVar(chordPads));
         if (!perfPads.empty())
-        {
-            juce::Array<juce::var> perfArr;
-            for (float v : perfPads)
-                perfArr.add((double) v);
-            root->setProperty("perfPads", perfArr);
-        }
+            root->setProperty("perfPads", floatsToVar(perfPads));
 
         // Custom scale pages
         if (!customScalePages.empty())
@@ -701,7 +827,7 @@ struct ProjectData
         ProjectData proj;
         if (auto* obj = v.getDynamicObject())
         {
-            // int version = (int) obj->getProperty("version"); // for future migration
+            const int version = juce::jmax(1, (int) obj->getProperty("version"));
             proj.name = obj->getProperty("name").toString();
             proj.bpm = (float)(double) obj->getProperty("bpm");
             proj.activePattern = juce::jlimit(0, 15, (int) obj->getProperty("activePattern"));
@@ -713,41 +839,30 @@ struct ProjectData
             auto mlVar = obj->getProperty("masterLevel");
             if (!mlVar.isVoid())
                 proj.masterLevel = (float)(double) mlVar;
-            if (auto* rollArr = obj->getProperty("roll").getArray())
-                for (auto& rv : *rollArr)
-                    proj.roll.push_back((float)(double) rv);
+            proj.roll = floatsFromVar(obj->getProperty("roll"));
             if (auto* allArps = obj->getProperty("arps").getArray())
                 for (auto& one : *allArps)
-                {
-                    std::vector<float> values;
-                    if (auto* arpArr = one.getArray())
-                        for (auto& av : *arpArr)
-                            values.push_back((float)(double) av);
-                    proj.arps.push_back(values);
-                }
+                    proj.arps.push_back(floatsFromVar(one));
             if (auto splitVar = obj->getProperty("keyboardSplit"); !splitVar.isVoid())
                 proj.keyboard.split = juce::jlimit(0, 3, (int) splitVar);
             if (auto octaveVar = obj->getProperty("keyboardOctave"); !octaveVar.isVoid())
                 proj.keyboard.octave = juce::jlimit(-8, 8, (int) octaveVar);
-            if (auto* masterArr = obj->getProperty("master").getArray())
-                for (auto& mv : *masterArr)
-                    proj.master.push_back((float)(double) mv);
+            proj.master = floatsFromVar(obj->getProperty("master"));
 
             if (auto* pArr = obj->getProperty("patterns").getArray())
             {
                 int count = juce::jmin((int) pArr->size(), 16);
                 for (int i = 0; i < count; ++i)
-                    proj.patterns[(size_t) i] = PatternData::fromVar((*pArr)[i]);
+                    proj.patterns[(size_t) i] = PatternData::fromVar((*pArr)[i], version, &proj.lost);
             }
+            if (version < FORMAT_VERSION)
+                translateOld(proj);
+            stored::report("project " + proj.name, proj.lost);
 
             proj.song = SongData::fromVar(obj->getProperty("song"));
 
-            if (auto* chordArr = obj->getProperty("chordPads").getArray())
-                for (auto& cv : *chordArr)
-                    proj.chordPads.push_back((float) (double) cv);
-            if (auto* perfArr = obj->getProperty("perfPads").getArray())
-                for (auto& pv : *perfArr)
-                    proj.perfPads.push_back((float) (double) pv);
+            proj.chordPads = floatsFromVar(obj->getProperty("chordPads"));
+            proj.perfPads = floatsFromVar(obj->getProperty("perfPads"));
 
             // Custom scale pages
             if (auto* scaleArr = obj->getProperty("scalePages").getArray())
@@ -772,6 +887,30 @@ struct ProjectData
             }
         }
         return proj;
+    }
+
+    // A project of before format 3: every position made today's. A track's sound is on the active
+    // pattern (one sound a track for all patterns); what layout it was written in is told from
+    // that sound, and the track's step locks in every pattern are read by the same layout.
+    static void translateOld(ProjectData& proj)
+    {
+        auto& sounds = proj.patterns[(size_t) proj.activePattern].tracks;
+        for (size_t t = 0; t < sounds.size(); ++t)
+        {
+            const int type = (int) sounds[t].engineType;
+            const auto layout = stored::old::sound(type, sounds[t].soundParams, proj.lost);
+            for (size_t p = 0; p < proj.patterns.size(); ++p)
+            {
+                if (t >= proj.patterns[p].tracks.size())
+                    continue;
+                auto& track = proj.patterns[p].tracks[t];
+                // (a sound kept on another pattern as well, by a build that did: by its own ids)
+                if ((int) p != proj.activePattern && ! track.soundParams.empty())
+                    stored::old::sound((int) track.engineType, track.soundParams, proj.lost);
+                for (auto& step : track.steps)
+                    stored::old::locks(type, layout, step.paramLocks, proj.lost);
+            }
+        }
     }
 
     juce::String toJSON() const

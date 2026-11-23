@@ -144,10 +144,10 @@ public:
     struct DrumSound { float tune, decay; };
     static DrumSound drumSound(int type)
     {
+        // [FOLD] 10 types offered (TOM, SNAR, FMSN, CSYN are resonator drum sounds now).
         static const DrumSound sounds[DrumEngine::NUM_DRUM_TYPES] = {
-            { 50, 0.5f }, { 52, 0.6f }, { 55, 0.7f }, { 200, 0.2f }, { 200, 0.2f }, { 1200, 0.3f }, { 8000, 0.04f },
-            { 8000, 0.5f }, { 7000, 1.0f }, { 100, 0.3f }, { 800, 0.3f }, { 5000, 0.2f }, { 2500, 0.3f }, { 40, 0.1f },
-            { 48, 0.5f }, { 8000, 0.3f } };
+            { 50, 0.5f }, { 52, 0.6f }, { 55, 0.7f }, { 1200, 0.3f }, { 5000, 0.2f }, { 40, 0.1f },
+            { 48, 0.5f }, { 7000, 1.0f }, { 100, 0.3f }, { 8000, 0.04f } };       // RSN: its first sound, a tom; BANK: the hat
         return sounds[type];
     }
 
@@ -260,9 +260,22 @@ public:
         if (type == EngineType::Sampler && page == "SLICE") asDest = "SLIC";
         if (type == EngineType::Wavetable && page == "SCAN") asDest = "TIME";
         if (type == EngineType::WaveSeq && page.contains(" ")) asDest = "P" + label.substring(1);    // one step: the only one that sounds
+        if (type == EngineType::WaveSeq && (page == "BODY" || page == "BDY2"))   // the body's cells: with the body in
+            for (int cell = 0; cell < VoiceBody::NumCells; ++cell)
+                if (spec.id == WaveSeqEngine::BodyBase + cell)
+                    asDest = VoiceBodySection::destLabel(cell);
+        if (type == EngineType::MacroOsc && (page == "BODY" || page == "BDY2"))   // (U4-MACRO: the same)
+            for (int cell = 0; cell < VoiceBody::NumCells; ++cell)
+                if (spec.id == MacroOscEngine::BodyBase + cell)
+                    asDest = VoiceBodySection::destLabel(cell);
+        if (type == EngineType::Resonator && page == "GRAIN") asDest = label == "SIZE" ? "GSIZ" : label;   // grains of a sample
         if (page == "STRIP") asDest = "AMP";
+        if (page.startsWith("SLT") || page == "LSHP") asDest = "AMP";
+        if (page == "PLFO" || page == "PSLT") asDest = "AMP";
         if (type == EngineType::FM && page.startsWith("OP"))
             asDest = "LVL" + page.substring(2);                             // six carriers: every operator is heard
+        if (type == EngineType::FM && (label == "XFAD" || label == "PENV"))
+            asDest = "POS1";                                                // six carriers, each reading a table
         if (type == EngineType::UnifiedVoice)
         {
             if (page == "FLT B") asDest = "RESB";
@@ -274,6 +287,71 @@ public:
         plan = L::prepare(type, asDest, labels);
         auto& e = *plan.engine;
         auto set = [&e](int id, float v) { e.setParameter(id, v); };
+        if (type == EngineType::Resonator && label == "LAG")
+        {
+            set(ResonatorEngine::ExciterMorphParam, (float) res::Scrape);    // a strike has no energy to smooth: one that lasts
+            // LAG is heard where the energy moves: under a pad's pressure, and on a note of a track
+            // whose pressure goes elsewhere (the energy then comes up from nothing through it; with
+            // the pad on EXC, as a resonator is made, a note starts at its strike). The sweep has
+            // no pad: it measures the second (the pressure route on the level, as a route was
+            // before the resonator had EXC).
+            e.setAftertouchRouter(nullptr);
+        }
+        if (type == EngineType::Resonator && (label == "COUP" || label == "REED"))
+            set(ResonatorEngine::ExciterMorphParam, (float) res::Bow);       // the junction's two cells: under an exciter that has one
+
+        // RDAM (release damping) is heard after note-off: a body that rings and a
+        // short amp release so the voice stops quickly, leaving the body to carry
+        // the tail — where RDAM shortens the decay.
+        if (label == "RDAM" && (type == EngineType::MacroOsc || type == EngineType::WaveSeq))
+        {
+            const int body = type == EngineType::MacroOsc ? MacroOscEngine::BodyBase : WaveSeqEngine::BodyBase;
+            const int ampRel = type == EngineType::MacroOsc ? MacroOscEngine::AmpRelease : WaveSeqEngine::AmpRelease;
+            set(body + VoiceBody::Couple, 0.5f);
+            set(body + VoiceBody::Decay, 4.0f);        // long ring
+            set(ampRel, 0.05f);                         // short release: voice stops, body rings
+            plan.seconds = 1.0;
+            plan.events = { { 0.0, 60, 0.7f }, { 0.3, 60, 0.0f } };   // one note, 0.7 s of tail
+        }
+        if (type == EngineType::FM && label == "XFAD")
+        {
+            // The crossfade of a wave sequence: four waves of each table, every operator part of
+            // the way through a step (where XFAD decides how much of the next wave is in).
+            set(FMEngine::SeqSteps, 3.0f);
+            for (int op = 0; op < 6; ++op)
+                set(op * 10 + FMEngine::OP_POSITION, 0.25f);
+        }
+        if (type == EngineType::FM && label == "PENV")
+            for (int op = 0; op < 6; ++op)
+                set(op * 10 + FMEngine::OP_POSITION, 0.5f);                 // room for the envelope both ways
+        // (The unified voice shows the router's STRIP and XIN pages at ids of its own: U4-UV.)
+        const bool unifiedIds = type == EngineType::UnifiedVoice;
+        const auto xinCell = [unifiedIds](int c) { return unifiedIds ? UnifiedVoiceEngine::XIN_IDS + c : mod::Router::xinId(c); };
+        const auto stripCell = [unifiedIds](int routerId) { return unifiedIds ? routerId - mod::Router::STRIP_BASE + UnifiedVoiceEngine::STRIP_IDS : routerId; };
+        if ((type == EngineType::MacroOsc || type == EngineType::FM || type == EngineType::WaveSeq || type == EngineType::Wavetable || type == EngineType::Sampler
+             || type == EngineType::Drum || type == EngineType::Resonator || unifiedIds) && page == "XIN")   // (AMP is destination 2 on all five; the unified voice's and the drum kit's (DrumVoice::ModAmp) are their own)
+        {
+            static_assert((int) FMVoice::LfoAmp == (int) MacroOscVoice::LfoAmp, "AMP is the same destination on both");
+            // The modulation router's XIN page: a 1.5 kHz sine on the track's input (two cycles
+            // a block, the same block for the whole render) on the level, through the route the
+            // cell belongs to; LPF and HPF through their filter.
+            static const std::vector<float> tone = []
+            {
+                std::vector<float> t((size_t) L::BLOCK);
+                for (int i = 0; i < L::BLOCK; ++i)
+                    t[(size_t) i] = 0.8f * std::sin(juce::MathConstants<float>::twoPi * 2.0f * (float) i / (float) L::BLOCK);
+                return t;
+            }();
+            using R = mod::Router;
+            e.setAudioInput({ tone.data(), tone.data(), L::BLOCK, 0.5f });
+            const bool second = label == "AMT2";
+            static_assert((int) MacroOscVoice::LfoAmp == (int) WavetableVoice::LfoAmp, "AMP is the same entry on both");
+            static_assert((int) MacroOscVoice::LfoAmp == (int) ResonatorEngine::DestAmp, "and on RSN");
+            set(xinCell(second ? R::XinDest2 : R::XinDest1), unifiedIds ? (float) UnifiedVoice::RAmp : (type == EngineType::Drum ? (float) DrumVoice::ModAmp : (float) MacroOscVoice::LfoAmp));
+            set(xinCell(second ? R::XinAmount2 : R::XinAmount1), 0.8f);
+            if (label == "LPF") set(xinCell(R::XinFilter1), 1.0f);
+            if (label == "HPF") set(xinCell(R::XinFilter1), 2.0f);
+        }
 
         // DRIV is heard on the type a new sound has (the SVF), not only on the ladder.
         const int filterBase = voiceFilterBase(type);
@@ -286,10 +364,10 @@ public:
         {
             e.setModWheel(1.0f);
             for (int r = 0; r < 3; ++r)
-                if (spec.id == S::stripAmountId(r))
-                    set(S::stripDestId(r), (float) L::indexOf(labels, "AMP"));
-            if (spec.id == S::STRIP_VIBRATO_RATE)
-                set(S::STRIP_VIBRATO, 1.0f);
+                if (spec.id == stripCell(S::stripAmountId(r)))
+                    set(stripCell(S::stripDestId(r)), (float) L::indexOf(labels, "AMP"));
+            if (spec.id == stripCell(S::STRIP_VIBRATO_RATE))
+                set(stripCell(S::STRIP_VIBRATO), 1.0f);
         }
         // The filter envelope's cells: a filter that is nearly closed, opened by its envelope, and
         // soft notes for the velocity cells (where a velocity amount takes most away).
@@ -307,11 +385,68 @@ public:
                 plan.events[0].velocity = plan.events[2].velocity = 0.25f;
         }
 
+        // A mod slot's amount: the note's velocity on the level. The custom shape's levels: LFO 1
+        // plays the shape on the level, from the start of each note.
+        if (EngineModSlots::ownsSlot(spec.id))
+        {
+            const int slot = EngineModSlots::slotOf(spec.id);
+            set(ModSlotParam::id(slot, ModSlotParam::SRC), (float) ModSrc::Velocity);
+            set(ModSlotParam::id(slot, ModSlotParam::DEST), (float) L::indexOf(labels, "AMP"));
+        }
+        if (EngineModSlots::ownsShape(spec.id))
+            L::setLfo(e, 0, L::indexOf(labels, "AMP"), 0.8f, (int) LFO::Shape::User, (int) L::KEY, 9.0f);
+
         // An LFO's own cells: the LFO on the level, fast enough to be heard in half a second.
         if (page.startsWith("LFO") && S::owns(spec.id))
         {
             const int lfo = spec.id >= S::id(1, S::Rate) ? 1 : 0;
             L::setLfo(e, lfo, L::indexOf(labels, "AMP"), 0.8f, L::SIN, label == "FADE" ? (int) L::KEY : (int) L::FREE, 9.0f);
+        }
+
+        // Per-pad LFO (PLFO): the pad's LFO needs a destination to be heard. Set DEST to AMP
+        // and a fast rate so RATE / DPTH / FADE have something to work with. Play the pad
+        // that owns the page (L::prepare plays pad 9, but the LFO is per-pad). Give the
+        // pad a longer sound (SubBass at 60 Hz, 0.5 s decay) so the LFO has time to act.
+        if (type == EngineType::Drum && page == "PLFO" && PadModParam::contains(spec.id))
+        {
+            const int pad = PadModParam::padOf(spec.id);
+            const int b = PadModParam::id(pad, 0);
+            const int ampDest = L::indexOf(L::destLabels(*plan.engine), "AMP");
+            set(b + PadModParam::LFO_DEST, (float) ampDest);
+            set(b + PadModParam::LFO_DEPTH, label == "DPTH" ? 0.5f : 0.8f);
+            set(b + PadModParam::LFO_RATE, label == "RATE" ? 5.0f : 9.0f);
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE, (float) (int) DrumSynthType::SubBass);
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TUNE, 60.0f);
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::DECAY, 0.5f);
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::LEVEL, 0.9f);
+            for (auto& ev : plan.events)
+                ev.note = pad;
+        }
+
+        // Per-pad slot (PSLT): a slot's amount needs a destination to be heard. Set DST to AMP
+        // and SRC to velocity so the amount routes something. Play the pad that owns the page
+        // with a longer sound.
+        if (type == EngineType::Drum && page == "PSLT" && PadModParam::contains(spec.id))
+        {
+            const int pad = PadModParam::padOf(spec.id);
+            const int b = PadModParam::id(pad, 0);
+            const int ampDest = L::indexOf(L::destLabels(*plan.engine), "AMP");
+            if (label == "AMT1")
+            {
+                set(b + PadModParam::SLOT1_DEST, (float) ampDest);
+                set(b + PadModParam::SLOT1_SRC, (float) mod::Src::Velocity);
+            }
+            if (label == "AMT2")
+            {
+                set(b + PadModParam::SLOT2_DEST, (float) ampDest);
+                set(b + PadModParam::SLOT2_SRC, (float) mod::Src::Velocity);
+            }
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TYPE, (float) (int) DrumSynthType::SubBass);
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::TUNE, 60.0f);
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::DECAY, 0.5f);
+            set(pad * DrumEngine::PARAMS_PER_VOICE + DrumEngine::LEVEL, 0.9f);
+            for (auto& ev : plan.events)
+                ev.note = pad;
         }
 
         switch (type)
@@ -320,6 +455,23 @@ public:
             {
                 using namespace UnifiedParam;
                 if (label == "NCOL") set(NOISE, 0.8f);
+                if (label == "XDPT")
+                {
+                    // The track's input at audio rate: an input (750 Hz, the same block every time)
+                    // and RING, where the depth is the crossfade.
+                    static const std::vector<float> tone = []
+                    {
+                        std::vector<float> t((size_t) L::BLOCK);
+                        for (size_t i = 0; i < t.size(); ++i)
+                            t[i] = 0.8f * std::sin(6.2831853f * (float) i / (float) L::BLOCK);
+                        return t;
+                    }();
+                    AudioInput in;
+                    in.left = in.right = tone.data();
+                    in.frames = (int) tone.size();
+                    e.setAudioInput(in);
+                    set(XIN, (float) UnifiedVoice::XinRing);
+                }
                 if (label == "LVL3") set(WAVE3, (float) (int) UnifiedVoice::OscWaveform::Saw);
                 if (label == "SPRD") set(STACK, 1.0f);
                 if (label == "GLID")
@@ -340,8 +492,19 @@ public:
                 }
                 break;
             }
+            case EngineType::MacroOsc:
+                // (U4-MACRO) The per-note spread as on the wavetable: a seed whose first notes land
+                // away from the middle; FVAR behind a filter that is closed enough to hear it.
+                if (page == "ANLG") set(MacroOscEngine::SpreadBase + VoiceSpread::Seed, 1.0f);
+                if (page == "ANLG" && label == "FVAR") set(MacroOscEngine::FilterBase + VoiceFilterSection::Cutoff, 800.0f);
+                break;
             case EngineType::Wavetable:
                 if (label == "MDPT") set(WavetableEngine::MorphSpeed, 4.0f);
+                // The per-note spread is drawn from a seed: one whose first notes land well away
+                // from the middle for every amount (seed 0's first FVAR draw is 0.007 octaves).
+                if (page == "ANLG") set(WavetableEngine::SpreadBase + VoiceSpread::Seed, 1.0f);
+                // PHAS: where the copies start against each other is heard as their beating.
+                if (page == "ANLG" && label == "PHAS") set(WavetableEngine::UnisonSpread, 0.5f);
                 if (page == "KEYS" || page.startsWith("K "))
                 {
                     // The key-frame pages: the KEYS table with all eight keys taken from the factory
@@ -373,10 +536,14 @@ public:
                     // The page is pad 1's: that pad is struck, as a kick machine for its KICK page.
                     if (page == "KICK")
                         set(DrumEngine::TYPE, (float) (int) DrumSynthType::KickSynth);
-                    if (page == "CYM")      // (and as a cymbal machine for its CYM page)
+                    if (page == "RSN")      // (and as a resonator drum for its RSN page: a tom; under a bow for MEET)
                     {
-                        set(DrumEngine::TYPE, (float) (int) DrumSynthType::CymbalSynth);
-                        set(DrumEngine::TUNE, 8000.0f);
+                        set(DrumEngine::TYPE, (float) (int) DrumSynthType::Resonator);
+                        set(DrumEngine::TUNE, 200.0f);
+                        if (label == "MEET")
+                            set(DrumEngine::SOUND_BASE + DrumEngine::RsnSound, (float) resonatorSoundIndex("CYMB"));
+                        if (label == "DIR")     // (the exciter's own sound: one that lasts, a brush)
+                            set(DrumEngine::SOUND_BASE + DrumEngine::RsnSound, (float) resonatorSoundIndex("SNRS"));
                     }
                     for (auto& ev : plan.events)
                         ev.note = 0;
@@ -394,6 +561,7 @@ public:
         {
             case EngineType::FM:        return FMEngine::FilterBase;
             case EngineType::MacroOsc:  return MacroOscEngine::FilterBase;
+            case EngineType::Resonator: return ResonatorEngine::FilterBase;
             case EngineType::Wavetable: return WavetableEngine::FilterBase;
             case EngineType::WaveSeq:   return WaveSeqEngine::FilterBase;
             default:                    return -1;
@@ -486,8 +654,11 @@ public:
                 if (type == EngineType::Drum && spec.id >= DrumEngine::KICK_BASE + DrumVoice::NumKickParams
                     && DrumEngine::isKickParam(spec.id))
                     continue;
-                if (type == EngineType::Drum && spec.id >= DrumEngine::CYMBAL_BASE + CymbalMachine::NumParams
-                    && DrumEngine::isCymbalParam(spec.id))
+                if (type == EngineType::Drum && spec.id >= DrumEngine::SOUND_BASE + DrumEngine::SOUND_CELLS
+                    && DrumEngine::isSoundParam(spec.id))
+                    continue;
+                // Per-pad modulation: pad 0's PLFO and PSLT pages are tested (the others duplicate).
+                if (type == EngineType::Drum && PadModParam::contains(spec.id) && PadModParam::padOf(spec.id) > 0)
                     continue;
                 const juce::String pageName = page.name;
                 const ParamSpec cell = spec;
@@ -538,13 +709,16 @@ public:
                 const auto type = r.where.fromFirstOccurrenceOf(" ", false, false);
                 if (r.label == "SNAP" || type == "HAT" || type == "RIM")
                     continue;
-                if (r.label == "TONE" && (type == "TOM" || type == "MKIK" || type == "KSYN"))
+                // [KICKS] (FMKK and KICK are points of the kick machine now: TONE is its low-pass too)
+                if (r.label == "TONE" && (type == "TOM" || type == "MKIK" || type == "KSYN" || type == "FMKK" || type == "KICK"))
                     continue;
                 if (r.label == "DEC" && (type == "SUB" || type == "CYMB"))
                     continue;
                 must.push_back(r);
             }
-            expect(must.size() >= 70);
+            // [FOLD] 10 types x 7 dests = 70 rows, minus SNAP on all (10), TONE on the kicks (4),
+            // DEC on SUB and CYMB (2) = 54.
+            expect(must.size() >= 50);
             expectEquals(deadOnes(must), juce::String());
         }
 
@@ -565,10 +739,9 @@ public:
                 }
                 return peak;
             };
-            kit.noteOn(15, 0.9f);               // the open hat (DEC 0.5 s)
-            kit.noteOff(15);                    // a tap
+            kit.noteOn(15, 0.9f);               // the open hat (DEC 0.5 s), held: it is open for as long as it is
             run(0.1);
-            expect(kit.getVoice(15).isActive(), "the open hat rings on after the tap");
+            expect(kit.getVoice(15).isActive(), "the open hat rings on while it is held");
             kit.noteOn(14, 0.9f);               // the closed hat chokes it
             run(0.1);
             expect(! kit.getVoice(15).isActive(), "choked");
@@ -763,7 +936,7 @@ public:
             const auto folder = juce::File::getSpecialLocation(juce::File::tempDirectory)
                                     .getChildFile("neptune-dead-audit-" + juce::String(juce::Random::getSystemRandom().nextInt(1000000)));
             ScreenAudit audit(r.mgr, r.display);
-            audit.engineNames = { "synth", "FM", "macro", "wavetable", "wave seq", "sampler", "drums", "MIDI" };
+            audit.engineNames = { "synth", "FM", "macro", "wavetable", "wave seq", "sampler", "drums", "MIDI", "resonator" };
             audit.setEngine = [&r](int e) { r.setEngine(r.seq.getSelectedTrack(), (EngineType) e); };
             // The app's own list (main.cpp, startScreenAudit) without SETTINGS and SCALE: this rig
             // gives those two screens none of the app's hooks (tempo, master effects, scale lock),

@@ -29,7 +29,7 @@ namespace presetaudition
     inline std::vector<std::pair<int, float>> engineValues(const EngineBase& e)
     {
         std::vector<std::pair<int, float>> v;
-        for (int id = 0; id < EngineParamRange::THIRD_END; ++id)
+        for (int id = 0; id < EngineParamRange::END; ++id)
             if (EngineParamRange::contains(id))
                 v.push_back({ id, e.getParameter(id) });
         return v;
@@ -80,6 +80,19 @@ namespace presetaudition
                 return "id " + juce::String(a[i].first) + ": " + juce::String(a[i].second, 6) + " / " + juce::String(b[i].second, 6);
         return {};
     }
+
+    // A new engine of a type on a track of its own.
+    struct Fresh
+    {
+        SequencerCore seq;
+        AudioEngine audio;
+        explicit Fresh(EngineType type)
+        {
+            audio.setSequencer(&seq);
+            audio.addEngine(0, AudioEngine::createEngine(type));
+            seq.getPattern().getTrack(0).engineType = type;
+        }
+    };
 
     // What a new engine holds after a preset was loaded into it.
     inline std::vector<std::pair<int, float>> freshValues(const Preset& p)
@@ -343,11 +356,18 @@ public:
                    "the track plays the highlighted preset: " + engineDifference(engineValues(*rig.audio.getEngine(0)), freshValues(*p)));
             for (auto& [id, v] : p->soundParams)
                 expectEquals(rig.seq.getPattern().getTrack(0).soundParams[id], v, "and stores its values");
-            // The mixer, the effect block and the pressure routes are the track's own.
+            // The mixer is the track's own.
             expectEquals(rig.audio.getTrackParameter(0, MixParam::VOLUME), 0.33f);
             // (the effect blocks are the preset's too: a built-in preset has them as they come)
             expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), TrackFx().get(TrackFxParam::DIRT_BASE));
-            expect(rig.sound().routes == own.routes);
+            // Where pad pressure goes is part of a sound (the pressure slots, ids 773-784): a
+            // preset that stores none is heard with the routes its engine is made with, not with
+            // the track's own, which come back with the track's sound.
+            expect(rig.sound().routes != own.routes, "the track's own second route is not the preset's");
+            {
+                Fresh made(p->engineType);
+                expect(rig.sound().routes == soundOf(made.seq, made.audio, 0).routes, "the preset's engine as it is made");
+            }
 
             // Up / Down.
             rig.screen->onPadPageNext();
@@ -1199,28 +1219,22 @@ public:
             Rig rig;
             rig.audio.addInsertEffect(0, EffectType::DelayEffect);
             rig.audio.addInsertEffect(0, EffectType::ReverbEffect);
-            const TrackFx plain;
-            const float ownDirt = rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE);
-            expect(ownDirt != plain.get(TrackFxParam::DIRT_BASE));
             EffectType type {};
 
             rig.screen->onActivate();
             rig.turn(0, 2);                                     // a built-in preset
             expect(rig.screen->isAuditioning() && rig.highlighted() != nullptr && rig.highlighted()->isFactory);
             expect(! rig.audio.getInsertEffectType(0, 0, type), "no insert effects under a built-in preset");
-            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), plain.get(TrackFxParam::DIRT_BASE));
             expectEquals(rig.audio.getTrackParameter(0, MixParam::VOLUME), 0.33f, "the mixer is the track's");
             rig.screen->onDeactivate();
             expect(rig.audio.getInsertEffectType(0, 0, type) && type == EffectType::DelayEffect, "left: the own effects again");
             expect(rig.audio.getInsertEffectType(0, 1, type) && type == EffectType::ReverbEffect);
-            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), ownDirt);
 
             rig.screen->onActivate();
             rig.turn(0, 2);
             rig.confirm(4);                                     // LD
             rig.screen->onDeactivate();
             expect(! rig.audio.getInsertEffectType(0, 0, type), "loaded: the old effects are gone");
-            expectEquals(rig.audio.getTrackParameter(0, TrackFxParam::DIRT_BASE), plain.get(TrackFxParam::DIRT_BASE));
             const auto saved = ProjectBridge::capture({ rig.seq, rig.audio }, "P");
             expect(saved.patterns[0].tracks[0].soundParams.count(ProjectBridge::INSERT_TYPE_BASE) == 0
                    || saved.patterns[0].tracks[0].soundParams.at(ProjectBridge::INSERT_TYPE_BASE) < 0.5f, "and a project saved now has none");

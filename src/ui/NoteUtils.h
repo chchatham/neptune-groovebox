@@ -25,6 +25,7 @@ inline juce::String engineAbbrev(int engineTypeInt)
         case 5: return "SP";
         case 6: return "DR";
         case 7: return "MD";
+        case 8: return "RS";     // the resonator (RSN): two characters, as the rest - TRACKS and PRESET give it 16 pixels
         default: return "??";
     }
 }

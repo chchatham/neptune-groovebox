@@ -34,8 +34,10 @@ public:
     juce::String getName() const override { return "TRACKS"; }
 
     // Page name and pattern number: "VOL P1". Six characters are what the name bar has left beside
-    // "TRACKS T1" and the page mark, so longer combinations are tightened ("SND1P1", "S1 P12"), and
-    // while a pattern is queued the status is just that: "P1>3".
+    // "TRACKS T1" and the page mark. A combination that is longer has its page shortened, never the
+    // space between the two taken out (the two ran together as "SND1P1"): the sends are "S1" and
+    // "S2" as on TRK FX ("S1 P1"), any other page its first and last letter ("VL P12"). While a
+    // pattern is queued the status is just that: "P1>3".
     juce::String getSubPage() const override
     {
         const juce::String pattern = "P" + juce::String(sequencer.getActivePatternIndex() + 1);
@@ -45,8 +47,6 @@ public:
         const juce::String name = pageName(page);
         if (name.length() + 1 + pattern.length() <= STATUS_ROOM)
             return name + " " + pattern;
-        if (name.length() + pattern.length() <= STATUS_ROOM)
-            return name + pattern;
         return name.substring(0, 1) + name.getLastCharacters(1) + " " + pattern;
     }
 
@@ -260,13 +260,12 @@ public:
         return names[juce::jlimit(0, (int) NUM_PAGES - 1, p)];
     }
 
-    static constexpr int ENGINE_TYPE_COUNT = 8;
     static constexpr int STATUS_ROOM = 6;
 
 private:
     static const ParamSpec& spec(int p)
     {
-        static const char* const engines[ENGINE_TYPE_COUNT] = { "VA", "FM", "MO", "WT", "WS", "SP", "DR", "MD" };
+        static const char* const engines[ENGINE_TYPE_COUNT] = { "VA", "FM", "MO", "WT", "WS", "SP", "DR", "MD", "RS" };
         static const ParamSpec specs[NUM_PAGES] = {
             { "VOL",  MixParam::VOLUME,        0.0f, 1.0f, MixParam::DEFAULT_VOLUME },
             { "PAN",  MixParam::PAN,          -1.0f, 1.0f, 0.0f },

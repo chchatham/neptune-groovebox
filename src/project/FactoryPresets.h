@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Preset.h"
+#include "StoredLists.h"
 #include "CymbalPresets.h"
 #include "../dsp/filters/FilterSlot.h"
 #include "../engine/DrumVoice.h"
@@ -39,11 +40,12 @@ namespace FactoryPresets
     //    VoiceIdx * 8 + offset:  0=Tune(Hz), 1=Decay(s), 2=Tone(0-1),
     //    3=Drive(0-1), 4=Snap(0-1), 5=Level(0-1), 6=Pan(0-1), 7=Type(enum)
     //
-    //  DrumSynthType values:
-    //    FMKick=0, AnalogKick=1, ModCyclesKick=2, NoiseSnare=3, FMSnare=4,
-    //    Clap=5, ClosedHat=6, OpenHat=7, Cymbal=8, Tom=9, Rim=10,
-    //    Shaker=11, Clave=12, SubBass=13, KickSynth=14 (its page: 400 + voice * 8 + n),
-    //    CymbalSynth=15 (its page: 528 + voice * 8 + n, see CymbalPresets.h)
+    //  DrumSynthType values (what TYPE offers):
+    //    FMKick=0, AnalogKick=1, ModCyclesKick=2, Clap=3, Shaker=4, SubBass=5,
+    //    KickSynth=6 (its page: 400 + voice * 8 + n), Cymbal=7,
+    //    Resonator=8 and OscBank=9 (their sound page: 528 + voice * 8 + n, see CymbalPresets.h).
+    //    Snares, toms, rim shots, claves and hats are sounds of those two: setDrumVoice takes
+    //    their old type names and sets the sound.
     //
     //  MacroOsc parameter IDs (from MacroOscEngine.h):
     //    0 = Model (0=VA, 1=FM2Op, 2=WaveFold, 3=Formant, 4=Harmonic,
@@ -117,6 +119,14 @@ namespace FactoryPresets
         return out;
     }
 
+    // ---- Destinations and sources BY NAME ---------------------------------------------------
+    // A preset written in code says what a route aims at by the entry's name, never by a number:
+    // a list that grows in its middle then moves no factory sound. The lookups are PresetRoute's
+    // (presets/PresetRoutes.h); the voices' own enums - WavetableVoice::LfoAmp,
+    // UnifiedVoice::LfoDest::Cutoff ... - are names too: "Format V3" holds them to their tables.
+    // A NAME THAT DOES NOT EXIST IS A DEFECT, NOT "OFF": it is kept in stored::unknownNames()
+    // (Preset.h), and the preset suites fail while one is there.
+
     // Helper to build a factory preset
     inline Preset make(const juce::String& name, const juce::String& category,
                        EngineType type, ParamMap params)
@@ -150,15 +160,9 @@ namespace FactoryPresets
                              float drive, float snap, float level,
                              float pan, int type)
     {
-        int base = voiceIdx * 8;
-        params[base + 0] = tune;
-        params[base + 1] = decay;
-        params[base + 2] = tone;
-        params[base + 3] = drive;
-        params[base + 4] = snap;
-        params[base + 5] = level;
-        params[base + 6] = pan;
-        params[base + 7] = (float)type;
+        // (A type that has become a sound of the resonator drum or of the oscillator bank is set
+        // as that sound: CymbalPresets.h.)
+        CymbalPresets::drum(params, voiceIdx, tune, decay, tone, drive, snap, level, pan, (DrumSynthType) type);
     }
 
     // ------------------------------------------------------------------
@@ -265,21 +269,11 @@ namespace FactoryPresets
             WheelRoute::to(p, 1, D::Cutoff, 0.35f);
         }
         // ---- effects
-        else if (n == "Noise Sweep")    // resonance up, the filter flutters
-        {
-            WheelRoute::to(p, 0, D::Resonance, 0.6f);
-            WheelRoute::motion(p, 1, 10.0f, S::SmoothRandom, D::Cutoff, 0.4f);
-        }
+        // (Noise Sweep and Wind are now wavetable engine presets with the engine's own strip route.)
         else if (n == "Laser")          // repeating downward zaps
         {
             WheelRoute::motion(p, 0, 8.0f, S::RampDown, D::Pitch, 0.6f);
         }
-        else if (n == "Wind")           // gusts, and the filter starts to whistle
-        {
-            WheelRoute::motion(p, 0, 1.5f, S::SmoothRandom, D::Cutoff, 0.6f);
-            WheelRoute::to(p, 1, D::Resonance, 0.5f);
-        }
-
         else if (n == "Narptune")       // opens the dark filter, gentle vibrato
         {
             WheelRoute::to(p, 0, D::Cutoff, 0.5f);
@@ -987,24 +981,29 @@ namespace FactoryPresets
 
         // ===================== FX (4) =====================
 
-        // Noise Sweep - noise osc, filter sweep
-        presets.push_back(make("Noise Sweep", "FX", EngineType::UnifiedVoice, {
-            {0, 1.0f},             // Osc1 noise-ish (high shape value)
-            {1, 0.0f},             // Osc2 off
-            {2, 1.0f},             // Osc1 only
-            {10, 500.0f},          // Low filter start
-            {11, 0.6f},            // Moderate reso
-            {14, 0.8f},            // Strong filter env
-            {20, 0.01f},           // Fast attack
-            {21, 2.0f},            // Long decay
-            {22, 0.0f},            // No sustain
-            {23, 1.0f},            // Long release
-            {24, 0.6f},            // Volume
-            {60, 0.01f},           // Filter env attack
-            {61, 3.0f},            // Filter env long decay (sweep)
-            {62, 0.0f},            // Filter env no sustain
-            {63, 0.5f},            // Filter env release
-        }));
+        // Noise Sweep - wavetable NOIS, resonant filter sweep from low to high.
+        // (Remade at U6: the original used shape 1.0 on the unified voice, which
+        // mapped to SAW after convertUnified; now it plays the NOIS table.)
+        {
+            using W = WavetableEngine;
+            const int F = W::FilterBase;
+            using VF = VoiceFilterSection;
+            presets.push_back(make("Noise Sweep", "FX", EngineType::Wavetable, {
+                {W::TableSelect, wavetableByLabel("NOIS")},
+                {W::Position, 0.5f},             // mid-noise
+                {F + VF::Cutoff, 500.0f},        // Low filter start
+                {F + VF::Resonance, 0.6f},       // Moderate reso
+                {F + VF::EnvAmount, 0.8f},       // Strong filter env: sweeps up
+                {F + VF::Attack, 0.01f},
+                {F + VF::Decay, 3.0f},           // Long sweep
+                {F + VF::Sustain, 0.0f},
+                {W::AmpAttack, 0.01f},
+                {W::AmpDecay, 2.0f},
+                {W::AmpSustain, 0.0f},
+                {W::AmpRelease, 1.0f},
+                {W::Level, 0.6f},
+            }));
+        }
 
         // FM Metallic - inharmonic ratios, feedback
         presets.push_back(make("FM Metallic", "FX", EngineType::FM, {
@@ -1050,20 +1049,28 @@ namespace FactoryPresets
             {63, 0.05f},           // Short release
         }));
 
-        // Wind - noise, bandpass filter
-        presets.push_back(make("Wind", "FX", EngineType::UnifiedVoice, {
-            {0, 1.0f},             // Osc1 noise
-            {1, 0.0f},             // Osc2 off
-            {2, 1.0f},             // Osc1 only
-            {10, 2000.0f},         // Medium filter
-            {11, 0.5f},            // Moderate reso
-            {14, 0.2f},            // Gentle filter env
-            {20, 0.5f},            // Slow attack
-            {21, 3.0f},            // Long decay
-            {22, 0.3f},            // Low sustain
-            {23, 3.0f},            // Long release
-            {24, 0.5f},            // Volume
-        }));
+        // Wind - wavetable NOIS through a wandering bandpass: a gust that rises and falls.
+        // (Remade at U6: the original used shape 1.0 on the unified voice = SAW after
+        // convertUnified. Now it plays the NOIS table with morph depth that moves the noise.)
+        {
+            using W = WavetableEngine;
+            const int F = W::FilterBase;
+            using VF = VoiceFilterSection;
+            presets.push_back(make("Wind", "FX", EngineType::Wavetable, {
+                {W::TableSelect, wavetableByLabel("NOIS")},
+                {W::Position, 0.3f},
+                {W::MorphSpeed, 0.08f},          // slow wander through the noise table
+                {W::MorphDepth, 0.5f},
+                {F + VF::Cutoff, 2000.0f},       // Medium filter
+                {F + VF::Resonance, 0.5f},       // Moderate reso
+                {F + VF::EnvAmount, 0.2f},       // Gentle filter env
+                {W::AmpAttack, 0.5f},
+                {W::AmpDecay, 3.0f},
+                {W::AmpSustain, 0.3f},
+                {W::AmpRelease, 3.0f},
+                {W::Level, 0.5f},
+            }));
+        }
 
         // ===================== DRUMS (6) =====================
 

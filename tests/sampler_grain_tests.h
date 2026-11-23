@@ -189,9 +189,10 @@ public:
             e.loadSample(s.data(), 24000, 1, 48000.0);
         }
         e.setParameter(SamplerEngine::Mode, (float) mode);
+        // (The seed is the voices' one generator since phase U4: the RAND start draws from it too.)
+        e.setGrainSeed(42u);
         if (grainKnobs)
         {
-            e.setGrainSeed(42u);
             e.setParameter(SamplerEngine::GrainSize, 0.3f);
             e.setParameter(SamplerEngine::GrainDensity, 150.0f);
             e.setParameter(SamplerEngine::GrainScan, -1.5f);

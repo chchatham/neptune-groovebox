@@ -11,7 +11,6 @@
 #include "../src/ui/BitmapFont.h"
 #include "../src/ui/PadLEDFeedback.h"
 #include "../src/ui/screens/StepViewScreen.h"
-#include "../src/dsp/ModMatrix.h"
 #include "../src/dsp/filters/LadderFilter.h"
 #include "../src/dsp/filters/DiodeFilter.h"
 #include "../src/dsp/filters/FilterSlot.h"
@@ -58,7 +57,7 @@
 #include "../src/ui/screens/SongScreen.h"
 #include "../src/ui/screens/AftertouchScreen.h"
 #include "custom_scale_deep_tests.h"
-#include "send_bus_full_tests.h"
+#include "effect_cores_dynamics_tests.h"
 #include "engine_macro_osc_tests.h"
 #include "engine_wavetable_tests.h"
 #include "engine_waveseq_tests.h"
@@ -70,7 +69,6 @@
 #include "arp_performance_tests.h"
 #include "mod_page_tests.h"
 #include "project_integration_tests.h"
-#include "modmatrix_wiring_tests.h"
 #include "filter_view_tests.h"
 #include "oled_mirror_tests.h"
 #include "midi_track_output_tests.h"
@@ -86,8 +84,10 @@
 #include "settings_project_tests.h"
 #include "pad_ratchet_tests.h"
 #include "lfo_modes_tests.h"
+#include "tempo_divisions_tests.h"
 #include "envelope_stage_curve_tests.h"
 #include "effects_more_tests.h"
+#include "effect_cores_mod_tests.h"
 #include "engine_filter_tests.h"
 #include "onset_click_tests.h"
 #include "engine_lfo_tests.h"
@@ -113,8 +113,45 @@
 #include "drum_keys_tests.h"
 #include "preset_audition_tests.h"
 #include "chord_pad_tests.h"
+#include "cross_thread_tests.h"
 #include "perf_fx_tests.h"
+#include "perf_banks_moves_tests.h"
 #include "saturation_tests.h"
+#include "effect_cores_time_tests.h"
+#include "effect_cores_sweep_tests.h"
+#include "track_input_tests.h"
+#include "track_input_integration_tests.h"
+#include "xin_fm_tests.h"
+#include "xin_unified_tests.h"
+#include "xin_wavetable_tests.h"
+#include "phase_osc_tests.h"
+#include "resonator_tests.h"
+#include "voice_body_tests.h"
+#include "vocoder_tests.h"
+#include "mod_slots_tests.h"
+#include "mod_router_tests.h"
+#include "router_sources_tests.h"
+#include "u4_fm_tests.h"
+#include "u4_waveseq_tests.h"
+#include "u4_wavetable_tests.h"
+#include "u4_sampler_tests.h"
+#include "router_phase_tests.h"
+#include "u4_unified_tests.h"
+#include "u4_drum_tests.h"
+#include "u5_pad_mod_tests.h"
+#include "kick_points_tests.h"
+#include "u4_rsn_tests.h"
+#include "u4_macro_tests.h"
+#include "body_fold_tests.h"
+#include "voice_filter_spread_tests.h"
+#include "multi_preset_tests.h"
+#include "factory_multi_tests.h"
+#include "project_boxes_tests.h"
+#include "p01_keyboard_tests.h"
+#include "pinned_on_cores_tests.h"
+#include "one_network_tests.h"
+#include "master_chain_tests.h"
+#include "send_chain_tests.h"
 #include "sampler_release_tests.h"
 #include "mod_wheel_tests.h"
 #include "breakbeat_tests.h"
@@ -127,7 +164,16 @@
 #include "keyboard_setup_tests.h"
 #include "click_audit_tests.h"
 #include "cymbal_machine_tests.h"
+#include "resonator_drum_tests.h"
 #include "robustness_tests.h"
+#include "effect_destinations_tests.h"
+#include "vox_cell_tests.h"
+#include "arch_chord_scale_tests.h"
+#include "through_zero_tests.h"
+#include "format_v3_tests.h"
+#include "fusion_presets_tests.h"
+#include "preset_distinctness_tests.h"
+#include "pressure_slots_tests.h"
 
 class MidiMessageTests : public juce::UnitTest
 {
@@ -1574,37 +1620,31 @@ public:
             }
         }
 
-        beginTest("The blocks are track parameters: pages on TRK FX, routed by the audio engine, lockable");
+        beginTest("DIRT and TALK are insert types in the chain, TRK FX has no block pages");
         {
             SequencerCore seq;
             AudioEngine audio;
             audio.addEngine(0, AudioEngine::createEngine(EngineType::Drum));
             TrackFxScreen screen(seq, &audio);
 
-            for (auto name : { "DIRT", "TALK", "MODFX", "FX" })
-                expect(screen.selectPageByName(name), juce::String(name) + " page exists for a drum track");
+            // The old block pages are gone.
+            expect(!screen.selectPageByName("DIRT"), "no DIRT page");
+            expect(!screen.selectPageByName("TALK"), "no TALK page");
+            expect(!screen.selectPageByName("MODFX"), "no MODFX page");
+            // But FX and IN are still there.
+            expect(screen.selectPageByName("FX"), "FX page exists");
+            expect(screen.selectPageByName("IN"), "IN page exists");
 
-            expect(screen.selectPageByName("TALK"));
-            screen.onEncoderChange(3, 50);                         // MIX up by half
-            int mixId = TrackFxParam::TALK_BASE + TalkBlock::Mix;
-            expectWithinAbsoluteError(audio.getTrackParameter(0, mixId), 0.5f, 0.001f);
-            expectWithinAbsoluteError(seq.getPattern().getTrack(0).soundParams[mixId], 0.5f, 0.001f);
-            expect(audio.getTrackFx(0) != nullptr && audio.getTrackFx(0)->talk.isActive());
+            // DIRT and TALK can be created as insert effects.
+            auto dirt = AudioEngine::createEffect(EffectType::DirtInsertEffect);
+            expect(dirt != nullptr, "DirtInsert created");
+            dirt->prepare(48000.0, 512);
+            expect(juce::String(AudioEngine::effectTypeName(EffectType::DirtInsertEffect)) == "DIRT");
 
-            // A step lock on the vowel returns to the track's value at the next trig.
-            int vowelId = TrackFxParam::TALK_BASE + TalkBlock::Vowel;
-            Step locked, plain;
-            locked.trig = plain.trig = true;
-            locked.paramLocks[vowelId] = 1.0f;
-            audio.applyStepLocks(0, locked);
-            expectWithinAbsoluteError(audio.getTrackParameter(0, vowelId), 1.0f, 0.001f);
-            audio.applyStepLocks(0, plain);
-            expectWithinAbsoluteError(audio.getTrackParameter(0, vowelId), 0.0f, 0.001f);
-
-            // Changing the engine keeps the track's effect settings.
-            audio.setSequencer(&seq);
-            audio.setEngineType(0, EngineType::FM);
-            expectWithinAbsoluteError(audio.getTrackParameter(0, mixId), 0.5f, 0.001f);
+            auto talk = AudioEngine::createEffect(EffectType::TalkInsertEffect);
+            expect(talk != nullptr, "TalkInsert created");
+            talk->prepare(48000.0, 512);
+            expect(juce::String(AudioEngine::effectTypeName(EffectType::TalkInsertEffect)) == "TALK");
         }
 
         beginTest("Every effect type can be put in an insert slot and names its parameters");
@@ -2784,94 +2824,6 @@ static SVFilterTests svFilterTests;
 static DisplayRendererTests displayRendererTests;
 static PadManagerTests padManagerTests;
 static BitmapFontTests bitmapFontTests;
-class ModMatrixTests : public juce::UnitTest
-{
-public:
-    ModMatrixTests() : UnitTest("Mod Matrix") {}
-
-    void runTest() override
-    {
-        beginTest("Empty mod matrix returns base value");
-        {
-            ModMatrix mm;
-            float result = mm.getModulatedValue(10, 0.5f);
-            expectEquals(result, 0.5f);
-        }
-
-        beginTest("Single bipolar modulation");
-        {
-            ModMatrix mm;
-            mm.addSlot({ModSource::LFO1, 10, 0.5f, true});
-            mm.setSourceValue(ModSource::LFO1, 1.0f);
-
-            float result = mm.getModulatedValue(10, 0.5f);
-            expectEquals(result, 1.0f);
-        }
-
-        beginTest("Single unipolar modulation");
-        {
-            ModMatrix mm;
-            mm.addSlot({ModSource::LFO1, 10, 1.0f, false});
-            mm.setSourceValue(ModSource::LFO1, -1.0f);
-
-            float result = mm.getModulatedValue(10, 0.0f);
-            expectEquals(result, 0.0f);
-
-            mm.setSourceValue(ModSource::LFO1, 1.0f);
-            result = mm.getModulatedValue(10, 0.0f);
-            expectEquals(result, 1.0f);
-        }
-
-        beginTest("Multiple sources summed");
-        {
-            ModMatrix mm;
-            mm.addSlot({ModSource::LFO1, 10, 0.3f, true});
-            mm.addSlot({ModSource::Env1, 10, 0.2f, true});
-            mm.setSourceValue(ModSource::LFO1, 1.0f);
-            mm.setSourceValue(ModSource::Env1, 1.0f);
-
-            float result = mm.getModulatedValue(10, 0.0f);
-            expectWithinAbsoluteError(result, 0.5f, 0.001f);
-        }
-
-        beginTest("Different destinations are independent");
-        {
-            ModMatrix mm;
-            mm.addSlot({ModSource::LFO1, 10, 1.0f, true});
-            mm.addSlot({ModSource::LFO2, 20, 0.5f, true});
-            mm.setSourceValue(ModSource::LFO1, 1.0f);
-            mm.setSourceValue(ModSource::LFO2, 1.0f);
-
-            float r1 = mm.getModulatedValue(10, 0.0f);
-            float r2 = mm.getModulatedValue(20, 0.0f);
-            expectEquals(r1, 1.0f);
-            expectEquals(r2, 0.5f);
-        }
-
-        beginTest("Remove slot");
-        {
-            ModMatrix mm;
-            mm.addSlot({ModSource::LFO1, 10, 1.0f, true});
-            mm.addSlot({ModSource::LFO2, 20, 1.0f, true});
-            expectEquals(mm.getSlotCount(), 2);
-            mm.removeSlot(0);
-            expectEquals(mm.getSlotCount(), 1);
-        }
-
-        beginTest("Process applies to param map");
-        {
-            ModMatrix mm;
-            mm.addSlot({ModSource::Velocity, 10, 0.5f, true});
-            mm.setSourceValue(ModSource::Velocity, 0.8f);
-
-            ParamMap params;
-            params[10] = 1.0f;
-            mm.process(params);
-            expectWithinAbsoluteError(params[10], 1.4f, 0.001f);
-        }
-    }
-};
-
 class LFOTests : public juce::UnitTest
 {
 public:
@@ -5348,7 +5300,6 @@ static UnifiedVoiceTests unifiedVoiceTests;
 static UnifiedVoiceEngineTests unifiedVoiceEngineTests;
 static PadLEDFeedbackTests padLEDFeedbackTests;
 static StepViewScreenTests stepViewScreenTests;
-static ModMatrixTests modMatrixTests;
 static LadderFilterTests ladderFilterTests;
 static FMOperatorTests fmOperatorTests;
 static FMVoiceTests fmVoiceTests;
@@ -6041,8 +5992,11 @@ public:
 
             expect(drum.getVoice(0).getType() == DrumSynthType::SubBass, "Pad 0 should be SubBass");
             expect(drum.getVoice(8).getType() == DrumSynthType::KickSynth, "Pad 9 (lower left) should be the kick machine");
-            expect(drum.getVoice(14).getType() == DrumSynthType::ClosedHat, "Pad 14 should be ClosedHat");
-            expect(drum.getVoice(15).getType() == DrumSynthType::OpenHat, "Pad 15 should be OpenHat");
+            // (The hats are the oscillator bank's HAT and OHAT since phase U2b.)
+            expect(drum.getVoice(14).getType() == DrumSynthType::OscBank
+                   && (int) drum.getVoice(14).getBankParam(OscBank::ParModel) == OscBank::Hat, "Pad 14 should be the closed hat");
+            expect(drum.getVoice(15).getType() == DrumSynthType::OscBank
+                   && (int) drum.getVoice(15).getBankParam(OscBank::ParModel) == OscBank::OpenHat, "Pad 15 should be the open hat");
         }
 
         beginTest("NoteOn maps correctly - direct and pad MIDI notes");
@@ -6206,11 +6160,15 @@ public:
 
             expect(!mgr.isScaleLocked(), "Scale should start unlocked");
 
+            // Scale toggles on RELEASE (not press), so the hold can be used for Scale + Up/Down.
             mgr.controlChangeReceived(7, 0x4A, 127);
-            expect(mgr.isScaleLocked(), "Scale should be locked after press");
+            expect(!mgr.isScaleLocked(), "Scale should not lock on press (deferred to release)");
+            mgr.controlChangeReceived(7, 0x4A, 0);
+            expect(mgr.isScaleLocked(), "Scale should be locked after release");
 
             mgr.controlChangeReceived(7, 0x4A, 127);
-            expect(!mgr.isScaleLocked(), "Scale should be unlocked after second press");
+            mgr.controlChangeReceived(7, 0x4A, 0);
+            expect(!mgr.isScaleLocked(), "Scale should be unlocked after second tap");
         }
 
         beginTest("Arp button toggles arpeggiator");
@@ -6268,11 +6226,13 @@ public:
             mgr.controlChangeReceived(1, 109, 127);
             expect(!mgr.isArpEnabled(), "second CC 109 press should toggle arp off");
 
+            // Scale toggles on release (not press), so the hold can serve Scale + Up/Down.
             mgr.controlChangeReceived(1, 110, 127);
-            expect(mgr.isScaleLocked(), "CC 110 press should lock scale");
             mgr.controlChangeReceived(1, 110, 0);
+            expect(mgr.isScaleLocked(), "CC 110 tap should lock scale");
             mgr.controlChangeReceived(1, 110, 127);
-            expect(!mgr.isScaleLocked(), "second CC 110 press should unlock scale");
+            mgr.controlChangeReceived(1, 110, 0);
+            expect(!mgr.isScaleLocked(), "second CC 110 tap should unlock scale");
 
             mgr.controlChangeReceived(1, 108, 0);
             expect(mgr.getActiveScreen()->getName() == "TRACKS", "CC 108 release alone should not navigate");
@@ -6858,12 +6818,13 @@ public:
             original.soundParams = {{0, 0.8f}, {10, 800.0f}, {11, 0.4f}, {24, 0.9f}};
             original.isFactory = false;
 
-            ModSlot slot;
-            slot.source = ModSource::LFO1;
+            // (An old file's "mods" entry: kept as it is, used by nothing.)
+            Preset::LegacyMod slot;
+            slot.source = 3;
             slot.destination = 10;
             slot.depth = 0.5f;
             slot.bipolar = true;
-            original.modSlots.push_back(slot);
+            original.legacyMods.push_back(slot);
 
             auto json = original.toJSON();
             auto restored = Preset::fromJSON(json);
@@ -6873,9 +6834,9 @@ public:
             expect(restored.engineType == EngineType::UnifiedVoice);
             expectEquals((int) restored.soundParams.size(), 4);
             expectWithinAbsoluteError(restored.soundParams[10], 800.0f, 0.01f);
-            expectEquals((int) restored.modSlots.size(), 1);
-            expect(restored.modSlots[0].source == ModSource::LFO1);
-            expectEquals(restored.modSlots[0].destination, 10);
+            expectEquals((int) restored.legacyMods.size(), 1);
+            expectEquals(restored.legacyMods[0].source, 3);
+            expectEquals(restored.legacyMods[0].destination, 10);
         }
 
         beginTest("Preset from empty JSON returns empty preset");
@@ -7874,7 +7835,7 @@ public:
         {
             AudioEngine audio;
             expect(audio.getSendBusType(0) == EffectType::ReverbEffect, "Bus 0 default is reverb");
-            audio.setSendBusEffect(0, EffectType::DelayEffect);
+            audio.setInsertEffect(AudioEngine::sendTrack(0), 0, EffectType::DelayEffect);
             expect(audio.getSendBusType(0) == EffectType::DelayEffect, "Bus 0 should now be delay");
             expect(audio.getSendBus(0).getChain().getEffectCount() == 1, "Chain should have 1 effect");
         }
@@ -9326,7 +9287,7 @@ public:
                 expect(p.isFactory, p.name + " should be factory");
                 expect(p.name.isNotEmpty(), "Preset should have a name");
                 expect(p.category.isNotEmpty(), "Preset should have a category");
-                expect((int)p.engineType >= 0 && (int)p.engineType <= (int)EngineType::MIDITrack,
+                expect((int)p.engineType >= 0 && (int)p.engineType < ENGINE_TYPE_COUNT,
                        p.name + " should have valid engine type");
             }
         }
@@ -9578,15 +9539,16 @@ public:
     {
         beginTest("AftertouchScreen has correct name");
         {
-            AftertouchRouter router;
-            AftertouchScreen screen(router);
+            AudioEngine audio;
+            AftertouchScreen screen(audio, [] { return 0; });
             expectEquals(screen.getName(), juce::String("AT ROUTE"));
         }
 
         beginTest("Top row = destinations of routes 1-4, bottom row = their depths");
         {
-            AftertouchRouter router;
-            AftertouchScreen screen(router);
+            AudioEngine audio;
+            audio.addEngine(0, AudioEngine::createEngine(EngineType::UnifiedVoice));
+            AftertouchScreen screen(audio, [] { return 0; });
             // Vocabulary: every destination cell is DEST (and its depth DPTH).
             expectEquals(screen.getEncoderName(0), juce::String("DEST"));
             expectEquals(screen.getEncoderName(3), juce::String("DEST"));
@@ -9598,21 +9560,24 @@ public:
 
         beginTest("Encoders edit the router the engines read");
         {
-            AftertouchRouter router;
-            AftertouchScreen screen(router);
-            expectEquals(router.getRouteCount(), (int) AftertouchRouter::MAX_ROUTES);
-            expect(router.getRoute(1).dest == AftertouchRouter::Destination::Off);
+            AudioEngine audio;
+            audio.addEngine(0, AudioEngine::createEngine(EngineType::UnifiedVoice));
+            audio.getEngine(0)->prepareToPlay(44100.0, 512);
+            int track = 0;
+            AftertouchScreen screen(audio, [&] { return track; });
+            // The default route: AMP at depth 1.0.
+            const auto r0 = audio.getPressureRouter(0);
+            expect(r0.effectiveRoute(0).dest == AftertouchRouter::Destination::Volume, "default is volume");
 
-            screen.onEncoderChange(1, 2);    // route 2: OFF -> FLT
-            expect(router.getRoute(1).dest == AftertouchRouter::Destination::FilterCutoff);
-            float before = router.getRoute(1).depth;
-            screen.onEncoderChange(5, 10);   // route 2 depth up
-            expect(router.getRoute(1).depth > before);
-
-            // Full pressure now opens the filter of a unified voice.
-            auto mod = router.computeModulation(1.0f);
-            expect(mod.cutoffMod > 0.0f);
-            expect(mod.volumeMod > 0.0f, "Route 1 defaults to volume");
+            // Turn DEST of route 2 from OFF to something (value 1 = one click up).
+            screen.onEncoderChange(1, 1);    // route 2: step DEST from OFF
+            const float dest1 = audio.getTrackParameter(0, PressureSlotParam::id(1, PressureSlotParam::DEST_OFFSET));
+            expect(dest1 > 0.0f, "route 2 is no longer OFF");
+            // The depth gets a default of 0.5 when a destination is first chosen.
+            const float depthNow = audio.getTrackParameter(0, PressureSlotParam::id(1, PressureSlotParam::AMT_OFFSET));
+            screen.onEncoderChange(5, 1);   // route 2 depth up
+            const float after = audio.getTrackParameter(0, PressureSlotParam::id(1, PressureSlotParam::AMT_OFFSET));
+            expect(after > depthNow, "the depth moved up");
         }
 
         beginTest("Pad pressure reaches the voices of every pitched engine through the shared router");
@@ -9833,8 +9798,10 @@ int main(int argc, char** argv)
             || name == "Track Effects"
             || name == "Pad Ratchet"
             || name == "LFO Modes"
+            || name == "Tempo Divisions"
             || name == "Envelope Stage Curves"
             || name == "Effects More"
+            || name == "Effect Cores Mod"
             || name == "Engine Filters"
             || name == "Engine LFOs"
             || name == "Sampler Grain"
@@ -9847,7 +9814,40 @@ int main(int argc, char** argv)
             || name == "Preset Audition"
             || name == "Chord Pads"
             || name == "Perf FX"
+            || name == "Perf Banks Moves"
             || name == "Saturation"
+            || name == "Effect Cores Time"
+            || name == "Effect Cores Sweep"
+            || name == "Track Input"
+            || name == "Track Input Integration"
+            || name == "XIN FM"
+            || name == "XIN Unified"
+            || name == "XIN Wavetable"
+            || name == "Phase Osc"
+            || name == "Resonator"
+            || name == "Voice Body"
+            || name == "Vocoder"
+            || name == "Mod Slots"
+            || name == "Mod Router"
+            || name == "Router Sources"
+            || name == "U4 FM"
+            || name == "U4 Wave Sequencer"
+            || name == "U4 Wavetable"
+            || name == "U4 Sampler"
+            || name == "Router Phase"
+            || name == "U4 Unified"
+            || name == "U4 Drum"
+            || name == "U5 Pad Mod"
+            || name == "Kick Points"
+            || name == "U4 RSN"
+            || name == "U4 Macro"
+            || name == "Body Fold"
+            || name == "Voice Filter Spread"
+            || name == "Multi Presets"
+            || name == "Project Boxes"
+            || name == "P01 Keyboard"
+            || name == "Pinned On Cores"
+            || name == "One Network"
             || name == "Control Grammar"
             || name == "Live Record"
             || name == "Held Step Pages"
@@ -9883,6 +9883,7 @@ int main(int argc, char** argv)
             || name == "Sampler Engine"
             || name == "Effect Param Lock"
             || name == "Send Bus Routing"
+            || name == "Send Chains"
             || name == "Custom Scale"
             || name == "Custom Scale Screen"
             || name == "Arpeggiator"
@@ -9900,9 +9901,7 @@ int main(int argc, char** argv)
             || name == "Song Screen"
             || name == "Aftertouch Screen"
             || name == "Custom Scale Deep"
-            || name == "Send Bus Manager"
-            || name == "Sidechain Compressor"
-            || name == "Send Bus Sidechain Integration"
+            || name == "Effect Cores Dynamics"
             || name == "Macro Osc Extended"
             || name == "Wavetable Extended"
             || name == "Wave Seq Extended"
@@ -9945,7 +9944,18 @@ int main(int argc, char** argv)
             || name == "Keyboard Setup"
             || name == "Click Audit"
             || name == "Cymbal Machine"
-            || name == "Robustness")
+            || name == "Resonator Drum"
+            || name == "Robustness"
+            || name == "Effect Destinations"
+            || name == "VOX Cell"
+            || name == "Cross Thread Steps"
+            || name == "ARCH Chord Scale"
+            || name == "Through Zero"
+            || name == "Format V3"
+            || name == "Factory Multis"
+            || name == "Fusion Presets"
+            || name == "Preset Distinctness"
+            || name == "Pressure Slots")
             ours.add(t);
     }
 

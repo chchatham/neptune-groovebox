@@ -5,6 +5,9 @@
 #include "../src/engine/AudioEngine.h"
 #include "../src/engine/EngineLfoSection.h"
 #include "../src/project/FactoryPresets.h"
+#include "../src/project/presets/FusionPresets.h"
+#include "../src/project/presets/ResonatorPresets.h"
+#include "../src/project/presets/ResonatorKits.h"
 #include "../src/project/Preset.h"
 #include "../src/project/ProjectBridge.h"
 #include "../src/sequencer/SequencerCore.h"
@@ -64,11 +67,19 @@ public:
             // engine defaults
             { "FM", 0.172f, 208, 252, -0.4f },              { "Macro oscillator", 0.335f, 536, 305, -0.6f },
             { "Wavetable", 0.825f, 196, 604, -4.2f },       { "Wave sequencer", 0.363f, 633, 635, -0.0f },
-            { "Sampler", 0.653f, 347, 495, 4.0f },          { "Drums", 0.347f, 57, 154, -0.0f },
+            { "Sampler", 0.653f, 347, 495, 4.0f },          { "Drums", 0.390f, 57, 141, -0.0f },
+            { "Resonator", 0.408f, 354, 474, 1.5f },        // (2026-11-21, U1: the engine rebuilt on dsp/Resonator.h - a struck string of 64 modes;
+                                                            //  the strip is ENRG and DAMP - 0.2: the highs ring longer. [U4-RSN] was 0.4 dB:
+                                                            //  on the router a note struck with the strip already up takes ENRG as it
+                                                            //  stands - the strike is harder - where the old routes glided in after it)
             // factory presets of these engines
             { "FM Bass 2", 0.116f, 199, 212, 0.5f },        { "FM Bell Pad", 0.128f, 421, 408, 0.3f },
             { "Anthem Bell", 0.266f, 221, 391, -0.0f },     // (2026-11-14)
-            { "Abyss Drone", 0.677f, 889, 1680, 1.5f },     // (2026-11-14; the strip opens its filter)
+            // (2026-11-14; the strip opens its filter. Level: 1.5 dB until phase U4, when the grains' random
+            // numbers became draws of spread::Generator: every grain is somewhere else, and this one
+            // number of one render moves with the seed - over eight seeds 1.8 .. 4.4 dB on the old engine,
+            // 3.1 .. 5.3 dB on the new, "U4 Sampler" has the six-seed comparison of the sound.)
+            { "Abyss Drone", 0.677f, 889, 1680, 4.5f },
             // The macro oscillator's thirty-two (2026-11-14), each model's own strip routes.
             { "Super Saw Lead", 0.255f, 452, 301, -1.0f },
             { "Hollow Sq Bass", 0.165f, 180, 136, -0.8f },
@@ -84,34 +95,44 @@ public:
             { "Fold Sweep Pad", 0.340f, 538, 1124, -1.5f },
             { "Choir Aah", 0.472f, 879, 2323, -7.0f },
             { "Talking Lead", 0.434f, 726, 1792, -9.2f },
-            { "Whisper Wind", 0.259f, 2894, 1157, -2.0f },
-            { "Vox Bass", 0.348f, 414, 643, -11.5f },
+            // (U4-MACRO, 2026-11-22: the models' noise - PLCK's burst, DUST's clicks, the whisper and
+            // the drum blend - became draws of the voice's generator per note (spread::Model) where
+            // its seed was a function of the note. These rows are one note's draw: re-measured. The
+            // old numbers in brackets; "U4 Macro" compares the mean of 32 notes, old against new.)
+            { "Whisper Wind", 0.259f, 2855, 1231, -2.6f },     // (0.259, 2894, 1157, -2.0)
+            { "Vox Bass", 0.347f, 413, 646, -12.3f },          // (0.348, 414, 643, -11.5: the strip brings the whisper in)
             { "Pure Organ", 0.236f, 203, 206, -1.7f },
             { "Stiff Bell", 0.333f, 203, 274, -3.7f },
             { "Clarinet Tone", 0.316f, 197, 210, -1.6f },
             { "Glass Harmonics", 0.526f, 249, 496, -3.1f },
-            { "Nylon Guitar", 0.372f, 916, 4996, -4.7f },
-            { "Pluck Bass", 0.259f, 4572, 7269, -2.6f },
-            { "Koto Snap", 0.541f, 1454, 5949, -7.4f },
-            { "String Drum", 0.229f, 8669, 7974, -1.0f },
-            { "Vinyl Crackle", 0.172f, 8159, 7674, 4.3f },
-            { "Pitched Rain", 0.113f, 226, 226, 1.8f },
-            { "Hiss Riser", 0.111f, 6262, 5182, 0.3f },
-            { "Dust Hat", 0.106f, 7713, 7548, 1.2f },
+            { "Nylon Guitar", 0.314f, 2825, 6227, -1.2f },     // (0.372, 916, 4996, -4.7: the burst's offset moves the centroid)
+            { "Pluck Bass", 0.240f, 5692, 7094, -1.3f },       // (0.259, 4572, 7269, -2.6)
+            { "Koto Snap", 0.491f, 3389, 6590, -2.6f },        // (0.541, 1454, 5949, -7.4)
+            { "String Drum", 0.230f, 8263, 7453, -1.2f },      // (0.229, 8669, 7974, -1.0)
+            { "Vinyl Crackle", 0.171f, 8195, 7694, 4.3f },     // (0.172, 8159, 7674, 4.3)
+            { "Pitched Rain", 0.111f, 214, 209, 1.5f },        // (0.113, 226, 226, 1.8)
+            { "Hiss Riser", 0.111f, 5116, 4336, 0.7f },        // (0.111, 6262, 5182, 0.3)
+            { "Dust Hat", 0.114f, 6841, 6564, 0.9f },          // (0.106, 7713, 7548, 1.2)
             { "Solo Cello", 0.178f, 272, 277, 3.9f },        { "Glass Bow", 0.326f, 516, 486, 5.5f },
             { "Scrape FX", 0.311f, 704, 419, 6.6f },         { "Bowed Bass", 0.182f, 214, 209, 5.1f },
             { "FM Pluck", 0.171f, 216, 289, 0.6f },         { "Electric Piano", 0.119f, 202, 248, -0.0f },
             { "Rhodes", 0.089f, 200, 211, 0.2f },           { "FM Metallic", 0.125f, 288, 292, -0.1f },
-            { "808 Kit 2", 0.355f, 55, 162, -0.5f },        { "FM Kit", 0.357f, 94, 229, -0.6f },
-            { "Electro Kit", 0.337f, 60, 183, -0.5f },      { "Minimal Kit", 0.361f, 50, 142, -1.0f },
-            { "Industrial Kit", 0.346f, 76, 235, -0.7f },   { "Percussion Kit", 0.359f, 54, 160, -1.0f },
-            { "Grain Cloud", 0.130f, 4972, 2938, 0.0f },    { "Resonator Pluck", 0.505f, 1631, 5380, -5.2f },
+            // (U2b: the kits' rows measured again. Their toms and snares are sounds of the resonator
+            // drum now, the hats the oscillator bank's: with the strip up DEC lengthens a tom's own
+            // ring inside its envelope as well, and DRIV on a snare is more wires. The strip changes
+            // the kits a quarter more than it did; where they sit at rest is where they sat.)
+            { "808 Kit 2", 0.384f, 55, 147, -0.5f },        { "FM Kit", 0.392f, 94, 214, -0.6f },
+            { "Electro Kit", 0.370f, 60, 168, -0.5f },      { "Minimal Kit", 0.396f, 50, 127, -1.0f },
+            { "Industrial Kit", 0.365f, 76, 219, -0.7f },   { "Percussion Kit", 0.402f, 54, 170, -1.0f },
+            { "Grain Cloud", 0.131f, 4931, 2915, 0.1f },    { "Resonator Pluck", 0.502f, 2398, 5783, -3.0f },  // (U4-MACRO: one draw; was 0.130 4972 2938 0.0 / 0.505 1631 5380 -5.2)
+            // Noise Sweep and Wind remade at U6 on the wavetable NOIS table (were saws from convertUnified).
+            { "Noise Sweep", 0.281f, 209, 199, -0.5f },     { "Wind", 0.349f, 218, 199, -0.6f },
             { "Digital Choir", 0.553f, 2486, 4057, -2.1f }, { "Frozen Sweep", 0.490f, 2613, 1152, -2.2f },
             { "Glitch Table", 0.239f, 197, 201, 0.0f },     { "Sequenced Bells", 0.609f, 5114, 5513, -0.2f },
             { "Morphing Texture", 0.590f, 613, 2007, 2.0f }, { "Glass Marimba", 0.175f, 207, 280, 0.0f },
             { "Metallic Stab", 0.140f, 234, 244, 0.0f },    { "FM Pad", 0.117f, 207, 227, 1.1f },
             { "Lo-Fi Tape", 0.298f, 407, 532, 0.3f },       { "Granular Pad", 0.686f, 334, 483, 4.6f },
-            { "Vinyl Scratch", 0.307f, 476, 568, 1.2f },    { "Lo-Fi Kit", 0.331f, 56, 157, -0.8f },
+            { "Vinyl Scratch", 0.307f, 476, 568, 1.2f },    { "Lo-Fi Kit", 0.357f, 57, 141, -0.8f },
             // The drum-break presets (measured when they were added, 2026-11-11): the sampler's own routes,
             // drive and sample-rate reduction, on a break that loops in time and on its slices.
             { "Break 100 Loop", 0.395f, 317, 290, 2.5f }, { "Break 100 Slices", 0.531f, 90, 104, 2.0f },
@@ -122,9 +143,15 @@ public:
             { "Break 120 Loop", 0.243f, 187, 178, 3.6f }, { "Break 120 Slices", 0.249f, 112, 90, 3.8f },
             { "Break 157 Loop", 0.223f, 1265, 968, 4.1f }, { "Break 157 Slices", 0.236f, 1662, 1167, 4.2f },
             { "Break 160 Loop", 0.264f, 207, 228, 3.2f }, { "Break 160 Slices", 0.265f, 150, 145, 3.1f },
-            { "Minimal Techno Kit", 0.376f, 49, 141, -1.0f },
+            { "Minimal Techno Kit", 0.416f, 49, 143, -1.0f },
             // The cymbal machine's two kits (2026-11-14): the strip's routes are the kit's own (DEC, DRIV).
-            { "Cymbal Works", 0.334f, 61, 280, -0.8f },     { "House Kit", 0.351f, 57, 187, -0.6f },
+            // Every drum row was measured again on 2026-11-21, when the cymbal machine's bodies moved
+            // onto the shared resonator (unification U2): each kit plays its sixteen pads here, two of
+            // them (ten of Cymbal Works) that machine. The strip changes the kits a seventh less and
+            // leaves them 7-25 % less bright at the top than before: three times the DEC lengthens the
+            // new cymbals' wash as it did the old ones', but not the tick of the stroke, which is now a
+            // larger part of them (crash, first 1.5 s: x 1.4 in level where the old one gave x 1.6).
+            { "Cymbal Works", 0.292f, 59, 242, -0.8f },     { "House Kit", 0.309f, 57, 170, -0.6f },
             // The presets for the wavetable engine's newer tables (measured when they were added,
             // 2026-11-11): the engine's own route, POS +60 and vibrato. The strip walks the vowels
             // (Vowel Choir ends on the dark O / U, so its brightness stays), raises the sync, FM and
@@ -145,14 +172,82 @@ public:
             { "Raw Sync Lead", 0.314f, 904, 1632, -0.0f },
             // the macro oscillator's models and the sampler's play modes
             { "model 0", 0.335f, 536, 305, -0.6f },          { "model 1", 0.654f, 2221, 2850, -0.3f },
-            { "model 2", 0.406f, 672, 925, 0.5f },          { "model 3", 0.367f, 601, 1027, -4.7f },
-            { "model 4", 0.373f, 201, 215, -2.6f },         { "model 5", 0.452f, 1291, 4554, -8.3f },
+            { "model 2", 0.406f, 672, 925, 0.5f },          { "model 3", 0.368f, 601, 1089, -4.8f },     // (U4-MACRO draw; was 0.367 601 1027 -4.7)
+            { "model 4", 0.373f, 201, 215, -2.6f },         { "model 5", 0.410f, 2170, 6241, -5.3f },     // (U4-MACRO draw; was 0.452 1291 4554 -8.3)
             { "model 6", 0.119f, 7586, 5587, 0.2f },        { "model 7", 0.370f, 797, 545, 10.5f },     // (re-measured 2026-11-14: the bowed string now sounds;
                                                              //  the earlier 23 Hz was its constant offset)
             { "mode 0", 0.653f, 347, 495, 4.0f },           { "mode 1", 0.640f, 275, 420, 2.9f },
             { "mode 2", 0.654f, 322, 463, 3.9f },           { "mode 3", 0.653f, 347, 495, 4.0f },
             { "mode 4", 0.653f, 347, 495, 4.0f },           { "mode 5", 0.653f, 347, 495, 4.0f },
-            { "mode 6", 0.653f, 358, 431, 2.9f } };
+            { "mode 6", 0.653f, 358, 431, 2.9f },
+            // The fusion presets (src/project/presets/FusionPresets.h; measured 2026-11-22, when they got
+            // their routes). Those of the resonator, DustBody, PluckBdy, MorphBdy and ShimrPad set STRIP
+            // routes of their own: the bow's and the breath's energy with vibrato (+5 to +7 dB: the strip
+            // is the harder bow), the dust thinned out, the string's damping taken away, the morph
+            // carried on to a gong, the sub brought in (158 Hz for 204). The others have their engine's
+            // route: the modulation index (FM), the fourth macro (macro), the position (wavetable), the
+            // rate (wave sequencer), decay and drive (PointKit: its resonator drums ring longer, +5 dB).
+            // Deep Mod is the unified voice's (its STRIP page: CUT), measured by "Fusion Presets".
+            { "BowCello", 0.297f, 467, 470, 6.6f },         { "BowGlass", 0.187f, 393, 394, 5.1f },
+            { "BrthPipe", 0.231f, 412, 357, 6.6f },         { "ScrapBar", 0.181f, 783, 952, 5.7f },
+            { "StepShpe", 0.190f, 789, 789, -0.8f },        { "PluckBdy", 0.336f, 214, 226, -0.2f },
+            { "DustBody", 0.653f, 290, 207, 0.4f },         { "ReedBody", 0.262f, 338, 378, -2.4f },
+            { "MorphBdy", 0.306f, 218, 221, -0.3f },        { "FMFilter", 0.207f, 244, 265, 0.2f },
+            { "SeqMorph", 0.326f, 354, 322, -0.2f },        { "Rnd Time", 0.425f, 541, 933, -3.1f },
+            { "FMWaveOp", 0.289f, 1074, 1353, -0.3f },      { "FM Cycle", 0.289f, 298, 354, 0.4f },
+            { "DualFilt", 0.185f, 1160, 1158, -0.3f },      { "SerlFilt", 0.123f, 448, 457, -0.3f },
+            { "Seeded", 0.355f, 329, 272, -1.8f },          { "SeedTabl", 0.448f, 389, 592, -0.1f },
+            { "Mono Wt", 0.438f, 1023, 2093, 3.1f },        { "Wide Pad", 0.272f, 547, 481, -0.2f },
+            { "SprngKey", 0.097f, 203, 241, -0.0f },        { "ShimrPad", 0.215f, 204, 158, 3.0f },
+            { "ThruFlng", 0.350f, 422, 269, -1.3f },        { "PointKit", 0.360f, 514, 755, 5.3f },
+            // The four kits of resonator drums (src/project/presets/ResonatorKits.h; measured 2026-11-22,
+            // when they were registered): the kit's own routes, DEC and DRIV.
+            { "Tom To Gong Kit", 0.361f, 62, 119, 0.8f },   { "Brush Kit", 0.291f, 100, 237, -0.1f },
+            { "Resonator Kit", 0.278f, 531, 566, 4.9f },    { "Clave Bells Kit", 0.461f, 71, 162, -0.4f },
+            // U6 resonator presets (default strip = ENRG + DAMP).
+            { "String To Bell", 0.471f, 443, 1052, 2.9f },
+            { "Shifting Bodies", 0.423f, 2696, 2676, 1.5f },
+            { "Strike To Bow", 0.413f, 345, 458, 1.5f },
+            { "Tom", 0.023f, 260, 267, -0.0f },
+            { "Snare", 0.024f, 775, 783, 0.7f },
+            { "Metal Snare", 0.038f, 536, 551, 0.7f },
+            { "Clave", 0.018f, 248, 252, 0.0f },
+            { "Rim Shot", 0.001f, 402, 402, 0.0f },
+            { "Hat Closed", 0.045f, 6876, 6921, 1.6f },
+            { "Hat Half Open", 0.044f, 6979, 7019, 1.6f },
+            { "Hat Open", 0.084f, 7080, 6879, 2.2f },
+            { "Hat Pedal", 0.036f, 6915, 6916, 1.3f },
+            { "Ride", 0.208f, 1899, 1886, 1.3f },
+            { "Ride Bell", 0.123f, 521, 517, 1.1f },
+            { "Crash", 0.243f, 2600, 2281, 0.8f },
+            { "China", 0.142f, 952, 995, 1.0f },
+            { "Splash", 0.141f, 1236, 1221, 1.2f },
+            { "Gong", 0.120f, 232, 236, 1.3f },
+            { "Tam-Tam", 0.303f, 504, 580, 5.0f },
+            { "Sheet Ride", 0.183f, 3607, 3484, 6.9f },
+            { "Shell Bell", 0.458f, 915, 1421, 3.0f },
+            { "Sheet Crash", 0.173f, 3842, 3605, 7.0f },
+            { "Sheet China", 0.218f, 2953, 3416, 6.8f },
+            { "Sheet Splash", 0.074f, 6670, 6681, 4.0f },
+            { "Domed Gong", 0.181f, 288, 293, 1.1f },
+            { "Flat Tam-Tam", 0.236f, 591, 662, 3.6f },
+            { "Beating Gong", 0.235f, 577, 654, 1.6f },
+            { "Bowed Snare", 0.033f, 948, 945, 0.9f },
+            { "Brushed Snare", 0.064f, 515, 520, 2.3f },
+            { "Brushed Ride", 0.213f, 2240, 2241, 2.0f },
+            { "Brushed Gong", 0.168f, 297, 374, 1.4f },
+            { "Bowed Cymbal", 0.190f, 606, 571, 3.6f },
+            { "Bowed Bar", 0.264f, 999, 1029, 4.0f },
+            { "Bowed Bell", 0.311f, 492, 496, 3.8f },
+            { "Tom Gong", 0.204f, 268, 303, 1.0f },
+            { "Bar Clave", 0.035f, 213, 218, 0.0f },
+            { "Tom To Gong", 0.037f, 282, 292, 0.1f },
+            // (Measured on 2026-11-22 while a resonator standing alone had no pressure route at all:
+            // 0.044, 1556 -> 1648, 1.4. A resonator is made with the pad on EXC again, as a track
+            // always had it, and a note then begins at its strike instead of coming up through
+            // LAG: the brush is a little darker at the start. The other resonator rows do not move.)
+            { "Stirred Snare", 0.043f, 1427, 1524, 1.3f },
+            { "Brush To Stick", 0.220f, 2118, 2119, 5.6f } };
         return refs;
     }
 
@@ -238,6 +333,15 @@ public:
         return D::render(plan);
     }
 
+    // The same with the strip moving: at rest while the smoother settles, pushed up as the plan
+    // starts (it rises in about 20 ms). For a phase (D::isPhase), which is heard while it moves.
+    static std::vector<float> renderWithStripRising(D::Plan& plan)
+    {
+        renderWithStrip(plan, 0.0f);    // (only for the settled smoother: its render is not used)
+        plan.engine->setModWheel(1.0f);
+        return D::render(plan);
+    }
+
     static bool finite(const std::vector<float>& x)
     {
         for (float s : x)
@@ -282,7 +386,8 @@ public:
                 const ParamSpec* lfoDest = pages.back().find(S::id(1, S::Dest));
                 expect(lfoDest != nullptr && dest.choices == lfoDest->choices && dest.numChoices == lfoDest->numChoices,
                        name + ": DST" + juce::String(r + 1) + " offers the LFOs' list");
-                expect(dest.kind == ParamKind::Choice && (int) dests.size() == dest.numChoices);
+                // (The engine's own, then the cells of the track's effects: E4.)
+                expect(dest.kind == ParamKind::Choice && (int) dests.size() + mod::TrackDest::COUNT == dest.numChoices);
                 expect(ChoiceGroups::find(dest.choices) != nullptr, name + ": the list has groups");
                 expectEquals(dest.turned(0.0f, 1, TurnStep::Coarse), 1.0f, name + ": Func + turn stops at the first destination");
                 expect(dest.turned(1.0f, 1, TurnStep::Coarse) > 2.0f, name + ": and then at the next group");
@@ -358,17 +463,31 @@ public:
         beginTest("Defaults: every factory preset of these engines answers the strip as it did");
         {
             int checked = 0;
-            for (auto& preset : FactoryPresets::getAll())
+            // All factory presets: the original list, plus the fusion and resonator presets.
+            auto all = FactoryPresets::getAll();
+            for (auto& p : FusionPresets::getAll()) all.push_back(p);
+            for (auto& p : resonatorPresets()) all.push_back(p);
+            for (auto& p : resonatorKits()) all.push_back(p);
+            for (auto& preset : all)
             {
                 if (preset.engineType == EngineType::MIDITrack || preset.engineType == EngineType::UnifiedVoice)
                     continue;
-                for (auto& [id, value] : preset.soundParams)
-                    expect(! S::ownsStrip(id), preset.name + " sets a STRIP cell (the reference is for the defaults)");
-                expect(refFor(preset.name) != nullptr, preset.name + ": no reference measurement");
+                // (A preset may set STRIP cells of its own - the fusion presets do where the engine's
+                // default route has nothing to work on: its row is then what its own routes give.)
+                if (refFor(preset.name) == nullptr)
+                {
+                    // Log what the reference row would be, so the builder can add it.
+                    auto m = measureStrip(preset.engineType, &preset.soundParams);
+                    logMessage("{ \"" + preset.name + "\", " + juce::String(m.diff, 3) + "f, "
+                               + juce::String((int) std::lround(m.centroid0)) + ", " + juce::String((int) std::lround(m.centroid127))
+                               + ", " + juce::String(m.levelDb, 1) + "f },");
+                    expect(false, preset.name + ": no reference measurement");
+                    continue;
+                }
                 checkAgainstReference(preset.name, measureStrip(preset.engineType, &preset.soundParams));
                 ++checked;
             }
-            expectEquals(checked, 99, "the factory presets of the six engines (63, two for each of the eight drum breaks, 20 for the newer wavetables)");
+            expect(checked >= 99, "at least the original 99 factory presets of the six engines, got " + juce::String(checked));
         }
 
         beginTest("Defaults: the macro oscillator's models and the sampler's play modes");
@@ -439,6 +558,14 @@ public:
             for (size_t d = 1; d < labels.size(); ++d)
             {
                 const auto& label = labels[d];
+                // A phase (D::isPhase) held where the strip holds it is no change of the sound: it is
+                // heard while the strip moves, against the same strip moving with no route.
+                const bool phase = D::isPhase(type, label);
+                // The drum kit reads the strip once, at the strike ("Drums: the strip is read at the strike"):
+                // a phase it sets is held for the whole hit, which nobody hears. "U4 Drum" hears PM from the
+                // track input and from an LFO.
+                if (phase && type == EngineType::Drum)
+                    continue;
                 float heard = 0.0f, atRest = 0.0f;
                 bool ok = true;
                 for (float amount : { 1.0f, -1.0f })
@@ -450,6 +577,13 @@ public:
                         stills[plain.variant] = renderWithStrip(plain, 1.0f);
                     }
                     const auto& still = stills[plain.variant];
+                    if (phase && stills.find(plain.variant + " rising") == stills.end())
+                    {
+                        auto rising = D::prepare(type, label, labels);
+                        clearRoutes(*rising.engine);
+                        stills[plain.variant + " rising"] = renderWithStripRising(rising);
+                    }
+                    const auto& stillMoving = stills[phase ? plain.variant + " rising" : plain.variant];
 
                     auto resting = D::prepare(type, label, labels);
                     clearRoutes(*resting.engine);
@@ -461,14 +595,14 @@ public:
                     clearRoutes(*up.engine);
                     up.engine->setParameter(S::stripDestId(1), (float) d);
                     up.engine->setParameter(S::stripAmountId(1), amount);
-                    const auto moved = renderWithStrip(up, 1.0f);
+                    const auto moved = phase ? renderWithStripRising(up) : renderWithStrip(up, 1.0f);
                     ok = ok && finite(moved);
-                    heard = std::max(heard, W::difference(still, moved));
+                    heard = std::max(heard, W::difference(stillMoving, moved));
                     if (heard >= 2.0f * D::MIN_DIFFERENCE)
                         break;
                 }
                 expect(ok, name + " " + label + ": output is finite");
-                expect(heard >= MIN_HELD_DIFFERENCE, name + " " + label + ": strip up, difference " + juce::String(heard, 4));
+                expect(heard >= MIN_HELD_DIFFERENCE, name + " " + label + (phase ? ": strip rising" : ": strip up") + ", difference " + juce::String(heard, 4));
                 expect(atRest <= W::MAX_REST_DIFFERENCE, name + " " + label + ": heard with the strip at rest (" + juce::String(atRest, 5) + ")");
                 if (heard < 3.0f * D::MIN_DIFFERENCE)
                     quiet << label << " " << juce::String(heard, 3) << "  ";
@@ -635,9 +769,14 @@ public:
                 const bool hasStrip = type != EngineType::UnifiedVoice;
                 for (int id = S::STRIP_BASE; id < S::STRIP_BASE + S::STRIP_COUNT; ++id)
                     expect((ids.count(id) > 0) == hasStrip || type == EngineType::UnifiedVoice, juce::String(name) + ": STRIP id " + juce::String(id));
+                // 182-189 are the modulation router's XIN page: on the macro oscillator and FM, the engines
+                // on the router so far; free on the others (the wave sequencer's BODY page, once there, is in
+                // the engine's own block: the id rule at the top of ModRouter.h).
+                const bool uses = type == EngineType::MacroOsc || type == EngineType::FM || type == EngineType::WaveSeq || type == EngineType::Wavetable || type == EngineType::Sampler
+                                  || type == EngineType::Drum || type == EngineType::Resonator;    // (the engines on the router)
                 if (hasStrip)
                     for (int id = S::STRIP_BASE + S::STRIP_COUNT; id < EngineParamRange::EXT_END; ++id)
-                        expect(ids.count(id) == 0, juce::String(name) + ": 182-189 stay free");
+                        expect((ids.count(id) > 0) == uses, juce::String(name) + (uses ? ": 182-189 are a page" : ": 182-189 stay free"));
             }
             for (int model = 0; model < 8; ++model)
             {

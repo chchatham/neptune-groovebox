@@ -163,7 +163,8 @@ public:
             for (auto& p : page.params)
                 e->setParameter(p.id, p.defaultVal);
         e->setTempo(120.0f);
-        e->setScanSeed(0x4E455054u);
+        e->setParameter(P::SpreadBase + VoiceSpread::Seed, 0.0f);      // (the RAND scan draws from the voices' generators)
+        e->seedSpread();
         e->prepareToPlay(sampleRate, WINDOW);
         e->setParameter(P::AmpAttack, 0.001f);
         e->setParameter(P::AmpSustain, 1.0f);
@@ -504,7 +505,7 @@ public:
             {
                 auto e = makeEngine();
                 if (seed != 0)
-                    e->setScanSeed(seed);
+                    e->setParameter(P::SpreadBase + VoiceSpread::Seed, (float) seed);  // SEED: which sequence of draws
                 e->setParameter(P::ScanMode, (float) WavetableScanMode::Rand);
                 e->setParameter(P::ScanTime, 1.6f);
                 e->setParameter(P::ScanSteps, 1.0f);        // 8 per pass: a new frame every 0.2 s
@@ -839,7 +840,7 @@ public:
                     e->setParameter(P::ScanSteps, 0.0f);
                     e->setParameter(P::ScanDirection, 1.0f);
                     e->setParameter(P::ScanSpeed, 4.0f);
-                    e->setScanSeed(99u);
+                    e->setParameter(P::SpreadBase + VoiceSpread::Seed, 99.0f);
                 }
                 e->noteOn(57, 0.8f, -1);
                 e->noteOn(64, 0.6f, -1);
@@ -1052,7 +1053,8 @@ public:
             WavetableEngine e;
             const auto pages = e.getParamPages();
             expect(pages.size() >= 4);
-            expect(pages[0].name == "WAVE" && pages[1].name == "SCAN" && pages[2].name == "OSC" && pages[3].name == "AMP");
+            expect(pages[0].name == "WAVE" && pages[1].name == "SCAN" && pages[2].name == "OSC" && pages[3].name == "ANLG"
+                   && pages[4].name == "AMP");
             const char* labels[8] = { "MODE", "TIME", "SYNC", "LEN", "STEP", "DIR", "SPD", "FRMS" };
             const int ids[8] = { 25, 26, 27, 28, 29, 30, 31, 32 };
             for (int c = 0; c < 8; ++c)
@@ -1069,7 +1071,8 @@ public:
                 expect(page.name.length() <= 5);
                 for (auto& p : page.params)
                 {
-                    expect(p.isValid(), page.name + ": an empty cell");
+                    if (! p.isValid())
+                        continue;       // an empty cell is legal on any page (the owner: empty knobs are fine); every other check is for every page
                     const juce::String label(p.label);
                     expect(label.isNotEmpty() && label.length() <= 4 && label == label.toUpperCase(), page.name + " / " + label);
                     expect(seen.insert(p.id).second, "id " + juce::String(p.id) + " is on two cells");

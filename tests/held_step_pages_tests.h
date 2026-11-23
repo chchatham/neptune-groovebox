@@ -155,6 +155,7 @@ public:
         beginTest("STEP: the page that opens, per engine");
         {
             for (auto type : { EngineType::UnifiedVoice, EngineType::FM, EngineType::Sampler,
+                               EngineType::Resonator,
                                EngineType::MacroOsc, EngineType::Wavetable, EngineType::WaveSeq })
             {
                 Rig r(type);

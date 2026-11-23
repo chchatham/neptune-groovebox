@@ -1624,7 +1624,7 @@ private:
             expectEquals(m.mgr.composeNameBar().pages, juce::String("1/5"));
 
             // The bank buttons go round: on from the last page is the first, back from the first is the last.
-            const char* names[] = { "PAN", "SND1", "SND2", "ENG", "VOL" };
+            const char* names[] = { "PAN P1", "S1 P1", "S2 P1", "ENG P1", "VOL P1" };      // (a send's page is S1 / S2 beside the pattern: "SND1 P1" is one character too long, and "SND1P1" ran the two together)
             for (int i = 0; i < 5; ++i)
             {
                 m.tap(BANK_DOWN);

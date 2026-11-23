@@ -1,142 +1,74 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "FxBlocks.h"
-#include "MultiTapDelay.h"
+#include "DelayCore.h"
 
-// Four-parameter front end for MultiTapDelay, so it can sit in an insert slot. MultiTapDelay
-// itself is unchanged (it keeps its 35 per-tap parameters for anything that drives it directly);
-// this class owns one and sets its taps from four macro controls:
+// Multi-tap delay: a setting of dly::Core (DelayCore.h). One line (the two inputs summed) read
+// at up to eight evenly spaced taps.
 //
 // TIME  time of the last tap; the taps are spaced evenly up to it (tap i at TIME x i / TAPS)
 // TAPS  number of taps, 1..8; they alternate left / right and get quieter towards the last
-// FDBK  feedback (regeneration of the whole pattern)
+// FDBK  feedback from the last tap, through a low-pass: the whole pattern comes round again every TIME
 // MIX   dry / wet
-//
-// MultiTapDelay sums the feedback of all active taps and divides by max(1, taps / 2), so with every
-// tap feeding back fully the loop gain could reach 2. The adapter gives each tap FDBK / 2 (FDBK
-// for a single tap), which keeps the worst-case loop gain at FDBK (at most 0.9).
-// TIME is smoothed here, because MultiTapDelay jumps its read positions when a tap time is set.
-class MultiTapInsert : public EffectBase
+// FX2:
+// WOW   the tape transport's wow and flutter on every tap (0 = a steady line)
+// DRIV  the tape stage in the loop: 0 = clean; up, every round is squashed, thickened and duller
+// SAT   the curve DRIV works: any of src/dsp/Saturation.h
+// READ  FWD, REV, OCT+ / 5TH+ / OCT- (see DelayCore.h)
+class MultiTapInsert : public dly::Family
 {
 public:
     enum Param { Time = 0, Taps, Feedback, Mix };
+    enum Extra { Wow = 0, Drive, Sat, Read };
 
-    static constexpr int MAX_TAPS = 8;
+    static constexpr int MAX_TAPS = dly::Core::MAX_TAPS;
+    static constexpr float MIN_TIME = 0.05f, MAX_TIME = 2.0f;
 
-    MultiTapInsert()
-    {
-        mix = 0.4f;
-        prepare(44100.0, 0);
-    }
+    MultiTapInsert() { seed(); }
 
-    ParamSpec getParamSpec(int index) const override
+protected:
+    const ParamSpec* cells() const override
     {
         using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "TIME", 0, 0.05f, 2.0f, 0.5f, K::Log, "s" };
-            case 1: return { "TAPS", 1, 1, MAX_TAPS, 4, K::Int };
-            case 2: return { "FDBK", 2, 0, 0.9f, 0.3f };
-            case 3: return { "MIX", 3, 0, 1, 0.4f };
-            default: return {};
-        }
+        static const ParamSpec c[CELLS] = {
+            { "TIME", 0, MIN_TIME, MAX_TIME, 0.5f, K::Log, "s" },
+            { "TAPS", 1, 1, (float) MAX_TAPS, 4, K::Int },
+            { "FDBK", 2, 0, 0.9f, 0.3f },
+            { "MIX", 3, 0, 1, 0.4f },
+            { "WOW", 0, 0, 1, 0 },
+            { "DRIV", 1, 0, 1, 0 },
+            { "SAT", 2, 0, (float) (sat::Count - 1), (float) sat::Fast, K::Choice, "", sat::names(), sat::Count },
+            { "READ", 3, 0, (float) (dly::read::Count - 1), 0, K::Choice, "", dly::read::names(), dly::read::Count } };
+        return c;
     }
-
-    void setParameter(int id, float value) override
+    int mixCell() const override { return Mix; }
+    dly::Core::Setup setup() const override
     {
-        switch (id)
-        {
-            case Time:     timeSec = std::clamp(value, 0.05f, 2.0f); break;
-            case Taps:     numTaps = std::clamp((int) std::lround(value), 1, MAX_TAPS); break;
-            case Feedback: feedback = std::clamp(value, 0.0f, 0.9f); break;
-            case Mix:      setMix(value); break;
-            default: break;
-        }
+        dly::Core::Setup s;
+        s.stereo = false;
+        s.hermite = false;          // eight reads a sample: the straight line
+        s.filterInput = false;
+        s.emphasis = s.makeup = true;
+        s.glideMs = 60.0f;
+        return s;
     }
+    float lineSeconds() const override { return dly::roomFor(MAX_TIME, MAX_TIME); }
 
-    float getParameter(int id) const override
+    void configure(const float* v) override
     {
-        switch (id)
-        {
-            case Time:     return timeSec;
-            case Taps:     return (float) numTaps;
-            case Feedback: return feedback;
-            case Mix:      return mix;
-            default:       return 0.0f;
-        }
-    }
-
-    void prepare(double sr, int maxBlockSize) override
-    {
-        sampleRate = sr;
-        delay.prepare(sr, maxBlockSize);
-        timeSmooth.setTime(sr, 60.0f);
-        reset();
-    }
-
-    void reset() override
-    {
-        delay.reset();
-        timeSmooth.snap(timeSec);
-        appliedTime = -1.0f;
-        appliedTaps = -1;
-        appliedFeedback = -1.0f;
-        appliedMix = -1.0f;
-    }
-
-    void process(float& left, float& right) override
-    {
-        if (!enabled) return;
-
-        float t = timeSmooth.next(timeSec);
-        if (t != appliedTime || numTaps != appliedTaps || feedback != appliedFeedback)
-            applyTaps(t);
-
-        if (mix != appliedMix)
-        {
-            appliedMix = mix;
-            delay.setParameter(MultiTapDelay::MixParam, mix);
-        }
-
-        delay.process(left, right);
-    }
-
-private:
-    void applyTaps(float t)
-    {
-        const int n = numTaps;
-        if (n != appliedTaps)
-            delay.setParameter(MultiTapDelay::NumTaps, (float) n);
-
-        const float perTapFeedback = (n >= 2) ? feedback * 0.5f : feedback;
+        const float time = v[Time];
+        const int n = std::clamp((int) std::lround(v[Taps]), 1, MAX_TAPS);
+        core.setTapCount(n);
         for (int i = 0; i < n; ++i)
         {
-            delay.setParameter(MultiTapDelay::tapTime(i), t * (float) (i + 1) / (float) n);
-            delay.setParameter(MultiTapDelay::tapFeedback(i), perTapFeedback);
-
-            if (n != appliedTaps)
-            {
-                float level = (n > 1) ? 1.0f - 0.6f * (float) i / (float) (n - 1) : 1.0f;
-                float pan = (n == 1) ? 0.5f : ((i % 2 == 0) ? 0.15f : 0.85f);
-                delay.setParameter(MultiTapDelay::tapLevel(i), level);
-                delay.setParameter(MultiTapDelay::tapPan(i), pan);
-            }
+            const float level = n > 1 ? 1.0f - 0.6f * (float) i / (float) (n - 1) : 1.0f;
+            const float pan = n == 1 ? 0.5f : (i % 2 == 0 ? 0.15f : 0.85f);
+            core.setTap(i, time * (float) (i + 1) / (float) n, level * (1.0f - pan), level * pan, i == n - 1 ? 1.0f : 0.0f);
         }
-
-        appliedTime = t;
-        appliedTaps = n;
-        appliedFeedback = feedback;
+        core.silenceTapsFrom(n);
+        core.setFeedback(v[Feedback]);
+        core.setFilter(8000.0f, 0.0f);
+        core.setTransport(v[4 + Wow]);
+        dly::driven(core, v[4 + Drive], v[4 + Sat]);
+        setRead(v[4 + Read], time);
     }
-
-    float timeSec = 0.5f;
-    int numTaps = 4;
-    float feedback = 0.3f;
-
-    MultiTapDelay delay;
-    fxb::Smoother timeSmooth;
-    float appliedTime = -1.0f;
-    int appliedTaps = -1;
-    float appliedFeedback = -1.0f;
-    float appliedMix = -1.0f;
 };

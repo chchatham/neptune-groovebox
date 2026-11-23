@@ -39,7 +39,7 @@ namespace ChoiceGroups
         const int* starts = nullptr;        // ascending indices at which a group begins (the first is 0)
         int count = 0;
     };
-    static constexpr int MAX_LISTS = 32;
+    static constexpr int MAX_LISTS = 256;       // (the resonator alone has 30, and every engine a source list beside its destinations)
 
     inline std::array<Entry, MAX_LISTS>& table() { static std::array<Entry, MAX_LISTS> t {}; return t; }
     inline std::atomic<int>& used() { static std::atomic<int> n { 0 }; return n; }
@@ -81,8 +81,13 @@ struct ParamSpec
     const char* const* choices = nullptr;
     int numChoices = 0;
     float stepSize = 0.0f;              // > 0: the value moves on this grid (Shift = 1/50 of it)
+    // A time or a rate that can be locked to a division of the tempo (an effect's SYNC: EffectBase.h).
+    // Its unit says which it is: "Hz" a rate, "ms" or "s" (or none) a time.
+    bool timeLike = false;
 
     bool isValid() const { return id >= 0; }
+    // The same cell, marked as a time or a rate that can follow the tempo.
+    ParamSpec timed() const { ParamSpec s = *this; s.timeLike = true; return s; }
     bool isBipolar() const { return kind != ParamKind::Choice && minVal < 0.0f && maxVal > 0.0f; }
     bool isDiscrete() const { return kind == ParamKind::Int || kind == ParamKind::Choice; }
 
@@ -194,8 +199,36 @@ struct ParamSpec
     //             unipolar continuous        0 / 25 / 50 / 75 / 100 % of the range, and the default
     //
     // The result is always inside [minVal, maxVal].
+    //
+    // A choice whose label is the empty string is a place the list keeps for the values stored in
+    // old sounds and offers no more (a drum pad's WAVE had CYCL at 1, which had nothing to read
+    // there): a turn passes over it to the next choice that has a name; where there is none that
+    // way it stops at the last named one before it.
     // =========================================================================================
     float turned(float current, int clicks, TurnStep mode) const
+    {
+        const float next = turnedByRule(current, clicks, mode);
+        if (kind != ParamKind::Choice || choices == nullptr || clicks == 0 || isOffered((int) std::lround(next)))
+            return next;
+        const int first = (int) std::lround(minVal), last = juce::jmin((int) std::lround(maxVal), numChoices - 1);
+        const int dir = clicks > 0 ? 1 : -1, landed = (int) std::lround(next), from = (int) std::lround(clamp(current));
+        for (int i = landed + dir; i >= first && i <= last; i += dir)
+            if (isOffered(i))
+                return (float) i;
+        for (int i = landed - dir; dir > 0 ? i > from : i < from; i -= dir)
+            if (isOffered(i))
+                return (float) i;
+        return (float) from;
+    }
+
+    // A place of a choice list that a knob stops at (see turned).
+    bool isOffered(int index) const
+    {
+        return kind != ParamKind::Choice || choices == nullptr || index < 0 || index >= numChoices
+            || (choices[index] != nullptr && choices[index][0] != 0);
+    }
+
+    float turnedByRule(float current, int clicks, TurnStep mode) const
     {
         current = clamp(current);
         if (clicks == 0)
@@ -469,8 +502,9 @@ namespace RangeParam
 // Track-level mixer parameters. They live in Track::soundParams like engine parameters but are
 // applied by the AudioEngine's mixer, never forwarded to an engine (engines use low ids freely:
 // the drum engine alone uses 0-127).
-// Which ids in a track's parameter map belong to its engine: 0-149, and a second block 158-189
-// (150-157 are the send-bus type selectors). Everything from 190 up is the mixer, effects, etc.
+// Which ids in a track's parameter map belong to its engine: 0-149, a second block 158-189
+// (150-157 are the send-bus type selectors), a third 400-655 and a fourth 700-779. The rest from
+// 190 up is the mixer, effects, etc.
 namespace EngineParamRange
 {
     static constexpr int FIRST_END = 150;
@@ -480,10 +514,121 @@ namespace EngineParamRange
     // cymbal-machine page (528-655), see DrumEngine.
     static constexpr int THIRD_BASE = 400;
     static constexpr int THIRD_END = 656;
+    // Fourth block, 700-784: the mod slots (ModSlotParam, 700-763), the custom LFO shape
+    // (LfoShapeParam, 764-771), how many slots are shown (772), pressure slots
+    // (PressureSlotParam, 773-784).
+    static constexpr int FOURTH_BASE = 700;
+    static constexpr int FOURTH_END = 785;
+    // Fifth block, 4000-4255: per-pad modulation for the drum kit (U5). Each pad (0-15) has 16
+    // cells starting at 4000 + pad * 16: 8 for a per-pad LFO (RATE, DPTH, SHPE, DEST, TRIG,
+    // SYNC, DIV, FADE) and 8 for two per-pad free slots (SRC1, DST1, AMT1, VIA1, SRC2, DST2,
+    // AMT2, VIA2). These sit in PadModParam (below) and are handled by DrumEngine; they are not
+    // in the router's id space. The ModRouter::idToDest array stays sized by FOURTH_END.
+    static constexpr int FIFTH_BASE = 4000;
+    static constexpr int FIFTH_END = 4256;
+    static constexpr int END = FOURTH_END;      // what a walk over the first four blocks stops at (and what sizes ModRouter::idToDest)
+    static constexpr int WALK_END = FIFTH_END;  // one past the last engine id including per-pad modulation
     static constexpr bool contains(int id)
     {
-        return (id >= 0 && id < FIRST_END) || (id >= EXT_BASE && id < EXT_END) || (id >= THIRD_BASE && id < THIRD_END);
+        return (id >= 0 && id < FIRST_END) || (id >= EXT_BASE && id < EXT_END) || (id >= THIRD_BASE && id < THIRD_END)
+            || (id >= FOURTH_BASE && id < FOURTH_END) || (id >= FIFTH_BASE && id < FIFTH_END);
     }
+}
+
+// The track's input: another track's sound (taken after its inserts, before its fader), TRK FX
+// page IN. Stored in Track::soundParams and applied by the AudioEngine, never sent to an engine.
+namespace TrackInParam
+{
+    static constexpr int BASE = 344;
+    static constexpr int SRC = 344;          // 0 = off, n = track number n (1-based)
+    static constexpr int LEVEL = 345;        // 0..1, default 1
+    static constexpr int MODE = 346;         // 0 OFF (the engine or an effect uses it), 1 MIX, 2 RING
+    static constexpr int FOLLOW_ATK = 347;   // the input's envelope follower: attack, ms, 1..200, default 5
+    static constexpr int FOLLOW_REL = 348;   // release, ms, 10..2000, default 150
+    static constexpr int END = 360;          // one past the last id (349-359 free)
+
+    static constexpr bool contains(int id) { return id >= BASE && id < END; }
+}
+
+// Mod slots, shared by the sound engines (the start of the fourth engine block): a slot is a
+// source, a destination, an amount and a second source that scales the amount.
+namespace ModSlotParam
+{
+    static constexpr int BASE = 700;
+    static constexpr int STRIDE = 4;
+    static constexpr int MAX_SLOTS = 16;
+    static constexpr int SRC = 0;            // per-slot offsets
+    static constexpr int DEST = 1;
+    static constexpr int AMT = 2;
+    static constexpr int VIA = 3;
+    static constexpr int END = 764;          // one past the last slot id
+    static constexpr int COUNT = 772;        // how many slots are shown
+
+    static constexpr int id(int slot, int offset) { return BASE + slot * STRIDE + offset; }
+}
+
+// The custom LFO shape: eight levels, one shape a track.
+namespace LfoShapeParam
+{
+    static constexpr int BASE = 764;
+    static constexpr int POINTS = 8;
+    static constexpr int END = 772;          // one past the last id
+}
+
+// The pressure routes as router slots: four slots, three cells each (DEST, AMT, BIPOLAR).
+// Source is fixed at PRES per voice, so polyphonic aftertouch reaches individual voices.
+// DEST is an index of the router's destination table (the same list the LFO, STRIP and XIN pages
+// use), so pressure reaches everything an LFO can reach, the 80 effect cells included.
+namespace PressureSlotParam
+{
+    static constexpr int BASE = 773;
+    static constexpr int STRIDE = 3;
+    static constexpr int MAX_SLOTS = 4;
+    static constexpr int DEST_OFFSET = 0;
+    static constexpr int AMT_OFFSET = 1;
+    static constexpr int BIPOLAR_OFFSET = 2;
+    static constexpr int END = BASE + MAX_SLOTS * STRIDE;    // 785
+
+    static constexpr int id(int slot, int offset) { return BASE + slot * STRIDE + offset; }
+    static constexpr bool contains(int paramId) { return paramId >= BASE && paramId < END; }
+}
+
+// Per-pad modulation for the drum kit (U5, EngineParamRange fifth block). Each pad has a
+// per-pad LFO and two per-pad free slots, 16 cells a pad, at ids 4000 + pad * 16 + cell.
+// The pages PLFO and PSLT appear for every pad on PARAM and DRUMS. The per-pad LFO reads the
+// same sources and aims at the same destinations as the kit's (DrumEngine::lfoDests()), so
+// a pad's snare can carry its own LFO while the kit's LFOs move the whole kit.
+namespace PadModParam
+{
+    static constexpr int BASE = EngineParamRange::FIFTH_BASE;   // 4000
+    static constexpr int PER_PAD = 16;
+    static constexpr int MAX_PADS = 16;
+    // Per-pad LFO (8 cells, offsets 0-7):
+    static constexpr int LFO_RATE = 0;
+    static constexpr int LFO_DEPTH = 1;
+    static constexpr int LFO_SHAPE = 2;
+    static constexpr int LFO_DEST = 3;
+    static constexpr int LFO_TRIGGER = 4;
+    static constexpr int LFO_SYNC = 5;
+    static constexpr int LFO_DIV = 6;
+    static constexpr int LFO_FADE = 7;
+    // Per-pad free slots (8 cells, offsets 8-15):
+    static constexpr int SLOT1_SRC = 8;
+    static constexpr int SLOT1_DEST = 9;
+    static constexpr int SLOT1_AMT = 10;
+    static constexpr int SLOT1_VIA = 11;
+    static constexpr int SLOT2_SRC = 12;
+    static constexpr int SLOT2_DEST = 13;
+    static constexpr int SLOT2_AMT = 14;
+    static constexpr int SLOT2_VIA = 15;
+    static constexpr int END = BASE + PER_PAD * MAX_PADS;      // 4256
+
+    static constexpr int id(int pad, int cell) { return BASE + pad * PER_PAD + cell; }
+    static constexpr int padOf(int id) { return (id - BASE) / PER_PAD; }
+    static constexpr int cellOf(int id) { return (id - BASE) % PER_PAD; }
+    static constexpr bool contains(int id) { return id >= BASE && id < END; }
+    static constexpr int slotOf(int cell) { return (cell - SLOT1_SRC) / 4; }       // 0 or 1
+    static constexpr int slotCell(int cell) { return (cell - SLOT1_SRC) % 4; }     // SRC=0 DEST=1 AMT=2 VIA=3
 }
 
 // Per-stage envelope curves: attack, decay and release of an envelope each have their own curve

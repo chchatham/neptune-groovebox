@@ -131,7 +131,7 @@ public:
                 for (int b = 0; b < 120; ++b)
                 {
                     r.render(1);
-                    reduction = std::min(reduction, r.audio.getMasterComp().getGainReductionDb());
+                    reduction = std::min(reduction, static_cast<Compressor*> (r.audio.getMasterEffect(EffectType::CompressorEffect))->getGainReductionDb());
                 }
                 // Attack 10 ms, then the decay takes 300 ms to fall to 0.7: at 100 ms the note is still
                 // at 0.9 of its peak. (Before: 0.46 of it at full velocity, the compressor's doing.)

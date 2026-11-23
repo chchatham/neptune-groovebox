@@ -1,6 +1,6 @@
 #pragma once
 
-#include "DrumVoice.h"
+#include "DrumTypes.h"     // (the voice itself at the end of this file: DrumTypes.h says why)
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <cmath>
 #include <cstdint>
@@ -8,6 +8,7 @@
 #include <string>
 #include <iterator>
 #include <vector>
+#include <type_traits>
 
 // The break loops of assets/breaks, built into the program by CMake (juce_add_binary_data). A build
 // without them still has the two breaks rendered below.
@@ -172,10 +173,14 @@ private:
 
     static constexpr double SR = 44100.0;
 
+public:
+    // One drum hit as the bank renders its built-in ones (public: "Kick Points" renders the bank's
+    // kicks with the old voice beside it).
+    template <typename Voice = DrumVoice>
     static std::vector<float> renderHit(DrumSynthType type, float tune, float decay, float tone,
                                         float drive, float snap, float seconds, float velocity = 1.0f)
     {
-        DrumVoice v;
+        Voice v;
         v.setSampleRate(SR);
         v.setType(type);
         v.setTune(tune);
@@ -184,6 +189,11 @@ private:
         v.setDrive(drive);
         v.setSnap(snap);
         v.setLevel(0.9f);
+        // (The old kick types are points of the kick machine: the hit as it was written, as the
+        // kick machine. The older voice of the tests renders them as they were.)
+        if constexpr (std::is_same<Voice, DrumVoice>::value)
+            if (Voice::isKickPoint(type))
+                v.applyKickPoint(Voice::kickPoint(type, tune, decay, tone, drive, snap, 0.9f));
         v.noteOn(velocity);
 
         std::vector<float> out((size_t) (seconds * SR), 0.0f);
@@ -197,6 +207,7 @@ private:
         return out;
     }
 
+private:
     // Two seconds of a warm, slowly moving tone on middle C (the sampler's default ROOT) that joins
     // up exactly where it repeats: three sawtooth-like voices of twelve harmonics, a few cents
     // apart. Every partial makes a whole number of cycles in the buffer (523 cycles of the middle
@@ -442,3 +453,5 @@ private:
     int defaultEntry = 0;
     int breakStart = 0, breakEnd = 0;
 };
+
+#include "DrumVoice.h"

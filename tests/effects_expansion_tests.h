@@ -3,7 +3,6 @@
 #include "../src/dsp/effects/HallReverb.h"
 #include "../src/dsp/effects/SpringReverb.h"
 #include "../src/dsp/effects/ShimmerReverb.h"
-#include "../src/dsp/effects/MultiTapDelay.h"
 #include "../src/dsp/effects/ReverseDelay.h"
 #include "../src/dsp/effects/Ensemble.h"
 #include "../src/dsp/effects/RotarySpeaker.h"
@@ -49,7 +48,6 @@ public:
         testHallReverb();
         testSpringReverb();
         testShimmerReverb();
-        testMultiTapDelay();
         testReverseDelay();
         testEnsemble();
         testRotarySpeaker();
@@ -147,8 +145,8 @@ private:
         expectWithinAbsoluteError(fx.getParameter(SpringReverb::Tension), 0.6f, 0.001f);
         fx.setParameter(SpringReverb::Damping, 0.4f);
         expectWithinAbsoluteError(fx.getParameter(SpringReverb::Damping), 0.4f, 0.001f);
-        fx.setParameter(SpringReverb::Mix, 0.5f);
-        expectWithinAbsoluteError(fx.getParameter(SpringReverb::Mix), 0.5f, 0.001f);
+        fx.setMix(0.5f);        // (no MIX cell: the slot's WET)
+        expectWithinAbsoluteError(fx.getMix(), 0.5f, 0.001f);
     }
 
     void testShimmerReverb()
@@ -165,32 +163,10 @@ private:
         expectWithinAbsoluteError(fx.getParameter(ShimmerReverb::ShiftMode), 1.0f, 0.001f);
         fx.setParameter(ShimmerReverb::Damping, 0.5f);
         expectWithinAbsoluteError(fx.getParameter(ShimmerReverb::Damping), 0.5f, 0.001f);
-        fx.setParameter(ShimmerReverb::Size, 1.2f);
-        expectWithinAbsoluteError(fx.getParameter(ShimmerReverb::Size), 1.2f, 0.001f);
-        fx.setParameter(ShimmerReverb::Mix, 0.3f);
-        expectWithinAbsoluteError(fx.getParameter(ShimmerReverb::Mix), 0.3f, 0.001f);
-    }
-
-    void testMultiTapDelay()
-    {
-        MultiTapDelay fx;
-        runStandardTests(fx, "MultiTapDelay");
-
-        beginTest("MultiTapDelay parameter round-trip");
-        // Test tap parameters
-        fx.setParameter(MultiTapDelay::tapTime(0), 0.5f);
-        expectWithinAbsoluteError(fx.getParameter(MultiTapDelay::tapTime(0)), 0.5f, 0.001f);
-        fx.setParameter(MultiTapDelay::tapLevel(0), 0.8f);
-        expectWithinAbsoluteError(fx.getParameter(MultiTapDelay::tapLevel(0)), 0.8f, 0.001f);
-        fx.setParameter(MultiTapDelay::tapPan(0), 0.3f);
-        expectWithinAbsoluteError(fx.getParameter(MultiTapDelay::tapPan(0)), 0.3f, 0.001f);
-        fx.setParameter(MultiTapDelay::tapFeedback(0), 0.6f);
-        expectWithinAbsoluteError(fx.getParameter(MultiTapDelay::tapFeedback(0)), 0.6f, 0.001f);
-        // Test global parameters
-        fx.setParameter(MultiTapDelay::NumTaps, 6.0f);
-        expectWithinAbsoluteError(fx.getParameter(MultiTapDelay::NumTaps), 6.0f, 0.001f);
-        fx.setParameter(MultiTapDelay::MixParam, 0.4f);
-        expectWithinAbsoluteError(fx.getParameter(MultiTapDelay::MixParam), 0.4f, 0.001f);
+        fx.setExtra(ShimmerReverb::Size, 1.2f);     // (FX2)
+        expectWithinAbsoluteError(fx.getExtra(ShimmerReverb::Size), 1.2f, 0.001f);
+        fx.setMix(0.3f);        // (no MIX cell: the slot's WET)
+        expectWithinAbsoluteError(fx.getMix(), 0.3f, 0.001f);
     }
 
     void testReverseDelay()
@@ -239,10 +215,15 @@ private:
         expectWithinAbsoluteError(fx.getParameter(RotarySpeaker::DrumRate), 1.5f, 0.001f);
         fx.setParameter(RotarySpeaker::Acceleration, 0.7f);
         expectWithinAbsoluteError(fx.getParameter(RotarySpeaker::Acceleration), 0.7f, 0.001f);
-        fx.setParameter(RotarySpeaker::CrossoverFreq, 1000.0f);
-        expectWithinAbsoluteError(fx.getParameter(RotarySpeaker::CrossoverFreq), 1000.0f, 0.1f);
-        fx.setParameter(RotarySpeaker::Mix, 0.5f);
-        expectWithinAbsoluteError(fx.getParameter(RotarySpeaker::Mix), 0.5f, 0.001f);
+        // (The crossover is a cell of FX2 and the mix the slot's WET: no ids beyond the four.)
+        fx.setExtra(RotarySpeaker::Crossover, 1000.0f);
+        expectWithinAbsoluteError(fx.getExtra(RotarySpeaker::Crossover), 1000.0f, 0.1f);
+        fx.setMix(0.5f);
+        expectWithinAbsoluteError(fx.getMix(), 0.5f, 0.001f);
+        fx.setParameter(4, 0.25f);
+        fx.setParameter(5, 0.25f);
+        expectWithinAbsoluteError(fx.getExtra(RotarySpeaker::Crossover), 1000.0f, 0.1f, "id 4 is no cell");
+        expectWithinAbsoluteError(fx.getMix(), 0.5f, 0.001f, "id 5 is no cell");
     }
 
     void testAutoPan()
@@ -259,8 +240,8 @@ private:
         expectWithinAbsoluteError(fx.getParameter(AutoPan::Shape), 1.0f, 0.001f);
         fx.setParameter(AutoPan::Phase, 0.25f);
         expectWithinAbsoluteError(fx.getParameter(AutoPan::Phase), 0.25f, 0.001f);
-        fx.setParameter(AutoPan::Mix, 0.8f);
-        expectWithinAbsoluteError(fx.getParameter(AutoPan::Mix), 0.8f, 0.001f);
+        fx.setMix(0.8f);
+        expectWithinAbsoluteError(fx.getMix(), 0.8f, 0.001f);
     }
 
     void testWaveshaper()
@@ -300,6 +281,9 @@ private:
     void testTransientShaper()
     {
         TransientShaper fx;
+        // (At rest the shaper is the dry sound, sample for sample, since phase E3: the standard
+        // tests want an effect that does something.)
+        fx.setParameter(TransientShaper::Attack, 0.8f);
         runStandardTests(fx, "TransientShaper");
 
         beginTest("TransientShaper parameter round-trip");
@@ -311,8 +295,8 @@ private:
         expectWithinAbsoluteError(fx.getParameter(TransientShaper::Speed), 0.7f, 0.001f);
         fx.setParameter(TransientShaper::Output, 3.0f);
         expectWithinAbsoluteError(fx.getParameter(TransientShaper::Output), 3.0f, 0.001f);
-        fx.setParameter(TransientShaper::Mix, 0.4f);
-        expectWithinAbsoluteError(fx.getParameter(TransientShaper::Mix), 0.4f, 0.001f);
+        fx.setMix(0.4f);
+        expectWithinAbsoluteError(fx.getMix(), 0.4f, 0.001f);
     }
 };
 

@@ -23,7 +23,6 @@ public:
         int current = -1;
         int loads = 0, saves = 0, saveAs = 0, news = 0;
         int lastSlot = -1;
-        bool autosave = true;
 
         SettingsScreen::Hooks hooks()
         {
@@ -34,8 +33,6 @@ public:
             h.saveToSlot = [this](int s) { ++saveAs; lastSlot = s; used[s] = true; current = s; return true; };
             h.saveCurrent = [this] { if (current < 0) return false; ++saves; return true; };
             h.newProject = [this] { ++news; current = -1; };
-            h.getAutosave = [this] { return autosave; };
-            h.setAutosave = [this](bool on) { autosave = on; };
             return h;
         }
     };
@@ -48,13 +45,13 @@ public:
 
     void runTest() override
     {
-        beginTest("Four pages; PROJ cells are SLOT LOAD SAVE SVAS / NEW AUTO");
+        beginTest("Four pages; PROJ cells are SLOT LOAD SAVE SVAS / NEW");
         {
             SettingsScreen screen;
             expectEquals(screen.getPageCount(), 4);
             expectEquals(screen.getName(), juce::String("SETUP"));
             toProjectPage(screen);
-            const char* expected[8] = { "SLOT", "LOAD", "SAVE", "SVAS", "NEW", "AUTO", "---", "---" };
+            const char* expected[8] = { "SLOT", "LOAD", "SAVE", "SVAS", "NEW", "---", "---", "---" };
             for (int i = 0; i < 8; ++i)
                 expectEquals(screen.getEncoderName(i), juce::String(expected[i]));
             expect(!screen.usesEncoderBar());
@@ -146,7 +143,7 @@ public:
             expectEquals(fake.loads, 1);
         }
 
-        beginTest("SAVE on a never-saved project uses the selected slot; NEW and AUTO work");
+        beginTest("SAVE on a never-saved project uses the selected slot; NEW works");
         {
             Fake fake;
             SettingsScreen screen(fake.hooks());
@@ -161,11 +158,6 @@ public:
             for (int i = 0; i < SettingsScreen::ACTION_STEPS; ++i)
                 screen.onEncoderChange(4, 1);
             expectEquals(fake.news, 1);
-
-            screen.onEncoderChange(5, 127);
-            expect(!fake.autosave);
-            screen.onEncoderChange(5, 1);
-            expect(fake.autosave);
         }
 
         beginTest("Renders every page");
@@ -242,11 +234,13 @@ public:
                 expectEquals(screen.getEncoderName(i), juce::String(expected[i]));
 
             screen.onEncoderChange(0, 20);
-            expect(audio.getMasterEQ().getParameter(0) > 3.0f, "Low shelf gain raised");
+            // (E5: the master section is an insert chain; the MASTR page's cells are cells of its EQ, CMP and LMT)
+            const int M = AudioEngine::MASTER_TRACK, CELLS = AudioEngine::EFFECT_PARAM_BASE;
+            expect(audio.getTrackParameter(M, CELLS + 4 * audio.getMasterSlot(EffectType::EQEffect) + 0) > 3.0f, "Low shelf gain raised");
             screen.onEncoderChange(4, 78);     // threshold down
-            expect(audio.getMasterComp().getThreshold() < -10.0f);
+            expect(audio.getTrackParameter(M, CELLS + 4 * audio.getMasterSlot(EffectType::CompressorEffect) + 0) < -10.0f);
             screen.onEncoderChange(5, 30);
-            expect(audio.getMasterComp().getRatio() > 2.0f);
+            expect(audio.getTrackParameter(M, CELLS + 4 * audio.getMasterSlot(EffectType::CompressorEffect) + 1) > 2.0f);
         }
 
         beginTest("A whole project survives save to a folder and load into a fresh instrument");
@@ -284,7 +278,7 @@ public:
             audio.setTrackParameter(2, WavetableEngine::TableSelect, 5.0f);
             audio.addInsertEffect(0, EffectType::DelayEffect);
             audio.setTrackParameter(0, AudioEngine::EFFECT_PARAM_BASE + 1, 0.8f);                 // delay feedback
-            audio.setSendBusEffect(0, EffectType::HallReverbEffect);
+            audio.setInsertEffect(AudioEngine::sendTrack(0), 0, EffectType::HallReverbEffect);
 
             auto& step = seq.getPattern(0).getTrack(0).getStep(3);
             step.trig = true;
@@ -348,7 +342,10 @@ public:
             expectEquals((int) audio2.getTrackParameter(0, UnifiedParam::MODEL_A), 2);
             expectWithinAbsoluteError(audio2.getTrackParameter(0, MixParam::VOLUME), 0.5f, 0.001f);
             expectWithinAbsoluteError(audio2.getTrackParameter(0, MixParam::PAN), -0.4f, 0.001f);
-            expectWithinAbsoluteError(audio2.getTrackParameter(0, TrackFxParam::TALK_BASE + TalkBlock::Mix), 0.7f, 0.001f);
+            // Old TrackFx params are no longer readable as track parameters; they are loaded as inserts.
+            // Check that the TALK insert was created from the saved TALK_BASE+Mix=0.7 value.
+            // (TrackFx params read 0 now.)
+            expectEquals(audio2.getTrackParameter(0, TrackFxParam::TALK_BASE + TalkBlock::Mix), 0.0f);
             expectWithinAbsoluteError(audio2.getTrackParameter(1, DrumEngine::PARAMS_PER_VOICE * 8 + DrumEngine::DECAY), 1.25f, 0.001f);
             expectEquals((int) audio2.getTrackParameter(2, WavetableEngine::TableSelect), 5);
 

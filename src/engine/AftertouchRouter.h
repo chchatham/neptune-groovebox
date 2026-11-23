@@ -22,7 +22,10 @@ public:
         DrumPitch,
         DrumDecay,
         DrumDrive,
-        DrumSnap
+        DrumSnap,
+        // The voice's exciter energy follows the pad's pressure (the resonator's exciters, the
+        // macro oscillator's bow).
+        Excite
     };
 
     struct Route
@@ -72,6 +75,7 @@ public:
         float wavePosMod = 0.0f;
         float vibratoMod = 0.0f;
         float panMod = 0.0f;
+        float exciteMod = 0.0f;
     };
 
     void removeRoute(int index)
@@ -96,11 +100,12 @@ public:
             case Destination::DrumDecay:    return "DEC";
             case Destination::DrumDrive:    return "DRIV";
             case Destination::DrumSnap:     return "SNAP";
+            case Destination::Excite:       return "EXC";
             default:                        return "---";
         }
     }
 
-    static constexpr int DEST_COUNT = 12;
+    static constexpr int DEST_COUNT = 13;
 
     ModValues computeModulation(float pressure) const
     {
@@ -126,10 +131,20 @@ public:
                 case Destination::WavePosition:  vals.wavePosMod  += mod; break;
                 case Destination::Vibrato:       vals.vibratoMod  += mod; break;
                 case Destination::PanSpread:     vals.panMod      += mod; break;
+                case Destination::Excite:        vals.exciteMod   += mod; break;
                 default:                         break;      // Off, and the drum destinations
             }
         }
         return vals;
+    }
+
+    // True when an active route has this destination and a depth that is not zero.
+    bool hasRoute(Destination d) const
+    {
+        for (int i = 0; i < routeCount; ++i)
+            if (routes[static_cast<size_t>(i)].dest == d && routes[static_cast<size_t>(i)].depth != 0.0f)
+                return true;
+        return false;
     }
 
     // Every route off.

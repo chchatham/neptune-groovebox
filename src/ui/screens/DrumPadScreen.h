@@ -1,17 +1,33 @@
 #pragma once
 
 #include "../ScreenManager.h"
+#include "../TurnNotice.h"
 #include "../../engine/DrumEngine.h"
+#include <cstring>
 #include <functional>
+#include <vector>
 
 // -----------------------------------------------------------------------------
 // DRUMS: the 16 pads play and select the 16 drum voices; the 8 encoders edit the
 // selected voice.
 //
 //   y 11-31  the pads as a 2 x 8 map (kit position, voice type; selected inverted)
-//   y 33-51  eight bars, one per encoder column: TUNE DEC TONE DRIV SNAP LEVL PAN TYPE
+//   y 33-51  eight bars, one per encoder column
 //   bottom   encoder labels (the standard encoder bar)
-// The name bar shows the selected pad and its voice type. Pads: one colour per kind of voice.
+// The name bar shows the selected pad and its voice type (on a further page: the page).
+// Pads: one colour per kind of voice.
+//
+// Knob pages (the bank buttons, going round): the selected pad's own pages, the same ones PARAM
+// shows for it (DrumEngine::padPages), eight knobs each:
+//   DR     TN DC TO DV SN LV PN TY     tune, decay, tone, drive, snap, level, pan, type
+//   KICK   SW ST SC SH KN KT HD AC     a kick: the kick machine's first page
+//   KCK2   KD LN RS LS LK SA ED PA     a kick: its second
+//   RSN    SN MR XM EN DP WR MT DR     a resonator drum
+//   BANK   MD PG CL EX DP BL CP LF     an oscillator bank
+//   PLFO   RT DP SH DS TG SY DV FD     the pad's own LFO
+//   PSLT   S1 D1 A1 V1 S2 D2 A2 V2     the pad's two own slots
+// Another pad keeps the page where it has one of that kind (a kick's KICK page becomes the
+// sound page of a resonator drum or a bank), else its DR page.
 // -----------------------------------------------------------------------------
 class DrumPadScreen : public Screen
 {
@@ -20,52 +36,106 @@ public:
 
     juce::String getName() const override { return "DRUMS"; }
 
+    // "P9 KSYN": the pad and its type; on a further page the page's name ("P9 KCK2"). Seven
+    // characters are what the name bar has beside "DRUMS T1" and the page mark, so a pad with two
+    // digits goes without its P ("16 KCK2").
     juce::String getSubPage() const override
     {
         auto* e = engine();
         if (!e || selectedVoice < 0) return "NO DRUM TRK";
-        return "P" + juce::String(selectedVoice + 1) + " "
-             + DrumEngine::typeNames()[juce::jlimit(0, DrumEngine::NUM_DRUM_TYPES - 1,
-                                                    (int) e->getVoice(selectedVoice).getType())];
+        if (notice.showing())
+            return notice.shown();
+        const juce::String word = getPageIndex() > 0
+                                      ? currentPage().name
+                                      : juce::String(DrumEngine::typeNames()[juce::jlimit(0, DrumEngine::NUM_DRUM_TYPES - 1,
+                                                                                          (int) e->getVoice(selectedVoice).getType())]);
+        const juce::String pad(selectedVoice + 1);
+        const juce::String text = "P" + pad + " " + word;
+        return text.length() <= STATUS_ROOM ? text : pad + " " + word;
+    }
+    static constexpr int STATUS_ROOM = 7;
+
+    // A cell's two letters on the bar and its name in the readout, by its label on the page.
+    struct CellName { const char* label; const char* two; const char* name; };
+    static const CellName* cellName(const char* label)
+    {
+        static const CellName names[] = {
+            { "TUNE", "TN", "TUNE" },       { "DEC",  "DC", "DECAY" },      { "TONE", "TO", "TONE" },       { "DRIV", "DV", "DRIVE" },
+            { "SNAP", "SN", "SNAP" },       { "LEVL", "LV", "LEVEL" },      { "PAN",  "PN", "PAN" },        { "TYPE", "TY", "TYPE" },
+            { "SWEP", "SW", "SWEEP" },      { "SWPT", "ST", "SWP TIME" },   { "SCRV", "SC", "SWP CURVE" },  { "SHAP", "SH", "SHAPE" },
+            { "KNCK", "KN", "KNOCK" },      { "KTON", "KT", "KNOCK TONE" }, { "HOLD", "HD", "HOLD" },       { "ACRV", "AC", "DEC CURVE" },
+            { "KIND", "KD", "KIND" },       { "LIN",  "LN", "LIN SWEEP" },  { "RES",  "RS", "TONE RESO" },  { "LPSW", "LS", "TONE SWP" },
+            { "LPKT", "LK", "TONE TRACK" }, { "SAT",  "SA", "SATURATE" },   { "EDGE", "ED", "EDGE" },       { "PATH", "PA", "STAGES" },
+            { "MODL", "MD", "MODEL" },      { "PING", "PG", "PING" },       { "COLR", "CL", "COLOUR" },     { "EXC",  "EX", "EXCITER" },
+            { "DAMP", "DP", "DAMPING" },    { "BLOM", "BL", "BLOOM" },      { "COUP", "CP", "COUPLING" },   { "LOFI", "LF", "LO-FI" },
+            { "SND",  "SN", "SOUND" },      { "MRPH", "MR", "MORPH" },      { "XMPH", "XM", "EXC MRPH" },   { "ENRG", "EN", "ENERGY" },
+            { "WIRE", "WR", "WIRES" },      { "MEET", "MT", "BOW MEETS" },  { "DIR",  "DR", "DIRECT" },
+            { "RATE", "RT", "LFO RATE" },   { "DPTH", "DP", "LFO DEPTH" },  { "SHPE", "SH", "LFO SHAPE" },  { "DEST", "DS", "LFO DEST" },
+            { "TRIG", "TG", "LFO TRIG" },   { "SYNC", "SY", "LFO SYNC" },   { "DIV",  "DV", "LFO DIV" },    { "FADE", "FD", "LFO FADE" },
+            { "SRC1", "S1", "SRC1" },       { "DST1", "D1", "DST1" },       { "AMT1", "A1", "AMT1" },       { "VIA1", "V1", "VIA1" },
+            { "SRC2", "S2", "SRC2" },       { "DST2", "D2", "DST2" },       { "AMT2", "A2", "AMT2" },       { "VIA2", "V2", "VIA2" } };
+        for (auto& n : names)
+            if (std::strcmp(n.label, label) == 0)
+                return &n;
+        return nullptr;
     }
 
-    // Full name and value of knob i, for the name bar.
+    // Full name and value of knob i, for the name bar ("KNOCK TONE 40"). The name bar has
+    // READOUT_ROOM characters for it beside "DRUMS"; where the full name would push the value out,
+    // the cell's own label stands for it ("KTON 40"): the value is what the turn is about.
+    static constexpr int READOUT_ROOM = 14;
     juce::String getEncoderReadout(int encoderIndex) const override
     {
-        static const char* const names[] = { "TUNE", "DECAY", "TONE", "DRIVE", "SNAP", "LEVEL", "PAN", "TYPE" };
-        static const char* const kickNames[] = { "SWEEP", "SWEEP TIME", "SWEEP CURVE", "SHAPE", "KNOCK", "KNOCK TONE", "HOLD", "DECAY CURVE" };
-        static const char* const cymbalNames[] = { "MODEL", "PING", "COLOUR", "NOISE", "DAMPING", "BLOOM", "VEL SENS", "LO-FI" };
         auto* e = engine();
         if (!e || selectedVoice < 0 || encoderIndex < 0 || encoderIndex >= 8) return {};
-        auto spec = currentPage().params[(size_t) encoderIndex];
-        return juce::String(onKickPage() ? kickNames[encoderIndex] : onCymbalPage() ? cymbalNames[encoderIndex] : names[encoderIndex])
-             + " " + spec.format(e->getParameter(spec.id));
+        if (notice.showing())
+            return notice.shown();
+        const auto spec = currentPage().params[(size_t) encoderIndex];
+        if (!spec.isValid()) return {};
+        const juce::String value = spec.format(e->getParameter(spec.id));
+        const auto* n = cellName(spec.label);
+        const juce::String full = juce::String(n != nullptr ? n->name : spec.label) + " " + value;
+        return full.length() <= READOUT_ROOM ? full : juce::String(spec.label) + " " + value;
     }
 
-    // A pad whose TYPE is KSYN (the kick machine) has a second knob page: sweep, shape, knock.
-    // So has one whose TYPE is CSYN (the cymbal machine): model, ping, colour, bloom.
-    bool hasKickPage() const
+    // ---- The selected pad's pages ----------------------------------------------------------------
+    enum class PadPage { Voice, Kick, Sound, Lfo, Slot };
+    std::vector<PadPage> pageKinds() const
     {
+        std::vector<PadPage> kinds { PadPage::Voice };
         auto* e = engine();
-        return e != nullptr && selectedVoice >= 0 && e->isKickMachine(selectedVoice);
+        if (e != nullptr && selectedVoice >= 0)
+        {
+            if (e->isKickMachine(selectedVoice)) kinds.push_back(PadPage::Kick);
+            if (e->hasSoundPage(selectedVoice))  kinds.push_back(PadPage::Sound);
+            kinds.push_back(PadPage::Lfo);
+            kinds.push_back(PadPage::Slot);
+        }
+        return kinds;
     }
-    bool hasCymbalPage() const
-    {
-        auto* e = engine();
-        return e != nullptr && selectedVoice >= 0 && e->isCymbalMachine(selectedVoice);
-    }
-    bool hasMachinePage() const { return hasKickPage() || hasCymbalPage(); }
-    bool onKickPage() const { return kickPage && hasKickPage(); }
-    bool onCymbalPage() const { return kickPage && hasCymbalPage(); }
     ParamPage currentPage() const
     {
-        return onKickPage() ? DrumEngine::kickPage(selectedVoice)
-             : onCymbalPage() ? DrumEngine::cymbalPage(selectedVoice) : DrumEngine::voicePage(selectedVoice);
+        auto* e = engine();
+        if (e == nullptr || selectedVoice < 0) return DrumEngine::voicePage(juce::jmax(0, selectedVoice));
+        const auto pages = e->padPages(selectedVoice);
+        return pages[(size_t) juce::jlimit(0, (int) pages.size() - 1, getPageIndex())];
     }
-    int getPageCount() const override { return hasMachinePage() ? 2 : 1; }
-    int getPageIndex() const override { return onKickPage() || onCymbalPage() ? 1 : 0; }
-    void onArrowLeft() override  { if (hasMachinePage()) kickPage = !kickPage; }
-    void onArrowRight() override { if (hasMachinePage()) kickPage = !kickPage; }
+    int getPageCount() const override { return (int) pageKinds().size(); }
+    int getPageIndex() const override
+    {
+        const auto kinds = pageKinds();
+        for (int i = 0; i < (int) kinds.size(); ++i)
+            if (kinds[(size_t) i] == wantedPage)
+                return i;
+        // (A kick's first page on a pad that is none: that pad's sound page, where it has one.)
+        if (wantedPage == PadPage::Kick)
+            for (int i = 0; i < (int) kinds.size(); ++i)
+                if (kinds[(size_t) i] == PadPage::Sound)
+                    return i;
+        return 0;
+    }
+    void onArrowLeft() override  { stepPage(-1); }
+    void onArrowRight() override { stepPage(1); }
 
     void render(DisplayRenderer& display) override
     {
@@ -95,6 +165,7 @@ public:
             for (int i = 0; i < 8; ++i)
             {
                 auto& spec = page.params[(size_t) i];
+                if (!spec.isValid()) continue;
                 int x = i * 16;
                 display.drawRect(x + 3, BAR_Y, 10, BAR_H, false);
                 int fill = (int) std::lround(spec.toNorm(e->getParameter(spec.id)) * (float) (BAR_H - 2));
@@ -106,11 +177,11 @@ public:
 
     juce::String getEncoderName(int encoderIndex) const override
     {
-        static const char* names[] = { "TN", "DC", "TO", "DV", "SN", "LV", "PN", "TY" };
-        static const char* kickNames[] = { "SW", "ST", "SC", "SH", "KN", "KT", "HD", "AC" };
-        static const char* cymbalNames[] = { "MD", "PG", "CL", "NS", "DP", "BL", "VS", "LF" };
         if (encoderIndex < 0 || encoderIndex >= 8 || selectedVoice < 0 || !engine()) return {};
-        return onKickPage() ? kickNames[encoderIndex] : onCymbalPage() ? cymbalNames[encoderIndex] : names[encoderIndex];
+        const auto spec = currentPage().params[(size_t) encoderIndex];
+        if (!spec.isValid()) return {};
+        const auto* n = cellName(spec.label);
+        return n != nullptr ? juce::String(n->two) : juce::String(spec.label).substring(0, 2);
     }
 
     void onPadPress(int padIndex, int velocity) override
@@ -155,6 +226,14 @@ public:
 
         auto spec = currentPage().params[(size_t) encoderIndex];
         const int clicks = (value > 64) ? value - 128 : value;
+        if (!spec.isValid() || clicks == 0) return;
+        // A depth or an amount whose destination is OFF moves nothing: say so (as PARAM does).
+        if (const char* why = e->padModIdleReason(spec.id))
+        {
+            notice.say(why);
+            return;
+        }
+        notice.clear();
         const float next = spec.turned(e->getParameter(spec.id), clicks, turnStep());
 
         if (paramSetter) paramSetter(spec.id, next);
@@ -165,7 +244,9 @@ public:
     {
         if (auto* e = engine()) e->setSelectedVoice(selectedVoice);
     }
-    void onDeactivate() override { padDown.fill(false); }
+    void onDeactivate() override { padDown.fill(false); notice.clear(); }
+
+    TurnNotice notice;
 
     // Pads: one colour per kind of voice, dim; the selected pad at full brightness; a pad that is
     // held or sounding white.
@@ -210,6 +291,8 @@ public:
             case DrumSynthType::Shaker:
             case DrumSynthType::Clave:         return { 0, 127, 20 };     // small percussion: green
             case DrumSynthType::SubBass:       return { 127, 110, 0 };    // sub: yellow
+            case DrumSynthType::OscBank:       return { 0, 110, 127 };    // the oscillator bank (hats, metal): cyan
+            case DrumSynthType::Resonator:     return { 70, 0, 127 };     // the resonator drum: violet
         }
         return { 60, 60, 60 };
     }
@@ -254,8 +337,16 @@ private:
     std::function<DrumEngine*()> engineProvider;
     std::function<void(int, float)> paramSetter;
     PadHooks padHooks;
+    void stepPage(int by)
+    {
+        const auto kinds = pageKinds();
+        const int n = (int) kinds.size();
+        wantedPage = kinds[(size_t) ((getPageIndex() + by + n) % n)];
+        notice.clear();
+    }
+
     int selectedVoice = 8;
-    bool kickPage = false;          // the second knob page, while the selected pad is a kick or cymbal machine
+    PadPage wantedPage = PadPage::Voice;    // the knob page, as a kind: a pad without it shows another (getPageIndex)
     std::array<bool, 16> padDown {};
     float lastVelocity[DrumEngine::NUM_VOICES] = {};
 };

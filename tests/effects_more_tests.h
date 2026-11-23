@@ -1080,7 +1080,17 @@ private:
                     kl[i] = kr[i] = keyAmp * dsp::xorshiftNoise(seed);
                 }
                 if (giveKey)
-                    fx.setSidechainBuffers(kl, kr);
+                {
+                    // (as the chain hands it: the first track's sound, through the one door)
+                    const float* tapsL[2] = { kl, kl };
+                    const float* tapsR[2] = { kr, kr };
+                    KeyFeed feed;
+                    feed.tapLeft = tapsL;
+                    feed.tapRight = tapsR;
+                    feed.taps = 2;
+                    feed.frames = count;
+                    feed.hand(fx);
+                }
                 fx.processStereo(l, r, count);
                 out.insert(out.end(), l, l + count);
                 done += count;
@@ -1095,7 +1105,7 @@ private:
             fx.setParameter(SidechainInsert::Threshold, -20.0f);
             fx.setParameter(SidechainInsert::Ratio, 10.0f);
             fx.prepare(sr, BLOCK);
-            expectEquals(fx.getSidechainTrack(), -1);
+            expectEquals(fx.keySource(), (int) EffectBase::KEY_SELF);
 
             Buf self;
             run(fx, 24000, 0.9f, self, false);
@@ -1107,7 +1117,7 @@ private:
             expectWithinAbsoluteError(rms(selfWithKey, 12000, 24000), dryRms, dryRms * 0.02f);
 
             fx.setParameter(SidechainInsert::Source, 2.0f);
-            expectEquals(fx.getSidechainTrack(), 1);
+            expectEquals(fx.keySource(), 1);
             Buf ducked;
             run(fx, 24000, 0.9f, ducked, true);
             float duckedRms = rms(ducked, 12000, 24000);

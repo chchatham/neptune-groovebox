@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Builds docs/Neptune-Groovebox-Manual.pdf.
 
-  tools/manual/dump_params.sh /tmp/params.json            # parameter pages, read from the real classes
+  tools/manual/dump_params.sh /tmp/params.json            # parameter pages, effects, built-in presets and multis, read from the real classes
   NEPTUNE_DUMP_SCREENS=/tmp/screens <the app binary>      # every screen and page as a PBM
   python3 tools/manual/build_manual.py /tmp/params.json /tmp/screens docs/Neptune-Groovebox-Manual.pdf
 
@@ -19,14 +19,17 @@ import chapters
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 ENGINE_NAMES = {"Unified Voice": "Synth", "FM Synth": "FM", "Macro Oscillator": "Macro", "Wavetable": "Wavetable",
-                "Wave Sequencer": "Wave seq", "Sampler": "Sampler", "Drum": "Drums", "MIDI Track": "MIDI track"}
+                "Wave Sequencer": "Wave seq", "Sampler": "Sampler", "Drum": "Drums", "MIDI Track": "MIDI track", "Resonator": "Resonator"}
 FX_NAMES = {"CHR": "Chorus", "DRV": "Drive", "FLG": "Flanger", "PHS": "Phaser", "TRM": "Tremolo", "DLY": "Delay",
             "RVB": "Reverb", "EQ": "Three-band EQ", "CMP": "Compressor", "LMT": "Limiter", "FLT": "Filter",
             "ENS": "Ensemble", "PAN": "Auto-pan", "ROT": "Rotary speaker", "WSH": "Waveshaper", "RED": "Rate reducer",
             "HALL": "Hall reverb", "SPRG": "Spring reverb", "SHIM": "Shimmer reverb", "RVSE": "Reverse delay",
             "TRNS": "Transient shaper", "RING": "Ring modulator", "VIB": "Vibrato", "WAH": "Wah", "AMP": "Amp simulator",
             "GEQ": "Four-band graphic EQ", "TAPE": "Tape delay", "LCR": "Left-centre-right delay",
-            "MTAP": "Multi-tap delay", "DUCK": "Sidechain compressor"}
+            "MTAP": "Multi-tap delay", "DUCK": "Sidechain compressor",
+            "VOC": "Vocoder: the track's input shapes this track's sound",
+            "DIRT": "Dirt: distortion, bit and rate reduction and a tuned feedback in one",
+            "TALK": "Talk: a vowel filter that moves by itself or with the playing level"}
 MACRO_MODELS = [("VA", "virtual analog", "SAWS SPRD HARM MORP"), ("FM", "two-operator FM", "INDX RATI DETN FDBK"),
                 ("FOLD", "wavefolder", "FOLD SHPE BIAS CHEB"), ("FORM", "formant", "VOWL SHFT Q MORP"),
                 ("HARM", "harmonic", "TILT EVOD NUM STRC"), ("PLCK", "plucked string", "DAMP PICK FDBK MORP"),
@@ -76,12 +79,13 @@ class Screens:
 def norm_label(label, device, page):
     if device == "FM" and page in ("FMMIX",) and re.fullmatch(r"LVL\d", label): return "LVL#", "LVL1–LVL6"
     if device == "FM" and re.fullmatch(r"RAT\d", label): return "RAT#", "RAT1–RAT6"
-    if device == "Wave seq":
+    if device == "Wave seq" and page != "LSHP":     # LSHP's L1-L8 are the custom LFO shape, not level steps
         m = re.fullmatch(r"([PSLT])\d+", label)
         if m: return m.group(1) + "#", f"{m.group(1)}1–{m.group(1)}16"
     if device == "Wavetable":
         m = re.fullmatch(r"(SMP|POS|PLC)\d", label)
         if m: return m.group(1) + "#", f"{m.group(1)}1–{m.group(1)}8"
+    if device == "Drums" and re.fullmatch(r"W\d+", label): return "W#", "W1–W16"
     if re.fullmatch(r"CC\d+", label): return "CC#", "CC16–CC23"
     return label, label
 
@@ -90,6 +94,8 @@ def norm_page(page):
     if re.fullmatch(r"OP\d", page): return "OP1–OP6"
     if re.fullmatch(r"DR \d+", page): return "DR"
     if re.fullmatch(r"LFO[12]", page): return "LFO1 / LFO2"
+    if re.fullmatch(r"WAV[12]", page): return "WAV1 / WAV2"
+    if re.fullmatch(r"SLT\d", page): return "SLT1–SLT8"
     m = re.fullmatch(r"(PIT|SHP|LVL|TIM) [AB]", page)
     if m: return f"{m.group(1)} A / B"
     return page
@@ -101,7 +107,7 @@ def num(v):
 
 def values_text(s):
     if s["choices"]:
-        ch = s["choices"]
+        ch = [c for c in s["choices"] if c]        # (an unnamed place is one the list keeps and no longer offers)
         if len(ch) <= 9 and sum(len(c) for c in ch) <= 44:
             return " ".join(ch)
         return f"{len(ch)} values (App. C)"
@@ -128,10 +134,51 @@ def describe(key, ctx):
     return None
 
 
+# The first entry whose page pattern matches wins, so a general entry written for one page can give its text to a
+# cell of the same name on another page without anything failing. Two checks on every engine cell:
+#   SUBJECT  a cell on a page with a subject of its own has text that names that subject;
+#   FOREIGN  text that belongs to one kind of page (a MIDI controller, a reverb, the wavetable's table, the strum)
+#            is not given to a cell elsewhere.
+SUBJECT = [(r"^(Macro|Wave seq)/BODY$", r"(?i)body"), (r"^(Macro|Wave seq)/BDY2$", r"BDY2"),
+           (r"^Resonator/(BODY|BOD2|EXC|GRAIN)$", r"(?i)resonator|body"),
+           (r"^Drums/RSN$", r"(?i)resonator"), (r"^Drums/BANK$", r"(?i)bank"), (r"^Drums/(KICK|KCK2)$", r"(?i)kick"),
+           (r"^Drums/WAV\d$", r"WAV1"), (r"^Drums/PLFO$", r"(?i)pad"), (r"^Drums/PSLT$", r"(?i)slot"),
+           (r"/STRIP$", r"(?i)strip"), (r"/XIN$", r"XIN|input"),
+           (r"/SLT\d$", r"(?i)slot"), (r"/LSHP$", r"LSHP"), (r"/LFO\d$", r"LFO"),
+           (r"^MIDI track/", r"(?i)\bsends?\b|controller")]
+FOREIGN = [(r"\(CC \d+\)", r"^MIDI track/"), (r"(?i)\breverb\b", r"^(MIDI track/|Insert )"), (r"XKEY", r"^(?!Insert )"), (r"Where in the wavetable", r"^Wavetable/"),
+           (r"HARM model", r"^Macro/"), (r"(?i)\bstrum", r"^ARP"), (r"(?i)cymbal machine", r"(?!)"),     # (the CYM page is gone)
+           (r"(?i)\bkick machine", r"^Drums/"), (r" macro of the ", r"^Macro/MACRO$"), (r"(?i)\bLFO starts", r"/(LFO\d|MOD2?|PLFO)$")]
+
+
+def context_errors(text, ctx):
+    errors = []
+    for page, need in SUBJECT:
+        if re.search(page, ctx) and not re.search(need, text):
+            errors.append(f"names no {need!r}")
+    for mark, allowed in FOREIGN:
+        if re.search(mark, text) and not re.search(allowed, ctx):
+            errors.append(f"has {mark!r}, which belongs to {allowed!r}")
+    return errors
+
+
+def duplicate_desc_keys():
+    """Keys written twice in glossary_data.py's DESC literal: Python keeps the last, silently."""
+    import ast
+    tree = ast.parse(open(os.path.join(HERE, "glossary_data.py"), encoding="utf-8").read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "DESC" for t in node.targets) \
+                and isinstance(node.value, ast.Dict):
+            keys = [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+            return sorted({k for k in keys if keys.count(k) > 1})
+    return []
+
+
 def glossary_rows(params):
     """-> list of dict(short, long, where, values, text), merged and sorted."""
     found = {}      # (short, long, text) -> {"where": {(kind, device): [pages]}, "values": set}
     missing = []
+    wrong = [f"{k}: written twice in DESC (the first is lost)" for k in duplicate_desc_keys()]
 
     def add(short, long_name, text, kind, device, page, values):
         e = found.setdefault((short, long_name, text), {"where": {}, "values": []})
@@ -149,6 +196,9 @@ def glossary_rows(params):
         if got is None:
             missing.append(f"{spec['label']} ({device}/{page})")
             return
+        if kind in ("engine", "insert"):
+            wrong.extend(f"{spec['label']} ({device}/{page}) reads {got[0]!r}: {e}"
+                         for e in context_errors(got[0] + " " + got[1], f"{ctx_device or device}/{page}"))
         add(shown, got[0], got[1], kind, device, norm_page(page), values_text(spec))
 
     for eng in params["engines"]:
@@ -163,14 +213,13 @@ def glossary_rows(params):
                 missing.append(f"{label} (Macro model {model})")
             else:
                 add(label, got[0], got[1], "engine", "Macro", "MACRO", "0–100")
-    for block in params["blocks"]:
-        for spec in block["specs"]:
-            take(spec, "trkfx", "TRK FX", block["name"], ctx_device="TRK FX " + block["name"])
     for fx in params["effects"]:
         for spec in fx["specs"]:
             take(spec, "insert", fx["name"], "FX", ctx_device="Insert " + fx["name"])
     if missing:
         raise SystemExit("glossary_data.py has no description for:\n  " + "\n  ".join(sorted(set(missing))))
+    if wrong:
+        raise SystemExit("glossary_data.py gives a cell another page's text:\n  " + "\n  ".join(sorted(set(wrong))))
 
     rows = []
     for (short, long_name, text), e in found.items():
@@ -353,10 +402,10 @@ def build_html(params, screens, pages=None):
         page = pages.get(anchor, "") if pages else ""
         items.append(f'<li class="{kind}"><a href="#{anchor}">{esc(text)}</a><span class="dots"></span><span>{page}</span></li>')
     cover = (f'<section class="cover"><div class="eyebrow">Owner\'s manual</div><div class="title">Neptune<br>Groovebox</div>'
-             f'<div class="sub">An eyes-free groovebox played entirely from a Launchkey Mini 25 MK4: eight sound engines, '
-             f'a step sequencer with parameter locks, per-pad pressure, and sampling.</div>'
+             f'<div class="sub">An eyes-free groovebox played entirely from a Launchkey Mini 25 MK4: eight sound engines '
+             f'and a MIDI track, one modulation router, a step sequencer with parameter locks, per-pad pressure, and sampling.</div>'
              f'{screens.svg("TRACKS", 1)}'
-             f'<div class="foot"><span>{esc(chapters.EDITION)}</span><span>Firmware NPE · macOS</span></div></section>')
+             f'<div class="foot"><span>{esc(chapters.EDITION)}</span><span>Firmware NPF · macOS</span></div></section>')
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>Neptune Groovebox Manual</title><style>{CSS}</style></head>'
             f'<body>{cover}<section class="toc"><h1>Contents</h1><ol>{"".join(items)}</ol></section>{"".join(body)}</body></html>')
 
@@ -370,6 +419,10 @@ def render(html_text, pdf_path):
 
 
 def main():
+    if sys.argv[1:2] == ["--check"]:        # the glossary's checks alone, without the screens or Chrome
+        params = json.load(open(sys.argv[2]))
+        print(f"{len(glossary_rows(params))} glossary rows, every cell described by its own page's text")
+        return
     params_path, screens_dir, out = sys.argv[1:4]
     params = json.load(open(params_path))
     screens = Screens(screens_dir)

@@ -8,14 +8,22 @@
 //
 //   SETUP   BPM  SWNG QNT  CLK  | MVOL PAT  HELP ---      (HELP: the Shift / Func help cards)
 //   MASTR   LOW  MID  MFRQ HIGH | THR  RATI MAKE CEIL     (master EQ, compressor, limiter)
-//   PROJ    SLOT LOAD SAVE SVAS | NEW  AUTO ---  ---
+//   PROJ    SLOT LOAD SAVE SVAS | NEW  ---  ---  ---
 //   CLICK   CLCK CLVL CNT  ---  | ---  ---  ---  ---      (the metronome: when, how loud, count-in)
 //
 // Projects live in numbered slots (there is no keyboard to type names): SLOT picks one, and the
 // strip at the bottom says whether it holds a project and which slot the current project came
 // from. LOAD / SAVE / SVAS / NEW are actions: four clicks clockwise on the knob, spread over at
 // least 300 ms (Screen::TurnConfirm), so a brushed knob never overwrites or discards anything;
-// the cell shows the progress and then OK or FAIL. Pads are dark on this screen.
+// the cell shows the progress and then OK or FAIL. One turn runs its action once: clicks that go
+// on after it has run do nothing until the knob has rested (ACTION_REST_MS), been turned back, or
+// another control has been used. (A long turn of SVAS used to save twice, and the second save
+// made the first one "what the slot held": Cancel in the Mac's box then took nothing back.)
+// Pads are dark on this screen.
+//
+// SAVE and SVAS save at once; the Mac then asks for the name and can take the save back (the app's
+// hooks: ui/ProjectSlots.h). The Mac also lists the projects by name while PROJ is showing
+// (ui/ProjectBrowser.h): a click there is selectSlot(), a double-click loadSlot().
 //
 // The screen knows nothing about the app: everything goes through the hooks below.
 // -----------------------------------------------------------------------------
@@ -24,6 +32,7 @@ class SettingsScreen : public GridScreen
 public:
     static constexpr int NUM_SLOTS = 32;
     static constexpr int ACTION_STEPS = TurnConfirm::STEPS;      // clockwise clicks needed to run an action
+    static constexpr juce::int64 ACTION_REST_MS = 600;           // a knob at rest this long starts a new turn
 
     struct Hooks
     {
@@ -45,7 +54,6 @@ public:
         std::function<bool(int)> saveToSlot;        // save as
         std::function<bool()> saveCurrent;          // false if never saved
         std::function<void()> newProject;
-        std::function<bool()> getAutosave;          std::function<void(bool)> setAutosave;
         // CLICK (kept by the app between sessions, not in the project)
         std::function<int()> getClickMode;          std::function<void(int)> setClickMode;     // 0 OFF, 1 REC, 2 PLAY
         std::function<float()> getClickLevel;       std::function<void(float)> setClickLevel;  // 0..1; the app lets it be heard
@@ -79,13 +87,27 @@ public:
         if (!action)
         {
             confirm.cancel();
+            ranKnob = -1;
             GridScreen::onEncoderChange(encoderIndex, value);
             return;
         }
         const auto which = (Action) (encoderIndex - 1);
+        const int delta = value > 64 ? value - 128 : value;
+        const auto now = clock ? clock() : UiClock::nowMs();
+        // The rest of the turn that has just run this action: nothing more (the cell keeps its OK).
+        if (ranKnob == encoderIndex && delta > 0 && now - ranLastMs < ACTION_REST_MS)
+        {
+            ranLastMs = now;
+            return;
+        }
+        ranKnob = -1;
         for (auto& r : actionResult) r = 0;
-        if (confirm.step(encoderIndex, value > 64 ? value - 128 : value, clock ? clock() : -1))
+        if (confirm.step(encoderIndex, delta, now))
+        {
             actionResult[(size_t) which] = runAction(which) ? 1 : -1;
+            ranKnob = encoderIndex;
+            ranLastMs = now;
+        }
     }
 
     void onArrowLeft() override  { resetActions(); GridScreen::onArrowLeft(); }
@@ -111,6 +133,28 @@ public:
 
     int getSelectedSlot() const { return selectedSlot; }
     void setSelectedSlot(int s) { selectedSlot = juce::jlimit(0, NUM_SLOTS - 1, s); }
+    // What an action cell (knob 1 LOAD ... 4 NEW) says it did: 1 = OK, -1 = FAIL, 0 = nothing yet.
+    int getActionResult(int encoderIndex) const
+    {
+        return encoderIndex >= 1 && encoderIndex <= NumActions ? actionResult[(size_t) (encoderIndex - 1)] : 0;
+    }
+    bool showsProjects() const { return gridPages[(size_t) gridPageIndex].name == "PROJ"; }
+
+    // The Mac's list of projects (ui/ProjectBrowser.h), under the screens' lock like a knob.
+    // A row clicked: what a turn of SLOT to that slot does.
+    void selectSlot(int slot)
+    {
+        setSelectedSlot(slot);
+        resetActions();
+    }
+    // A row double-clicked: SLOT goes there and LOAD runs (the same hook; the cell shows OK or FAIL).
+    bool loadSlot(int slot)
+    {
+        selectSlot(slot);
+        const bool ok = runAction(Load);
+        actionResult[(size_t) Load] = ok ? 1 : -1;
+        return ok;
+    }
     juce::String getStatusLine() const { return statusLine(); }
 
 protected:
@@ -154,6 +198,7 @@ private:
     void resetActions()
     {
         confirm.cancel();
+        ranKnob = -1;
         for (auto& r : actionResult) r = 0;
     }
 
@@ -248,9 +293,6 @@ private:
         proj.cells[2] = actionCell("SAVE", Save, 2);
         proj.cells[3] = actionCell("SVAS", SaveAs, 3);
         proj.cells[4] = actionCell("NEW", New, 4);
-        proj.cells[5] = cell(onOff("AUTO"),
-                             [this] { return (hooks.getAutosave && hooks.getAutosave()) ? 1.0f : 0.0f; },
-                             [this](float v) { if (hooks.setAutosave) hooks.setAutosave(v > 0.5f); });
         gridPages.push_back(proj);
 
         // The metronome. CLCK: never, while recording, or whenever the transport runs. CLVL: its
@@ -277,4 +319,6 @@ private:
     TurnConfirm confirm;
     std::function<juce::int64()> clock;
     int actionResult[NumActions] = {};      // 1 = OK, -1 = FAIL
+    int ranKnob = -1;                       // the knob whose turn has just run its action
+    juce::int64 ranLastMs = 0;              // ... and its last click
 };

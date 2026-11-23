@@ -194,16 +194,20 @@ public:
 
         beginTest("Tempo sync: every division lasts its number of beats, at any sample rate");
         {
-            expectEquals(LFO::NUM_DIVISIONS, 17);
+            // (Re-pinned 2026-11-22, one table of divisions: the seventeen stored ones, then the five
+            // from dsp/TempoDivisions.h an LFO gained, appended.)
+            expectEquals(LFO::NUM_DIVISIONS, 22);
             const char* names[] = { "8BAR", "4BAR", "2BAR", "1BAR", "1/2D", "1/2", "1/4D", "1/2T", "1/4",
-                                    "1/8D", "1/4T", "1/8", "1/16D", "1/8T", "1/16", "1/16T", "1/32" };
-            const double beats[] = { 32, 16, 8, 4, 3, 2, 1.5, 4.0 / 3.0, 1, 0.75, 2.0 / 3.0, 0.5, 0.375, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125 };
+                                    "1/8D", "1/4T", "1/8", "1/16D", "1/8T", "1/16", "1/16T", "1/32",
+                                    "1/32T", "1/64", "1/128", "16BAR", "1/32D" };
+            const double beats[] = { 32, 16, 8, 4, 3, 2, 1.5, 4.0 / 3.0, 1, 0.75, 2.0 / 3.0, 0.5, 0.375, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125,
+                                     1.0 / 12.0, 1.0 / 16.0, 1.0 / 32.0, 64, 0.1875 };
             for (int d = 0; d < LFO::NUM_DIVISIONS; ++d)
             {
                 expectEquals(juce::String(LFO::divisionName(d)), juce::String(names[d]));
                 expect(juce::String(names[d]).length() <= 5, "fits a cell");
                 expectWithinAbsoluteError((double) LFO::divisionBeats(d), beats[d], 1.0e-6);
-                if (d > 0)
+                if (d > 0 && d < 17)
                     expect(LFO::divisionBeats(d) < LFO::divisionBeats(d - 1), "longest first");
 
                 // Measured: skip the very long ones at the high rate to keep the test quick.
@@ -818,6 +822,9 @@ public:
                 s.lfo(ModParam::LFO_TRIG, 1.0f, 1);
                 s.lfo(ModParam::LFO_DEPTH, lfo2Depth, 1);
                 s.lfo(ModParam::LFO_DEST, (float) (int) lfo2Dest, 1);
+                // (U4-UV: the LFOs are the router's; one runs while something reads it, so LFO 1 has
+                // a destination, and its phase is the router voice's LFO's.)
+                s.lfo(ModParam::LFO_DEST, (float) (int) D::Amp, 0);
                 s.engine.noteOn(57, 1.0f, -1);
                 int wraps = 0;
                 double prev = 0.0;
@@ -826,7 +833,7 @@ public:
                 {
                     out.clear();
                     s.render(32.0 / 44100.0, out);
-                    double p = s.engine.getVoice(0).getLFOBank().getLFO(0).getPhase();
+                    double p = s.engine.getVoice(0).getRouterVoice().getLfo(0).getPhase();
                     if (p < prev) ++wraps;
                     prev = p;
                 }

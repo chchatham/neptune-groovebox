@@ -1,6 +1,8 @@
 #pragma once
 
+#include "../dsp/LevelCrusher.h"
 #include "../dsp/DSPUtils.h"
+#include "../dsp/Resonator.h"
 #include "../dsp/filters/SVFilter.h"
 #include <algorithm>
 #include <array>
@@ -15,30 +17,37 @@
 //     into bands with a decay each (K. Werner, J. Abel, J. Smith, their circuit analysis of
 //     that cymbal voice in the proceedings of ICMC / SMC 2014, pp. 1453-1460; G. Reid, "Practical
 //     cymbal synthesis", Sound On Sound, 2002). Later machines multiplied the squares in pairs.
-//     Models METL and RING.
-//   * A real cymbal or gong is a plate with hundreds of inharmonic modes, more of them per octave
-//     the higher one looks, each ringing for a shorter time the higher it is. A light stroke gives
-//     a bell-like set of partials; a hard one sends the energy up from the low modes it excites
-//     into the high ones within tens of milliseconds (a crash) or over a second or more (a
-//     tam-tam's bloom), and the pitch of a gong glides while it is loud (T. Rossing, "Science of
-//     Percussion Instruments"; K. Legge, N. Fletcher, "Nonlinearity, chaos, and the sound of
-//     shallow gongs", JASA 1989; A. Chaigne, C. Touze, O. Thomas, "Nonlinear vibrations and chaos
-//     in gongs and cymbals", Acoust. Sci. & Tech. 2005; M. Ducceschi, C. Touze, "Modal approach
-//     for nonlinear vibrations of damped impacted plates", JSV 2015).
-//     Models RIDE, BELL, CRSH, CHNA, SPLS, GONG and TAM are a bank of 48 damped modes:
-//       - 12 "ping" modes: the partials one hears as the stick's note, pure tones;
-//       - 36 "wash" modes spread from the low mids to the top, each standing for the cluster of
-//         real modes around it: its amplitude is moved by its own slow noise, so it is a narrow
-//         band of noise that rings (NOIS: from pure partials to hiss);
-//       - every mode has its own decay, shorter the higher it is (DAMP), and the high wash
-//         arrives late and louder the harder the stroke: the cascade, drawn as an envelope (BLOM);
-//       - a stroke ADDS to what is still ringing, in whatever phase it finds it: a ride pattern
-//         builds its wash and no two strokes are the same.
+//     Models METL and RING: they have no body, and keep their own few lines here.
+//   * A real cymbal or gong is a plate with hundreds of inharmonic modes, each ringing for a
+//     shorter time the higher it is. A light stroke gives a bell-like set of partials; a hard one
+//     sends the energy up from the low modes it excites into the high ones within tens of
+//     milliseconds (a crash) or over a second or more (a tam-tam's bloom), and the pitch of a
+//     gong glides while it is loud (T. Rossing, "Science of Percussion Instruments"; K. Legge,
+//     N. Fletcher, "Nonlinearity, chaos, and the sound of shallow gongs", JASA 1989; A. Chaigne,
+//     C. Touze, O. Thomas, "Nonlinear vibrations and chaos in gongs and cymbals", Acoust. Sci. &
+//     Tech. 2005; M. Ducceschi, C. Touze, "Modal approach for nonlinear vibrations of damped
+//     impacted plates", JSV 2015).
+//     Models RIDE, BELL, CRSH, CHNA, SPLS, GONG and TAM are seven points of the resonator's
+//     latent space (res::cymbalPoints in dsp/Resonator.h: sheets and shells with heavy loss at the
+//     top) on the shared bank of modes (dsp/ModeBank.h), played by the resonator's own exciter:
+//       - the stroke is the exciter's strike: one impulse, as hard as SNAP: the partials (PING);
+//       - the wash is the exciter FED: noise into the same body for as long as there is energy,
+//         and the energy is an envelope that the stroke starts. That is the cascade: while the
+//         cymbal is loud, energy keeps arriving in its high modes. Those are so heavily damped
+//         (DAMP) that what they give is bands of hiss; the low ones ring as partials long after.
+//         The feed reaches less far up as it falls (its brightness follows its level), so the top
+//         goes first and a soft stroke is a later moment of a hard one: duller and shorter;
+//       - BLOM lets the feed arrive late: the top comes after the stroke (a tam-tam's swell);
+//       - a stroke ADDS to what is still ringing, in whatever phase it finds it.
+//     EXC moves what plays it from the stroke to the exciter's bow, breath and scrape, where pad
+//     pressure is the energy; COUP is the exciter's grip on the cymbal's own motion.
+//     What the latent space does not hold, and is given up: partials placed by hand (a pair that
+//     beats, a bell's own five), and a level for each mode.
 //   * The sampled cymbals of the 1983 generation of drum machines were short recordings read from
 //     a 6-bit memory at about 30 kHz, tuned by the read-out clock: the grain and the folded-over
 //     highs are that sound (LOFI: a sample-and-hold and a coarse converter that follows the level).
 //
-// Nothing here allocates. One mode costs a rotation, a random number and two one-pole smoothers.
+// Nothing here allocates. A mode costs a rotation; modes that have rung out are not run.
 class CymbalMachine
 {
 public:
@@ -47,26 +56,32 @@ public:
     enum Param
     {
         ParModel = 0,   // MODL  which instrument
-        ParPing,        // PING  0 = wash only .. 0.5 = both .. 1 = the ping (the partials) only
-        ParColour,      // COLR  where the wash sits: dark .. the model's own (0.5) .. bright
-        ParNoise,       // NOIS  the wash from pure ringing partials (0) to hiss (1)
-        ParDamp,        // DAMP  how much sooner the highs die than the lows (0 = together)
-        ParBloom,       // BLOM  the highs arrive late and louder (and a gong's pitch glides)
-        ParVelSens,     // VSNS  how much a harder hit is brighter and longer (0 = only louder)
+        ParPing,        // PING  0 = wash only .. 0.5 = both .. 1 = the stroke (the partials) only
+        ParColour,      // COLR  dark .. the model's own (0.5) .. bright and thin
+        ParExcite,      // EXC   what plays it: 0 the stroke .. 1 a bow .. 2 breath .. 3 a scrape
+        ParDamp,        // DAMP  the loss at the top: the highs die sooner and turn from partials to hiss
+        ParBloom,       // BLOM  the wash arrives late and from below (and a gong's pitch glides)
+        ParCouple,      // COUP  the exciter's grip on the cymbal's own motion
         ParLofi,        // LOFI  the grain of an early sampled cymbal (0 = off)
         NumParams
     };
 
-    static constexpr int NUM_PING = 12;
-    static constexpr int NUM_WASH = 36;
-    static constexpr int NUM_MODES = NUM_PING + NUM_WASH;
+    static constexpr int NUM_MODES = res::MODES;
     static constexpr float NATURAL_TUNE = 8000.0f;      // TUNE at which a model has its own pitch
+    static constexpr float MAX_EXCITE = (float) (res::NumExcitePoints - 1);
 
     static float paramDefault(int index)
     {
-        static constexpr float defaults[NumParams] = { (float) Ride, 0.5f, 0.5f, 0.5f, 0.4f, 0.3f, 0.5f, 0.0f };
+        static constexpr float defaults[NumParams] = { (float) Ride, 0.5f, 0.5f, 0.0f, 0.4f, 0.3f, 0.0f, 0.0f };
         return (index >= 0 && index < NumParams) ? defaults[index] : 0.0f;
     }
+    static float paramMax(int index)
+    {
+        return index == ParModel ? (float) (NumModels - 1) : (index == ParExcite ? MAX_EXCITE : 1.0f);
+    }
+
+    // The first partial of a model's body at TUNE 8000, Hz (0: METL and RING have no body).
+    static float modelPitch(int model) { return def(model).bank ? 0.0f : def(model).pitch; }
 
     static const char* const* modelNames()
     {
@@ -87,7 +102,14 @@ public:
         bandHigh.setMode(SVFilter::Mode::BandPass);
         bandLow.setResonance(BAND_Q);
         bandHigh.setResonance(BAND_Q);
-        followerDecay = std::exp(-1.0f / (0.03f * (float) sampleRate));
+        crusher.prepare(sampleRate);
+        // The envelope, the pitch and the exciter are looked at about 750 times a second.
+        controlSamples = std::clamp((int) std::lround(sampleRate / 750.0), 8, 512);
+        pressK = 1.0f - std::exp(-(float) controlSamples / (0.008f * (float) sampleRate));
+        jitterK = onePole(30.0f / 0.644f);
+        jitterGain = noiseGain(jitterK);
+        core.prepare(sampleRate);
+        pressTarget = 0.0f;
         reset();
     }
 
@@ -99,11 +121,12 @@ public:
     float getParam(int index) const { return (index >= 0 && index < NumParams) ? params[(size_t) index] : 0.0f; }
 
     bool isActive() const { return active || fade != 0.0f; }
+    int modesAwake() const { return active && ! def(struckModel).bank ? core.modesAwake() : 0; }
 
     // Pad pressure on DEC: the sound that is ringing rings `stretch` times as long while it lasts.
     void setDecayStretch(float stretch)
     {
-        stretch = std::clamp(stretch, 0.25f, 8.0f);
+        stretch = stretch >= 0.25f ? std::min(stretch, 8.0f) : 0.25f;       // (what is no number is the least)
         if (stretch != decayStretch)
         {
             decayStretch = stretch;
@@ -111,17 +134,34 @@ public:
         }
     }
 
+    // The pad's own pressure, 0..1: the energy of a bow, of breath, of a scrape (EXC from 1 up;
+    // a stick has left the cymbal, and EXC 0 does not hear it).
+    // A pad pressed again on a bowed cymbal that has rung out starts it again as it was last played.
+    void setPressure(float pressure)
+    {
+        pressTarget = pressure > 0.0f ? std::min(pressure, 1.0f) : 0.0f;
+        if (! active && pressTarget * fed > 0.0f)
+        {
+            active = true;
+            coefsStale = true;
+            control = 0;
+        }
+    }
+
     void reset()
     {
-        x.fill(0.0f); y.fill(0.0f); u.fill(0.0f); n1.fill(0.0f); n2.fill(0.0f);
-        direct.fill(1.0f); later.fill(0.0f);
-        numActive = 0;
+        core.reset();
+        feed = feedTarget = 0.0f;
+        energyNow = energyStep = 0.0f;
+        pressNow = 0.0f;
+        strokeHold = 0;
         envLow = envHighShort = envHighLong = 0.0f;
         targetLow = targetHighShort = targetHighLong = 0.0f;
+        n1.fill(0.0f); n2.fill(0.0f);
         clickEnv = 0.0f;
         hp.reset(); clickBand.reset(); bandLow.reset(); bandHigh.reset();
         choking = false;
-        held = 0.0f; holdPhase = 1.0; follower = 0.0f; peak = 0.0f;
+        crusher.reset();
         glide = 0.0f;
         fade = 0.0f; lastOut = 0.0f;
         active = false;
@@ -152,54 +192,74 @@ public:
     // only a change of model starts from nothing (the old sound is faded over 2 ms).
     void strike(const Strike& hit)
     {
-        const int model = std::clamp((int) std::lround(params[ParModel]), 0, (int) NumModels - 1);
+        const int model = params[ParModel] >= 0.0f ? (int) std::lround(std::min(params[ParModel], (float) (NumModels - 1))) : 0;
         if (active && model != struckModel)
         {
             const float carry = lastOut;
             reset();
             fade = carry;           // the old sound's last value glides to nothing
         }
+        const bool ringing = active;
         if (! active)
-        {
-            const float carry = fade;
-            reset();
-            fade = carry;
-        }
+            finish();
         struckModel = model;
         active = true;
         choking = false;        // (the coefficients are worked out again below)
         const ModelDef& m = def(model);
 
-        const float vel = std::clamp(hit.velocity, 0.0f, 1.0f);
+        const float vel = clamp01(hit.velocity);
         const float ping = clamp01(params[ParPing]), colour = clamp01(params[ParColour]);
-        const float noise = clamp01(params[ParNoise]), damp = clamp01(params[ParDamp]);
-        const float bloom = clamp01(params[ParBloom]), sens = clamp01(params[ParVelSens]);
+        const float damp = clamp01(params[ParDamp]), bloom = clamp01(params[ParBloom]);
         const float tone = clamp01(hit.tone), snap = clamp01(hit.snap);
-        const float dec = std::clamp(hit.decay, 0.001f, 16.0f);
+        const float dec = std::isfinite(hit.decay) ? std::clamp(hit.decay, 0.001f, 16.0f) : 1.0f;
         const float fs = (float) sampleRate;
+        excite = std::isfinite(params[ParExcite]) ? std::clamp(params[ParExcite], 0.0f, MAX_EXCITE) : 0.0f;
+        couple = clamp01(params[ParCouple]);
+        // How much of it is fed (and hears the pad's pressure), how much is a stick's stroke.
+        fed = std::min(1.0f, excite);
+        const float stick = 1.0f - fed;
 
         tuneRatio = ratioFor(hit.tune);
         const float pingGain = ping <= 0.5f ? ping * 2.0f : 1.0f;
         const float washGain = ping >= 0.5f ? (1.0f - ping) * 2.0f : 1.0f;
         // A harder hit rings longer and (below) is brighter; a full hit is the sound as set.
-        const float velLength = std::exp2(sens * (vel - 1.0f) * 1.2f);
-        const float velTilt = sens * (vel - 1.0f) * 1.4f;                   // octaves of gain per octave
+        const float velLength = std::exp2(VEL_SENS * (vel - 1.0f) * 1.2f);
+        const float velTilt = VEL_SENS * (vel - 1.0f) * 1.4f;
         // A soft mallet (SNAP below the middle) excites less of the top and takes a few ms to land.
         const float soft = snap < 0.5f ? (0.5f - snap) * 2.0f : 0.0f;
+        const float hard = std::max(0.0f, (snap - 0.2f) / 0.8f);
         const float softAttack = 0.012f * soft * soft;
-        const float toneTilt = (tone - 0.5f) * 0.8f - soft * 0.6f;
-        const float dampExp = damp * 1.6f;
-        const float ring = dec * m.washT * velLength;       // seconds to -60 dB where the wash is strongest
+        // A harder tip is a little louder. A mallet is not quieter for being soft: what its
+        // softness keeps out of the body (the resonator's strike is as loud as an impulse, and
+        // knows nothing of the low-pass before it) is made up for, so the level does not hang on SNAP.
+        const float tip = snap >= 0.5f ? 0.7f + 0.6f * snap : std::exp2(MALLET_EVEN * soft);
 
-        // The stick itself: a burst of noise, shorter and brighter the harder the tip.
+        // The stick itself, where there is no body to take it (METL, RING): a burst of noise,
+        // shorter and brighter the harder the tip.
+        if (m.click > 0.0f)
         {
-            const float hard = std::max(0.0f, (snap - 0.2f) / 0.8f);
             const float seconds = 0.0030f - 0.0022f * hard;
             clickDecay = std::exp(-1.0f / (seconds * fs));
             clickBand.setCutoff(std::min(0.45f * fs, (3000.0f + 5000.0f * hard) * std::sqrt(tuneRatio)));
-            clickEnv = std::max(clickEnv, m.click * hard * hard * vel * (0.4f + 0.6f * vel) * 2.2f);
+            clickEnv = std::max(clickEnv, m.click * hard * hard * vel * (0.4f + 0.6f * vel) * 2.2f * stick);
         }
-        hp.setCutoff(std::clamp(m.hpHz * tuneRatio, 20.0f, 0.3f * fs));
+        // The thin voicing is the stick's: a bow, breath or a scrape is heard on the whole body (the
+        // bow sings on its lowest partial).
+        const float thin = m.bank ? m.hpHz : std::exp2((colour - 0.5f) * COLOUR_THIN + std::max(0.0f, tone - 0.5f) * 2.0f) * (fed < 1.0f ? m.hpHz * std::pow(FED_HP / m.hpHz, fed) : FED_HP);
+        hp.setCutoff(std::clamp(thin * tuneRatio, 20.0f, 0.3f * fs));
+
+        // What is fed: an envelope the stroke starts. Strokes add as powers do.
+        const float cascade = (1.0f + m.cascade * bloom * vel * vel) / (1.0f + m.cascade * bloom);
+        const float level = vel * cascade;
+        washMix = m.bank ? 1.0f : washGain * m.washLevel;
+        feedTarget = std::min(MAX_FEED, std::sqrt(feedTarget * feedTarget + level * level));
+        feedAttack = 1.0f - std::exp(-(float) controlSamples / ((5.0e-4f + softAttack + m.bloomT * bloom * bloom) * fs));
+        // (What rings is not cut short by a softer stroke.)
+        const float ring = dec * m.ring * velLength;
+        ringSeconds = ringing ? std::max(ringSeconds, ring) : ring;
+        feedSeconds = std::max(0.004f, ringSeconds * m.feed);
+
+        const res::ExciteLatent played = exciterAt(m, m.reach);
 
         if (m.bank)
         {
@@ -215,128 +275,63 @@ public:
             attackHighLong = attackCoef(1.0e-4f + softAttack + bloom * bloom * 0.25f);
             attackHighShort = attackCoef(1.0e-4f + softAttack);
             const float bright = std::exp2((tone - 0.5f) * 3.0f + velTilt * 1.5f - soft);
-            bankLowGain = 0.6f * pingGain * m.pingLevel;
-            bankHighGain = 3.0f * washGain * m.washLevel * bright;
-            jitter = noise * noise * 0.04f;
-            for (int i = 0; i < 6; ++i)
-            {
-                cn[(size_t) i] = onePole(30.0f / 0.644f);
-                gn[(size_t) i] = noiseGain(cn[(size_t) i]);
-            }
-            targetLow = std::max(targetLow, vel);
-            targetHighShort = std::max(targetHighShort, vel);
-            targetHighLong = std::max(targetHighLong, vel);
+            bankLowGain = 0.6f * pingGain;
+            bankHighGain = 3.0f * washGain * bright;
+            // The exciter's grain is the oscillators' unrest; its grip couples them in pairs
+            // (METL towards RING's products, RING towards METL's sum).
+            jitter = played[res::Grain] * played[res::Grain] * 0.04f;
+            pairs = model == Ring ? 1.0f - couple : couple;
+            targetLow = std::max(targetLow, vel * stick);
+            targetHighShort = std::max(targetHighShort, vel * stick);
+            targetHighLong = std::max(targetHighLong, vel * stick);
             outGain = m.gain;
             coefsStale = true;
             control = 0;
             return;
         }
 
-        // ---- the modes ---------------------------------------------------------------------------
-        // Their pitches depend on the model and TUNE only, so a mode keeps its place from stroke
-        // to stroke and what it still holds can be added to.
-        float amp[NUM_MODES], attack[NUM_MODES], share[NUM_MODES];     // share: the part of a mode that is there at once
-        const float pingLow = m.pingHz[0];
-        float sumSq = 0.0f;
-        for (int k = 0; k < NUM_PING; ++k)
-        {
-            const float f = m.pingHz[k];
-            hz[(size_t) k] = f;
-            amp[k] = dsp::dbToLinear(m.pingDb[k]) * std::exp2(toneTilt * 0.5f * std::log2(f / (pingLow * 3.0f)));
-            sumSq += amp[k] * amp[k];
-            t60[(size_t) k] = ring * m.pingT * ringFactor(f / m.washPeak, dampExp);
-            attack[k] = softAttack;
-            share[k] = (1.0f - soft) * (1.0f - soft);
-            const float w = std::max(0.0f, noise * 2.0f - 1.0f) * 0.4f;
-            setNoise(k, w, f * tuneRatio * 0.006f);
-        }
-        const float pingNorm = vel * pingGain * m.pingLevel / std::sqrt(std::max(sumSq, 1.0e-12f));
-        for (int k = 0; k < NUM_PING; ++k)
-            amp[k] *= pingNorm * std::exp2(velTilt * std::max(0.0f, std::log2(m.pingHz[k] / pingLow)));
+        // ---- the body ------------------------------------------------------------------------
+        // The model's point of the latent space; DAMP is its loss (0.4: the point's own), COLR
+        // and TONE its tilt.
+        res::BodyLatent body = res::cymbalPoints()[(size_t) m.point];
+        body[res::Damp] = damp <= 0.4f ? body[res::Damp] * damp * 2.5f
+                                       : body[res::Damp] + (1.0f - body[res::Damp]) * (damp - 0.4f) * (1.0f / 0.6f);
+        body[res::Tilt] = clamp01(body[res::Tilt] - (colour - 0.5f) * COLOUR_TILT - (tone - 0.5f) * 0.3f);
+        core.setBody(body);
 
-        const float step = std::pow(m.washHi / m.washLo, 1.0f / (float) (NUM_WASH - 1));
-        const float peakHz = m.washPeak * std::exp2((colour - 0.5f) * 3.0f);
-        sumSq = 0.0f;
-        for (int i = 0; i < NUM_WASH; ++i)
-        {
-            const int k = NUM_PING + i;
-            const float pos = (float) i / (float) (NUM_WASH - 1);
-            // Irregular spacing and uneven strengths, the same at every stroke: the instrument's own face.
-            const float f = m.washLo * std::pow(step, (float) i + 0.7f * (hash01(model, i) - 0.5f));
-            hz[(size_t) k] = f;
-            const float octaves = std::log2(f / peakHz) / m.washSigma;
-            amp[k] = std::exp(-0.5f * octaves * octaves)
-                   * dsp::dbToLinear(m.trashDb * (hash01(model, i + 100) * 2.0f - 1.0f))
-                   * std::exp2(toneTilt * std::log2(f / peakHz));
-            sumSq += amp[k] * amp[k];
-            t60[(size_t) k] = ring * ringFactor(f / m.washPeak, dampExp);
-            attack[k] = softAttack + m.bloomT * bloom * bloom * (0.15f + 0.85f * pos);
-            const float w = std::min(1.0f, noise * m.noise * (0.5f + 0.5f * pos) * 1.6f);
-            setNoise(k, w, f * tuneRatio * (step - 1.0f) * 0.5f * m.width * (0.15f + 0.85f * noise));
-        }
-        const float washNorm = vel * washGain * m.washLevel / std::sqrt(std::max(sumSq, 1.0e-12f));
-        for (int i = 0; i < NUM_WASH; ++i)
-        {
-            const int k = NUM_PING + i;
-            const float pos = (float) i / (float) (NUM_WASH - 1);
-            // The cascade: the harder the hit, the more of the energy ends up in the high modes.
-            // The stroke itself puts in what there would be without it, less at the top (HIDE);
-            // the rest arrives over the attack time.
-            const float cascade = 1.0f + m.cascade * bloom * pos * vel * vel;
-            share[k] = (1.0f - soft) * (1.0f - soft) * std::max(0.0f, 1.0f - bloom * m.hide * pos) / cascade;
-            amp[k] *= washNorm * cascade
-                    * std::exp2(velTilt * std::max(0.0f, std::log2(hz[(size_t) k] / m.washLo)));
-        }
+        // The feed reaches less far up as it falls, the more the higher the loss; a darker COLR
+        // lowers it as a whole.
+        reach = m.reach + std::min(0.0f, colour - 0.5f) * COLOUR_REACH;
+        reachSlope = REACH_SLOPE * damp;
 
-        const float nyquistGuard = 0.45f * fs;
-        for (int k = 0; k < NUM_MODES; ++k)
+        // The stroke: the exciter's strike for three milliseconds (one impulse through its
+        // low-pass, as hard as SNAP and the velocity make it), then the feed takes over. With BLOM
+        // the stroke itself leaves the top out. A bow or a scrape has no stroke: nothing is taken
+        // at once, the exciter moves to where it is wanted.
+        if (stick > 0.0f)
         {
-            const size_t i = (size_t) k;
-            logR[i] = -6.9078f / (std::max(0.004f, t60[i]) * fs);
-            float a = hz[i] * tuneRatio < nyquistGuard ? amp[k] : 0.0f;
-            // What is heard of the mode now: its motion times what has arrived of it.
-            const float rise = 1.0f - u[i];
-            const float heard = direct[i] + later[i] * rise * rise;
-            float sx = x[i] * heard, sy = y[i] * heard;
-            const float mag = std::sqrt(sx * sx + sy * sy);
-            // What a mode can hold is limited (two and a half full strokes): a roll builds, not without end.
-            a = std::min(a, std::max(0.0f, amp[k] * 2.5f / std::max(vel, 0.05f) - mag));
-            // The part of the stroke that is there at once is added to the motion (the output,
-            // x, does not jump); the rest arrives over the mode's attack time.
-            const bool atOnce = attack[k] < 2.0e-4f;
-            const float now = atOnce ? 1.0f : std::clamp(share[k], 0.0f, 1.0f);
-            sy += a * now;
-            const float sounding = std::sqrt(sx * sx + sy * sy);
-            const float full = sounding + a * (1.0f - now);
-            if (full < 1.0e-9f)
-            {
-                x[i] = y[i] = 0.0f;
-                direct[i] = 1.0f; later[i] = 0.0f; u[i] = 0.0f; ua[i] = 0.0f;
-                continue;
-            }
-            if (sounding < 1.0e-7f * full)
-            {
-                // From nothing: all of it is still to come.
-                x[i] = 0.0f; y[i] = full;
-                direct[i] = 0.0f; later[i] = 1.0f;
-            }
-            else
-            {
-                x[i] = sx * (full / sounding);
-                y[i] = sy * (full / sounding);
-                direct[i] = sounding / full;
-                later[i] = 1.0f - direct[i];
-            }
-            u[i] = later[i] > 0.0f ? 1.0f : 0.0f;
-            ua[i] = atOnce ? 0.0f : std::exp(-1.0f / (attack[k] * fs));
+            const float strokeHard = m.strokeHard + (snap - 0.5f) * (snap < 0.5f ? MALLET_HARD : TIP_HARD) + velTilt * 0.15f + (tone - 0.5f) * 0.2f
+                                   + std::min(0.0f, colour - 0.5f) * COLOUR_REACH - bloom * m.hide;
+            core.setExciter(res::ExciteLatent { { 0.0f, 0.0f, 0.0f, 0.0f, clamp01(strokeHard) } });
+            core.setPitch(m.pitch * tuneRatio * std::exp2(m.glide * bloom * vel * vel / 12.0f));
+            core.setDecay(ringSeconds * decayStretch);
+            core.strike(vel * stick * pingGain * m.pingLevel * tip);
+            strokeHold = (int) (STROKE_SECONDS * fs);
         }
-        numActive = NUM_MODES;
+        else if (! ringing)
+        {
+            // (Where the exciter grips, its strike is the first bite of a bow.)
+            core.setExciter(played);
+            core.setPitch(m.pitch * tuneRatio);
+            core.setDecay(ringSeconds * decayStretch);
+            core.strike(vel);
+        }
 
         // A gong's pitch starts off where the stroke bends it and settles.
         glide = m.glide * bloom * vel * vel;
-        glideDecay = std::exp(-(float) CONTROL_RATE / (std::max(0.02f, m.glideT) * fs));
+        glideDecay = std::exp(-(float) controlSamples / (std::max(0.02f, m.glideT) * fs));
 
-        outGain = m.gain;
+        outGain = m.gain + (FED_GAIN - m.gain) * fed;
         coefsStale = true;
         control = 0;
     }
@@ -344,6 +339,8 @@ public:
     // One sample. tuneHz: TUNE as it is now (bend, LFO and pressure move a ringing cymbal).
     float process(float tuneHz)
     {
+        if (active && --control <= 0)
+            controlTick(tuneHz);        // (it may find that the sound is over)
         if (! active)
         {
             if (fade == 0.0f)
@@ -351,111 +348,111 @@ public:
             return fadeOut(0.0f);
         }
 
-        if (--control <= 0)
-            controlTick(tuneHz);
-
-        const bool bank = def(struckModel).bank;
-        float out = bank ? processBank() : processModes();
+        energyNow += energyStep;
+        float out = def(struckModel).bank ? processBank() : core.tick(0.0f, energyNow);
 
         if (clickEnv > 1.0e-5f)
         {
             out += clickBand.process(nextNoise() * clickEnv);
             clickEnv *= clickDecay;
         }
-        out = hp.process(out) * outGain;
+        // (The offset keeps the high-pass out of the smallest numbers while a silent body is still fed.)
+        out = hp.process(out + 1.0e-18f) * outGain;
 
         const float lofi = params[ParLofi];
         if (lofi > 0.001f)
-            out = crush(out, std::min(lofi, 1.0f));
+            out = crusher.process(out, std::min(lofi, 1.0f));     // LOFI (dsp/LevelCrusher.h)
 
-        out = fadeOut(out);
+        // What fits is untouched. The tick of a stroke (every partial of the body moving off in
+        // step: a peak many times the level of what follows) is bent to half as much again.
+        out = res::outLimit(fadeOut(out), OUT_LIMIT);
         lastOut = out;
         return out;
     }
 
 private:
     // ---- the models --------------------------------------------------------------------------------
-    // Pitches are at TUNE 8000. Ping levels are in dB among themselves; pingLevel and washLevel set
-    // the two layers against each other (PING at the middle).
+    // Pitches are at TUNE 8000.
     struct ModelDef
     {
-        bool bank;                      // the six-oscillator bank instead of the modes
-        float pingHz[NUM_PING];
-        float pingDb[NUM_PING];
-        float pingT;                    // how long a ping partial rings against a wash mode at its pitch
-        float pingLevel;
-        float washLo, washHi;           // the wash modes lie between these
-        float washPeak, washSigma;      // where the wash is strongest, and how wide (octaves)
-        float washT;                    // seconds to -60 dB at washPeak, per second of DEC
-        float washLevel;
-        float noise, width;             // how much of a wash mode is noise, and how wide its band
-        float bloomT;                   // seconds the top of the wash takes to arrive with BLOM at the top
-        float cascade;                  // how much louder the top gets with BLOM at the top
-        float hide;                     // how much of the top the stroke itself leaves out with BLOM at the top
+        bool bank;                      // the six-oscillator bank instead of a body
+        float squares[6];               // ... and its pitches
+        int point;                      // the body: which of res::cymbalPoints
+        float pitch;                    // its first partial
+        float ring;                     // seconds that partial rings (to -60 dB), per second of DEC
+        float feed;                     // how long the wash is fed, as a part of that
+        float reach;                    // how far up the feed reaches at full level (the exciter's HARD)
+        float grain;                    // what the feed is made of (the exciter's GRAN: 1 = noise)
+        float pingLevel, washLevel;     // the stroke and the wash (PING at the middle). A body made by its stroke
+                                        // (BELL, GONG, TAM) keeps the stroke at 0.85: a soft mallet's make-up then fits the exciter's most
+        float strokeHard;               // the stick's HARD at SNAP 0.5
+        float bloomT;                   // seconds the wash takes to arrive with BLOM at the top
+        float cascade;                  // how much more of the wash a full hit gets than a soft one, with BLOM
+        float hide;                     // how much of the top the stroke itself leaves out with BLOM at the top (in HARD)
         float glide, glideT;            // semitones the pitch starts off by with BLOM at the top; its time
-        float click;                    // the stick
+        float click;                    // the stick, where there is no body
         float hpHz;
-        float trashDb;                  // how uneven the wash modes are
         float gain;
     };
 
     static const ModelDef& def(int model)
     {
         static const ModelDef defs[NumModels] = {
-            // METL: six squares, summed (pingHz holds their pitches).
-            { true, { 205.3f, 304.4f, 369.6f, 522.7f, 540.0f, 800.0f }, {}, 1.0f, 1.0f,
-              0, 0, 0, 0, 1.0f, 1.0f, 0, 0, 0, 0, 0, 0, 0, 0.3f, 2000.0f, 0, 0.85f },
+            // METL: six squares, summed.
+            { true, { 205.3f, 304.4f, 369.6f, 522.7f, 540.0f, 800.0f }, 0, 0, 1.0f, 0.5f, 0, 0.0f, 1, 1, 0, 0.1f, 0.0f, 0, 0, 0.1f, 0.3f, 2000.0f, 0.85f },
             // RING: the squares multiplied in pairs: many more partials, none of them a square's own.
-            { true, { 263.0f, 414.5f, 317.2f, 587.1f, 731.0f, 1147.0f }, {}, 1.0f, 1.0f,
-              0, 0, 0, 0, 1.0f, 1.0f, 0, 0, 0, 0, 0, 0, 0, 0.3f, 1600.0f, 0, 0.5f },
+            { true, { 263.0f, 414.5f, 317.2f, 587.1f, 731.0f, 1147.0f }, 0, 0, 1.0f, 0.5f, 0, 0.25f, 1, 1, 0, 0.1f, 0.0f, 0, 0, 0.1f, 0.3f, 1600.0f, 0.5f },
             // RIDE: a stick on the bow of a heavy cymbal: a clear ping over a quiet, long wash.
-            { false, { 431.0f, 692.0f, 1043.0f, 1489.0f, 2078.0f, 2811.0f, 3594.0f, 4467.0f, 5486.0f, 6619.0f, 7906.0f, 9372.0f },
-              { -20.0f, -16.0f, -12.0f, -8.0f, -3.0f, -3.0f, 0.0f, -2.0f, -1.0f, -4.0f, -6.0f, -9.0f }, 0.12f, 1.3f,
-              900.0f, 15000.0f, 5200.0f, 1.3f, 3.0f, 0.6f, 0.9f, 1.0f, 0.06f, 1.2f, 0.4f, 0.0f, 0.1f, 0.9f, 250.0f, 3.0f, 0.36f },
-            // BELL: the cup of the ride: strong, long partials (two of them pairs that beat), hardly a wash.
-            { false, { 622.0f, 931.0f, 938.5f, 1352.0f, 1836.0f, 2444.0f, 2459.0f, 3087.0f, 3861.0f, 4688.0f, 5637.0f, 6719.0f },
-              { -4.0f, 0.0f, -6.0f, -2.0f, -1.0f, -3.0f, -9.0f, -4.0f, -5.0f, -7.0f, -9.0f, -11.0f }, 1.0f, 1.0f,
-              1500.0f, 14000.0f, 6000.0f, 1.2f, 1.5f, 0.25f, 0.6f, 0.8f, 0.05f, 1.5f, 0.2f, 0.0f, 0.1f, 0.8f, 300.0f, 3.0f, 0.42f },
-            // CRSH: nearly all wash, wide and long; a few low partials are left humming at the end.
-            { false, { 287.0f, 398.0f, 523.0f, 741.0f, 1012.0f, 1367.0f, 1790.0f, 2333.0f, 2954.0f, 3731.0f, 4610.0f, 5720.0f },
-              { -3.0f, -2.0f, 0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -5.0f, -6.0f, -7.0f, -8.0f, -9.0f }, 1.0f, 0.15f,
-              600.0f, 16000.0f, 4800.0f, 1.7f, 2.0f, 1.0f, 1.0f, 1.2f, 0.06f, 1.2f, 0.5f, 0.0f, 0.1f, 0.8f, 180.0f, 3.0f, 0.36f },
+            { false, {}, res::CymRide, 240.0f, 5.0f, 1.0f, 0.93f, 1.0f, 1.2f, 0.6f, 0.8f, 0.06f, 1.2f, 0.1f, 0.0f, 0.1f, 0.0f, 2000.0f, 1.5f },
+            // BELL: the cup of the ride: strong, long partials, hardly a wash.
+            { false, {}, res::CymBell, 622.0f, 4.0f, 0.3f, 0.7f, 1.0f, 0.85f, 0.34f, 0.7f, 0.05f, 1.5f, 0.05f, 0.0f, 0.1f, 0.0f, 300.0f, 0.97f },
+            // CRSH: nearly all wash, wide and long; the low partials are left humming at the end.
+            { false, {}, res::CymCrash, 175.0f, 4.7f, 0.93f, 0.95f, 1.0f, 0.4f, 1.0f, 0.86f, 0.06f, 1.2f, 0.1f, 0.0f, 0.1f, 0.0f, 1800.0f, 2.3f },
             // CHNA: short, uneven and harsh in the middle.
-            { false, { 498.0f, 713.0f, 1021.0f, 1260.0f, 1594.0f, 2011.0f, 2530.0f, 2988.0f, 3620.0f, 4387.0f, 5190.0f, 6240.0f },
-              { -5.0f, -3.0f, 0.0f, -2.0f, 0.0f, -1.0f, -2.0f, -1.0f, -4.0f, -5.0f, -7.0f, -9.0f }, 0.6f, 0.6f,
-              700.0f, 13000.0f, 3000.0f, 1.3f, 1.0f, 1.0f, 1.2f, 1.5f, 0.03f, 1.5f, 0.4f, 0.0f, 0.1f, 0.8f, 250.0f, 7.0f, 0.36f },
+            { false, {}, res::CymChina, 190.0f, 2.0f, 0.9f, 0.92f, 1.0f, 0.8f, 1.0f, 0.88f, 0.03f, 1.5f, 0.1f, 0.0f, 0.1f, 0.0f, 1400.0f, 2.4f },
             // SPLS: small, high and quickly gone.
-            { false, { 812.0f, 1190.0f, 1675.0f, 2260.0f, 2985.0f, 3790.0f, 4760.0f, 5810.0f, 7020.0f, 8390.0f, 9900.0f, 11600.0f },
-              { -3.0f, -1.0f, 0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -5.0f, -6.0f, -7.0f, -8.0f, -9.0f }, 0.8f, 0.4f,
-              1800.0f, 17000.0f, 7500.0f, 1.3f, 0.9f, 1.0f, 1.0f, 1.0f, 0.015f, 1.0f, 0.3f, 0.0f, 0.1f, 0.7f, 500.0f, 3.0f, 0.36f },
-            // GONG: a gong with a note (the lowest partial is a pair that beats); its pitch falls as it settles.
-            { false, { 196.0f, 197.4f, 393.0f, 471.0f, 588.0f, 762.0f, 969.0f, 1193.0f, 1466.0f, 1795.0f, 2190.0f, 2660.0f },
-              { 0.0f, -5.0f, -4.0f, -8.0f, -9.0f, -11.0f, -13.0f, -15.0f, -17.0f, -19.0f, -21.0f, -23.0f }, 1.5f, 1.0f,
-              350.0f, 7000.0f, 1500.0f, 1.5f, 3.0f, 0.35f, 0.5f, 0.6f, 0.5f, 2.0f, 1.0f, 0.8f, 0.45f, 0.15f, 60.0f, 3.0f, 0.5f },
+            { false, {}, res::CymSplash, 240.0f, 2.0f, 1.0f, 0.92f, 1.0f, 0.9f, 1.0f, 0.86f, 0.015f, 1.0f, 0.05f, 0.0f, 0.1f, 0.0f, 3000.0f, 1.3f },
+            // GONG: a gong with a note; its pitch falls as it settles.
+            { false, {}, res::CymGong, 196.0f, 8.0f, 0.35f, 0.6f, 1.0f, 0.85f, 0.855f, 0.7f, 0.5f, 2.0f, 0.2f, 0.45f, 0.8f, 0.0f, 60.0f, 1.36f },
             // TAM: a tam-tam: a dense low cluster at once, the shimmer blooming above it afterwards.
-            { false, { 71.0f, 92.5f, 118.0f, 141.0f, 167.0f, 203.0f, 248.0f, 289.0f, 341.0f, 397.0f, 466.0f, 541.0f },
-              { -2.0f, 0.0f, -1.0f, -3.0f, -2.0f, -4.0f, -4.0f, -6.0f, -6.0f, -8.0f, -9.0f, -10.0f }, 2.0f, 0.6f,
-              300.0f, 10000.0f, 2500.0f, 1.8f, 3.0f, 1.2f, 0.9f, 1.0f, 1.6f, 4.0f, 1.0f, 0.3f, 1.0f, 0.1f, 35.0f, 3.0f, 0.45f } };
+            { false, {}, res::CymTam, 71.0f, 12.0f, 0.4f, 0.9f, 1.0f, 0.85f, 0.45f, 0.75f, 1.0f, 4.0f, 0.3f, 0.3f, 1.0f, 0.0f, 35.0f, 4.36f } };
         return defs[std::clamp(model, 0, (int) NumModels - 1)];
     }
 
-    static constexpr int CONTROL_RATE = 32;         // samples between retunes, trims and glide steps
     static constexpr float BAND_Q = 2.0f;
     static constexpr float CHOKE_SECONDS = 0.06f;   // to -60 dB under the hand
+    static constexpr float STROKE_SECONDS = 0.003f; // the exciter is a stick for this long
+    static constexpr float VEL_SENS = 0.55f;        // how much a harder hit is brighter and longer
+    static constexpr float MAX_FEED = 1.6f;         // what a roll can build the feed to
+    static constexpr float FED_HP = 90.0f;          // the high-pass under a bow (the stick's is the model's)
+    static constexpr float FED_GAIN = 0.5f;         // ... and the gain
+    static constexpr float OUT_LIMIT = 1.5f;
+    static constexpr float FEED_OVER = 1.0e-4f;     // the feed's end
+    static constexpr float SILENT = 1.0e-10f;       // what the body holds when the voice is let go (-100 dB)
+    static constexpr float REACH_SLOPE = 0.35f;      // HARD the feed loses per halving of its level, at DAMP 1
+    static constexpr float COLOUR_TILT = 0.5f, COLOUR_REACH = 0.6f, COLOUR_THIN = 3.0f, MALLET_HARD = 1.4f, TIP_HARD = 0.5f;
+    static constexpr float MALLET_EVEN = 1.2f;      // octaves of level the softest mallet is made up by
 
-    // How long a mode rings against one at the middle of the wash: the higher, the shorter; the
-    // lowest modes are all much alike.
-    static float ringFactor(float ratio, float exponent) { return std::min(2.5f, std::pow(ratio, -exponent)); }
+    static float clamp01(float v) { return v >= 0.0f ? std::min(v, 1.0f) : 0.0f; }     // (not-a-number is 0)
+    static float ratioFor(float tuneHz) { return tuneHz >= 0.0f ? std::clamp(tuneHz / NATURAL_TUNE, 0.125f, 2.0f) : 1.0f; }
 
-    static float clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
-    static float ratioFor(float tuneHz) { return std::clamp(tuneHz / NATURAL_TUNE, 0.125f, 2.0f); }
-
-    // A number in 0..1 that is always the same for the same model and place.
-    static float hash01(int model, int i)
+    // The exciter at EXC: the cymbal's own feed at 0 (noise as the model grains it, reaching as far
+    // up as `hard`), then the resonator's bow, breath and scrape (dsp/Resonator.h), latent by
+    // latent between two neighbours; COUP is added to its grip.
+    res::ExciteLatent exciterAt(const ModelDef& m, float hard) const
     {
-        uint32_t h = (uint32_t) (model * 7919 + i * 104729 + 12345);
-        h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
-        return (float) (h >> 8) * (1.0f / 16777216.0f);
+        const auto& points = res::excitePoints();
+        const res::ExciteLatent own { { 1.0f, m.grain, 0.0f, 0.0f, hard } };
+        const int a = std::min((int) excite, (int) res::NumExcitePoints - 2);
+        const float t = excite - (float) a;
+        res::ExciteLatent out;
+        for (size_t i = 0; i < out.size(); ++i)
+        {
+            const float from = a == 0 ? own[i] : points[(size_t) a][i];
+            out[i] = clamp01(from + (points[(size_t) a + 1][i] - from) * t);
+        }
+        out[res::Couple] = clamp01(out[res::Couple] + couple);
+        return out;
     }
 
     float onePole(float hertz) const
@@ -473,15 +470,6 @@ private:
         return (float) (1.0 / std::sqrt(std::max(variance, 1.0e-20)));
     }
 
-    // Mode k: `amount` of it is a band of noise half-width `hertz` wide, the rest the pure partial.
-    void setNoise(int k, float amount, float hertz)
-    {
-        const size_t i = (size_t) k;
-        cn[i] = onePole(hertz / 0.644f);
-        carrier[i] = 1.0f - amount;
-        gn[i] = amount * noiseGain(cn[i]);
-    }
-
     float nextNoise()
     {
         noiseSeed = noiseSeed * 1664525u + 1013904223u;
@@ -490,7 +478,9 @@ private:
 
     void controlTick(float tuneHz)
     {
-        control = CONTROL_RATE;
+        control = controlSamples;
+        const ModelDef& m = def(struckModel);
+        const float fs = (float) sampleRate;
         float ratio = ratioFor(tuneHz);
         if (glide != 0.0f)
         {
@@ -499,57 +489,68 @@ private:
             if (std::abs(glide) < 1.0e-3f)
                 glide = 0.0f;
         }
-        const bool bank = def(struckModel).bank;
-        if (ratio != tuneRatio || coefsStale)
+        const bool moved = ratio != tuneRatio || coefsStale;
+        if (moved)
         {
             tuneRatio = ratio;
             coefsStale = false;
-            const float fs = (float) sampleRate;
-            const float hand = choking ? -6.9078f / (CHOKE_SECONDS * fs) : 0.0f;
-            if (bank)
+            feedDecay = std::exp(-6.9078f * (float) controlSamples / (feedSeconds * decayStretch * fs));
+        }
+
+        // The feed's envelope and the pad's pressure, a straight line from one look to the next.
+        // (A hand on it: nothing is fed any more.)
+        if (choking)
+            feedTarget = feed = pressNow = 0.0f;
+        // (It rises as slowly as BLOM says and falls as fast as it is told to. 80 dB down it is
+        // over: what it still fed would keep every partial of the body awake for nothing.)
+        feedTarget *= feedDecay;
+        if (feedTarget < FEED_OVER) feedTarget = 0.0f;
+        feed += (feedTarget > feed ? feedAttack : std::max(feedAttack, 1.0f - feedDecay)) * (feedTarget - feed);
+        if (feedTarget <= 0.0f && feed < FEED_OVER) feed = 0.0f;
+        const float pressed = choking ? 0.0f : pressTarget * fed;
+        pressNow += pressK * (pressed - pressNow);
+        if (pressNow < 1.0e-6f) pressNow = 0.0f;
+        const float energy = std::min(res::Resonator::MAX_ENERGY, (m.bank ? fed : washMix) * feed + pressNow);
+        energyStep = (energy - energyNow) / (float) controlSamples;
+        const bool fedOut = energy <= 0.0f && energyNow < 1.0e-5f && pressed <= 0.0f;
+
+        if (m.bank)
+        {
+            if (moved)
             {
-                const ModelDef& m = def(struckModel);
+                const float hand = choking ? -6.9078f / (CHOKE_SECONDS * fs) : 0.0f;
                 for (int i = 0; i < 6; ++i)
-                    inc[(size_t) i] = std::min(0.45, (double) (m.pingHz[i] * ratio) / sampleRate);
+                    inc[(size_t) i] = std::min(0.45, (double) (m.squares[i] * ratio) / sampleRate);
                 decayLow = std::exp(logLow / decayStretch + hand);
                 decayHighLong = std::exp(logHighLong / decayStretch + hand);
                 decayHighShort = std::exp(logHighShort + hand);
             }
-            else
-            {
-                for (int k = 0; k < numActive; ++k)
-                {
-                    const size_t i = (size_t) k;
-                    const float w = std::min(dsp::TWO_PI_F * hz[i] * ratio / fs, 2.9f);
-                    const float r = std::exp(logR[i] / decayStretch + hand);
-                    c[i] = r * std::cos(w);
-                    s[i] = r * std::sin(w);
-                }
-            }
-        }
-
-        if (bank)
-        {
-            if (targetLow < 1.0e-4f && targetHighLong < 1.0e-4f && targetHighShort < 1.0e-4f
+            if (fedOut && targetLow < 1.0e-4f && targetHighLong < 1.0e-4f && targetHighShort < 1.0e-4f
                 && envLow < 1.0e-4f && envHighLong < 1.0e-4f && clickEnv < 1.0e-4f)
                 finish();
             return;
         }
 
-        // The modes that have died away are dropped from the top (the highest die first).
-        while (numActive > 0)
+        if (moved)
         {
-            const size_t i = (size_t) (numActive - 1);
-            if (x[i] * x[i] + y[i] * y[i] > 1.0e-9f)
-                break;
-            x[i] = y[i] = 0.0f;
-            --numActive;
+            core.setPitch(m.pitch * ratio);
+            if (! choking)
+                core.setDecay(ringSeconds * decayStretch);
         }
-        for (int k = 0; k < numActive; ++k)
-            if (u[(size_t) k] < 1.0e-9f)
-                u[(size_t) k] = 0.0f;
-        if (numActive == 0 && clickEnv < 1.0e-4f)
-            finish();
+        // (The hand damps the body once the feed has stopped: the exciter makes a short body's
+        // feed louder, and what was still being fed would burst out.)
+        if (choking && energyNow < 1.0e-4f)
+            core.setDecay(CHOKE_SECONDS);
+        if (strokeHold > 0)
+            strokeHold -= controlSamples;
+        else
+        {
+            // The feed's brightness follows its level (see the top of the file).
+            const float level = (feed + pressNow) > 1.0e-6f ? std::log2(feed + pressNow) : -20.0f;
+            core.setExciter(exciterAt(m, clamp01(reach + reachSlope * level)));
+            if (fedOut && core.held() < SILENT)
+                finish();
+        }
     }
 
     void finish()
@@ -559,35 +560,8 @@ private:
         fade = carry;
     }
 
-    float processModes()
-    {
-        float sum = 0.0f;
-        const int n = numActive;
-        float* const px = x.data(); float* const py = y.data(); float* const pu = u.data();
-        float* const p1 = n1.data(); float* const p2 = n2.data(); uint32_t* const ps = seeds.data();
-        const float* const pc = c.data(); const float* const psn = s.data(); const float* const pua = ua.data();
-        const float* const pcn = cn.data(); const float* const pgn = gn.data(); const float* const pcar = carrier.data();
-        const float* const pd = direct.data(); const float* const pl = later.data();
-        for (int k = 0; k < n; ++k)
-        {
-            const float xn = px[k] * pc[k] - py[k] * psn[k];    // (auto-vectorised: keep it free of branches)
-            const float yn = px[k] * psn[k] + py[k] * pc[k];
-            px[k] = xn;
-            py[k] = yn;
-            pu[k] *= pua[k];
-            ps[k] = ps[k] * 1664525u + 1013904223u;
-            const float white = (float) (int32_t) ps[k] * (1.0f / 2147483648.0f);
-            p1[k] += pcn[k] * (white - p1[k]);
-            p2[k] += pcn[k] * (p1[k] - p2[k]);
-            const float rise = 1.0f - pu[k];
-            sum += xn * (pd[k] + pl[k] * rise * rise) * (pcar[k] + pgn[k] * p2[k]);
-        }
-        return sum;
-    }
-
     float processBank()
     {
-        const bool ring = struckModel == Ring;
         float sq[6];
         for (int i = 0; i < 6; ++i)
         {
@@ -597,9 +571,9 @@ private:
             {
                 seeds[k] = seeds[k] * 1664525u + 1013904223u;
                 const float white = (float) (int32_t) seeds[k] * (1.0f / 2147483648.0f);
-                n1[k] += cn[k] * (white - n1[k]);
-                n2[k] += cn[k] * (n1[k] - n2[k]);
-                step *= 1.0 + (double) (jitter * gn[k] * n2[k]);
+                n1[k] += jitterK * (white - n1[k]);
+                n2[k] += jitterK * (n1[k] - n2[k]);
+                step *= 1.0 + (double) (jitter * jitterGain * n2[k]);
                 step = std::clamp(step, 1.0e-5, 0.45);
             }
             double& ph = phase[k];
@@ -612,37 +586,20 @@ private:
             v -= dsp::polyBLEP(half, step);
             sq[i] = v;
         }
-        const float sum = ring ? (sq[0] * sq[1] + sq[2] * sq[3] + sq[4] * sq[5]) * (1.0f / 3.0f)
-                               : (sq[0] + sq[1] + sq[2] + sq[3] + sq[4] + sq[5]) * (1.0f / 6.0f);
+        const float summed = pairs < 1.0f ? (sq[0] + sq[1] + sq[2] + sq[3] + sq[4] + sq[5]) * (1.0f / 6.0f) : 0.0f;
+        const float sum = pairs <= 0.0f ? summed
+                        : summed + pairs * ((sq[0] * sq[1] + sq[2] * sq[3] + sq[4] * sq[5]) * (1.0f / 3.0f) - summed);
 
+        // (What is fed - a bow, the pad's pressure - holds the bands up.)
         targetLow *= decayLow;
         targetHighShort *= decayHighShort;
         targetHighLong *= decayHighLong;
-        envLow += attackLow * (targetLow - envLow);
-        envHighShort += attackHighShort * (targetHighShort - envHighShort);
-        envHighLong += attackHighLong * (targetHighLong - envHighLong);
+        envLow += attackLow * (std::max(targetLow, energyNow) - envLow);
+        envHighShort += attackHighShort * (std::max(targetHighShort, energyNow) - envHighShort);
+        envHighLong += attackHighLong * (std::max(targetHighLong, energyNow) - envHighLong);
 
         return bankLowGain * bandLow.process(sum) * envLow
              + bankHighGain * bandHigh.process(sum) * (0.45f * envHighShort + 0.55f * envHighLong);
-    }
-
-    // LOFI: the sound is read out at a low rate (held between readings) by a converter with few
-    // steps. The steps follow the level of the sound, as the level control after an early
-    // sampler's converter did, down to a floor: the tail turns to grit and then stops.
-    float crush(float in, float amount)
-    {
-        const float mag = std::abs(in);
-        follower = mag > follower ? mag : follower * followerDecay;
-        peak = std::max(peak, mag);
-        holdPhase += (double) (32000.0f * std::exp2(-2.6f * amount)) / sampleRate;
-        if (holdPhase >= 1.0)
-        {
-            holdPhase -= std::floor(holdPhase);
-            const float levels = std::exp2(8.0f - 4.0f * amount);
-            const float stepSize = std::max(std::max(follower, 0.02f * peak), 1.0e-6f) * 2.0f / levels;
-            held = std::round(in / stepSize) * stepSize;
-        }
-        return held;
     }
 
     // The 2 ms glide to nothing of a sound that was cut off by a change of model.
@@ -660,35 +617,34 @@ private:
     float fadeCoef() const { return std::exp(-1.0f / (0.0007f * (float) sampleRate)); }
 
     double sampleRate = 44100.0;
-    std::array<float, NumParams> params { { (float) Ride, 0.5f, 0.5f, 0.5f, 0.4f, 0.3f, 0.5f, 0.0f } };
+    std::array<float, NumParams> params { { (float) Ride, 0.5f, 0.5f, 0.0f, 0.4f, 0.3f, 0.0f, 0.0f } };
     bool active = false;
     int struckModel = Ride;
-    int control = 0;
+    int control = 0, controlSamples = 64;
     float tuneRatio = 1.0f;
     float decayStretch = 1.0f;
     bool coefsStale = true;
     float outGain = 1.0f;
 
-    // The modes (structure of arrays: the loop over them is the cost of the voice).
-    std::array<float, NUM_MODES> x {}, y {};            // the mode's motion; x is what is heard
-    std::array<float, NUM_MODES> c {}, s {};            // its rotation per sample, decay included
-    std::array<float, NUM_MODES> u {}, ua {};           // what is still to arrive of it (1 -> 0)
-    std::array<float, NUM_MODES> direct {}, later {};   // the part that is there at once, and the part that arrives
-    std::array<float, NUM_MODES> n1 {}, n2 {}, cn {}, gn {}, carrier {};    // its slow noise
-    std::array<float, NUM_MODES> hz {}, t60 {}, logR {};
-    std::array<uint32_t, NUM_MODES> seeds = [] {
-        std::array<uint32_t, NUM_MODES> a {};
-        for (size_t i = 0; i < a.size(); ++i) a[i] = 0x9e3779b9u * (uint32_t) (i + 1);
-        return a;
-    }();
-    int numActive = 0;
+    // The body and what plays it (dsp/Resonator.h on dsp/ModeBank.h).
+    res::Resonator core;
+    float excite = 0.0f, couple = 0.0f, fed = 0.0f;         // EXC and COUP as struck; EXC's fed part
+    float feed = 0.0f, feedTarget = 0.0f, feedAttack = 1.0f, feedDecay = 0.0f;
+    float ringSeconds = 1.0f, feedSeconds = 1.0f;
+    float reach = 0.8f, reachSlope = 0.04f, washMix = 1.0f;
+    float energyNow = 0.0f, energyStep = 0.0f;
+    float pressTarget = 0.0f, pressNow = 0.0f, pressK = 0.1f;
+    int strokeHold = 0;
     float glide = 0.0f, glideDecay = 0.0f;
 
     // The oscillator bank.
     std::array<double, 6> phase { { 0.0, 0.31, 0.62, 0.17, 0.83, 0.45 } };
     std::array<double, 6> inc {};
+    std::array<float, 6> n1 {}, n2 {};                      // each oscillator's slow noise
+    float jitterK = 0.0f, jitterGain = 1.0f;                // ... its rate and what brings it to a variance of one
+    std::array<uint32_t, 6> seeds { { 0x9e3779b9u, 0x3c6ef372u, 0xdaa66d2bu, 0x78dde6e4u, 0x1715609du, 0xb54cda56u } };
     SVFilter bandLow, bandHigh;
-    float jitter = 0.0f;
+    float jitter = 0.0f, pairs = 0.0f;
     float bankLowGain = 1.0f, bankHighGain = 1.0f;
     float envLow = 0.0f, envHighShort = 0.0f, envHighLong = 0.0f;
     float targetLow = 0.0f, targetHighShort = 0.0f, targetHighLong = 0.0f;
@@ -701,8 +657,6 @@ private:
     float clickEnv = 0.0f, clickDecay = 0.0f;
     uint32_t noiseSeed = 0x2545f491u;
     bool choking = false;
-    float followerDecay = 0.0f;
-    float held = 0.0f, follower = 0.0f, peak = 0.0f;
-    double holdPhase = 1.0;
+    dsp::LevelCrusher crusher;      // LOFI
     float fade = 0.0f, lastOut = 0.0f;
 };

@@ -184,6 +184,25 @@ public:
             return;
         }
 
+        // Latched pads: a pad pressed with no other pad physically down is a new chord.
+        if (anyScaleLatched.load())
+        {
+            bool anotherDown = false;
+            for (int i = 0; i < 16; ++i)
+                if (i != padIndex && soundingNote[(size_t) i] >= 0 && !scalePadLatched[(size_t) i])
+                    anotherDown = true;
+            if (!anotherDown)
+                releaseScaleLatched();
+        }
+
+        // Release a pad that is re-pressed without an intervening release.
+        if (soundingNote[(size_t) padIndex] >= 0)
+        {
+            if (noteOffCallback) noteOffCallback(soundingNote[(size_t) padIndex]);
+            soundingNote[(size_t) padIndex] = -1;
+            scalePadLatched[(size_t) padIndex] = false;
+        }
+
         selectedPad = padIndex;
         int midiNote = scaleManager.getNoteForPad(padIndex);
         soundingNote[(size_t) padIndex] = midiNote;
@@ -205,11 +224,20 @@ public:
     {
         if (padIndex >= 0 && padIndex < CustomScaleManager::PADS_PER_PAGE)
         {
-            // Release the note that was started by this pad, even if the page changed meanwhile.
             int midiNote = soundingNote[(size_t) padIndex];
-            soundingNote[(size_t) padIndex] = -1;
-            if (noteOffCallback && midiNote >= 0)
-                noteOffCallback(midiNote);
+            if (midiNote >= 0 && latchOn && latchOn() && !scaleManager.isEditMode())
+            {
+                // Under the key latch the note stays: a new chord or latch-off releases it.
+                scalePadLatched[(size_t) padIndex] = true;
+                latchSeen = latchReleases ? latchReleases() : 0;
+                anyScaleLatched = true;
+            }
+            else
+            {
+                soundingNote[(size_t) padIndex] = -1;
+                if (noteOffCallback && midiNote >= 0)
+                    noteOffCallback(midiNote);
+            }
         }
 
         if (scaleManager.isEditMode())
@@ -296,6 +324,20 @@ public:
     void setLockHooks(std::function<bool()> get, std::function<void(bool)> set) { getLock = std::move(get); setLock = std::move(set); }
     void setNoteOffCallback(std::function<void(int midiNote)> cb) { noteOffCallback = std::move(cb); }
     void setAftertouchCallback(std::function<void(int midiNote, int pressure)> cb) { aftertouchCallback = std::move(cb); }
+    // The key latch: when on, released scale pads keep sounding until a new chord starts or latch
+    // is turned off. serviceScaleLatch() checks whether the latch has released its notes.
+    void setLatchState(std::function<bool()> on, std::function<int()> releaseCount)
+    {
+        latchOn = std::move(on);
+        latchReleases = std::move(releaseCount);
+    }
+    bool latchIsWaiting() const { return anyScaleLatched.load(); }
+    void serviceScaleLatch()
+    {
+        if (!anyScaleLatched.load()) return;
+        if (!latchOn || !latchOn() || (latchReleases && latchReleases() != latchSeen))
+            releaseScaleLatched();
+    }
 
     // Pads: the root one colour, the other notes another, a held pad bright. In edit mode the
     // pad being edited is white and the rest dim red.
@@ -445,6 +487,22 @@ private:
         }
     }
 
+    void releaseScaleLatched()
+    {
+        for (int i = 0; i < 16; ++i)
+        {
+            if (scalePadLatched[(size_t) i])
+            {
+                scalePadLatched[(size_t) i] = false;
+                int note = soundingNote[(size_t) i];
+                soundingNote[(size_t) i] = -1;
+                if (noteOffCallback && note >= 0)
+                    noteOffCallback(note);
+            }
+        }
+        anyScaleLatched = false;
+    }
+
     CustomScaleManager& scaleManager;
     int selectedPad = -1;
     bool browseMode = false;
@@ -454,5 +512,10 @@ private:
     std::function<void(bool)> setLock;
     std::function<void(int)> noteOffCallback;
     std::function<void(int, int)> aftertouchCallback;
+    std::function<bool()> latchOn;
+    std::function<int()> latchReleases;
+    std::array<bool, 16> scalePadLatched {};
+    std::atomic<bool> anyScaleLatched { false };
+    int latchSeen = 0;
     std::array<int, 16> soundingNote = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 };

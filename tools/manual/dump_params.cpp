@@ -1,7 +1,7 @@
 #include <juce_core/juce_core.h>
 #include <juce_audio_basics/juce_audio_basics.h>
 #include "SRCROOT/engine/AudioEngine.h"
-#include "SRCROOT/dsp/effects/TrackFx.h"
+#include "SRCROOT/project/PresetManager.h"
 #include <cstdio>
 
 static juce::var specVar(const ParamSpec& s)
@@ -33,7 +33,7 @@ int main()
 {
     auto* root = new juce::DynamicObject();
     juce::Array<juce::var> engines;
-    for (int t = 0; t <= (int) EngineType::MIDITrack; ++t)
+    for (int t = 0; t < ENGINE_TYPE_COUNT; ++t)
     {
         auto e = AudioEngine::createEngine((EngineType) t);
         if (!e) continue;
@@ -62,9 +62,40 @@ int main()
         fx.add(juce::var(o));
     }
     root->setProperty("effects", fx);
-    juce::Array<juce::var> blocks;
-    blocks.add(pageVar(DirtBlock::page())); blocks.add(pageVar(TalkBlock::page())); blocks.add(pageVar(ModFxBlock::page()));
-    root->setProperty("blocks", blocks);
+    // The built-in presets and multi presets, in the order PRESET lists them (nothing is read from disk).
+    PresetManager manager;
+    juce::Array<juce::var> presets;
+    for (int i = 0; i < manager.getPresetCount(); ++i)
+    {
+        const auto& p = manager.getPreset(i);
+        if (!p.isFactory) continue;
+        auto* o = new juce::DynamicObject();
+        o->setProperty("name", p.name);
+        o->setProperty("category", p.category);
+        o->setProperty("engine", (int) p.engineType);
+        presets.add(juce::var(o));
+    }
+    root->setProperty("presets", presets);
+    juce::Array<juce::var> multis;
+    for (int i = 0; i < manager.getMultiCount(); ++i)
+    {
+        const auto& m = manager.getMulti(i);
+        auto* o = new juce::DynamicObject();
+        o->setProperty("name", m.name);
+        o->setProperty("play", m.playMember);
+        juce::Array<juce::var> members;
+        for (auto& member : m.members)
+        {
+            auto* mo = new juce::DynamicObject();
+            mo->setProperty("name", member.preset.name);
+            mo->setProperty("engine", (int) member.preset.engineType);
+            mo->setProperty("pattern", member.hasPattern);
+            members.add(juce::var(mo));
+        }
+        o->setProperty("members", members);
+        multis.add(juce::var(o));
+    }
+    root->setProperty("multis", multis);
     puts(juce::JSON::toString(juce::var(root)).toRawUTF8());
     return 0;
 }

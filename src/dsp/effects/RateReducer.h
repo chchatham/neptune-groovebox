@@ -88,9 +88,7 @@ public:
 
         // Bit depth reduction
         // Map bitDepth 0-1: at 0 = 16 bits (clean), at 1 = 1 bit (extreme)
-        float bits = 16.0f - bitDepth * 15.0f;
-        float levels = std::pow(2.0f, bits);
-        float invLevels = 1.0f / levels;
+        // (levels = 2 ^ bits and its inverse are worked out when BITS is set: recalcLevels)
         wetL = std::floor(wetL * levels + 0.5f) * invLevels;
         wetR = std::floor(wetR * levels + 0.5f) * invLevels;
 
@@ -107,6 +105,7 @@ public:
                 break;
             case BitDepth:
                 bitDepth = std::clamp(value, 0.0f, 1.0f);
+                recalcLevels();
                 break;
             case PreFilter:
                 preFilter = std::clamp(value, 0.0f, 1.0f);
@@ -142,6 +141,20 @@ private:
     float preFilterL = 0.0f;
     float preFilterR = 0.0f;
     float cachedPreFilterCoeff = 0.5f;
+
+    // The quantiser's steps for the BITS setting: a power and a division a setting, not a sample.
+    float levels = levelsFor(0.0f);
+    float invLevels = 1.0f / levelsFor(0.0f);
+    static float levelsFor(float depth)
+    {
+        const float bits = 16.0f - depth * 15.0f;
+        return std::pow(2.0f, bits);
+    }
+    void recalcLevels()
+    {
+        levels = levelsFor(bitDepth);
+        invLevels = 1.0f / levels;
+    }
 
     void recalcFilterCoeff()
     {

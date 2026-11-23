@@ -90,9 +90,16 @@ void SequencerCore::processBlock(int numSamples)
         firstSample = processCountIn(numSamples, samplesPerBeat);
 
     if (!playing)
+    {
+        takePerfMoves(perfPosition());      // (played as the transport stopped: where it stopped)
         return;
+    }
 
     auto& pat = patterns[activePattern];
+    // Where the PERF moves' window begins: track 1's place at the block's first sample (after a
+    // count-in has started the transport, if one did).
+    const int perfPattern = activePattern;
+    const double perfFrom = perfPosition();
     // A tempo change keeps every track where it is within its step (and the beat within the beat):
     // the time gone by is counted in samples, which are now a different part of a step.
     if (cachedSamplesPerStep > 0.0 && currentSamplesPerStep != cachedSamplesPerStep)
@@ -196,6 +203,32 @@ void SequencerCore::processBlock(int numSamples)
     blockSample = numSamples;
     if (activeLanePlayers > 0 || activeCaptures > 0)
         advancePressureLanes(numSamples, currentSamplesPerStep);
+
+    // PERF pad moves: those between where track 1 was at the block's first sample and where it
+    // is now, in time order (round the pattern's end when the track went round it).
+    if (onPerfMove)
+    {
+        const float to = (float) perfPosition();
+        if (activePattern != perfLanePattern)
+        {
+            // Another pattern (in this block, or chosen between two): what the last one's lane
+            // held down is let go.
+            releasePerfPlayback();
+            perfLanePattern = activePattern;
+        }
+        if (activePattern != perfPattern)
+            playPerfMoves(0.0f, to, false);         // (changed in this block: the new lane from its top)
+        else if ((float) perfFrom <= to)
+            playPerfMoves((float) perfFrom, to, false);
+        else
+        {
+            playPerfMoves((float) perfFrom, 0.0f, true);
+            playPerfMoves(0.0f, to, false);
+        }
+    }
+    // What was played on the pads since the last block, into the lane: after the window has been
+    // played, so that a move is not played back in the block it was recorded in.
+    takePerfMoves(activePattern == perfPattern ? perfFrom : 0.0);
 }
 
 void SequencerCore::requestStart()
@@ -237,6 +270,9 @@ void SequencerCore::beginPlaying()
     blockSample = 0;
     firstBeatDue = true;
 
+    perfPlaybackDown.fill(false);
+    perfLanePattern = activePattern;
+
     playing = true;
     listeners.call(&Listener::transportStarted);
 }
@@ -269,6 +305,8 @@ void SequencerCore::stop()
                 onNoteOff(noff.trackIndex, noff.pitch);
         }
     }
+
+    releasePerfPlayback();
 
     listeners.call(&Listener::transportStopped);
 }
@@ -344,68 +382,73 @@ void SequencerCore::recordNote(int trackIndex, int note, float velocity)
     if (trackIndex < 0 || trackIndex >= pat.getTrackCount())
         return;
 
-    auto& track = pat.getTrack(trackIndex);
-    int stepIdx = currentSteps[trackIndex];
-
-    double currentSamplesPerStep = (60.0 / tempo.load()) * sampleRate / 4.0;
-    double trackStepLen = currentSamplesPerStep / track.speedMultiplier;
-
-    float rawOffset = (float)(stepAccumulators[trackIndex] / trackStepLen);
-    bool nextStep = false;
-    if (rawOffset > 0.5f)
+    auto doRecord = [&]
     {
-        stepIdx = (stepIdx + 1) % track.length;
-        rawOffset -= 1.0f;
-        nextStep = true;
-    }
+        auto& track = pat.getTrack(trackIndex);
+        int stepIdx = currentSteps[trackIndex];
 
-    // The same step in the same pass: a chord, or two pads together. Otherwise this pass's note
-    // replaces what the step held.
-    const size_t t = (size_t) juce::jlimit(0, MAX_TRACKS - 1, trackIndex);
-    const int visit = (trackIndex < (int) stepVisits.size() ? stepVisits[(size_t) trackIndex] : 0) + (nextStep ? 1 : 0);
-    const bool sameVisit = recordStampStep[t] == stepIdx && recordStampVisit[t] == visit;
-    recordStampStep[t] = stepIdx;
-    recordStampVisit[t] = visit;
+        double currentSamplesPerStep = (60.0 / tempo.load()) * sampleRate / 4.0;
+        double trackStepLen = currentSamplesPerStep / track.speedMultiplier;
 
-    auto& step = track.getStep(stepIdx);
-    if (!sameVisit)
-    {
-        // The notes go, and their pressure lanes with them (the buffers back to the pool); pressure
-        // still being recorded for them has nowhere to go.
-        dropCapturesOn(activePattern, trackIndex, stepIdx, -1);
-        for (auto& n : step.notes)
-            recycleLane(n.lane);
-        step.notes.clear();
-        step.pressureScale = 1.0f;
-        step.microTiming = (recordMode.load() == RecordMode::Quant) ? 0.0f : rawOffset;
-    }
-    bool present = false;
-    for (auto& n : step.notes)
-        if (n.pitch == note)
+        float rawOffset = (float)(stepAccumulators[trackIndex] / trackStepLen);
+        bool nextStep = false;
+        if (rawOffset > 0.5f)
         {
-            // Hit again in the same pass (a roll): the latest hit counts, without the earlier one's pressure.
-            dropCapturesOn(activePattern, trackIndex, stepIdx, note);
-            recycleLane(n.lane);
-            n.velocity = velocity;
+            stepIdx = (stepIdx + 1) % track.length;
+            rawOffset -= 1.0f;
+            nextStep = true;
+        }
+
+        // The same step in the same pass: a chord, or two pads together. Otherwise this pass's note
+        // replaces what the step held.
+        const size_t t = (size_t) juce::jlimit(0, MAX_TRACKS - 1, trackIndex);
+        const int visit = (trackIndex < (int) stepVisits.size() ? stepVisits[(size_t) trackIndex] : 0) + (nextStep ? 1 : 0);
+        const bool sameVisit = recordStampStep[t] == stepIdx && recordStampVisit[t] == visit;
+        recordStampStep[t] = stepIdx;
+        recordStampVisit[t] = visit;
+
+        auto& step = track.getStep(stepIdx);
+        if (!sameVisit)
+        {
+            // The notes go, and their pressure lanes with them (the buffers back to the pool); pressure
+            // still being recorded for them has nowhere to go.
+            dropCapturesOn(activePattern, trackIndex, stepIdx, -1);
+            for (auto& n : step.notes)
+                recycleLane(n.lane);
+            step.notes.clear();
+            step.pressureScale = 1.0f;
+            step.microTiming = (recordMode.load() == RecordMode::Quant) ? 0.0f : rawOffset;
+        }
+        bool present = false;
+        for (auto& n : step.notes)
+            if (n.pitch == note)
+            {
+                // Hit again in the same pass (a roll): the latest hit counts, without the earlier one's pressure.
+                dropCapturesOn(activePattern, trackIndex, stepIdx, note);
+                recycleLane(n.lane);
+                n.velocity = velocity;
+                present = true;
+            }
+        if (!present && (int) step.notes.size() < MAX_RECORDED_NOTES_PER_STEP)
+        {
+            step.notes.push_back({ note, velocity, {} });
             present = true;
         }
-    if (!present && (int) step.notes.size() < MAX_RECORDED_NOTES_PER_STEP)
-    {
-        step.notes.push_back({ note, velocity, {} });
-        present = true;
-    }
-    step.trig = true;
+        step.trig = true;
 
-    lastRecord = { present, activePattern, trackIndex, stepIdx, note, visit };
-    recordSerial.fetch_add(1, std::memory_order_relaxed);
+        lastRecord = { present, activePattern, trackIndex, stepIdx, note, visit };
+        recordSerial.fetch_add(1, std::memory_order_relaxed);
 
-    // It was just heard as it was played: the sequencer leaves it out of this pass.
-    recordedStep[t] = nextStep ? (stepIdx | NEXT_STEP) : stepIdx;
+        // It was just heard as it was played: the sequencer leaves it out of this pass.
+        recordedStep[t] = nextStep ? (stepIdx | NEXT_STEP) : stepIdx;
 
-    lastRecordedTrack = trackIndex;
-    const int first = firstRecordedSteps[t].load();
-    if (first < 0 || stepIdx < first)
-        firstRecordedSteps[t] = stepIdx;
+        lastRecordedTrack = trackIndex;
+        const int first = firstRecordedSteps[t].load();
+        if (first < 0 || stepIdx < first)
+            firstRecordedSteps[t] = stepIdx;
+    };
+
+    withStructure(doRecord);
 }
 
 int SequencerCore::getCurrentStep(int trackIndex) const
@@ -528,7 +571,7 @@ void SequencerCore::fireStep(int trackIndex, int stepIndex)
 
     // A muted (or un-soloed) track keeps running so it is still in step when it comes back;
     // it just makes no sound.
-    const bool audible = isTrackAudible(trackIndex);
+    const bool audible = trackPlays(trackIndex);
 
     if (audible && onTrig)
         onTrig(trackIndex, step);
@@ -842,7 +885,7 @@ void SequencerCore::advancePressureLanes(int numSamples, double samplesPerStepNo
             p.elapsed += stepsIn(p.pattern, p.track);
             float scale = 1.0f;
             const Note* note = laneNote(p, scale);
-            if (note == nullptr || !isTrackAudible(p.track))
+            if (note == nullptr || !trackPlays(p.track))
             {
                 p.active = false;
                 --activeLanePlayers;
@@ -1007,4 +1050,114 @@ bool SequencerCore::isStepActiveDuringFill(int trackIdx, int stepIdx) const
         return false;
 
     return evaluateTrigCondition(step.trigCondition, trackIdx);
+}
+
+// ---- PERF pad moves -------------------------------------------------------------------------
+
+// MIDI thread (one writer at a time: the screens' lock). No lock, no memory, no clock: the audio
+// thread stamps the move when it takes it (takePerfMoves).
+void SequencerCore::recordPerfMove(const PerfFx::Move& move)
+{
+    if (! playing.load() || ! recording.load())
+        return;
+    const uint32_t written = perfRingWritten.load(std::memory_order_relaxed);
+    if (written - perfRingRead.load(std::memory_order_acquire) >= PERF_RING)
+    {
+        perfMovesLost.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    perfRing[(size_t) (written & (PERF_RING - 1))] = move;
+    perfRingWritten.store(written + 1, std::memory_order_release);
+}
+
+// Track 1's place in the active pattern, in steps and parts of a step.
+double SequencerCore::perfPosition() const
+{
+    const auto& pat = patterns[activePattern];
+    if (pat.getTrackCount() <= 0 || currentSteps.empty())
+        return 0.0;
+    const double trackStepLen = cachedSamplesPerStep / (double) pat.getTrack(0).speedMultiplier;
+    // (Within the step, whatever a change of speed has just made of the count.)
+    const double part = trackStepLen > 0.0 ? stepAccumulators[0] / trackStepLen : 0.0;
+    return (double) currentSteps[0] + (part > 0.0 ? std::min(part, 0.999999) : 0.0);
+}
+
+// Audio thread: what the ring holds goes into the active pattern's lane at `stepPos`, in the
+// order it was played (MoveLane::add puts a move behind those already at its time). At most a
+// ring's worth a call; a lane that is full takes no more.
+void SequencerCore::takePerfMoves(double stepPos)
+{
+    const uint32_t written = perfRingWritten.load(std::memory_order_acquire);
+    uint32_t read = perfRingRead.load(std::memory_order_relaxed);
+    if (read == written)
+        return;
+
+    auto& pat = patterns[activePattern];
+    if (recordMode.load() == RecordMode::Quant)
+    {
+        // The nearest step; the one past the last is the first.
+        stepPos = std::round(stepPos);
+        const double length = pat.getTrackCount() > 0 ? (double) pat.getTrack(0).length : 0.0;
+        if (length > 0.0 && stepPos >= length)
+            stepPos -= length;
+    }
+    for (; read != written; ++read)
+    {
+        PerfFx::Move m = perfRing[(size_t) (read & (PERF_RING - 1))];
+        m.stepTime = (float) stepPos;
+        if (! pat.perfMoves.add(m))
+            perfMovesLost.fetch_add(1, std::memory_order_relaxed);
+    }
+    perfRingRead.store(read, std::memory_order_release);
+}
+
+// The lane's moves from `from` up to `to` (not `to` itself), or up to the lane's end, in the
+// order they are in: found by a search of the sorted lane, not by a walk through all of it.
+void SequencerCore::playPerfMoves(float from, float to, bool toTheEnd)
+{
+    const auto& lane = patterns[activePattern].perfMoves;
+    if (lane.empty() || ! onPerfMove)
+        return;
+
+    const size_t count = lane.moves.size();
+    for (size_t i = lane.firstAt(from); i < count; ++i)
+    {
+        const PerfFx::Move& m = lane.moves[i];
+        if (! toTheEnd && ! (m.stepTime < to))
+            break;
+
+        // A live finger wins: skip playback for pads a finger is on.
+        const int absPad = (int) m.bank * PerfFx::PADS + (int) m.pad;
+        if (absPad >= 0 && absPad < MAX_PERF_PADS && perfPadLive[(size_t) absPad].load(std::memory_order_relaxed))
+            continue;
+
+        onPerfMove(m);
+
+        // Track which pads playback holds down.
+        if (absPad >= 0 && absPad < MAX_PERF_PADS)
+        {
+            if (m.type == PerfFx::MOVE_PRESS)
+                perfPlaybackDown[(size_t) absPad] = true;
+            else if (m.type == PerfFx::MOVE_RELEASE)
+                perfPlaybackDown[(size_t) absPad] = false;
+        }
+    }
+}
+
+void SequencerCore::releasePerfPlayback()
+{
+    if (! onPerfMove)
+        return;
+    for (int i = 0; i < MAX_PERF_PADS; ++i)
+    {
+        if (perfPlaybackDown[(size_t) i])
+        {
+            PerfFx::Move m;
+            m.pad = (uint8_t) (i % PerfFx::PADS);
+            m.bank = (uint8_t) (i / PerfFx::PADS);
+            m.type = PerfFx::MOVE_RELEASE;
+            onPerfMove(m);
+            perfPlaybackDown[(size_t) i] = false;
+        }
+    }
 }

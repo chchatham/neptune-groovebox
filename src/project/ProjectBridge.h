@@ -4,6 +4,7 @@
 #include "TrackPresetNames.h"
 #include "../sequencer/SequencerCore.h"
 #include "../engine/AudioEngine.h"
+#include "../engine/UnifiedVoiceEngine.h"
 #include "../arpeggiator/Arpeggiator.h"
 #include "../controller/ChordPads.h"
 
@@ -11,8 +12,8 @@
 // Moves the whole live state of the instrument into a ProjectData (for saving)
 // and back (after loading or "new"): tempo, all 16 patterns with every step and
 // lock, each track's engine and every parameter the pages show (engine, mixer,
-// effect blocks, insert effects), send buses, master level, song, custom scale
-// pages and pad-pressure routing.
+// effect blocks, insert effects) with its pad-pressure slots (AT ROUTE), send
+// buses, master level, song and custom scale pages.
 //
 // The sound of a track (engine, parameters, effects) is one per track, shared by
 // all patterns; it is stored on the active pattern's tracks and written to every
@@ -20,6 +21,11 @@
 // -----------------------------------------------------------------------------
 namespace ProjectBridge
 {
+    // (Format 3 stores a cell that is a position in a list by the entry's name: StoredLists.h,
+    // which Project.h brings. It reads each engine's tables itself, at first use: there is nothing
+    // to register, and a file read before any project was captured or applied - the session, at
+    // start - is read with every list in place.)
+
     // Insert-slot effect types are stored with the track's parameters: id = INSERT_TYPE_BASE + slot,
     // value = effect type + 1 (0 = empty). The ids sit between the insert parameters (200-231)
     // and the effect blocks (240+).
@@ -33,7 +39,7 @@ namespace ProjectBridge
         AudioEngine& audio;
         SongMode* song = nullptr;
         CustomScaleManager* scales = nullptr;
-        AftertouchRouter* pressure = nullptr;     // legacy single router (optional); the routes are per track in `audio`
+        AftertouchRouter* pressure = nullptr;     // legacy single router (optional): only what an old project's one list is read into
         std::function<Arpeggiator*(int track)> arpForTrack;     // one arpeggiator per track
         ChordPads* chords = nullptr;              // the CHORD screen's pads
         std::function<KeyboardSetup()> getKeyboard;               // the keys' split and octave
@@ -162,15 +168,256 @@ namespace ProjectBridge
         s.pressureScale = within(d.pressureScale, 0.0f, 2.0f, 1.0f);
     }
 
+    // ---- The DIRT / TALK / MODFX blocks of before (ids 240-263, TrackFxParam) ---------------------
+    // Every track had the three blocks, in front of its insert slots. They are insert effects now
+    // (DIRT, TALK; PHS, FLG, CHR, ROT for what MODFX held), so a stored sound that has a block
+    // switched on gets that effect IN FRONT of its chain, and the inserts it stores move back.
+    // trackFxPrepend() is the ONE place that says which blocks were on and what each becomes: the
+    // sound (convertTrackFxParams) and the locks of its steps (convertStepLocks) both go by it.
+
+    // An id of an insert slot: which slot, and the same cell of another slot.
+    struct InsertId
+    {
+        int slot = -1;              // -1: not an insert id
+        int base = 0, perSlot = 1, cell = 0;
+        int at(int otherSlot) const
+        {
+            return otherSlot >= 0 && otherSlot < AudioEngine::MAX_INSERTS_PER_TRACK ? base + otherSlot * perSlot + cell : -1;
+        }
+    };
+    inline InsertId insertId(int id)
+    {
+        const int slots = AudioEngine::MAX_INSERTS_PER_TRACK;
+        auto in = [id](int base, int perSlot) { return InsertId { (id - base) / perSlot, base, perSlot, (id - base) % perSlot }; };
+        if (id >= AudioEngine::EFFECT_PARAM_BASE && id < AudioEngine::EFFECT_PARAM_BASE + slots * 4)
+            return in(AudioEngine::EFFECT_PARAM_BASE, 4);
+        if (id >= INSERT_TYPE_BASE && id < INSERT_TYPE_BASE + slots)
+            return in(INSERT_TYPE_BASE, 1);
+        for (int base : { AudioEngine::INSERT_ON_BASE, AudioEngine::INSERT_WET_BASE, AudioEngine::INSERT_SYNC_BASE, AudioEngine::INSERT_DIV_BASE })
+            if (id >= base && id < base + slots)
+                return in(base, 1);
+        if (AudioEngine::isInsertExtraParam(id))
+            return in(AudioEngine::INSERT_EXTRA_BASE, EffectBase::MAX_EXTRAS);
+        return {};
+    }
+
+    // How many insert slots a stored sound names (up to the first slot without a type).
+    inline int storedInsertCount(const ParamMap& params)
+    {
+        int count = 0;
+        for (; count < AudioEngine::MAX_INSERTS_PER_TRACK; ++count)
+        {
+            auto it = params.find(INSERT_TYPE_BASE + count);
+            if (it == params.end() || ! (it->second >= 0.5f))
+                break;
+        }
+        return count;
+    }
+
+    struct OldBlockSlot
+    {
+        static constexpr int CELLS = 4 + EffectBase::MAX_EXTRAS;
+        EffectType type;
+        float cells[CELLS];         // the effect's four cells, then its cells beyond four
+        float wet = -1.0f;          // the slot's WET; below 0: as a new slot has it (1)
+        int block = -1;             // the block whose cells are this effect's, one for one (TrackFxParam::
+                                    // DIRT_BASE / TALK_BASE: a step's lock on one follows it); -1: none
+        // Cell `cell` of this effect in slot `slot`, as an insert id.
+        static int cellId(int slot, int cell)
+        {
+            return cell < 4 ? AudioEngine::EFFECT_PARAM_BASE + slot * 4 + cell
+                            : AudioEngine::INSERT_EXTRA_BASE + slot * EffectBase::MAX_EXTRAS + (cell - 4);
+        }
+    };
+    static_assert(OldBlockSlot::CELLS == 8, "a block had eight cells: its effect's four and four beyond");
+
+    // What goes in front of the chain, in order: DIRT, TALK, then MODFX's phaser, flanger, chorus,
+    // rotary - each only if it was on, and no more of them than the chain has slots left for.
+    // (What does not fit is not loaded: the sound's own inserts are never pushed off the end.)
+    inline std::vector<OldBlockSlot> trackFxPrepend(const ParamMap& params)
+    {
+        auto val = [&](int id) -> float
+        {
+            auto it = params.find(id);
+            return it != params.end() ? it->second : 0.0f;
+        };
+        const int dirt = TrackFxParam::DIRT_BASE, talk = TrackFxParam::TALK_BASE, modfx = TrackFxParam::MODFX_BASE;
+        std::vector<OldBlockSlot> prepend;
+
+        // DIRT: on if any of Drive, Bits, Rate, Feedback > 0 and Mix > 0.
+        if (val(dirt + 7) > 0.0f && (val(dirt + 0) > 0.0f || val(dirt + 2) > 0.0f || val(dirt + 3) > 0.0f || val(dirt + 4) > 0.0f))
+            prepend.push_back({ EffectType::DirtInsertEffect,
+                                { val(dirt + 0), val(dirt + 1), val(dirt + 2), val(dirt + 3), val(dirt + 4), val(dirt + 5), val(dirt + 6), val(dirt + 7) },
+                                -1.0f, dirt });
+        // TALK: on if Mix > 0.
+        if (val(talk + 3) > 0.0f)
+            prepend.push_back({ EffectType::TalkInsertEffect,
+                                { val(talk + 0), val(talk + 1), val(talk + 2), val(talk + 3), val(talk + 4), val(talk + 5), val(talk + 6), val(talk + 7) },
+                                -1.0f, talk });
+
+        // MODFX: each sub-effect that was on becomes an insert of its own (its cells map to no
+        // cell of theirs one for one: a step's lock on a MODFX cell is not carried over).
+        auto wetFor = [](float depth) { return 0.5f * juce::jmin(1.0f, depth * 4.0f); };
+        const float phaserDepth = val(modfx + 5), flangerDepth = val(modfx + 3), chorusDepth = val(modfx + 1), rotaryDepth = val(modfx + 7);
+        // Phaser: Rate -> cell 0, Depth -> cell 1, Feedback 0.5, Stages 6; its mix is the slot's WET.
+        if (phaserDepth > 0.0f)
+            prepend.push_back({ EffectType::PhaserEffect, { val(modfx + 4), phaserDepth, 0.5f, 6.0f, 0, 0, 0, 0 }, wetFor(phaserDepth) });
+        // Flanger: Rate -> cell 0, Depth -> cell 1, Feedback 0.6, Mix -> cell 3.
+        if (flangerDepth > 0.0f)
+            prepend.push_back({ EffectType::FlangerEffect, { val(modfx + 2), flangerDepth, 0.6f, wetFor(flangerDepth), 0, 0, 0, 0 } });
+        // Chorus: Rate -> cell 0, Depth -> cell 1, Mix -> cell 2, Voices 3.
+        if (chorusDepth > 0.0f)
+            prepend.push_back({ EffectType::ChorusEffect, { val(modfx + 0), chorusDepth, wetFor(chorusDepth), 3.0f, 0, 0, 0, 0 } });
+        // Rotary: Speed -> cell 0; its depth is the slot's WET (the old block used setMix).
+        if (rotaryDepth > 0.0f)
+            prepend.push_back({ EffectType::RotaryEffect, { val(modfx + 6), 0, 0, 0, 0, 0, 0, 0 }, rotaryDepth });
+
+        const int room = AudioEngine::MAX_INSERTS_PER_TRACK - storedInsertCount(params);
+        if ((int) prepend.size() > room)
+            prepend.resize((size_t) juce::jmax(0, room));
+        return prepend;
+    }
+
+    // A stored sound with its old blocks as insert effects in front of its chain: the block ids
+    // are gone from it, the blocks' effects are its first slots, and the inserts it named follow.
+    // A sound with no block on (or no slot free for one) is returned as it is.
+    inline ParamMap convertTrackFxParams(const ParamMap& params)
+    {
+        const auto prepend = trackFxPrepend(params);
+        if (prepend.empty())
+            return params;
+        const int shift = (int) prepend.size();
+        const int named = storedInsertCount(params);
+
+        ParamMap out;
+        for (auto& [id, v] : params)
+        {
+            if (TrackFxParam::isTrackFxParam(id))
+                continue;
+            const auto insert = insertId(id);
+            if (insert.slot < 0)
+                out[id] = v;
+            else if (const int moved = insert.at(insert.slot + shift); insert.slot < named && moved >= 0)
+                out[moved] = v;                 // (a slot the sound names no effect for holds nothing)
+        }
+        for (int i = 0; i < shift; ++i)
+        {
+            const auto& slot = prepend[(size_t) i];
+            out[INSERT_TYPE_BASE + i] = (float) ((int) slot.type + 1);
+            for (int c = 0; c < OldBlockSlot::CELLS; ++c)
+                out[OldBlockSlot::cellId(i, c)] = slot.cells[c];
+            if (slot.wet >= 0.0f)
+                out[AudioEngine::INSERT_WET_BASE + i] = slot.wet;
+        }
+        return out;
+    }
+
+    // The locks of a track's steps, for a sound whose blocks convertTrackFxParams turned into
+    // inserts (`params`: the sound as it was stored, BEFORE that): a lock on a DIRT or TALK cell
+    // goes to the same cell of the insert the block became, a lock on an insert slot moves back
+    // with its slot (off the end of the chain: gone), a lock on a block that became no insert
+    // (MODFX; a block that was off, or had no slot left) is dropped.
+    inline void convertStepLocks(const ParamMap& params, Track& track)
+    {
+        const auto prepend = trackFxPrepend(params);
+        if (prepend.empty())
+            return;
+        const int shift = (int) prepend.size();
+        auto slotOfBlock = [&](int block)
+        {
+            for (int i = 0; i < shift; ++i)
+                if (prepend[(size_t) i].block == block)
+                    return i;
+            return -1;
+        };
+
+        for (auto& step : track.steps)
+        {
+            ParamMap newLocks;
+            for (auto& [id, v] : step.paramLocks)
+            {
+                if (TrackFxParam::isTrackFxParam(id))
+                {
+                    const int block = id < TrackFxParam::TALK_BASE ? TrackFxParam::DIRT_BASE
+                                    : id < TrackFxParam::MODFX_BASE ? TrackFxParam::TALK_BASE : TrackFxParam::MODFX_BASE;
+                    if (const int slot = slotOfBlock(block); slot >= 0)
+                        newLocks[OldBlockSlot::cellId(slot, id - block)] = v;
+                }
+                else if (const auto insert = insertId(id); insert.slot >= 0)
+                {
+                    if (const int moved = insert.at(insert.slot + shift); moved >= 0)
+                        newLocks[moved] = v;
+                }
+                else
+                    newLocks[id] = v;
+            }
+            step.paramLocks = std::move(newLocks);
+        }
+    }
+
+    // The insert slots of a chain as stored values: a track's, or with AudioEngine::sendTrack(bus) a
+    // send's (the same ids for both). Type + 1 a slot, its switches, its four cells, and the cells
+    // beyond four that the effect has.
+    inline void captureChain(const AudioEngine& audio, int t, ParamMap& out)
+    {
+        for (int slot = 0; slot < AudioEngine::MAX_INSERTS_PER_TRACK; ++slot)
+        {
+            EffectType type;
+            if (!audio.getInsertEffectType(t, slot, type))
+                break;
+            out[INSERT_TYPE_BASE + slot] = (float) ((int) type + 1);
+            out[AudioEngine::INSERT_ON_BASE + slot] = audio.getTrackParameter(t, AudioEngine::INSERT_ON_BASE + slot);
+            out[AudioEngine::INSERT_WET_BASE + slot] = audio.getTrackParameter(t, AudioEngine::INSERT_WET_BASE + slot);
+            out[AudioEngine::INSERT_SYNC_BASE + slot] = audio.getTrackParameter(t, AudioEngine::INSERT_SYNC_BASE + slot);
+            out[AudioEngine::INSERT_DIV_BASE + slot] = audio.getTrackParameter(t, AudioEngine::INSERT_DIV_BASE + slot);
+            for (int p = 0; p < 4; ++p)
+                out[AudioEngine::EFFECT_PARAM_BASE + slot * 4 + p] =
+                    audio.getTrackParameter(t, AudioEngine::EFFECT_PARAM_BASE + slot * 4 + p);
+            // (Only the extra cells the effect has: a file from before them reads the same as one without.)
+            if (auto* chain = audio.getInsertChain(t))
+                if (auto* fx = chain->getEffect(slot))
+                    for (int p = 0; p < EffectBase::MAX_EXTRAS; ++p)
+                        if (fx->getExtraSpec(p).isValid())
+                            out[AudioEngine::INSERT_EXTRA_BASE + slot * EffectBase::MAX_EXTRAS + p] = fx->getExtra(p);
+        }
+    }
+
+    // A chain emptied and given the effects a stored map names (INSERT_TYPE_BASE + slot, up to the
+    // first slot without one); their cells are set afterwards by whoever applies the map.
+    inline void buildChain(AudioEngine& audio, int t, const ParamMap& stored)
+    {
+        while (audio.getInsertChain(t) != nullptr && audio.getInsertChain(t)->getEffectCount() > 0)
+            audio.removeInsertEffect(t, 0);
+        for (int slot = 0; slot < AudioEngine::MAX_INSERTS_PER_TRACK; ++slot)
+        {
+            auto it = stored.find(INSERT_TYPE_BASE + slot);
+            if (it == stored.end() || ! (it->second >= 0.5f))
+                break;
+            int type1 = juce::jlimit(1, (int) EffectType::NumEffectTypes, (int) std::lround(juce::jmin(it->second, 1.0e6f)));
+            audio.addInsertEffect(t, static_cast<EffectType>(type1 - 1));
+        }
+    }
+
+    // A send's stored chain put on the bus: the effects, then every value of theirs.
+    inline void applySendChain(AudioEngine& audio, int bus, const ParamMap& stored)
+    {
+        const int t = AudioEngine::sendTrack(bus);
+        buildChain(audio, t, stored);
+        for (auto& [id, value] : stored)
+            if (AudioEngine::isInsertParam(id))
+                audio.setTrackParameter(t, id, value);
+    }
+
     // Everything that defines how track `t` sounds, read from the engine / mixer / effects (they are
     // the truth; values the user never touched are included).
     inline ParamMap captureTrackSound(const Live& live, int t, const ParamMap& stored)
     {
         ParamMap out = stored;
 
-        // Stale insert-slot entries are rebuilt below.
+        // Stale insert-slot entries are rebuilt below; the ids of the DIRT / TALK / MODFX blocks of
+        // before hold nothing any more (those effects are inserts of the chain).
         for (auto it = out.begin(); it != out.end();)
-            it = ((it->first >= AudioEngine::EFFECT_PARAM_BASE && it->first < TrackFxParam::DIRT_BASE)
+            it = ((it->first >= AudioEngine::EFFECT_PARAM_BASE && it->first < TrackFxParam::END)
                   || AudioEngine::isInsertSwitchParam(it->first) || AudioEngine::isInsertExtraParam(it->first)) ? out.erase(it) : std::next(it);
 
         if (auto* engine = live.audio.getEngine(t))
@@ -189,34 +436,21 @@ namespace ProjectBridge
                 out[id] = engine->getParameter(id);
         }
 
+        // Where pad pressure goes (AT ROUTE): the router's pressure slots, cells on no page.
+        if (auto* engine = live.audio.getEngine(t); engine != nullptr && engine->modRouter() != nullptr)
+            for (int id = PressureSlotParam::BASE; id < PressureSlotParam::END; ++id)
+                out[id] = engine->getParameter(id);
+
         out[MixParam::VOLUME] = live.audio.getTrackParameter(t, MixParam::VOLUME);
         out[MixParam::PAN] = live.audio.getTrackParameter(t, MixParam::PAN);
         for (int s = 0; s < MixParam::MAX_SENDS; ++s)
             out[MixParam::SEND_BASE + s] = live.audio.getTrackParameter(t, MixParam::SEND_BASE + s);
 
-        for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
+        // The track's input (TRK FX page IN).
+        for (int id : AudioEngine::TRACK_IN_IDS)
             out[id] = live.audio.getTrackParameter(t, id);
 
-        for (int slot = 0; slot < AudioEngine::MAX_INSERTS_PER_TRACK; ++slot)
-        {
-            EffectType type;
-            if (!live.audio.getInsertEffectType(t, slot, type))
-                break;
-            out[INSERT_TYPE_BASE + slot] = (float) ((int) type + 1);
-            out[AudioEngine::INSERT_ON_BASE + slot] = live.audio.getTrackParameter(t, AudioEngine::INSERT_ON_BASE + slot);
-            out[AudioEngine::INSERT_WET_BASE + slot] = live.audio.getTrackParameter(t, AudioEngine::INSERT_WET_BASE + slot);
-            out[AudioEngine::INSERT_SYNC_BASE + slot] = live.audio.getTrackParameter(t, AudioEngine::INSERT_SYNC_BASE + slot);
-            out[AudioEngine::INSERT_DIV_BASE + slot] = live.audio.getTrackParameter(t, AudioEngine::INSERT_DIV_BASE + slot);
-            for (int p = 0; p < 4; ++p)
-                out[AudioEngine::EFFECT_PARAM_BASE + slot * 4 + p] =
-                    live.audio.getTrackParameter(t, AudioEngine::EFFECT_PARAM_BASE + slot * 4 + p);
-            // (Only the extra cells the effect has: a file from before them reads the same as one without.)
-            if (auto* chain = live.audio.getInsertChain(t))
-                if (auto* fx = const_cast<EffectChain*>(chain)->getEffect(slot))
-                    for (int p = 0; p < EffectBase::MAX_EXTRAS; ++p)
-                        if (fx->getExtraSpec(p).isValid())
-                            out[AudioEngine::INSERT_EXTRA_BASE + slot * EffectBase::MAX_EXTRAS + p] = fx->getExtra(p);
-        }
+        captureChain(live.audio, t, out);
         return out;
     }
 
@@ -277,6 +511,8 @@ namespace ProjectBridge
                 for (int s = 0; s < track.length && s < (int) track.steps.size(); ++s)
                     td.steps.push_back(captureStep(track.steps[(size_t) s]));
             }
+            if (! pat.perfMoves.empty())
+                pd.perfMoves = pat.perfMoves.toFlat();
         }
 
         // The engine type of a track is the one actually loaded.
@@ -289,10 +525,19 @@ namespace ProjectBridge
             for (int t = 0; t < (int) activeTracks.size(); ++t)
                 activeTracks[(size_t) t].presetName = live.presetNames->nameFor(t, activeTracks[(size_t) t].engineType);
 
+        // ARCH memory for unified-voice tracks.
+        for (int t = 0; t < (int) activeTracks.size(); ++t)
+            if (activeTracks[(size_t) t].engineType == EngineType::UnifiedVoice)
+                if (auto* uv = dynamic_cast<UnifiedVoiceEngine*>(live.audio.getEngine(t)))
+                    activeTracks[(size_t) t].archMemory = uv->captureArchMemory();
+
         for (int b = 0; b < live.audio.getSendCount(); ++b)
         {
             SendBusData sb;
-            sb.effectType = (int) live.audio.getSendBusType(b);
+            sb.effectType = (int) live.audio.getSendBusType(b);      // (for a build that reads one type a bus)
+            sb.sendLevel = live.audio.getSendBus(b).getSendLevel();
+            sb.hasChain = true;
+            captureChain(live.audio, AudioEngine::sendTrack(b), sb.chain);
             data.sendBuses.push_back(sb);
         }
 
@@ -342,7 +587,9 @@ namespace ProjectBridge
         if (live.getKeyboard)
             data.keyboard = live.getKeyboard();
 
-        // Pad-pressure routes, one list per track.
+        // Pad-pressure routes, one list per track. (The truth is in each track's parameters: its
+        // pressure slots, ids 773-784. This list is the same in the words of a build from before
+        // the slots had cells; a slot aimed at something those words cannot name is OFF in it.)
         for (int t = 0; t < live.sequencer.getPattern().getTrackCount() && t < AudioEngine::MAX_TRACKS; ++t)
         {
             AftertouchRouteData routes;
@@ -375,9 +622,8 @@ namespace ProjectBridge
         live.audio.setMasterLevel(data.masterLevel);
         {
             // Stored master settings, or the defaults for a project without them.
-            static const float defaults[AudioEngine::NUM_MASTER_PARAMS] = { 0, 0, 1000, 0, 0, 1, 0, -0.3f };
             for (int i = 0; i < AudioEngine::NUM_MASTER_PARAMS; ++i)
-                live.audio.setMasterParam(i, storedValue(data.master, (size_t) i, defaults[i]));
+                live.audio.setMasterParam(i, storedValue(data.master, (size_t) i, AudioEngine::MASTER_DEFAULTS[i]));
         }
         live.audio.setSequencer(&live.sequencer);
 
@@ -413,11 +659,16 @@ namespace ProjectBridge
                 {
                     // (a number that is no engine, from a damaged file, is the engine a new track has)
                     const int stored = (int) soundTracks[(size_t) t].engineType;
-                    track.engineType = stored >= 0 && stored <= (int) EngineType::MIDITrack ? soundTracks[(size_t) t].engineType
+                    track.engineType = stored >= 0 && stored < ENGINE_TYPE_COUNT ? soundTracks[(size_t) t].engineType
                                                                                           : EngineType::UnifiedVoice;
                     track.soundParams = soundTracks[(size_t) t].soundParams;
                 }
             }
+            // Recorded PERF pad moves for this pattern (empty for older projects).
+            if (! pd.perfMoves.empty())
+                pat.perfMoves.fromFlat(pd.perfMoves);
+            else
+                pat.perfMoves.clear();
         }
 
         live.sequencer.selectPattern(active, SequencerCore::ChangeMode::Immediate);
@@ -448,42 +699,64 @@ namespace ProjectBridge
                 }
             }
 
+            // The DIRT / TALK / MODFX blocks of a project of before them are inserts in front of its
+            // chain: the sound, and the locks of its steps in every pattern. `sound` is what the
+            // track holds from here on (for a project without such a block: `params` itself).
+            const ParamMap sound = convertTrackFxParams(params);
+            for (int p = 0; p < SequencerCore::MAX_PATTERNS; ++p)
+                convertStepLocks(params, live.sequencer.getPattern(p).getTrack(t));
+
             // A fresh engine of the stored type (this clears the track's stored engine parameters,
             // so they are put back afterwards), then the insert chain, then every parameter.
             if (live.audio.getEngine(t) == nullptr)
                 live.audio.addEngine(t, AudioEngine::createEngine(type));
             live.audio.setEngineType(t, type, true);
             for (int p = 0; p < SequencerCore::MAX_PATTERNS; ++p)
-                live.sequencer.getPattern(p).getTrack(t).soundParams = params;
+                live.sequencer.getPattern(p).getTrack(t).soundParams = sound;
 
-            while (live.audio.getInsertChain(t) != nullptr && live.audio.getInsertChain(t)->getEffectCount() > 0)
-                live.audio.removeInsertEffect(t, 0);
-            for (int slot = 0; slot < AudioEngine::MAX_INSERTS_PER_TRACK; ++slot)
-            {
-                auto it = params.find(INSERT_TYPE_BASE + slot);
-                if (it == params.end() || it->second < 0.5f)
-                    break;
-                int type1 = juce::jlimit(1, (int) EffectType::NumEffectTypes, (int) std::lround(it->second));
-                live.audio.addInsertEffect(t, static_cast<EffectType>(type1 - 1));
-            }
+            buildChain(live.audio, t, sound);
 
             // A project that never stored a mixer value gets the defaults, not the previous project's.
             live.audio.setTrackParameter(t, MixParam::VOLUME, MixParam::DEFAULT_VOLUME);
             live.audio.setTrackParameter(t, MixParam::PAN, 0.0f);
             for (int s = 0; s < MixParam::MAX_SENDS; ++s)
                 live.audio.setTrackParameter(t, MixParam::SEND_BASE + s, 0.0f);
-            const TrackFx defaults;
-            for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
-                live.audio.setTrackParameter(t, id, defaults.get(id));
 
-            live.audio.applyAllTrackParameters(t, params);
+            // (and no input: a project saved before tracks had one)
+            for (int id : AudioEngine::TRACK_IN_IDS)
+                live.audio.setTrackParameter(t, id, AudioEngine::trackInDefault(id));
+
+            live.audio.applyAllTrackParameters(t, sound);
+
+            // ARCH memory for unified-voice tracks (absent in older projects: nothing to restore).
+            if (t < (int) soundTracks.size() && !soundTracks[(size_t) t].archMemory.empty())
+                if (auto* uv = dynamic_cast<UnifiedVoiceEngine*>(live.audio.getEngine(t)))
+                    uv->applyArchMemory(soundTracks[(size_t) t].archMemory);
         }
 
-        for (int b = 0; b < (int) data.sendBuses.size() && b < live.audio.getSendCount(); ++b)
+        // The sends: as a new project has them (a project without stored sends), then what the
+        // file holds. A file with the buses' chains: each chain as it was saved. A file from
+        // before them names one type a bus: the type a new project has there means that bus as it
+        // is in a new project (the reverb at DCAY 0.6 / DAMP 0.4, the delay at 0.375 s / 0.35: all
+        // such a project ever played), any other type that effect as it is made, its mix at 1.
+        live.audio.resetSendBuses();
+        for (int b = 0; b < (int) data.sendBuses.size() && b < AudioEngine::MAX_SENDS; ++b)
         {
-            int type = juce::jlimit(0, (int) EffectType::NumEffectTypes - 1, data.sendBuses[(size_t) b].effectType);
-            if ((int) live.audio.getSendBusType(b) != type)
-                live.audio.setSendBusEffect(b, static_cast<EffectType>(type));
+            const auto& stored = data.sendBuses[(size_t) b];
+            if (stored.hasChain)
+            {
+                while (live.audio.getSendCount() <= b)
+                    if (live.audio.addSendBus(AudioEngine::defaultSendType(b)) < 0)
+                        break;
+                if (b < live.audio.getSendCount())
+                    applySendChain(live.audio, b, stored.chain);
+            }
+            else if (b < live.audio.getSendCount())
+            {
+                int type = juce::jlimit(0, (int) EffectType::NumEffectTypes - 1, stored.effectType);
+                if (type != (int) AudioEngine::defaultSendType(b))
+                    live.audio.setInsertEffect(AudioEngine::sendTrack(b), 0, static_cast<EffectType>(type));
+            }
         }
 
         if (live.song != nullptr)
@@ -569,9 +842,11 @@ namespace ProjectBridge
                 live.presetNames->set(t, t < trackCount && t < (int) soundTracks.size() ? soundTracks[(size_t) t].presetName : juce::String(),
                                       t < trackCount ? live.sequencer.getPattern(active).getTrack(t).engineType : EngineType::UnifiedVoice);
 
-        // Pad-pressure routes. A project with per-track lists: each track gets its own. An older
-        // project with one list: every track whose engine uses a router gets that list (it never
-        // reached the drum kits, which keep their default). Neither: each engine's default.
+        // Pad-pressure routes. A project that stores a track's pressure slots with its parameters
+        // (ids 773-784): they are set already, and nothing here touches them. Before the slots had
+        // cells - a project with per-track lists: each track gets its own. An older project with
+        // one list: every track whose engine uses a router gets that list (it never reached the
+        // drum kits, which keep their default). Neither: each engine's default.
         auto toRouter = [](const AftertouchRouteData& list)
         {
             AftertouchRouter router;
@@ -589,10 +864,12 @@ namespace ProjectBridge
         const bool hasGlobal = !data.aftertouchRouting.routes.empty();
         if (live.pressure != nullptr && hasGlobal)
             *live.pressure = toRouter(data.aftertouchRouting);
-        live.audio.adoptLegacyRouter();         // what was just loaded is not an edit to copy to every track
 
         for (int t = 0; t < trackCount; ++t)
         {
+            const auto& stored = live.sequencer.getPattern(active).getTrack(t).soundParams;
+            if (stored.lower_bound(PressureSlotParam::BASE) != stored.lower_bound(PressureSlotParam::END))
+                continue;
             if (t < (int) data.trackAftertouch.size())
                 live.audio.setPressureRouter(t, toRouter(data.trackAftertouch[(size_t) t]));
             else if (hasGlobal && live.audio.getEngineTypeOf(t) != EngineType::Drum)

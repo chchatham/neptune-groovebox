@@ -305,7 +305,7 @@ public:
             LFO lfo2;
             lfo2.cycleShape(-1);
             expectEquals(static_cast<int>(lfo2.getShape()),
-                         static_cast<int>(LFO::Shape::ExpDown));
+                         static_cast<int>(LFO::Shape::UserSmooth));
         }
 
         beginTest("LFO shape names");

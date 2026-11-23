@@ -3,7 +3,10 @@
 #include "EngineBase.h"
 #include "VoiceAllocator.h"
 #include "VoiceFilterSection.h"
-#include "EngineLfoSection.h"
+#include "VoiceBodySection.h"
+#include "ModRouter.h"
+#include "VoiceSpread.h"
+#include "../dsp/PhaseOsc.h"
 #include "../dsp/Envelope.h"
 #include "../dsp/EnvelopeChain.h"
 #include "../dsp/DSPUtils.h"
@@ -24,7 +27,15 @@
 //
 // Steps crossfade smoothly based on the crossfade amount parameter.
 // Loop modes: forward, reverse, ping-pong, random, one-shot.
-// Oscillators use polyBLEP antialiasing (same pattern as UnifiedVoice).
+// The waves are computed from the phase (polyBLEP); the phase itself is the shared oscillator's
+// (dsp/PhaseOsc.h), so the track input or any slot can modulate it (the destination PM).
+// Everything that moves the sound goes through the modulation router (ModRouter.h): the LFOs,
+// the strip, the pad's pressure routes, the free slots, the track input at audio rate. The voice
+// hands the router its four lanes as sources (PLAN SLAN LLAN TLAN: what the pitch, shape, level
+// and time lane stand at), so a lane can step any cell of the engine. A random loop draws from
+// the one per-note generator (spread::Generator, stream Lanes): a render repeats.
+// Last in the voice, after the filter and the amp envelope: BODY (VoiceBodySection.h), off
+// until its MIX is raised; the voice is alive while its source sounds or its body rings.
 // All state is pre-allocated — no heap allocation on audio thread.
 // ============================================================================
 class WaveSeqVoice
@@ -35,32 +46,53 @@ public:
 
     enum class Waveform { Sine, Saw, Square, Triangle, Pulse, Noise };
 
-    enum class LoopMode { Forward, Reverse, PingPong, Random, OneShot };
+    // Random: any step of the lane each time, drawn from the per-note generator.
+    // OldRandom (ORND): the random loop as it was before the unification, kept reachable until the
+    // owner has heard both: an LCG's low bits shared by the four lanes and the noise step, never
+    // started again. With lane lengths of 2, 4, 8 or 16 it is no random walk but a short cycle
+    // (each lane goes round 4 steps of 16, or between 2 of 8), another one from note to note,
+    // and the same one in every voice of a chord. tests/u4_waveseq_tests.h measures both.
+    enum class LoopMode { Forward, Reverse, PingPong, Random, OneShot, OldRandom };
 
     // Lane indices
     enum Lane { TimingLane = 0, PitchLane = 1, ShapeLane = 2, LevelLane = 3 };
 
-    // LFO destinations (EngineLfoSection), in the order of the DEST cell.
+    // The destinations the voice reads by name: indices of the engine's table (WaveSeqEngine::
+    // lfoDests), in the order of the DEST cells.
     enum LfoDest
     {
         LfoOff = 0,
-        LfoPitch,       // +-12 semitones, depth squared
-        LfoAmp,         // gain 0..2
-        LfoPan,         // +-1
-        LfoCutoff,      // +-4 octaves
+        LfoPitch,       // per sample: a frequency ratio (+-12 semitones, amount squared)
+        LfoAmp,         // per sample: a gain, 0..4 (an audio-rate slot may take it to -4)
+        LfoPan,         // per sample: +-1
+        LfoCutoff,      // per sample: octaves (+-4 at full depth)
         LfoResonance,   // +-0.5
-        LfoRate,        // how fast the sequence runs, +-2 octaves around RATE
-        LfoCrossfade,   // +-1 around XFAD (0..1)
-        LfoPitchRange,  // +-1 around PRNG (0..2): how far the pitch lane reaches
+        LfoRate,        // how fast the sequence runs: a factor on RATE, +-2 octaves
+        LfoCrossfade,   // the XFAD cell (+-1 around it, held to 0..1)
+        LfoPitchRange,  // +-1 added to PRNG, the sum held to 0..2: how far the pitch lane reaches
         NumLfoDests
     };
 
-    static const char* const* lfoDestLabels()
+    // The ones further down the table (after the lanes' steps and BODY's cells, whose number
+    // grows): the engine reads their places from the table once (WaveSeqEngine::dests()), so a
+    // section that grows cannot leave them pointing at another entry.
+    struct Dests
     {
-        static const char* const names[NumLfoDests] = {
-            "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "RATE", "XFAD", "PRNG" };
-        return names;
-    }
+        int envTime = -1;       // ETIM: the amp envelope's time (and its chain's), a factor
+        int filterTime = -1;    // FTIM: the filter envelope's time, a factor
+        int phase = -1;         // PM, per sample: cycles added to the oscillator's phase (+-1 at full depth)
+    };
+
+    // The voice's own sources, in the order the engine publishes them (WaveSeqEngine::sources):
+    // what each lane stands at, at control rate (with SLID on, the glide between two steps).
+    enum Published
+    {
+        PubPitch = 0,   // PLAN: the pitch lane's step, -24..24 semitones as -1..1 (before PRNG)
+        PubShape,       // SLAN: the shape lane's step, SIN..NOIS as 0..1
+        PubLevel,       // LLAN: the level lane's step, 0..1
+        PubTime,        // TLAN: the time lane's step, 30 ms..2 s as 0..1 (by octaves)
+        NumPublished
+    };
 
     struct SeqStep
     {
@@ -85,7 +117,10 @@ public:
         ampEnv.setSampleRate(sr);
         envChain.setSampleRate(sr);
         filter.setSampleRate(sr);
-        lfos.setSampleRate(sr);
+        body.setSampleRate(sr);
+        mods.prepare(sr);
+        osc.setSampleRate(sr);
+        prevOsc.setSampleRate(sr);
         declick.setSampleRate(sr);
         gainDeclick.setSampleRate(sr);
         levelStep = (float) (1.0 / (0.004 * sr));
@@ -98,20 +133,26 @@ public:
         baseFrequency = dsp::midiNoteToHz(note);
     }
 
-    void noteOn()
+    void noteOn(const mod::Router& router)
     {
         if (active)
         {
             declick.arm();      // struck again while sounding: the restart must not jump,
             gainDeclick.arm();  // nor the step to the new velocity
         }
-        else
-            lfos.snapSlews();
-        // An LFO on a page cell is read before the first sample (the engine sets the cell then).
-        if (lfos.keyed()) lfos.noteOnAndSample(); else lfos.noteOn();
+        // The note's randoms: RAND, RND2 .. of the router and what a random loop draws while the
+        // note sounds, all of the one generator. (Whatever is routed is read before the note's
+        // first sample: mod::Voice::tick.)
+        generator.advance();
+        mods.noteOn(router, currentNote, velocity, generator);
+        laneDraws.start(generator, spread::Lanes);
         filter.noteOn(currentNote, velocity, active);
+        body.noteOn(currentNote);
         if (envChainEnabled && envChain.getStageCount() > 0)
+        {
             envChain.noteOn();
+            chainLevel = 0.0f;  // (the chain begins every note from nothing: so does the source ENV)
+        }
         else
             ampEnv.noteOn();
         active = true;
@@ -137,8 +178,8 @@ public:
         direction = lanes[TimingLane].direction;
 
         stepPhase = 0.0;
-        oscPhase = 0.0;
-        prevOscPhase = 0.0;
+        osc.reset();
+        prevOsc.reset();
         crossfadePhase = 1.0f; // no crossfade at start
         prevTimingStep = lanes[TimingLane].currentStep;
         sequenceFinished = false;
@@ -155,66 +196,156 @@ public:
         filter.noteOff();
     }
 
-    bool isActive() const { return active; }
+    // The source sounds, or the body it went through still rings.
+    bool isActive() const { return active || body.ringing(); }
 
-    float process()
+    // The per-note generator's seed (the engine: its seed and this voice's number).
+    void seedRandom(uint32_t engineSeed, int voice) { generator.seed(engineSeed, voice); }
+
+    // One sub-block of n samples, added to left / right. pressure: this voice's pad;
+    // setCell(voice, dest, value) sets a page cell of this voice (a control-rate destination of
+    // the router). The source sounds, or only the body it went through still rings.
+    template <typename SetCell>
+    void render(const mod::Router& router, const Dests& d, float* left, float* right, int n, float pressure, const SetCell& setCell)
     {
-        if (!active)
-            return 0.0f;
+        // The lanes as sources: worked out only while a slot reads them.
+        if (router.wants(PubPitch)) mods.publish(PubPitch, lanePitch() * (1.0f / 24.0f));
+        if (router.wants(PubShape)) mods.publish(PubShape, (float) (int) steps[(size_t) lanes[ShapeLane].currentStep].shape * 0.2f);
+        if (router.wants(PubLevel)) mods.publish(PubLevel, laneLevel());
+        if (router.wants(PubTime))  mods.publish(PubTime, timeAsUnit(steps[(size_t) lanes[TimingLane].currentStep].duration));
 
-        if (! lfos.anyOn() && ! lfoApplied)
-            return processCore();
-
-        // LFOs: rate, crossfade and pitch range are moved for this sample only (the set values stay).
-        if (! lfos.anyOn())
+        const float envLevel = envChainEnabled && envChain.getStageCount() > 0 ? chainLevel : ampEnv.getCurrentLevel();
+        const bool moved = mods.tick(router, n, active ? envLevel : 0.0f, filter.getEnvelope().getCurrentLevel(), pressure);
+        if (! moved)
         {
-            lfoSemis = 0.0f;
-            filter.setLfoOctaves(0.0f);
-            filter.setResonanceMod(0.0f);
-            lfoGain = 1.0f;
-            lfoPan = 0.0f;
-            lfoApplied = false;
-            lfos.snapSlews();
-            return processCore();
+            // Nothing moves this voice: the sequence as it is without any modulation.
+            if (cutMoved)
+            {
+                filter.setLfoOctaves(0.0f);
+                cutMoved = false;
+            }
+            if (! body.engaged())
+            {
+                for (int i = 0; i < n && active; ++i)
+                {
+                    const float s = processCore(1.0f, 1.0, 0.0);
+                    left[i] += s;
+                    right[i] += s;
+                }
+                return;
+            }
+            // (Sample by sample "the source sounds or the body rings": a body that has rung out
+            // and was put away is not started again by the samples left of the sub-block.)
+            for (int i = 0; i < n && isActive(); ++i)
+            {
+                const float s = body.process(active ? processCore(1.0f, 1.0, 0.0) : 0.0f, active);
+                left[i] += s;
+                right[i] += s;
+            }
+            return;
         }
 
-        lfos.tick();
-        lfoApplied = true;
-        const float setSpeed = speedMultiplier, setCrossfade = crossfadeAmount, setRange = pitchRange;
-        const float rate = lfos.amount(LfoRate);
-        if (rate != 0.0f)
-            speedMultiplier = std::max(0.01f, speedMultiplier * std::exp2(-2.0f * rate));
-        // Only what is routed is limited to its cell's range: a stored sound may hold a value
-        // beyond it (factory presets have PRNG up to 12), and a route elsewhere must leave it alone.
-        if (lfos.routed(LfoCrossfade))
-            crossfadeAmount = juce::jlimit(0.0f, 1.0f, crossfadeAmount + lfos.amount(LfoCrossfade));
-        if (lfos.routed(LfoPitchRange))
-            pitchRange = juce::jlimit(0.0f, 2.0f, pitchRange + lfos.amount(LfoPitchRange));
-        lfoSemis = lfos.pitchSemitones(LfoPitch);
-        filter.setLfoOctaves(lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES);
-        filter.setResonanceMod(lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE);
-        lfoGain = lfos.gain(LfoAmp);
-        lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.panAmount(LfoPan));
+        mods.forEachControl([&](int dest, float value) { setControl(d, dest, value, setCell); });
+        const float* pitch = mods.buffer(LfoPitch);
+        const float* amp = mods.buffer(LfoAmp);
+        const float* pan = mods.buffer(LfoPan);
+        const float* cutoff = mods.buffer(LfoCutoff);
+        const float* pm = mods.buffer(d.phase);
+        if (cutoff == nullptr && cutMoved)
+            filter.setLfoOctaves(0.0f);
+        cutMoved = cutoff != nullptr;
 
-        const float out = processCore();
+        // Rate, crossfade and pitch range are moved for these samples only (the set values stay).
+        // Only what is routed is held to its cell's range: a stored sound may hold a value beyond
+        // it (factory presets have PRNG up to 12), and a route elsewhere must leave it alone.
+        const float setSpeed = speedMultiplier, setCrossfade = crossfadeAmount, setRange = pitchRange;
+        if (mods.moved(LfoRate))
+            speedMultiplier = std::max(0.01f, speedMultiplier / std::max(1.0e-3f, mods.value(LfoRate)));
+        if (mods.moved(LfoCrossfade))
+            crossfadeAmount = juce::jlimit(0.0f, 1.0f, mods.value(LfoCrossfade));
+        if (mods.moved(LfoPitchRange))
+            pitchRange = juce::jlimit(0.0f, 2.0f, pitchRange + mods.value(LfoPitchRange));
+
+        for (int i = 0; i < n && isActive(); ++i)
+        {
+            float s = 0.0f;
+            if (active)
+            {
+                if (cutoff) filter.setLfoOctaves(cutoff[i]);
+                s = processCore(amp ? amp[i] : 1.0f, pitch ? (double) pitch[i] : 1.0, pm ? (double) pm[i] : 0.0);
+            }
+            if (body.engaged())
+                s = body.process(s, active);
+            // PAN moves its own voice between the channels (balance law: the centre is unchanged).
+            const float p = pan ? pan[i] : 0.0f;
+            left[i] += p > 0.0f ? s * (1.0f - p) : s;
+            right[i] += p < 0.0f ? s * (1.0f + p) : s;
+        }
 
         speedMultiplier = setSpeed;
         crossfadeAmount = setCrossfade;
         pitchRange = setRange;
-        return out;
     }
 
-    VoiceLfos& getLfos() { return lfos; }
-    // -1..1 from LFOs routed to the pan (as of the last processed sample); the engine places the voice.
-    float getLfoPan() const { return lfoPan; }
+    // A control-rate destination of the router: the resonance, an envelope's time, or one of this
+    // voice's page cells. (RATE, XFAD and PRNG are read where the sub-block is rendered.)
+    template <typename SetCell>
+    void setControl(const Dests& d, int dest, float value, const SetCell& setCell)
+    {
+        if (dest == LfoResonance)
+            filter.setResonanceMod(value);
+        else if (dest == d.envTime)
+            setEnvTimeScale(value);
+        else if (dest == d.filterTime)
+            filter.setEnvTimeScale(value);
+        else if (dest != LfoRate && dest != LfoCrossfade && dest != LfoPitchRange)
+            setCell(*this, dest, value);
+    }
+
+    // ETIM: every stage time of the amp envelope, and of the chain's stages, times this. Under a
+    // sounding note the running stage goes on from where it is (Envelope::setTimeScale).
+    void setEnvTimeScale(float scale)
+    {
+        ampEnv.setTimeScale(scale);
+        for (int s = 0; s < envChain.getStageCount(); ++s)
+            envChain.getEnvelopeMut(s).setTimeScale(scale);
+    }
+
+    VoiceBody& getBody() { return body; }
+    mod::Voice& getMod() { return mods; }
+
+    // What the pitch and the level lane stand at (with SLID on: on the way to the next step).
+    float lanePitch() const
+    {
+        float v = steps[(size_t) lanes[PitchLane].currentStep].pitchOffset;
+        if (laneInterpolation && interpProgress < 1.0f)
+            v = v * (1.0f - interpProgress) + steps[(size_t) getNextLaneStep(PitchLane)].pitchOffset * interpProgress;
+        return v;
+    }
+    float laneLevel() const
+    {
+        float v = steps[(size_t) lanes[LevelLane].currentStep].level;
+        if (laneInterpolation && interpProgress < 1.0f)
+            v = v * (1.0f - interpProgress) + steps[(size_t) getNextLaneStep(LevelLane)].level * interpProgress;
+        return v;
+    }
+    // A step time as 0..1 over the T cells' range (30 ms .. 2 s), by octaves.
+    static float timeAsUnit(float seconds)
+    {
+        static const float span = std::log2(2.0f / 0.03f);
+        return seconds > 0.03f ? std::min(1.0f, std::log2(seconds / 0.03f) / span) : 0.0f;
+    }
 
 private:
-    float processCore()
+    // One sample of the voice's own sound: sequence, filter, envelope, level. amp: the gain the
+    // router has for the level (1 = none); ratio: its factor on the pitch (1 = none); pm: cycles
+    // it adds to the oscillator's phase (0 = none).
+    float processCore(float amp, double ratio, double pm)
     {
         float ampVal;
         if (envChainEnabled && envChain.getStageCount() > 0)
         {
-            ampVal = envChain.process();
+            ampVal = chainLevel = envChain.process();
             if (!envChain.isActive())
             {
                 active = false;
@@ -265,11 +396,19 @@ private:
             // Shape does NOT interpolate - snaps
         }
 
-        double freq = baseFrequency * std::exp2((pitchSemitones + pitchOffsetSemis + lfoSemis) / 12.0);
+        // (2 ^ (semitones / 12) is worked out again only when the semitones have moved: within
+        // a step they stand still.)
+        const float semis = pitchSemitones + pitchOffsetSemis;
+        if (semis != semisNow)
+        {
+            semisNow = semis;
+            semisRatio = std::exp2(semis / 12.0);
+        }
+        double freq = baseFrequency * semisRatio * ratio;
         double phaseInc = freq / sampleRate;
 
         // Generate current step waveform
-        float currentSample = generateWaveform(shape, oscPhase, phaseInc);
+        float currentSample = generateWaveform(shape, osc.at(pm), phaseInc);
 
         // Crossfade with previous step if active
         float output;
@@ -278,15 +417,20 @@ private:
         {
             // Use previous step's shape and pitch for crossfade source
             float prevPitch = steps[(size_t) prevTimingStep].pitchOffset * pitchRange;
-            double prevFreq = baseFrequency * std::exp2((prevPitch + pitchOffsetSemis + lfoSemis) / 12.0);
+            const float prevSemis = prevPitch + pitchOffsetSemis;
+            if (prevSemis != prevSemisNow)
+            {
+                prevSemisNow = prevSemis;
+                prevSemisRatio = std::exp2(prevSemis / 12.0);
+            }
+            double prevFreq = baseFrequency * prevSemisRatio * ratio;
             double prevPhaseInc = prevFreq / sampleRate;
             Waveform prevShape = steps[(size_t) prevTimingStep].shape;
 
-            float prevSample = generateWaveform(prevShape, prevOscPhase, prevPhaseInc);
+            float prevSample = generateWaveform(prevShape, prevOsc.at(pm), prevPhaseInc);
 
             // Advance previous oscillator phase
-            prevOscPhase += prevPhaseInc;
-            prevOscPhase = dsp::wrapPhase(prevOscPhase);
+            prevOsc.advance(prevPhaseInc);
 
             // Equal-power crossfade
             float fadeIn = crossfadePhase;
@@ -313,8 +457,7 @@ private:
         }
 
         // Advance oscillator phase
-        oscPhase += phaseInc;
-        oscPhase = dsp::wrapPhase(oscPhase);
+        osc.advance(phaseInc);
 
         // Advance step timing (driven by timing lane)
         float effectiveDuration = stepDuration * speedMultiplier * tempoScale;
@@ -334,23 +477,22 @@ private:
             interpProgress = 0.0f;
         }
 
-        // Velocity's share, LEVL and pressure's share of the level are moved to over a few
-        // milliseconds under a sounding note; the first sample of a note takes them as they stand.
+        // Velocity's share and LEVL are moved to over a few milliseconds under a sounding note;
+        // the first sample of a note takes them as they stand. (What the router has for the
+        // level - an LFO, the pad's pressure - comes already led: amp.)
         const float velGain = 1.0f - velSens + velSens * velocity;
         if (struck)
         {
             struck = false;
             velGainNow = velGain;
             masterLevelNow = masterLevel;
-            gainModNow = gainMod;
         }
         else
         {
             if (velGainNow != velGain)         velGainNow = dsp::towards(velGainNow, velGain, levelStep);
             if (masterLevelNow != masterLevel) masterLevelNow = dsp::towards(masterLevelNow, masterLevel, levelStep);
-            if (gainModNow != gainMod)         gainModNow = dsp::towards(gainModNow, gainMod, 2.0f * levelStep);
         }
-        return gainDeclick.process(filter.process(declick.process(output)) * ampVal * velGainNow * masterLevelNow * gainModNow * lfoGain);
+        return gainDeclick.process(filter.process(declick.process(output)) * ampVal * velGainNow * masterLevelNow * amp);
     }
 
 public:
@@ -412,7 +554,6 @@ public:
 
     void setPitchOffset(float semitones) { pitchOffsetSemis = semitones; }   // tune, bend
     void setVelocitySensitivity(float s) { velSens = juce::jlimit(0.0f, 1.0f, s); }
-    void setGainMod(float g) { gainMod = g; }                                // pressure
     void setTempoScale(float s) { tempoScale = std::max(0.01f, s); }         // tempo sync of step times
     float getGateLength() const { return gateLength; }
 
@@ -426,9 +567,11 @@ public:
         ampEnv.reset();
         envChain.reset();
         filter.reset();
+        body.reset();
         active = false;
-        oscPhase = 0.0;
-        prevOscPhase = 0.0;
+        chainLevel = 0.0f;
+        osc.reset();
+        prevOsc.reset();
         stepPhase = 0.0;
         currentStep = 0;
         prevTimingStep = 0;
@@ -463,6 +606,7 @@ private:
                 return next;
             }
             case LoopMode::Random:
+            case LoopMode::OldRandom:
                 return lane.currentStep; // can't predict random
             case LoopMode::OneShot:
                 if (lane.currentStep < lane.length - 1)
@@ -515,10 +659,10 @@ private:
             case Waveform::Noise:
             {
                 // Fast deterministic noise using xorshift on mutable seed
-                rngState ^= rngState << 13;
-                rngState ^= rngState >> 17;
-                rngState ^= rngState << 5;
-                return (float) (rngState & 0x7FFFFFFF) / (float) 0x7FFFFFFF * 2.0f - 1.0f;
+                noiseState ^= noiseState << 13;
+                noiseState ^= noiseState >> 17;
+                noiseState ^= noiseState << 5;
+                return (float) (noiseState & 0x7FFFFFFF) / (float) 0x7FFFFFFF * 2.0f - 1.0f;
             }
         }
 
@@ -559,9 +703,9 @@ private:
 
             case LoopMode::Random:
             {
-                // LCG — no heap, deterministic per-voice
-                rngState = rngState * 1664525u + 1013904223u;
-                lane.currentStep = (int) (rngState % (uint32_t) lane.length);
+                // The next draw of this note's run (the per-note generator, stream Lanes): any
+                // step of the lane, each as likely as the other.
+                lane.currentStep = std::min(lane.length - 1, (int) (laneDraws.unipolar() * (float) lane.length));
                 break;
             }
 
@@ -570,6 +714,12 @@ private:
                     ++lane.currentStep;
                 else
                     lane.finished = true;
+                break;
+
+            case LoopMode::OldRandom:
+                // (As it was, on the state the noise step also turns: see LoopMode.)
+                noiseState = noiseState * 1664525u + 1013904223u;
+                lane.currentStep = (int) (noiseState % (uint32_t) lane.length);
                 break;
         }
     }
@@ -581,7 +731,7 @@ private:
             return;
 
         prevTimingStep = lanes[TimingLane].currentStep;
-        prevOscPhase = oscPhase;
+        prevOsc = osc;
         crossfadePhase = 0.0f;
         const Waveform shapeBefore = steps[(size_t) lanes[ShapeLane].currentStep].shape;
 
@@ -640,9 +790,10 @@ private:
     float crossfadeAmount = 0.5f;
     float crossfadePhase = 1.0f;
 
-    // Oscillator state (current and previous for crossfade)
-    double oscPhase = 0.0;
-    double prevOscPhase = 0.0;
+    // Oscillator state (current and previous for crossfade): the shared phase (dsp/PhaseOsc.h)
+    phaseosc::PhaseOsc osc, prevOsc;
+    float semisNow = 0.0f, prevSemisNow = 0.0f;         // the semitones the two ratios below are for
+    double semisRatio = 1.0, prevSemisRatio = 1.0;
 
     // Parameters
     float speedMultiplier = 1.0f;
@@ -651,8 +802,7 @@ private:
     float gateLength = 1.0f;
     float pitchOffsetSemis = 0.0f;
     float velSens = 1.0f;
-    float gainMod = 1.0f;
-    float velGainNow = 1.0f, masterLevelNow = 0.8f, gainModNow = 1.0f, stepLevelNow = 1.0f, levelStep = 0.005f;
+    float velGainNow = 1.0f, masterLevelNow = 0.8f, stepLevelNow = 1.0f, levelStep = 0.005f;
     bool struck = true, shapeSwitched = false;
     float tempoScale = 1.0f;
     LoopMode loopMode = LoopMode::Forward;
@@ -661,15 +811,18 @@ private:
     Envelope ampEnv;
     dsp::Declick declick;       // on the oscillator, before the filter (whose state smears a jump)
     dsp::Declick gainDeclick;   // on the output
-    VoiceLfos lfos;
-    bool lfoApplied = false;
-    float lfoSemis = 0.0f;
-    float lfoGain = 1.0f;
-    float lfoPan = 0.0f;
+    mod::Voice mods;
+    bool cutMoved = false;       // the router's cutoff octaves are on the filter
+    float chainLevel = 0.0f;     // the envelope chain as of its last sample (the source ENV while CHAN is on)
+    spread::Generator generator; // the per-note randoms: the router's RAND .., a random loop's steps
+    spread::Sequence laneDraws;
     VoiceFilter filter;          // after the wave mix, before the amp envelope
+    VoiceBody body;              // last: after the amp envelope (it rings on when the source has stopped)
     EnvelopeChain envChain;
     bool envChainEnabled = false;
-    mutable uint32_t rngState = 12345u; // mutable for const generateWaveform
+    // The noise step's generator (not a draw of the note: it runs on from note to note), and
+    // what ORND steps by. mutable for const generateWaveform.
+    mutable uint32_t noiseState = 12345u;
 };
 
 
@@ -679,7 +832,7 @@ private:
 // Parameters:
 //   0  = Seq Length       (1-16 steps, sets all lanes)
 //   1  = Crossfade        (0-100%)
-//   2  = Loop Mode        (0=Forward, 1=Reverse, 2=PingPong, 3=Random, 4=OneShot)
+//   2  = Loop Mode        (0=Forward, 1=Reverse, 2=PingPong, 3=Random, 4=OneShot, 5=the old random)
 //   3  = Speed            (0.1x-10x multiplier)
 //   4  = Pitch Range      (0-24 semitones — scales per-step pitch offsets)
 //   5  = Shape Mix        (global waveform select, 0-5)
@@ -725,24 +878,33 @@ public:
         BendRangeParam = 23,   // semitones
         TempoSync      = 24,   // on: a step time of 250 ms is one sixteenth at the current tempo
         Rate           = 25,   // playback rate of the sequence (higher = faster)
+        VoiceCountParam = 26,  // VOX: polyphony 1..16 (default 8)
         // Per-step data, + step index 0..15
         StepPitch      = 32,   // semitones (scaled by PitchRange)
         StepShape      = 48,   // waveform
         StepLevel      = 64,
         StepTime       = 80,   // seconds
-        FilterBase     = 100   // 100-115: the per-voice filter (VoiceFilterSection offsets)
+        FilterBase     = 100,  // 100-115: the per-voice filter (VoiceFilterSection offsets)
+        // 133-140: BODY (VoiceBodySection cells). In the engine's own block: 158-189 are the
+        // modulation router's on every engine (the id rule at the top of ModRouter.h).
+        BodyBase       = 133
+        // 158-189 and 700-772 are the modulation router's (mod::Router: LFO1, LFO2, STRIP, XIN,
+        // the slots, the custom LFO shape): everything that moves this engine's sound goes
+        // through it, the pad's pressure routes and the track input at audio rate included.
     };
 
+    static constexpr int MAX_VOICES = 16;
+
     explicit WaveSeqEngine(int maxVoices = 8)
-        : allocator(maxVoices)
+        : allocator(MAX_VOICES)
     {
-        voices.resize((size_t) maxVoices);
+        voices.resize((size_t) MAX_VOICES);
 
         allocator.setNoteOnCallback([this](int voiceIdx, const Voice& v)
         {
             auto& voice = voices[(size_t) voiceIdx];
             voice.setNote(v.note, v.velocity);
-            voice.noteOn();
+            voice.noteOn(router);
         });
 
         allocator.setNoteOffCallback([this](int voiceIdx, const Voice& /*v*/)
@@ -752,6 +914,12 @@ public:
 
         // A new note takes a silent voice while there is one: release tails ring out.
         allocator.setVoiceSoundingQuery([this](int voiceIdx) { return voices[(size_t) voiceIdx].isActive(); });
+
+        // The per-note randoms (RAND, RND2 .., a random loop's steps) repeat from run to run: the
+        // same notes in the same order on a new engine draw the same values. (This engine has no
+        // ANLG page, so no SEED cell: the seed is fixed until it gets one.)
+        for (int v = 0; v < MAX_VOICES; ++v)
+            voices[(size_t) v].seedRandom(0, v);
 
         // Seed every parameter (including a default 8-step sequence that actually moves) so
         // getParameter is always the true value.
@@ -763,64 +931,151 @@ public:
                 if (p.isValid())
                 {
                     float v = p.defaultVal;
-                    if (p.id >= StepPitch && p.id < StepPitch + 16) v = defPitch[p.id - StepPitch];
+                    if (p.id == VoiceCountParam) v = (float) maxVoices;      // (held to 1 .. 16 by the cell)
+                    else if (p.id >= StepPitch && p.id < StepPitch + 16) v = defPitch[p.id - StepPitch];
                     else if (p.id >= StepShape && p.id < StepShape + 16) v = defShape[p.id - StepShape];
                     else if (p.id >= StepLevel && p.id < StepLevel + 16) v = defLevel[p.id - StepLevel];
                     setParameter(p.id, v);
                 }
         filterSection.applyAll(VoiceFilterSection::each(voices));
-        lfoSection.applyAll(EngineLfoSection::each(voices));
     }
 
     // SEQ and LANES (how the sequence runs), then two pages per lane with one cell per step
-    // (encoder N = step N, or step N + 8 on the second page), then AMP.
+    // (encoder N = step N, or step N + 8 on the second page), then AMP, the filter's two and BODY:
+    // the engine's own pages, without the modulation router's.
     static const ParamPages& pages()
     {
         static const ParamPages list = build();
         return list;
     }
 
-    // The LFO destinations: the original eight, then level, the amp envelope, the filter and the
-    // other LFO, then the lanes step by step (P1-P16 pitch, L1-L16 level, T1-T16 time: each voice
-    // has its own copy of the sequence, so an LFO bends one voice's step).
+    // What can be moved (the modulation router's table), in the order the DEST cells have always
+    // had: the original eight (pitch, level, pan, cutoff, resonance, the sequence's rate and the
+    // pitch lane's reach as inputs of the voice; XFAD, a page cell), then level, the amp envelope,
+    // the filter and the other LFO, then the lanes step by step (P1-P16 pitch, L1-L16 level,
+    // T1-T16 time: each voice has its own copy of the sequence, so a slot bends one voice's
+    // step), BODY's eight cells (BMIX ... BKTK), and new at the end: the two envelope times ETIM /
+    // FTIM and PM, the oscillator's phase. 86 entries of DestTable::MAX 96.
+    // Per sample (so the track input reaches them at audio rate): PTCH, AMP, PAN, CUT, PM.
+    // RATE and PRNG are inputs, not the cells: RATE is a factor on the sequence's speed that is
+    // not held to the RATE cell's range (the strip's default doubles the speed whatever RATE is),
+    // and PRNG an offset of +-1 on a cell of 0..2 whose stored value may lie beyond that range
+    // (factory presets hold up to 12): the voice holds the sum to 0..2 only while a slot is
+    // aimed at it, and a sound nothing is routed to keeps its value.
     // Not offered: LEN, LOOP, the lane lengths, SYNC, SLID, SHP*, the shape lane, CHAN, STGS,
     // COMB (choices and counts), TUNE, FINE and BEND (PTCH is the pitch), and what the filter
     // leaves out.
-    static const LfoDestList& lfoDests(const ParamPages* enginePages = nullptr)
+    static const mod::DestTable& lfoDests()
     {
-        if (enginePages == nullptr)
-            pages();                    // the list is made on the way (build())
-        static const LfoDestList list = makeLfoDests(*enginePages);
-        static const bool registered = (list.registerGroups(), true);
+        static const mod::DestTable table = []
+        {
+            const ParamPages& p = pages();
+            mod::DestTable t;
+            t.group();
+            t.input("PTCH", 1.0f, 1.0f, 1.0f / 1024.0f, 1024.0f, mod::Pitch);      // a ratio: one octave x the amount squared
+            t.input("AMP", 1.0f, 1.0f, 0.0f, 4.0f, mod::PerSample).audioFloor(-4.0f);  // (below 0: ring modulation)
+            t.input("PAN", 0.0f, 1.0f, -1.0f, 1.0f, mod::PerSample);
+            t.input("CUT", 0.0f, 4.0f, -16.0f, 16.0f, mod::PerSample);              // octaves
+            t.input("RESO", 0.0f, 0.5f, -1.0f, 1.0f);
+            t.input("RATE", 1.0f, 2.0f, 1.0f / 64.0f, 64.0f, mod::Exp);             // a factor: +-2 octaves
+            t.add(p, Crossfade);
+            t.input("PRNG", 0.0f, 1.0f, -2.0f, 2.0f);                               // an offset
+            jassert(t.size() == WaveSeqVoice::NumLfoDests);
+            t.group();
+            for (int id : { (int) Level, (int) AmpAttack, (int) AmpDecay, (int) AmpSustain, (int) AmpRelease, (int) VelSens })
+                t.add(p, id);
+            VoiceFilterSection::addLfoDests(t, p, FilterBase);
+            t.addCross();
+            for (int base : { (int) StepPitch, (int) StepLevel, (int) StepTime })
+                for (int half = 0; half < 2; ++half)
+                {
+                    t.group();
+                    for (int i = 0; i < 8; ++i)
+                        t.add(p, base + half * 8 + i);
+                }
+            t.group();
+            for (int c = 0; c < (int) VoiceBody::NumCells; ++c)
+                t.add(p, BodyBase + c, VoiceBodySection::destLabel(c));
+            // New with the router, after what was there before (a stored DEST keeps its meaning).
+            t.group();
+            t.envTimes();
+            t.input("PM", 0.0f, 1.0f, -4.0f, 4.0f, mod::PerSample | mod::Phase);    // cycles (a phase: a cycle is no change)
+            // The mod strip until the STRIP page says otherwise: the sequence up to twice as fast
+            // (RATE +50 = one octave of speed, so the top of the strip is in time again).
+            t.stripRoute(0, WaveSeqVoice::LfoRate, 0.5f);
+            // Pad pressure until AT ROUTE says otherwise: the level, a gain of 1 + pressure.
+            t.pressureRoute(0, "AMP", 1.0f);
+            t.finish(2);
+            return t;
+        }();
+        static const bool registered = [] { table.registerGroups(); return true; }();
         juce::ignoreUnused(registered);
-        return list;
+        return table;
     }
 
-    static LfoDestList makeLfoDests(const ParamPages& p)
+    // The destinations the voice reads by number beyond the first eight: ETIM, FTIM and PM, where
+    // the table has them ("U4 Wave Sequencer" checks that each is found and acts).
+    static const WaveSeqVoice::Dests& dests()
     {
-        LfoDestList l(WaveSeqVoice::lfoDestLabels(), WaveSeqVoice::NumLfoDests);
-        l.group();
-        for (int id : { (int) Level, (int) AmpAttack, (int) AmpDecay, (int) AmpSustain, (int) AmpRelease, (int) VelSens })
-            l.add(p, id);
-        VoiceFilterSection::addLfoDests(l, p, FilterBase);
-        l.addCross();
-        for (int base : { (int) StepPitch, (int) StepLevel, (int) StepTime })
-            for (int half = 0; half < 2; ++half)
-            {
-                l.group();
-                for (int i = 0; i < 8; ++i)
-                    l.add(p, base + half * 8 + i);
-            }
-        // The mod strip until the STRIP page says otherwise: the sequence up to twice as fast
-        // (RATE +50 = one octave of speed, so the top of the strip is in time again).
-        l.stripRoute(0, WaveSeqVoice::LfoRate, 0.5f);
-        return l;
+        static const WaveSeqVoice::Dests found = []
+        {
+            const auto& t = lfoDests();
+            WaveSeqVoice::Dests d;
+            d.envTime = t.ampTime();
+            d.filterTime = t.filterTime();
+            d.phase = t.indexOfLabel("PM");
+            return d;
+        }();
+        return found;
     }
+
+    // What a slot can read here beside the router's own sources: the list SRC and VIA show. The
+    // four lanes, each as the step it stands at in this voice (WaveSeqVoice::Published), at
+    // control rate: a lane steps the filter, the body, an LFO's rate, another lane's steps.
+    //   PLAN  the pitch lane: -24..24 semitones as -1..1 (the step as set, before PRNG)
+    //   SLAN  the shape lane: SIN SAW SQR TRI PLS NOIS as 0, 0.2 .. 1
+    //   LLAN  the level lane: 0..1
+    //   TLAN  the time lane: 30 ms .. 2 s as 0..1, by octaves
+    // With SLID on, PLAN and LLAN glide between steps as the sound does. A lane whose length
+    // differs from the time lane's is a pattern of its own length (PLEN 3 against TLEN 8).
+    static const mod::SourceTable& sources()
+    {
+        static const mod::SourceTable table = []
+        {
+            mod::SourceTable t(2);
+            t.publish("PLAN");
+            t.publish("SLAN", mod::Unipolar);
+            t.publish("LLAN", mod::Unipolar);
+            t.publish("TLAN", mod::Unipolar);
+            jassert(t.published() == WaveSeqVoice::NumPublished);
+            return t;
+        }();
+        static const bool registered = [] { table.registerGroups(); return true; }();
+        juce::ignoreUnused(registered);
+        return table;
+    }
+
+    // What an old pressure route (AftertouchRouter::Destination) is here, as a slot's DEST.
+    int pressureDestOf(AftertouchRouter::Destination d) const override
+    {
+        using D = AftertouchRouter::Destination;
+        switch (d)
+        {
+            case D::Volume:         return WaveSeqVoice::LfoAmp;
+            case D::FilterCutoff:   return WaveSeqVoice::LfoCutoff;
+            case D::PanSpread:      return WaveSeqVoice::LfoPan;
+            default:                return 0;
+        }
+    }
+
+    mod::Router* modRouter() override { return &router; }
+    const mod::Router* modRouter() const override { return &router; }
 
     ParamPages getParamPages() const override
     {
         ParamPages out = pages();
         filterSection.updateModeCell(out);
+        router.appendPages(out);        // XIN, SLT1 .., LSHP, STRIP, LFO1, LFO2
         return out;
     }
 
@@ -830,7 +1085,7 @@ public:
     {
         tempoBpm = bpm;
         updateTempoScale();
-        lfoSection.setTempo(bpm, EngineLfoSection::each(voices));
+        router.setTempo(bpm);
     }
 
     EngineType getType() const override { return EngineType::WaveSeq; }
@@ -839,6 +1094,7 @@ public:
     void prepareToPlay(double sr, int /*samplesPerBlock*/) override
     {
         sampleRate = sr;
+        router.prepare(sr);
         for (auto& v : voices)
             v.setSampleRate(sr);
     }
@@ -849,57 +1105,61 @@ public:
         auto* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer(1) : nullptr;
         int numSamples = buffer.getNumSamples();
 
-        // Once per block: tuning and bend, and each voice's pressure (volume). The mod strip: the
-        // routes of the STRIP page (by default the sequence runs up to twice as fast), and the
-        // cutoff by the filter's WHL amount.
+        // Once per block: tuning and bend, the strip (the cutoff by the filter's WHL amount; its
+        // routes are the router's: by default the sequence runs up to twice as fast), the track's
+        // pressure routes and the track input.
         wheelNow = smoothWheel(wheelNow, wheel, numSamples, sampleRate);
-        lfoSection.stripBlock(wheelNow, numSamples, sampleRate, EngineLfoSection::each(voices),
-                              [this](int key) { setParameter(key, getParameter(key)); });
-        for (int v = 0; v < (int) voices.size(); ++v)
+        const float semitones = tune + fine / 100.0f + bend * bendRange;
+        const float wheelOctaves = filterSection.externalOctaves(wheelNow, 0.0f);
+        for (auto& voice : voices)
         {
-            float pressure = v < allocator.getVoiceCount() ? allocator.getAftertouch(v) : 0.0f;
-            AftertouchRouter::ModValues m;
-            if (pressure > 0.0f)
-                m = (aftertouchRouter ? *aftertouchRouter : allocator.getAftertouchRouter()).computeModulation(pressure);
-            voices[(size_t) v].setGainMod(juce::jlimit(0.0f, 2.0f, 1.0f + m.volumeMod));
-            voices[(size_t) v].setPitchOffset(tune + fine / 100.0f + bend * bendRange);
-            voices[(size_t) v].getFilter().setExternalOctaves(filterSection.externalOctaves(wheelNow, m.cutoffMod));
+            voice.setPitchOffset(semitones);
+            voice.getBody().setPitchOffset(semitones);
+            voice.getFilter().setExternalOctaves(wheelOctaves);
         }
-
-        for (int i = 0; i < numSamples; ++i)
+        router.beginBlock(audioInput.left, audioInput.right, audioInput.connected() ? audioInput.frames : 0,
+                          audioInput.envelope, wheelNow, sampleRate);
+        const auto setCell = [this](WaveSeqVoice& voice, int dest, float value)
         {
-            // An LFO routed to PAN moves its own voice between the channels (balance law: the
-            // centre is unchanged, so a sound without that routing is exactly as before).
-            float sampleL = 0.0f, sampleR = 0.0f;
-            for (auto& voice : voices)
+            applyVoiceParam(voice, router.dests()[dest].id, value);
+        };
+        const WaveSeqVoice::Dests& d = dests();
+
+        // Sub-blocks: the router's control rate. Inside one the voices are rendered one after
+        // the other (they share the router's per-sample buffers).
+        for (int offset = 0; offset < numSamples;)
+        {
+            const int n = router.beginChunk(offset, numSamples);
+            std::fill(mixL.begin(), mixL.begin() + n, 0.0f);
+            std::fill(mixR.begin(), mixR.begin() + n, 0.0f);
+            for (int v = 0; v < (int) voices.size(); ++v)
             {
+                auto& voice = voices[(size_t) v];
                 if (! voice.isActive())
+                {
+                    // Its LFOs keep time; a cell it was left holding goes back to its set value.
+                    if (voice.getMod().idle(router, n))
+                        voice.getMod().restore(router, [&](int dest, float value) { voice.setControl(d, dest, value, setCell); });
                     continue;
-                // LFOs on page cells: this voice's own value of each (as of its last sample).
-                if (voice.getLfos().keyed())
-                    voice.getLfos().forEachKeyed([&voice](int key, float value) { applyVoiceParam(voice, key, value); });
-                const float s = voice.process();
-                const float pan = voice.getLfoPan();
-                sampleL += pan > 0.0f ? s * (1.0f - pan) : s;
-                sampleR += pan < 0.0f ? s * (1.0f + pan) : s;
+                }
+                const float pressure = v < allocator.getVoiceCount() ? allocator.getAftertouch(v) : 0.0f;
+                voice.render(router, d, mixL.data(), mixR.data(), n, pressure, setCell);
             }
-
-            sampleL *= 0.7f;
-            sampleR *= 0.7f;
-
-            if (right)
+            for (int i = 0; i < n; ++i)
             {
-                left[i] += sampleL;
-                right[i] += sampleR;
+                const float sampleL = mixL[(size_t) i] * 0.7f, sampleR = mixR[(size_t) i] * 0.7f;
+                if (right)
+                {
+                    left[offset + i] += sampleL;
+                    right[offset + i] += sampleR;
+                }
+                else
+                {
+                    left[offset + i] += 0.5f * (sampleL + sampleR);
+                }
             }
-            else
-            {
-                left[i] += 0.5f * (sampleL + sampleR);
-            }
+            offset += n;
         }
-
-        lfoSection.endBlock(numSamples, EngineLfoSection::each(voices));
-        lfoSection.afterLetGo([this](int key) { setParameter(key, getParameter(key)); });
     }
 
     void releaseResources() override
@@ -946,21 +1206,32 @@ private:
 public:
     void setParameter(ParamId id, float value) override
     {
+        if (id == VoiceCountParam)
+        {
+            // (The allocator keeps to it: no more than VOX voices are given notes, and a lowered
+            // VOX releases the voices past it - they ring out.)
+            const int n = juce::jlimit(1, MAX_VOICES, (int) std::lround(value));
+            params[id] = (float) n;
+            allocator.setVoiceLimit(n);
+            return;
+        }
+        if (bodySection.owns(id))
+        {
+            bodySection.set(id, value, VoiceBodySection::each(voices));
+            router.setBase(id, bodySection.get(id));
+            return;
+        }
         if (filterSection.owns(id))
         {
             if (filterSection.swaps(id, value))
                 soundSwapped();
             filterSection.set(id, value, VoiceFilterSection::each(voices));
-            lfoSection.baseChanged(id, filterSection.get(id), EngineLfoSection::each(voices));
+            router.setBase(id, filterSection.get(id));
             return;
         }
-        if (lfoSection.owns(id))
+        if (mod::Router::owns(id))
         {
-            // A cell an LFO has let go of goes back to its set value on every voice.
-            const int released = lfoSection.set(id, value, EngineLfoSection::each(voices),
-                                                [this](int key) { return getParameter(key); });
-            if (released >= 0)
-                setParameter(released, getParameter(released));
+            router.set(id, value);
             return;
         }
         if (StageCurveParam::owns(id))
@@ -974,15 +1245,17 @@ public:
             soundSwapped();
         params[id] = value;
         applyParameter(id, value);
-        lfoSection.baseChanged(id, value, EngineLfoSection::each(voices));
+        router.setBase(id, value);
     }
 
     float getParameter(ParamId id) const override
     {
+        if (bodySection.owns(id))
+            return bodySection.get(id);
         if (filterSection.owns(id))
             return filterSection.get(id);
-        if (lfoSection.owns(id))
-            return lfoSection.get(id);
+        if (mod::Router::owns(id))
+            return router.get(id);
         if (StageCurveParam::owns(id))
             return stageCurves.get(id);
         auto it = params.find(id);
@@ -991,10 +1264,12 @@ public:
 
     juce::String getParameterName(ParamId id) const override
     {
+        if (bodySection.owns(id))
+            return VoiceBodySection::name(id - BodyBase);
         if (filterSection.owns(id))
             return VoiceFilterSection::name(id - FilterBase);
-        if (EngineLfoSection::owns(id))
-            return EngineLfoSection::name(id);
+        if (mod::Router::owns(id))
+            return mod::Router::name(id);
         switch (id)
         {
             case SeqLength:       return "Seq Length";
@@ -1041,7 +1316,7 @@ public:
 private:
     static ParamPages build()
     {
-        static const char* const loops[] = { "FWD", "REV", "PING", "RAND", "ONCE" };
+        static const char* const loops[] = { "FWD", "REV", "PING", "RAND", "ONCE", "ORND" };
         static const char* const shapes[] = { "SIN", "SAW", "SQR", "TRI", "PLS", "NOIS" };
         static const char* const chain[] = { "OFF", "SER", "PAR" };
         static const char* const combine[] = { "SUM", "MAX" };
@@ -1056,7 +1331,7 @@ private:
             { "SEQ", "SEQ", {{
                 { "LEN",  SeqLength, 1, 16, 8, I },
                 { "XFAD", Crossfade, 0, 1, 0.3f, L },
-                { "LOOP", LoopModeParam, 0, 4, 0, C, "", loops, 5 },
+                { "LOOP", LoopModeParam, 0, 5, 0, C, "", loops, 6 },
                 { "RATE", Rate, 0.25f, 4, 1, G, "x" },
                 { "PRNG", PitchRange, 0, 2, 1, L, "x" },
                 { "TUNE", TuneParam, -24, 24, 0, I, "st" },
@@ -1106,8 +1381,10 @@ private:
             { "CHAN", EnvChainMode, 0, 2, 0, C, "", chain, 3 },
             { "STGS", EnvChainStages, 1, 8, 2, I },
             { "COMB", EnvChainCombine, 0, 1, 0, C, "", combine, 2 } }} });
+        // VOICE: polyphony. Before the filter pages (before STRIP / LFO pages).
+        out.push_back({ "VOICE", "VOX", {{ { "VOX", VoiceCountParam, 1, MAX_VOICES, 8, I }, {}, {}, {}, {}, {}, {}, {} }} });
         VoiceFilterSection::appendPages(out, FilterBase);
-        EngineLfoSection(lfoDests(&out)).appendPages(out);
+        VoiceBodySection::appendPage(out, BodyBase);
         return out;
     }
 
@@ -1136,10 +1413,15 @@ private:
         }
     }
 
-    // One voice's own value of a page cell: what an LFO routed to that cell sets, sample by
-    // sample. Envelope times act on the stage that is running (the chain's stages are copies).
+    // One voice's own value of a page cell: what a slot routed to that cell sets, once a
+    // sub-block. Envelope times act on the stage that is running (the chain's stages are copies).
     static void applyVoiceParam(WaveSeqVoice& voice, ParamId id, float value)
     {
+        if (VoiceBodySection::ownsId(id, BodyBase))
+        {
+            VoiceBodySection::applyTo(voice.getBody(), id - BodyBase, value);
+            return;
+        }
         if (id >= FilterBase)
         {
             VoiceFilterSection::applyTo(voice.getFilter(), id - FilterBase, value);
@@ -1225,7 +1507,7 @@ private:
 
             case LoopModeParam:
             {
-                int modeIdx = juce::jlimit(0, 4, (int) value);
+                int modeIdx = juce::jlimit(0, 5, (int) value);
                 auto mode = static_cast<WaveSeqVoice::LoopMode>(modeIdx);
                 for (auto& v : voices)
                     v.setLoopMode(mode);
@@ -1372,7 +1654,9 @@ private:
     float wheelNow = 0.0f;                                  // the strip, smoothed per block
 
     VoiceFilterSection filterSection { FilterBase };
-    EngineLfoSection lfoSection { lfoDests() };
+    VoiceBodySection bodySection { BodyBase };
+    mod::Router router { lfoDests(), 2, 0, &sources() };
+    std::array<float, mod::Router::MAX_CHUNK> mixL {}, mixR {};
     float tempoBpm = 120.0f;
     bool syncOn = false;
     VoiceAllocator allocator;

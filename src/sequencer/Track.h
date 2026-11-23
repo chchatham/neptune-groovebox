@@ -3,6 +3,7 @@
 #include "Step.h"
 #include "../engine/EngineBase.h"
 #include <juce_core/juce_core.h>
+#include <functional>
 #include <vector>
 
 struct Track
@@ -94,6 +95,19 @@ struct Track
     }
 };
 
+// The structure lock as whoever changes step vectors is handed it: a function that runs `work`
+// with AudioEngine::structure() held (GrammarHooks::structureLock makes it), so that the audio
+// thread, which only tries that lock, skips a block instead of reading a vector while it moves.
+using StructureLockFn = std::function<void(const std::function<void()>&)>;
+
+// `work` under the lock - or as it is where none was given (a sequencer or a screen made without
+// an engine, as the tests make them).
+inline void underStructure(const StructureLockFn& lock, const std::function<void()>& work)
+{
+    if (lock) lock(work);
+    else      work();
+}
+
 // The length knob (LN on STEP, on TRK FX): a track made longer plays on as it was, its steps
 // looping through the new ones. One turn of the knob - clicks no more than 1.5 s apart, on one
 // track - loops the track as it was when the turn began, so 16 turned up to 64 is the 16 four
@@ -112,15 +126,21 @@ struct LengthTurn
             loops = !track.anythingFrom(track.length);
         }
         lastMs = nowMs;
-        if (loops && newLength > track.length)
-            track.lengthenLooping(newLength, period);
-        else
-            track.setLength(newLength);
+        underStructure(lock, [&]
+        {
+            if (loops && newLength > track.length)
+                track.lengthenLooping(newLength, period);
+            else
+                track.setLength(newLength);
+        });
     }
+
+    void setStructureLock(StructureLockFn fn) { lock = std::move(fn); }
 
 private:
     const Track* turning = nullptr;
     int period = 0;
     bool loops = false;
     juce::int64 lastMs = 0;
+    StructureLockFn lock;
 };

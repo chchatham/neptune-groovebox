@@ -9,6 +9,7 @@
 #include "../UiClock.h"
 #include "../../engine/AudioEngine.h"
 #include "../../engine/PerfFx.h"
+#include "../../sequencer/SequencerCore.h"
 #include "../../dsp/DSPUtils.h"
 
 // PERF: effects played from the pads (src/engine/PerfFx.h). Every pad holds up to four effects
@@ -16,8 +17,10 @@
 // selected at the press, MSTR = the whole mix, or a track by number). The press itself and the
 // pad's pressure each move any of an effect's values, by an amount set per value.
 // The pad touched last is the one on the knobs (as on DRUMS); holding it and turning changes it
-// while it is heard. Up / Down choose which of its layers the knobs show (the strip at the bottom
-// shows the four: a letter where a layer holds an effect, the shown one inverted).
+// while it is heard. Up / Down change the bank (four banks of sixteen pads, as on CHORD); LY on the
+// PRESS page chooses which of the pad's layers the knobs show (the strip at the bottom shows the
+// four: a letter where a layer holds an effect, the shown one inverted). The name bar says the
+// bank and the knob page ("B1 FX").
 // The pads can be pinned like those of DRUMS, SCALE and CHORD.
 //
 // Knob pages (the first three keep one layout: knob 4 is WET, knobs 5 - 8 the effect's own four):
@@ -44,24 +47,20 @@ public:
         rebuild();
     }
 
+    // Set the sequencer for recording pad moves and for live-finger priority.
+    void setSequencer(SequencerCore* seq) { sequencer = seq; }
+
     juce::String getName() const override { return "PERF"; }
 
-    // What a press of the shown layer does ("DUB>MSTR"), or what the page's knobs are.
+    // The bank and the knob page: "B1 FX", "B1 PRESS", "B1 PRES", "B1 MORE". Eight characters are
+    // what the name bar has beside "PERF T1" and the page mark, and it keeps whole words from the
+    // start, so anything longer ("B1 DUB>MSTR", "B1 PRESSURE") was cut to the bank alone. What the
+    // shown layer does is in the FX page's own cells (TRK, FX); its letter is in the strip.
     juce::String getSubPage() const override
     {
         if (notice.showing())
             return notice.shown();
-        switch (gridPageIndex)
-        {
-            case PAGE_PRESS:    return "PRESS";
-            case PAGE_PRESSURE: return "PRESSURE";
-            case PAGE_MORE:     return "MORE";
-            default: break;
-        }
-        const auto& l = rack.get(shown, layer);
-        if (l.kind == PerfFx::NONE)
-            return juce::String::charToString((juce::juce_wchar) ('A' + layer)) + " EMPTY";
-        return juce::String(AudioEngine::perfKindName(l.kind)) + ">" + targetName(l.target);
+        return "B" + juce::String(rack.getBank() + 1) + " " + getPageName();
     }
 
     int getShownLayer() const { return layer; }
@@ -85,19 +84,65 @@ public:
             notice.say("EMPTY: TURN FX");
             return;
         }
-        rack.press(padIndex, selectedTrack ? selectedTrack() : 0);
+        const int sel = selectedTrack ? selectedTrack() : 0;
+        rack.press(padIndex, sel);
+        // Mark pad as live-held (playback defers); record the press.
+        const int absPad = rack.absolutePad(padIndex);
+        if (sequencer)
+        {
+            sequencer->setPerfPadLive(absPad, true);
+            if (sequencer->isPlaying() && sequencer->isRecording())
+            {
+                PerfFx::Move m;
+                m.pad = (uint8_t) (padIndex);
+                m.bank = (uint8_t) rack.getBank();
+                m.type = PerfFx::MOVE_PRESS;
+                m.pressure = (uint8_t) juce::jlimit(0, 127, velocity);
+                m.selectedTrack = (int8_t) sel;
+                sequencer->recordPerfMove(m);
+            }
+        }
     }
 
     void onPadAftertouch(int padIndex, int value) override
     {
         if (padIndex >= 0 && padIndex < PerfFx::PADS)
+        {
             rack.setPressure(padIndex, (float) value / 127.0f);
+            // Record the pressure.
+            if (sequencer && sequencer->isPlaying() && sequencer->isRecording())
+            {
+                PerfFx::Move m;
+                m.pad = (uint8_t) (padIndex);
+                m.bank = (uint8_t) rack.getBank();
+                m.type = PerfFx::MOVE_PRESSURE;
+                m.pressure = (uint8_t) juce::jlimit(0, 255, value * 2);
+                m.selectedTrack = 0;
+                sequencer->recordPerfMove(m);
+            }
+        }
     }
 
     void onPadRelease(int padIndex) override
     {
         if (padIndex >= 0 && padIndex < PerfFx::PADS)
+        {
             rack.release(padIndex);
+            const int absPad = rack.absolutePad(padIndex);
+            if (sequencer)
+            {
+                sequencer->setPerfPadLive(absPad, false);
+                if (sequencer->isPlaying() && sequencer->isRecording())
+                {
+                    PerfFx::Move m;
+                    m.pad = (uint8_t) (padIndex);
+                    m.bank = (uint8_t) rack.getBank();
+                    m.type = PerfFx::MOVE_RELEASE;
+                    m.selectedTrack = 0;
+                    sequencer->recordPerfMove(m);
+                }
+            }
+        }
     }
 
     bool getPadColours(std::array<PadColour, 16>& out) const override
@@ -118,14 +163,16 @@ public:
         return true;
     }
 
-    // Up / Down: the layer on the knobs, round and round.
-    void onPadPagePrev() override { setLayer((layer + PerfFx::LAYERS - 1) % PerfFx::LAYERS); }
-    void onPadPageNext() override { setLayer((layer + 1) % PerfFx::LAYERS); }
+    // Up / Down: the bank (like CHORD). Layer is on a separate gesture (the strip).
+    void onPadPagePrev() override { setBank((rack.getBank() + PerfFx::NUM_BANKS - 1) % PerfFx::NUM_BANKS); }
+    void onPadPageNext() override { setBank((rack.getBank() + 1) % PerfFx::NUM_BANKS); }
     void getHelpFacts(HelpFacts& facts) const override
     {
         GridScreen::getHelpFacts(facts);
-        facts.tapUpDown = "PERF LAYER";
+        facts.tapUpDown = "PERF BANK";
     }
+
+    int getShownBank() const { return rack.getBank(); }
 
     // ---- knobs -----------------------------------------------------------------------------------
     void render(DisplayRenderer& display) override
@@ -140,10 +187,11 @@ public:
         const int clicks = dsp::encoderDelta(value);
         if (clicks == 0 || encoderIndex < 0 || encoderIndex >= 8)
             return;
-        const bool clearKnob = gridPageIndex == PAGE_MORE && encoderIndex == 7;
-        if (! clearKnob)
+        const bool clearPadKnob  = gridPageIndex == PAGE_MORE && encoderIndex == 7;
+        const bool clearTakeKnob = gridPageIndex == PAGE_MORE && encoderIndex == 6;
+        if (! clearPadKnob && ! clearTakeKnob)
             confirm.cancel();
-        if (clearKnob)
+        if (clearPadKnob)
         {
             if (rack.get(shown).empty())
             {
@@ -161,6 +209,22 @@ public:
             notice.say("PAD CLEARED");
             return;
         }
+        if (clearTakeKnob)
+        {
+            if (! sequencer || sequencer->getPattern().perfMoves.empty())
+            {
+                notice.say("NO TAKE");
+                return;
+            }
+            if (! confirm.step(6, clicks))
+                return;
+            {
+                const UndoMark mark(*this, undoPointMoves("CLEAR"));
+                sequencer->clearPerfMoves();
+            }
+            notice.say("TAKE CLEARED");
+            return;
+        }
         GridScreen::onEncoderChange(encoderIndex, value);
     }
 
@@ -168,6 +232,8 @@ public:
     {
         if (gridPageIndex == PAGE_MORE && encoderIndex == 7 && confirm.knob == 7)
             return "CLEAR PAD " + confirm.progress();
+        if (gridPageIndex == PAGE_MORE && encoderIndex == 6 && confirm.knob == 6)
+            return "CLR TAKE " + confirm.progress();
         return {};
     }
 
@@ -262,6 +328,16 @@ private:
         rebuild();
     }
 
+    void setBank(int b)
+    {
+        confirm.cancel();
+        rack.setBank(b);
+        // Keep shown pad in range; first layer of the first occupied pad.
+        shown = 0;
+        layer = rack.get(0).firstLayer();
+        rebuild();
+    }
+
     // The pages follow the shown pad and layer and what is on it (also after a project load or an undo).
     void refresh()
     {
@@ -276,11 +352,31 @@ private:
         UndoPoint point;
         point.scope = UndoPoint::Scope::Custom;
         point.verb = verb;
-        const juce::String pad = "PAD " + juce::String(shown + 1);
+        const juce::String bankStr = "B" + juce::String(rack.getBank() + 1);
+        const juce::String pad = bankStr + " PAD " + juce::String(shown + 1);
         point.names = { "PERF " + pad, pad, "PAD" };
         point.coalesceKey = coalesceKey;
         point.capture = [this] { return rack.toFlat(); };
         point.apply = [this](const std::vector<float>& v) { rack.fromFlat(v); };
+        return point;
+    }
+
+    // An undo point for the recorded moves in the active pattern.
+    UndoPoint undoPointMoves(const juce::String& verb) const
+    {
+        UndoPoint point;
+        point.scope = UndoPoint::Scope::Custom;
+        point.verb = verb;
+        point.names = { "PERF TAKE", "TAKE", "TAKE" };
+        point.capture = [this]
+        {
+            return sequencer ? sequencer->getPattern().perfMoves.toFlat() : std::vector<float>();
+        };
+        point.apply = [this](const std::vector<float>& v)
+        {
+            if (sequencer)
+                sequencer->applyPerfMoves(v);       // (under the structure lock: the audio thread reads the lane)
+        };
         return point;
     }
 
@@ -418,6 +514,11 @@ private:
         press.cells[1] = cell({ "QNT", 1, 0, PerfFx::NUM_QUANT - 1, 0, K::Choice, "", grids, PerfFx::NUM_QUANT },
                               [pad] { return (float) pad().quantize; },
                               [this](float v) { changePad([v](PerfFx::Setting& p) { p.quantize = (int) std::lround(v); }); });
+        // Layer selector on the PRESS page: turns through A B C D.
+        static const char* const layerNames[] = { "A", "B", "C", "D" };
+        press.cells[2] = cell({ "LY", 2, 0, PerfFx::LAYERS - 1, 0, K::Choice, "", layerNames, PerfFx::LAYERS },
+                              [this] { return (float) layer; },
+                              [this](float v) { setLayer((int) std::lround(v)); });
         static const char* const curves[] = { "LIN", "SOFT", "HARD" };
         pressure.cells[0] = cell({ "CURV", 0, 0, PerfFx::NUM_CURVES - 1, 0, K::Choice, "", curves, PerfFx::NUM_CURVES },
                                  [pad] { return (float) pad().pressureCurve; },
@@ -441,6 +542,12 @@ private:
                               [lay, i] { return lay().extra[(size_t) i]; },
                               [this, i](float v) { change([v, i](PerfFx::Layer& l) { l.extra[(size_t) i] = v; }); });
         }
+        // TAKE: four clicks to clear the recorded pad moves in this pattern.
+        static const char* const takeNames[] = { ">>>>" };
+        more.cells[6] = cell({ "TAKE", 6, 0, 0, 0, K::Choice, "", takeNames, 1 },
+                             [] { return 0.0f; }, [](float) {},
+                             [this](float) { return confirm.knob == 6 ? confirm.progress() : juce::String(">>>>"); });
+
         static const char* const clearNames[] = { ">>>>" };
         more.cells[7] = cell({ "CLR", 7, 0, 0, 0, K::Choice, "", clearNames, 1 },
                              [] { return 0.0f; }, [](float) {},
@@ -496,6 +603,7 @@ private:
     }
 
     PerfFxRack& rack;
+    SequencerCore* sequencer = nullptr;
     std::function<int()> selectedTrack, trackCount;
     int shown = 0, layer = 0;
     int builtKind = -1, builtTracks = -1;

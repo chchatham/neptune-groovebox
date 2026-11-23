@@ -60,6 +60,13 @@ public:
                     held.push_back({ note, (float) velocity / 127.0f });
                 return held;
             });
+            screen->setPhysicalKeysProvider([this]
+            {
+                std::vector<ChordPads::Note> held;
+                for (auto& [note, velocity] : mgr.getPhysicallyHeldKeys())
+                    held.push_back({ note, (float) velocity / 127.0f });
+                return held;
+            });
             screen->setNoteCallback([this](int n, int v) { played.add("on" + juce::String(n) + ":" + juce::String(v)); });
             screen->setNoteOffCallback([this](int n) { played.add("off" + juce::String(n)); });
             screen->setAftertouchCallback([this](int n, int p) { played.add("at" + juce::String(n) + ":" + juce::String(p)); });
@@ -182,15 +189,29 @@ public:
             expectEquals(r.name(0), juce::String("--"), "and once more: the pad as it was before any chord");
         }
 
-        beginTest("Latched keys count as held");
+        beginTest("Latched notes alone do not store; physically held keys do store");
         {
             Rig r;
             r.shift(true); r.tap(109); r.shift(false);          // Shift + Arp: key latch (no arp on)
             expect(r.mgr.isKeyLatchOn());
-            r.keyOn(62); r.keyOn(65); r.keyOn(69);
-            r.keyOff(62); r.keyOff(65); r.keyOff(69);           // hands off the keys: the latch holds them
+            // Store a known chord on pad 3 first (with real keys down).
+            r.keyOn(60); r.keyOn(64); r.keyOn(67);
             r.padOn(3); r.padOff(3);
-            expectEquals(r.name(3), juce::String("Dm"));
+            r.keyOff(60); r.keyOff(64); r.keyOff(67);
+            expectEquals(r.name(3), juce::String("C"));
+            // Now: latch is holding C. Press and release Dm keys: the latch replaces with Dm.
+            r.keyOn(62); r.keyOn(65); r.keyOn(69);
+            r.keyOff(62); r.keyOff(65); r.keyOff(69);           // hands off: the latch holds Dm
+            // A pad press with no physical keys: plays, does not store.
+            r.played.clear();
+            r.padOn(3); r.padOff(3);
+            expectEquals(r.name(3), juce::String("C"), "latched notes alone do not overwrite");
+            expect(r.played.size() > 0, "the pad played its chord instead");
+            // With a finger on a key, the pad stores.
+            r.keyOn(62); r.keyOn(65); r.keyOn(69);              // physically holding Dm
+            r.padOn(4); r.padOff(4);
+            r.keyOff(62); r.keyOff(65); r.keyOff(69);
+            expectEquals(r.name(4), juce::String("Dm"), "physically held keys store the chord");
         }
 
         beginTest("No physical keys held: a pad plays its chord, not stores; arp latch does not count as held keys");

@@ -21,29 +21,6 @@ inline float flushDenormal(float x) { return std::abs(x) < 1.0e-15f ? 0.0f : x; 
 // exactly 1 with zero slope, which makes the clamp seamless. Output is always within -1..1.
 constexpr float softSat(float x) { return dsp::fastTanh(std::clamp(x, -3.0f, 3.0f)); }
 
-// A tape transport's unsteadiness: slow wow and faster flutter, as a share of the delay time (to be
-// scaled by the caller, then delay *= 1 + that). The arithmetic is TapeDelay's, moved here unchanged.
-struct TapeTransport
-{
-    static constexpr double WOW_HZ = 0.6, FLUTTER_HZ = 7.0;
-    static constexpr float WOW_DEPTH = 0.003f, FLUTTER_DEPTH = 0.0006f;
-
-    void reset() { wowPhase = flutterPhase = 0.0; }
-
-    float next(double sampleRate)
-    {
-        const float mod = WOW_DEPTH * (float) std::sin(wowPhase * dsp::TWO_PI_D)
-                        + FLUTTER_DEPTH * (float) std::sin(flutterPhase * dsp::TWO_PI_D);
-        wowPhase += WOW_HZ / sampleRate;
-        if (wowPhase >= 1.0) wowPhase -= 1.0;
-        flutterPhase += FLUTTER_HZ / sampleRate;
-        if (flutterPhase >= 1.0) flutterPhase -= 1.0;
-        return mod;
-    }
-
-    double wowPhase = 0.0, flutterPhase = 0.0;
-};
-
 // One-pole parameter smoother (exponential approach, y += a (target - y)).
 struct Smoother
 {
@@ -180,6 +157,8 @@ struct OnePole
 
 // Peak envelope follower with separate attack and release times (Zoelzer, "DAFX: Digital Audio
 // Effects", dynamics chapter: peak level detector).
+// (Its last user is the track-input follower in AudioEngine.h; every effect's follower is
+// dyn::Follower, Detector.h, which is this recursion with a hold. When that one has moved, this goes.)
 struct EnvelopeFollower
 {
     void setTimes(double sr, float attackMs, float releaseMs)
@@ -201,69 +180,8 @@ struct EnvelopeFollower
     float att = 1.0f, rel = 1.0f;
 };
 
-// Circular delay line with fractional read. Memory is allocated in prepare() only.
-// Call read...() before write() for the current sample: a delay of d then returns the sample
-// written d calls ago. Linear read needs d >= 1, Hermite read needs d >= 2.
-// Interpolation: 4-point, 3rd-order Hermite (Catmull-Rom) as in Olli Niemitalo, "Polynomial
-// Interpolators for High-Quality Resampling of Oversampled Audio".
-class DelayLine
-{
-public:
-    void prepare(int maxDelaySamples)
-    {
-        int n = 16;
-        while (n < maxDelaySamples + 8)
-            n <<= 1;
-        buf.assign((size_t) n, 0.0f);
-        mask = n - 1;
-        maxDelay = (float) (n - 6);
-        w = 0;
-    }
-
-    void clear()
-    {
-        std::fill(buf.begin(), buf.end(), 0.0f);
-        w = 0;
-    }
-
-    bool isPrepared() const { return !buf.empty(); }
-    float getMaxDelay() const { return maxDelay; }
-
-    void write(float x)
-    {
-        buf[(size_t) w] = x;
-        w = (w + 1) & mask;
-    }
-
-    float readLinear(float d) const
-    {
-        d = std::clamp(d, 1.0f, maxDelay);
-        int di = (int) d;
-        float fr = d - (float) di;
-        float x0 = at(di), x1 = at(di + 1);
-        return x0 + fr * (x1 - x0);
-    }
-
-    float readHermite(float d) const
-    {
-        d = std::clamp(d, 2.0f, maxDelay);
-        int di = (int) d;
-        float fr = d - (float) di;
-        float xm1 = at(di - 1), x0 = at(di), x1 = at(di + 1), x2 = at(di + 2);
-        float c1 = 0.5f * (x1 - xm1);
-        float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
-        float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
-        return ((c3 * fr + c2) * fr + c1) * fr + x0;
-    }
-
-private:
-    float at(int delay) const { return buf[(size_t) ((w - delay) & mask)]; }
-
-    std::vector<float> buf;
-    int mask = 0;
-    int w = 0;
-    float maxDelay = 1.0f;
-};
+// (The circular line with a fractional read is dly::Line, DelayCore.h; a tape's wow and flutter
+// dly::Transport there.)
 
 // Fixed-size circular line read at a whole number of samples (the reverbs' tank and FDN-style lines).
 template <int N>

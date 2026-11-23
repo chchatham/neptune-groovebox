@@ -97,7 +97,13 @@ public:
                 }
                 return std::unique_ptr<EngineBase>(std::move(e));
             };
-            g.phases = [](EngineBase& e) { return voicePhases<FMEngine>(e, 8); };
+            g.phases = [](EngineBase& e)        // (its LFOs are the modulation router's)
+            {
+                std::vector<double> out;
+                for (int v = 0; v < 8; ++v)
+                    out.push_back(static_cast<FMEngine&> (e).getVoice(v).getMod().getLfo(0).getPhase());
+                return out;
+            };
             r.push_back(g);
         }
         {
@@ -111,7 +117,13 @@ public:
                 e->setParameter(MacroOscEngine::AmpSustain, 1.0f);
                 return std::unique_ptr<EngineBase>(std::move(e));
             };
-            g.phases = [](EngineBase& e) { return voicePhases<MacroOscEngine>(e, 8); };
+            g.phases = [](EngineBase& e)        // (its LFOs are the modulation router's)
+            {
+                std::vector<double> out;
+                for (int v = 0; v < 8; ++v)
+                    out.push_back(static_cast<MacroOscEngine&> (e).getVoice(v).getMod().getLfo(0).getPhase());
+                return out;
+            };
             r.push_back(g);
         }
         {
@@ -128,7 +140,13 @@ public:
                 e->setParameter(WavetableEngine::AmpSustain, 1.0f);
                 return std::unique_ptr<EngineBase>(std::move(e));
             };
-            g.phases = [](EngineBase& e) { return voicePhases<WavetableEngine>(e, 8); };
+            g.phases = [](EngineBase& e)       // (on the modulation router: its voices' LFOs)
+            {
+                std::vector<double> out;
+                for (int v = 0; v < 8; ++v)
+                    out.push_back(static_cast<WavetableEngine&>(e).getVoice(v).getMod().getLfo(0).getPhase());
+                return out;
+            };
             r.push_back(g);
         }
         {
@@ -151,7 +169,13 @@ public:
                 e->setParameter(WaveSeqEngine::AmpSustain, 1.0f);
                 return std::unique_ptr<EngineBase>(std::move(e));
             };
-            g.phases = [](EngineBase& e) { return voicePhases<WaveSeqEngine>(e, 8); };
+            g.phases = [](EngineBase& e)        // (its LFOs are the modulation router's)
+            {
+                std::vector<double> out;
+                for (int v = 0; v < 8; ++v)
+                    out.push_back(static_cast<WaveSeqEngine&> (e).getVoice(v).getMod().getLfo(0).getPhase());
+                return out;
+            };
             r.push_back(g);
         }
         {
@@ -178,7 +202,13 @@ public:
                 e->setParameter(1 * 8 + DrumEngine::TUNE, 661.5f);
                 return std::unique_ptr<EngineBase>(std::move(e));
             };
-            g.phases = [](EngineBase& e) { return voicePhases<DrumEngine>(e, DrumEngine::NUM_VOICES); };
+            g.phases = [](EngineBase& e)        // (its LFOs are the modulation router's)
+            {
+                std::vector<double> out;
+                for (int v = 0; v < DrumEngine::NUM_VOICES; ++v)
+                    out.push_back(static_cast<DrumEngine&> (e).getVoice(v).getMod().getLfo(0).getPhase());
+                return out;
+            };
             r.push_back(g);
         }
         return r;
@@ -449,16 +479,23 @@ public:
                 }
                 expectEquals(page.params[5].numChoices, LFO::NUM_DIVISIONS, rig.name + " every division offered");
                 expectEquals(juce::String(page.params[7].choices[0]), juce::String("OFF"), rig.name + " destination 0 is OFF");
-                expect(page.params[7].numChoices >= 7 && page.params[7].numChoices <= S::MAX_DESTS, rig.name + " destination count");
+                // (The engine's own, then the cells of the track's effects: E4, "Effect Destinations".)
+                const int own = mod::TrackDest::firstIn(page.params[7].choices, page.params[7].numChoices);
+                expect(own >= 7 && own <= S::MAX_DESTS && page.params[7].numChoices == own + mod::TrackDest::COUNT, rig.name + " destination count");
             }
 
             // The LFO ids are on these two pages only, the STRIP page before them has 174-181, and
-            // nothing strays into 182-189 or 150-157.
+            // nothing strays into 182-189 or 150-157 (158-189 are the modulation router's on every engine,
+            // 182-189 its XIN page: the id rule at the top of ModRouter.h. BODY's cells are in the engine's
+            // own block).
             for (size_t i = 0; i < pages.size(); ++i)
                 for (auto& p : pages[i].params)
                 {
-                    expect(p.isValid(), rig.name + " " + pages[i].name + " has an empty cell");
-                    expect(p.id < 150 || (p.id >= 158 && p.id <= 181) || DrumEngine::isKickParam(p.id) || DrumEngine::isCymbalParam(p.id), rig.name + " id outside its ranges: " + juce::String(p.id));
+                    if (! p.isValid())
+                        continue;       // an empty cell is legal on any page (the owner: empty knobs are fine); every other check is for every page
+                    expect(p.id < 150 || (p.id >= 158 && p.id <= 181) || DrumEngine::isKickParam(p.id) || DrumEngine::isSoundParam(p.id)
+                           || DrumEngine::isPadModParam(p.id)
+                           || EngineModSlots::owns(p.id) || ((rig.name == "Macro" || rig.name == "FM" || rig.name == "WaveSeq" || rig.name == "Wavetable" || rig.name == "Sampler" || rig.name == "Drum") && pages[i].name == "XIN" && p.id >= 182 && p.id <= 189), rig.name + " id outside its ranges: " + juce::String(p.id));
                     expect(S::ownsLfo(p.id) == (i + 2 >= pages.size()), rig.name + " " + pages[i].name + ": LFO ids only on the LFO pages");
                     expect(S::ownsStrip(p.id) == (i + 3 == pages.size()), rig.name + " " + pages[i].name + ": STRIP ids only on the STRIP page");
                 }

@@ -59,6 +59,20 @@ public:
     void setRelease(float v) { params.release = v; }
     const Params& getParams() const { return params; }
 
+    // Every stage time (attack, decay, release) times this, 1/64 .. 64; the params stay as set.
+    // What it is for: the per-note spread of envelope times (EVAR) and envelope time as a
+    // modulation destination (mod::DestTable::envTimes: ETIM, FTIM), with no second copy of the
+    // params. Set under a sounding note it changes how fast the running stage goes on from where
+    // it is: the level does not jump (a stage keeps its place as a fraction of its time). At 1 the
+    // envelope is, bit for bit, what it is without it (x * 1.0f is x).
+    static constexpr float MIN_TIME_SCALE = 1.0f / 64.0f, MAX_TIME_SCALE = 64.0f;
+    void setTimeScale(float scale)
+    {
+        timeScale = scale >= MIN_TIME_SCALE ? (scale <= MAX_TIME_SCALE ? scale : MAX_TIME_SCALE)
+                                            : (scale < MIN_TIME_SCALE ? MIN_TIME_SCALE : 1.0f);    // (not a number: none)
+    }
+    float getTimeScale() const { return timeScale; }
+
     void noteOn()
     {
         stage = Stage::Attack;
@@ -95,7 +109,7 @@ public:
 
             case Stage::Attack:
             {
-                float duration = std::max(params.attack, 0.001f);
+                float duration = std::max(params.attack * timeScale, 0.001f);
                 stageProgress += dt / duration;
                 if (stageProgress >= 1.0f)
                 {
@@ -114,7 +128,7 @@ public:
 
             case Stage::Decay:
             {
-                float duration = std::max(params.decay, 0.001f);
+                float duration = std::max(params.decay * timeScale, 0.001f);
                 stageProgress += dt / duration;
                 if (stageProgress >= 1.0f)
                 {
@@ -141,7 +155,7 @@ public:
 
             case Stage::Release:
             {
-                float duration = std::max(params.release, 0.001f);
+                float duration = std::max(params.release * timeScale, 0.001f);
                 stageProgress += dt / duration;
                 if (stageProgress >= 1.0f)
                 {
@@ -212,6 +226,7 @@ private:
     double sampleRate = 44100.0;
     float dtPerSample = 1.0f / 44100.0f;
     Params params;
+    float timeScale = 1.0f;
     Stage stage = Stage::Idle;
     float currentLevel = 0.0f;
     float stageProgress = 0.0f;

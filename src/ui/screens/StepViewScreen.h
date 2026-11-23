@@ -31,6 +31,7 @@ public:
     // pressure routes; CLR (four clicks) removes it. The bottom half shows the recorded curves.
     // The engine is needed for >LCK; `showStatus` says what >LCK and CLR did.
     void setAudioEngine(AudioEngine* audio) { audioEngine = audio; }
+    void setStructureLock(StructureLockFn fn) { lengthTurn.setStructureLock(std::move(fn)); }
     std::function<void(const juce::String&)> showStatus;
     bool isPressurePage() const { return isDetailActive() && detailKind() == Detail::Pressure; }
 

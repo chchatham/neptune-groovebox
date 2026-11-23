@@ -33,6 +33,9 @@
 // another is held down adds to them. Latch off, or whatever lets go of latched keys (transport
 // stop), ends them: serviceStrum() sees to that too. (With the arp on the pads feed the arp, whose
 // own latch keeps them.)
+// Third knob page, SETS (when the app gives the chord-set callbacks): SL the chord-set slot (the
+// name bar names it, "SETS C1"; the readout marks a slot that holds a set with *), LD load it into
+// the four banks, SV save the four banks to it (four clicks each).
 // Display: the sixteen pads as two rows of eight cells, the chord's root over its kind ("C#" over
 // "m7"; "M" = major, a line under an inversion, "--" = empty). While keys are held the name bar
 // names the chord and says what a pad will do; after a store it says where the chord went.
@@ -43,8 +46,23 @@ public:
 
     explicit ChordPadScreen(ChordPads& pads) : chords(pads) {}
 
+    // Chord-set save / load: the app provides the callbacks. Each takes a slot (0-based) and
+    // the chords to save / load into, and returns true on success.
+    using SaveCb = std::function<bool(int slot, const ChordPads&)>;
+    using LoadCb = std::function<bool(int slot, ChordPads&)>;
+    using ExistsCb = std::function<bool(int slot)>;
+    void setChordSetCallbacks(SaveCb save, LoadCb load, ExistsCb exists, int numSlots)
+    {
+        chordSave = std::move(save);
+        chordLoad = std::move(load);
+        chordExists = std::move(exists);
+        chordSlots = numSlots;
+    }
+
     // The keys that count as held now (physically down or latched), with their velocities.
     void setHeldKeysProvider(HeldKeys p) { heldKeys = std::move(p); }
+    // Only physically held keys (no latched notes): used to decide when to store a chord.
+    void setPhysicalKeysProvider(HeldKeys p) { physicalKeys = std::move(p); }
     // The pads play through these (the same path as the SCALE pads): note, velocity 1..127.
     void setNoteCallback(std::function<void(int, int)> cb) { noteOn = std::move(cb); }
     void setNoteOffCallback(std::function<void(int)> cb) { noteOff = std::move(cb); }
@@ -85,9 +103,11 @@ public:
     {
         if (flash.isNotEmpty() && UiClock::nowMs() - flashMs < FLASH_MS)
             return flash;
-        const auto held = held_();
-        if (!held.empty())
-            return ChordPads::nameOf(held.data(), (int) held.size()).full() + " > PAD";
+        const auto phys = physical_();
+        if (!phys.empty())
+            return ChordPads::nameOf(phys.data(), (int) phys.size()).full() + " > PAD";
+        if (page == 2)
+            return "SETS C" + juce::String(setsSlot + 1);
         if (page == 1)
             return chords.strumMs > 0.0f ? "STRUM " + juce::String((int) std::lround(chords.strumMs)) : juce::String("STRUM OFF");
         juce::String sub = "B" + juce::String(chords.getBank() + 1);
@@ -100,6 +120,8 @@ public:
     {
         // (A pinned screen keeps getting its pads; one that is left lets go of what it plays.)
         confirm.cancel();
+        setsConfirm.cancel();
+        setsResult = 0;
     }
 
     // ---- pads ------------------------------------------------------------------------------------
@@ -109,8 +131,9 @@ public:
             return;
         confirm.cancel();
 
-        // Keys held: the pad takes their chord. Nothing is played (the keys are sounding).
-        auto held = held_();
+        // Keys PHYSICALLY held: the pad takes their chord. Nothing is played (the keys are sounding).
+        // Latched notes alone do not count: under a latch a pad press plays its chord.
+        auto held = physical_();
         if (!held.empty())
         {
             UndoPoint point;
@@ -193,7 +216,7 @@ public:
 
     bool getPadColours(std::array<PadColour, 16>& out) const override
     {
-        const bool keysHeld = !held_().empty();
+        const bool keysHeld = !physical_().empty();
         for (int i = 0; i < ChordPads::PADS; ++i)
         {
             const auto& c = chords.get(i);
@@ -213,11 +236,26 @@ public:
     {
         static const char* const names[] = { "BK", "TR", "OC", "VL", "", "", "", "CL" };
         static const char* const strum[] = { "TM", "DR", "HU", "VR", "FL", "", "", "" };
-        return (encoderIndex >= 0 && encoderIndex < 8) ? (page == 1 ? strum : names)[encoderIndex] : "";
+        // (Two letters a knob: that is what a bar screen's sixteen-pixel column holds. LD and SV as on PRESET.)
+        static const char* const sets[]  = { "SL", "", "LD", "", "", "", "", "SV" };
+        if (encoderIndex < 0 || encoderIndex >= 8) return "";
+        return page == 2 ? sets[encoderIndex] : (page == 1 ? strum[encoderIndex] : names[encoderIndex]);
     }
 
     juce::String getEncoderReadout(int encoderIndex) const override
     {
+        if (page == 2)
+        {
+            switch (encoderIndex)
+            {
+                case 0: return "SLOT " + juce::String(setsSlot + 1) + (chordExists && chordExists(setsSlot) ? " *" : "");
+                case 2: return "LOAD" + (setsConfirm.knob == 2 ? " " + setsConfirm.progress() : juce::String())
+                                      + (setsResult == 1 ? " OK" : setsResult == -1 ? " --" : "");
+                case 7: return "SAVE" + (setsConfirm.knob == 7 ? " " + setsConfirm.progress() : juce::String())
+                                      + (setsResult == 2 ? " OK" : setsResult == -2 ? " --" : "");
+                default: return {};
+            }
+        }
         if (page == 1)
         {
             auto percent = [](float v) { return juce::String((int) std::lround(v * 100.0f)) + "%"; };
@@ -250,6 +288,54 @@ public:
         const int clicks = dsp::encoderDelta(value);
         if (clicks == 0)
             return;
+        if (page == 2)
+        {
+            // The SETS page: SLOT, LOAD, SAVE.
+            if (encoderIndex != 2 && encoderIndex != 7)
+                setsConfirm.cancel();
+            setsResult = 0;
+            switch (encoderIndex)
+            {
+                case 0:
+                    setsSlot = juce::jlimit(0, juce::jmax(0, chordSlots - 1), setsSlot + clicks);
+                    setsConfirm.cancel();
+                    break;
+                case 2:
+                    // LOAD: four clicks clockwise.
+                    if (setsConfirm.step(2, clicks))
+                    {
+                        if (chordLoad && chordLoad(setsSlot, chords))
+                        {
+                            setsResult = 1;
+                            say("LOADED C" + juce::String(setsSlot + 1));
+                        }
+                        else
+                        {
+                            setsResult = -1;
+                            say("SLOT EMPTY");
+                        }
+                    }
+                    break;
+                case 7:
+                    // SAVE: four clicks clockwise.
+                    if (setsConfirm.step(7, clicks))
+                    {
+                        if (chordSave && chordSave(setsSlot, chords))
+                        {
+                            setsResult = 2;
+                            say("SAVED C" + juce::String(setsSlot + 1));
+                        }
+                        else
+                        {
+                            setsResult = -2;
+                            say("SAVE FAILED");
+                        }
+                    }
+                    break;
+                default: break;
+            }
+            return;
+        }
         if (encoderIndex != 7 || page == 1)
             confirm.cancel();
         if (page == 1)
@@ -304,11 +390,11 @@ public:
     void onPadPagePrev() override { setBank((chords.getBank() + ChordPads::NUM_BANKS - 1) % ChordPads::NUM_BANKS); }
     void onPadPageNext() override { setBank((chords.getBank() + 1) % ChordPads::NUM_BANKS); }
     void getHelpFacts(HelpFacts& facts) const override { facts.tapUpDown = "CHORD BANK"; }
-    // The bank buttons: the pads' page and the STRUM page.
-    int getPageCount() const override { return 2; }
+    // The bank buttons: the pads' page, STRUM, and SETS (when chord-set callbacks are set).
+    int getPageCount() const override { return hasSets() ? 3 : 2; }
     int getPageIndex() const override { return page; }
-    void onArrowLeft() override  { confirm.cancel(); page = 1 - page; }
-    void onArrowRight() override { confirm.cancel(); page = 1 - page; }
+    void onArrowLeft() override  { confirm.cancel(); setsConfirm.cancel(); page = (page + getPageCount() - 1) % getPageCount(); }
+    void onArrowRight() override { confirm.cancel(); setsConfirm.cancel(); page = (page + 1) % getPageCount(); }
 
     // ---- picture ---------------------------------------------------------------------------------
     void render(DisplayRenderer& display) override
@@ -346,6 +432,7 @@ private:
     static constexpr juce::int64 FLASH_MS = 1500;
 
     std::vector<ChordPads::Note> held_() const { return heldKeys ? heldKeys() : std::vector<ChordPads::Note>(); }
+    std::vector<ChordPads::Note> physical_() const { return physicalKeys ? physicalKeys() : held_(); }
 
     void say(const juce::String& text) { flash = text; flashMs = UiClock::nowMs(); }
 
@@ -400,6 +487,7 @@ private:
 
     ChordPads& chords;
     HeldKeys heldKeys;
+    HeldKeys physicalKeys;
     std::function<void(int, int)> noteOn, pressure;
     std::function<void(int)> noteOff;
     std::function<bool()> strumAllowed, latchOn;
@@ -417,4 +505,14 @@ private:
     TurnConfirm confirm;
     juce::String flash;
     juce::int64 flashMs = 0;
+
+    // ---- chord set save / load (the SETS page) --------------------------------------------------
+    SaveCb chordSave;
+    LoadCb chordLoad;
+    ExistsCb chordExists;
+    int chordSlots = 0;
+    int setsSlot = 0;
+    int setsResult = 0;        // 1 = loaded OK, -1 = load fail, 2 = saved OK, -2 = save fail
+    TurnConfirm setsConfirm;
+    bool hasSets() const { return chordSlots > 0 && chordSave && chordLoad; }
 };

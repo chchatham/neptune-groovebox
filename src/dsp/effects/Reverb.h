@@ -1,181 +1,108 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "FxBlocks.h"
-#include "../DSPUtils.h"
-#include <array>
-#include <cmath>
-#include <algorithm>
+#include "ReverbParts.h"
 
-// Plate reverb based on the Dattorro topology (1997).
-// Four allpass diffusers → two cross-coupled tank delay lines with
-// embedded allpass stages and damping filters. All buffers pre-allocated.
-class Reverb : public EffectBase
+// The send reverb (RVB): a plate after Dattorro (1997) - four allpass diffusers, then two loops that
+// feed each other, each with an allpass and a damping filter, heard at seven places a side. It is
+// rvb::setting::plate() of the one network (ReverbParts.h), but it still plays its own pinned loop,
+// rvb::Tank, which with SHIM at 0 and HOLD off does, operation for operation, what the send reverb
+// always did (the suites "P01 Keyboard" and "Pinned On Cores" hold that in place), until the owner
+// has compared the two by ear (rvb::network::forPinned puts it on the network). A turned SIZE is
+// glided to (the pitch of what is in the tank bends) where it used to jump.
+//
+// DCAY  the loops' gain: how long the tail is
+// DAMP  the top of the spectrum dies sooner
+// SIZE  the plate's size: every length scaled
+// MIX   dry / wet
+// FX2:
+// PDLY  pre-delay: the plate answers this much later
+// SHIM  how much of what comes round is read at another pitch (the shimmer reverb's heads, in the plate)
+// MODE  that pitch: an octave up, a fifth up, an octave and a fifth up, an octave down, backwards,
+//       two octaves down; HOLD = as the HOLD cell
+// HOLD  ON = the way in shuts and the tank loses nothing: what is in it goes round until HOLD is OFF
+class Reverb : public CellEffect
 {
 public:
-    ParamSpec getParamSpec(int index) const override
+    enum Param { Decay = 0, Damping, Size, Mix };
+    enum Extra { PreDelay = 0, Shimmer, ShiftMode, Hold };
+
+    Reverb()
+    {
+        seed();
+        setWetOnly(false);     // pinned (P01): it mixes by itself in a chain too, sample for sample as it always did
+        // (The object as it always started, which is not what its cells call their defaults.)
+        setCell(Decay, 0.7f);
+        setCell(Damping, 0.5f);
+        mix = 1.0f;
+    }
+
+    void setDecay(float d) { setCell(Decay, d); }
+    void setDamping(float d) { setCell(Damping, d); }
+    void setSize(float s) { setCell(Size, s); }
+    void setPreDelay(float ms) { setCell(4 + PreDelay, ms); }
+    void setHighCut(float hz) { tank.setHighCut(hz); net.setHighCut(hz); }      // the low-pass on the way in (not a cell: 10 kHz unless set)
+
+    static constexpr float MAX_PRE_MS = 100.0f;      // (the PDLY cell's range)
+
+protected:
+    const ParamSpec* cells() const override
     {
         using K = ParamKind;
-        switch (index)
+        static const ParamSpec c[CELLS] = {
+            { "DCAY", 0, 0, 0.99f, 0.6f },
+            { "DAMP", 1, 0, 1, 0.4f },
+            { "SIZE", 2, rvb::Front::MIN_SIZE, rvb::Front::MAX_SIZE, 1.0f, K::Linear, "x" },
+            { "MIX", 3, 0, 1, 0.5f },
+            { "PDLY", 0, 0, MAX_PRE_MS, 10, K::Linear, "ms" },
+            { "SHIM", 1, 0, 1, 0 },
+            { "MODE", 2, 0, (float) (rvb::shift::Count - 1), 0, K::Choice, "", rvb::shift::names(), rvb::shift::Count },
+            { "HOLD", 3, 0, 1, 0, K::Choice, "", ParamChoices::offOn, 2 } };
+        return c;
+    }
+    int mixCell() const override { return Mix; }
+
+    void configure(const float* v) override
+    {
+        const float speed = rvb::shift::speedOf((int) std::lround(v[4 + ShiftMode]));
+        if (onNet)
         {
-            case 0: return { "DCAY", 0, 0, 0.99f, 0.6f };
-            case 1: return { "DAMP", 1, 0, 1, 0.4f };
-            case 2: return { "SIZE", 2, 0.25f, 2.0f, 1.0f, K::Linear, "x" };
-            case 3: return { "MIX", 3, 0, 1, 0.5f };
-            default: return {};
+            // DCAY is the loops' gain: here the time it takes them 60 dB down, and (as the plate
+            // always had it) the loop allpasses' coefficient.
+            net.setSize(v[Size]);
+            net.setDecay(v[Decay] > 0.0f ? 6.9078f * net.passSeconds() / -std::log(v[Decay]) : 0.01f);
+            net.setDiffusion(-v[Decay]);
+            net.setDamping(v[Damping]);
+            net.setPreDelay(v[4 + PreDelay]);
+            net.setShimmer(v[4 + Shimmer], speed);
+            net.setHold(v[4 + Hold] > 0.5f);
+            return;
         }
+        tank.setDecay(v[Decay]);
+        tank.setDamping(v[Damping]);
+        tank.setSize(v[Size]);
+        tank.setPreDelay(v[4 + PreDelay]);
+        tank.setShimmer(v[4 + Shimmer], speed);
+        tank.setHold(v[4 + Hold] > 0.5f);
     }
 
-    void setParameter(int id, float value) override
+    void prepareCore() override
     {
-        switch (id)
-        {
-            case 0: setDecay(value); break;
-            case 1: setDamping(value); break;
-            case 2: setSize(value); break;
-            case 3: setMix(value); break;
-            default: break;
-        }
+        if (onNet != rvb::network::forPinned) { onNet = rvb::network::forPinned; touch(); }
+        if (onNet) net.prepare(sampleRate, rvb::setting::plate());
+        else       tank.prepare(sampleRate);
     }
-
-    float getParameter(int id) const override
+    void resetCore() override { if (onNet) net.reset(); else tank.reset(); }
+    void controlCore() override { if (onNet) net.control(); else tank.control(); }
+    bool coasting() const override { return onNet ? net.resting() : tank.resting(); }
+    void runCore(float* left, float* right, int n, float mixFrom, float mixTo) override
     {
-        switch (id)
-        {
-            case 0: return decay;
-            case 1: return damping;
-            case 2: return size;
-            case 3: return mix;
-            default: return 0.0f;
-        }
-    }
-
-    void prepare(double sr, int /*maxBlockSize*/) override
-    {
-        sampleRate = sr;
-        scaleFactor = sr / 29761.0;
-        recalcLpCoeff();
-        reset();
-    }
-
-    void reset() override
-    {
-        for (auto& ap : inputAP) ap.clear();
-        for (auto& ap : tankAP) ap.clear();
-        for (auto& dl : tankDelay) dl.clear();
-        dampL = 0.0f;
-        dampR = 0.0f;
-        preLpZ = 0.0f;
-    }
-
-    void setDecay(float d) { decay = std::clamp(d, 0.0f, 0.99f); }
-    void setDamping(float d) { damping = std::clamp(d, 0.0f, 1.0f); }
-    void setPreDelay(float ms) { preDelayMs = std::clamp(ms, 0.0f, 100.0f); }
-    void setSize(float s) { size = std::clamp(s, 0.25f, 2.0f); }
-    void setHighCut(float hz) { preLpFreq = std::clamp(hz, 1000.0f, 20000.0f); recalcLpCoeff(); }
-
-    void process(float& left, float& right) override
-    {
-        if (!enabled) return;
-
-        float dryL = left;
-        float dryR = right;
-
-        float mono = (left + right) * 0.5f;
-
-        preLpZ += cachedLpCoeff * (mono - preLpZ);
-        mono = preLpZ;
-
-        int pdSamples = (int)(preDelayMs * 0.001f * (float)sampleRate);
-        pdSamples = std::clamp(pdSamples, 0, (int)preDelayBuf.size() - 1);
-        preDelayBuf[(size_t)pdWritePos] = mono;
-        int pdReadPos = pdWritePos - pdSamples;
-        if (pdReadPos < 0) pdReadPos += (int)preDelayBuf.size();
-        mono = preDelayBuf[(size_t)pdReadPos];
-        pdWritePos = (pdWritePos + 1) % (int)preDelayBuf.size();
-
-        mono = inputAP[0].process(mono, scaled(142), 0.75f);
-        mono = inputAP[1].process(mono, scaled(107), 0.75f);
-        mono = inputAP[2].process(mono, scaled(379), 0.625f);
-        mono = inputAP[3].process(mono, scaled(277), 0.625f);
-
-        float tankL = tankDelay[1].read(scaled(3720));
-        float tankR = tankDelay[0].read(scaled(3163));
-
-        float inL = mono + tankL * decay;
-        float inR = mono + tankR * decay;
-
-        inL = tankAP[0].process(inL, scaled(672), -decay);
-        inL = dampFilter(inL, dampL);
-        tankDelay[0].write(inL);
-
-        inR = tankAP[1].process(inR, scaled(908), -decay);
-        inR = dampFilter(inR, dampR);
-        tankDelay[1].write(inR);
-
-        float outL = tankDelay[0].read(scaled(266))
-                   + tankDelay[0].read(scaled(2974))
-                   - tankAP[1].readAt(scaled(1913))
-                   + tankDelay[1].read(scaled(1996))
-                   - tankDelay[0].read(scaled(1913))
-                   - tankAP[0].readAt(scaled(1066))
-                   - tankDelay[1].read(scaled(121));
-
-        float outR = tankDelay[1].read(scaled(353))
-                   + tankDelay[1].read(scaled(3627))
-                   - tankAP[0].readAt(scaled(1228))
-                   + tankDelay[0].read(scaled(2111))
-                   - tankDelay[1].read(scaled(335))
-                   - tankAP[1].readAt(scaled(187))
-                   - tankDelay[0].read(scaled(1913));
-
-        outL *= 0.6f;
-        outR *= 0.6f;
-
-        left  = dryL * (1.0f - mix) + outL * mix;
-        right = dryR * (1.0f - mix) + outR * mix;
+        if (onNet) net.run(left, right, n, mixFrom, mixTo);
+        else       tank.run(left, right, n, mixFrom, mixTo);
     }
 
 private:
-    float decay = 0.7f;
-    float damping = 0.5f;
-    float preDelayMs = 10.0f;
-    float size = 1.0f;
-    float preLpFreq = 10000.0f;
-    double scaleFactor = 1.0;
-    float cachedLpCoeff = 0.5f;
-    float preLpZ = 0.0f;
-    float dampL = 0.0f;
-    float dampR = 0.0f;
-
-    int scaled(int baseSamples) const
-    {
-        return std::max(1, (int)(baseSamples * scaleFactor * size));
-    }
-
-    void recalcLpCoeff()
-    {
-        if (sampleRate > 0.0)
-            cachedLpCoeff = 1.0f - std::exp(-dsp::TWO_PI_F * preLpFreq / (float)sampleRate);
-    }
-
-    float dampFilter(float in, float& state) const
-    {
-        state = in * (1.0f - damping) + state * damping;
-        return state;
-    }
-
-    static constexpr int MAX_AP_SIZE = 16384;
-    static constexpr int MAX_DELAY_SIZE = 16384;
-    static constexpr int MAX_PREDELAY = 8192;
-
-    using AllpassStage = fxb::FixedAllpass<MAX_AP_SIZE>;
-
-    using DelayLine = fxb::FixedDelay<MAX_DELAY_SIZE>;
-
-    std::array<AllpassStage, 4> inputAP;
-    std::array<AllpassStage, 2> tankAP;
-    std::array<DelayLine, 2> tankDelay;
-    std::array<float, MAX_PREDELAY> preDelayBuf {};
-    int pdWritePos = 0;
+    // PINNED: the plate's own loop, until the owner has heard it against the network's plate.
+    rvb::Tank tank;
+    rvb::Net net;
+    bool onNet = false;
 };

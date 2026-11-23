@@ -4,8 +4,12 @@
 #include "../ScreenManager.h"
 #include "../ScreenLayout.h"
 #include "../NoteUtils.h"
+#include "../BitmapFont.h"
+#include "../TurnNotice.h"
+#include "../GrammarHooks.h"
 #include "../../sequencer/SequencerCore.h"
 #include "../../engine/AudioEngine.h"
+#include "../../engine/UnifiedVoiceEngine.h"
 #include "../../project/PresetManager.h"
 #include "../../project/ProjectBridge.h"
 #include <set>
@@ -24,6 +28,15 @@
 // A preset of the track's own engine is applied to the running engine (no new engine, held notes
 // keep sounding); only a preset of another engine type builds a new engine.
 // A project saved while a preset is auditioned stores the remembered sound (keepOriginalInSave).
+//
+// MULT, the last category, lists the multi presets (MultiPreset.h) and nothing else, whatever EN
+// says. A multi is never auditioned: moving onto one gives the track its own sound back, and the
+// name bar says where the multi would land ("3TRK>T7-9": the earliest empty tracks, EmptyTracks)
+// or that there is no room ("NEED 3 EMPTY"). LD loads every member - engine, sound, starter pattern
+// into the active pattern, preset name, routings turned from member numbers into track numbers -
+// as ONE undo step, and selects the track of the member the keys should play.
+// SV on a track that listens to another track (its input, a DUCK insert) or that another track
+// listens to saves all the connected tracks as one multi; any other track saves a single preset.
 // -----------------------------------------------------------------------------
 class PresetScreen : public Screen
 {
@@ -40,6 +53,8 @@ public:
     {
         if (flash.isNotEmpty())
             return flash;
+        if (multiListed())
+            return landingText();
         auto cats = PresetManager::getCategories();
         juce::String sub = (categoryIndex >= 0 && categoryIndex < cats.size()) ? cats[categoryIndex] : juce::String("ALL");
         // ANY: presets of any engine. AUD: a preset is being heard for listening only (the track's
@@ -134,6 +149,7 @@ public:
         if (getKeyboard && keyboardSet)
             data.keyboard = snapshotKeyboard;
         td.presetName = trackPresets.nameFor(snapshotTrack, snapshotType);
+        td.archMemory = snapshotArchMem;
         td.sampleName.clear();
         if (snapshotType == EngineType::Sampler || snapshotType == EngineType::Wavetable)
         {
@@ -155,28 +171,64 @@ public:
         }
     }
 
+    // The category row: where each tab stands and what it says. All the categories are on the row
+    // at once (ten of them: nine tabs of two letters were all the row held, and MULT, the tenth,
+    // was off its right end until CT reached it). A tab says as many letters as tell it from the
+    // others: one where no other category begins with it, else two (ALL INIT BASS PAD LEAD KEYS FX
+    // PERC KIT MULT read "A I B PA L KE FX PE KI M"; a name of two letters is said whole). The
+    // name bar says the chosen category in full. The tabs are spread over the row with what room
+    // there is between them, at least two blank columns besides each tab's own margin; if a list
+    // ever has more than fits so, the tabs keep to two columns between them and run off the right.
+    struct Tab { int x = 0, width = 0; juce::String label; };
+    static std::vector<Tab> tabLayout(const juce::StringArray& cats)
+    {
+        std::vector<Tab> tabs;
+        int used = 0;
+        for (auto& category : cats)
+        {
+            const auto name = category.toUpperCase();
+            int sameStart = 0;
+            for (auto& other : cats)
+                if (other.toUpperCase().startsWith(name.substring(0, 1)))
+                    ++sameStart;
+            Tab tab;
+            tab.label = name.substring(0, (name.length() <= 2 || sameStart > 1) ? 2 : 1);
+            tab.width = tab.label.length() * BitmapFont::TOTAL_CHAR_WIDTH + 1;     // (a blank column each side of the letters)
+            used += tab.width;
+            tabs.push_back(tab);
+        }
+        const int gaps = juce::jmax(1, (int) tabs.size() - 1);
+        const float gap = juce::jmax(2.0f, (float) (DisplayRenderer::WIDTH - used) / (float) gaps);
+        float x = 0.0f;
+        for (auto& tab : tabs)
+        {
+            tab.x = (int) std::lround(x);
+            x += (float) tab.width + gap;
+        }
+        return tabs;
+    }
+
     void render(DisplayRenderer& display) override
     {
         // Another track was selected (Shift + Up / Down, hold Up / Down + pad): the picture is
         // drawn straight after, so this is where the old track gets its sound back at once.
         followTrack();
 
-        auto cats = PresetManager::getCategories();
-        int catCount = (int) cats.size();
-
-        // Category tabs across the top of content zone
-        int tabY = 12;
-        int tabW = (catCount > 0) ? juce::jmin(128 / catCount, 24) : 16;
-        for (int i = 0; i < catCount && i * tabW < 128; ++i)
+        // Category tabs across the top of the content zone: every category at once (tabLayout: laid
+        // out when the list of categories is another than the one the tabs were made for), the
+        // chosen one inverted.
+        constexpr int tabY = 12;
+        if (const auto cats = PresetManager::getCategories(); cats != tabCategories)
         {
-            int tx = i * tabW;
-            // Nine categories share 128 px: two letters fit a 14 px tab without running into the next.
-            juce::String label = cats[i].substring(0, tabW >= 19 ? 3 : 2).toUpperCase();
-            int textW = label.length() * 6;
-            int textX = tx + (tabW - textW) / 2;
-            display.drawString(textX, tabY, label);
-            if (i == categoryIndex)
-                display.invertRegion(tx, tabY - 1, tabW, 9);
+            tabCategories = cats;
+            tabs = tabLayout(cats);
+        }
+        for (int cat = 0; cat < (int) tabs.size(); ++cat)
+        {
+            const auto& tab = tabs[(size_t) cat];
+            display.drawString(tab.x + 1, tabY, tab.label);
+            if (cat == categoryIndex)
+                display.invertRegion(tab.x, tabY - 1, tab.width, 9);
         }
         display.drawHLine(0, tabY + 9, 128);
 
@@ -202,14 +254,26 @@ public:
                 break;
 
             int y = startY + i * lineHeight + (i * 1);
-            auto& preset = presetManager.getPreset(filteredIndices[(size_t) listIdx]);
+            if (multiListed())
+            {
+                // A multi: how many tracks it takes, where a preset shows its engine.
+                auto& multi = presetManager.getMulti(filteredIndices[(size_t) listIdx]);
+                display.drawString(2, y, juce::String(multi.memberCount()) + (multi.memberCount() < 10 ? "T" : ""));
+                display.drawString(18, y, multi.name.substring(0, 15));
+                if (multi.isFactory)
+                    display.drawChar(119, y, '*');
+            }
+            else
+            {
+                auto& preset = presetManager.getPreset(filteredIndices[(size_t) listIdx]);
 
-            auto eng = NoteUtils::engineAbbrev((int)preset.engineType);
-            display.drawString(2, y, eng);
-            display.drawString(18, y, preset.name.substring(0, 15));
+                auto eng = NoteUtils::engineAbbrev((int)preset.engineType);
+                display.drawString(2, y, eng);
+                display.drawString(18, y, preset.name.substring(0, 15));
 
-            if (preset.isFactory)
-                display.drawChar(119, y, '*');       // clear of the scroll bar at 126
+                if (preset.isFactory)
+                    display.drawChar(119, y, '*');       // clear of the scroll bar at 126
+            }
 
             if (listIdx == selectedIndex)
                 display.invertRegion(0, y - 1, 128, lineHeight);
@@ -276,11 +340,13 @@ public:
                 break;
             }
             case 4:   // LD - the highlighted preset becomes the track's sound
-                flash = keepSelectedPreset() ? "LOAD OK" : "LOAD FAIL";
+                if (multiListed())
+                    loadHighlightedMulti();     // (says in the name bar where it went, or why not)
+                else
+                    flash = keepSelectedPreset() ? "LOAD OK" : "LOAD FAIL";
                 break;
-            case 5:   // SV
-                saveCurrentTrackAsPreset();
-                flash = "SAVED";
+            case 5:   // SV - the track's sound; with the tracks it is connected to, as a multi
+                flash = saveCurrentTrackAsPreset() ? "SAVED MULTI" : "SAVED";
                 break;
             case 6:   // DL - user presets only
                 flash = deleteSelectedPreset() ? "DELETED" : "FACTORY";
@@ -320,6 +386,7 @@ public:
         {
             case 0:
                 if (filteredIndices.empty() || selectedIndex >= (int) filteredIndices.size()) return "PRESET --";
+                if (multiListed()) return landingText();        // (its name is in the list)
                 return "PRESET " + presetManager.getPreset(filteredIndices[(size_t) selectedIndex]).name;
             case 1:
             {
@@ -348,6 +415,17 @@ public:
     // user preset, or the name is empty or in use. Call holding ScreenManager::getLock().
     bool renameUserPreset(const juce::String& from, const juce::String& typed)
     {
+        if (savedIsMulti(from))
+        {
+            const auto highlighted = highlightedKey();
+            const int multi = presetManager.findUserMulti(from);
+            const auto oldKey = multiKey(presetManager.getMulti(multi));
+            if (!presetManager.renameMulti(multi, typed))
+                return false;
+            multisChanged(highlighted == oldKey ? multiKey(presetManager.getMulti(multi)) : highlighted);
+            if (onUserPresetsChanged) onUserPresetsChanged();
+            return true;
+        }
         const int index = presetManager.findUserPreset(from);
         if (index < 0)
             return false;
@@ -379,6 +457,8 @@ public:
     // - a track whose sound came from no preset, or whose engine is another one since: `savedName`.
     juce::String suggestedName(const juce::String& savedName) const
     {
+        if (savedIsMulti(savedName))
+            return savedName;
         const int saved = presetManager.findUserPreset(savedName);
         const auto origin = trackPresets.get(savedTrack);
         if (origin.name.isEmpty() || saved < 0 || presetManager.getPreset(saved).engineType != origin.engine)
@@ -412,6 +492,18 @@ public:
         if (name.equalsIgnoreCase(from))
             return NameUse::New;
         NameUse use = NameUse::New;
+        if (savedIsMulti(from))
+        {
+            // A multi's name is looked for among the multis (a single preset may have the same one).
+            for (int i = 0; i < presetManager.getMultiCount(); ++i)
+                if (presetManager.getMulti(i).name.equalsIgnoreCase(name))
+                {
+                    if (presetManager.getMulti(i).isFactory)
+                        return NameUse::BuiltIn;
+                    use = NameUse::Replaces;
+                }
+            return use;
+        }
         for (int i = 0; i < presetManager.getPresetCount(); ++i)
             if (presetManager.getPreset(i).name.equalsIgnoreCase(name))
             {
@@ -428,6 +520,8 @@ public:
     bool nameSavedPreset(const juce::String& from, const juce::String& typed)
     {
         const auto name = PresetManager::cleanName(typed);
+        if (savedIsMulti(from))
+            return nameSavedMulti(from, name);
         if (name.isEmpty() || presetManager.findUserPreset(from) < 0)
             return false;
         const bool same = name.equalsIgnoreCase(from);      // (the name it has, in whatever letters: kept)
@@ -464,6 +558,14 @@ public:
     // The box was cancelled: the preset SV saved as `name` is taken away again.
     bool cancelSavedPreset(const juce::String& name)
     {
+        if (savedIsMulti(name))
+        {
+            const auto highlighted = highlightedKey();
+            presetManager.removeMulti(presetManager.findUserMulti(name));
+            multisChanged(highlighted);
+            if (onUserPresetsChanged) onUserPresetsChanged();
+            return true;
+        }
         const int index = presetManager.findUserPreset(name);
         if (index < 0)
             return false;
@@ -542,17 +644,23 @@ private:
         return juce::String((int) p.engineType) + "/" + p.category + "/" + p.name;
     }
 
-    juce::String highlightedKey() const
+    static juce::String multiKey(const MultiPreset& m) { return "MULT/" + m.name; }
+
+    // The key of row `i` of the list as it is shown (presets, or multis under MULT).
+    juce::String keyAt(int i) const
     {
-        if (filteredIndices.empty() || selectedIndex < 0 || selectedIndex >= (int) filteredIndices.size())
+        if (i < 0 || i >= (int) filteredIndices.size())
             return {};
-        return keyOf(presetManager.getPreset(filteredIndices[(size_t) selectedIndex]));
+        const int index = filteredIndices[(size_t) i];
+        return multiListed() ? multiKey(presetManager.getMulti(index)) : keyOf(presetManager.getPreset(index));
     }
+
+    juce::String highlightedKey() const { return keyAt(selectedIndex); }
 
     void selectByKey(const juce::String& key)
     {
         for (int i = 0; i < (int) filteredIndices.size(); ++i)
-            if (keyOf(presetManager.getPreset(filteredIndices[(size_t) i])) == key)
+            if (keyAt(i) == key)
             {
                 selectedIndex = i;
                 return;
@@ -566,13 +674,20 @@ private:
         const auto key = highlightedKey();
         if (key == shownKey) return;
         shownKey = key;
+        if (multiListed())
+        {
+            // A multi is not auditioned (it would take over several tracks): moving onto one ends
+            // an audition as moving off a preset does.
+            restoreSnapshot();
+            return;
+        }
         if (!audition) return;
         if (key.isEmpty())
         {
             restoreSnapshot();
             return;
         }
-        applyPreset(presetManager.getPreset(filteredIndices[(size_t) selectedIndex]));
+        applyPreset(presetManager.getPreset(filteredIndices[(size_t) selectedIndex]), sequencer.getSelectedTrack());
         auditioned = true;
         heardKey = key;
     }
@@ -584,6 +699,7 @@ private:
         for (int id = 0; id < EngineParamRange::FIRST_END; ++id) fn(id);
         for (int id = EngineParamRange::EXT_BASE; id < EngineParamRange::EXT_END; ++id) fn(id);
         for (int id = EngineParamRange::THIRD_BASE; id < EngineParamRange::THIRD_END; ++id) fn(id);
+        for (int id = EngineParamRange::FOURTH_BASE; id < EngineParamRange::FOURTH_END; ++id) fn(id);
     }
 
     static ParamMap readEngine(const EngineBase& engine)
@@ -635,6 +751,10 @@ private:
         snapshotArp.clear();
         if (auto* arp = arpOf(snapshotTrack))
             snapshotArp = ProjectBridge::captureArp(*arp);
+        snapshotArchMem.clear();
+        if (snapshotType == EngineType::UnifiedVoice && audioEngine)
+            if (auto* uv = dynamic_cast<UnifiedVoiceEngine*>(audioEngine->getEngine(snapshotTrack)))
+                snapshotArchMem = uv->captureArchMemory();
         snapshotKeyboard = getKeyboard ? getKeyboard() : KeyboardSetup();
         keyboardSet = false;
         ownEngine = nullptr;
@@ -797,10 +917,10 @@ private:
             parkedEngine.reset();
             track.engineType = snapshotType;
             track.soundParams = snapshotStored;
+            // (every engine value, the pressure slots among them: where pad pressure goes is part of the sound)
             driveEngineTo(snapshotTrack, snapshotEngine, locked);
             setInsertChain(snapshotTrack, snapshotSaved);
             applyTrackLevelValues(snapshotTrack, snapshotSaved);
-            audioEngine->setPressureRouter(snapshotTrack, snapshotRoutes);
             setArp(snapshotTrack, snapshotArp);
             ownKeyboardFollowsHand();
             setKeyboard(snapshotKeyboard);
@@ -855,7 +975,14 @@ private:
         auto cats = PresetManager::getCategories();
         juce::String cat = (categoryIndex > 0 && categoryIndex < cats.size())
                                ? cats[categoryIndex] : "";
-        if (anyEngine)
+        if (multiListed())
+        {
+            // Every multi, whatever the track's engine and whatever EN says.
+            filteredIndices.clear();
+            for (int i = 0; i < presetManager.getMultiCount(); ++i)
+                filteredIndices.push_back(i);
+        }
+        else if (anyEngine)
         {
             filteredIndices.clear();
             for (int i = 0; i < presetManager.getPresetCount(); ++i)
@@ -867,23 +994,57 @@ private:
         selectedIndex = juce::jlimit(0, juce::jmax(0, (int) filteredIndices.size() - 1), selectedIndex);
     }
 
-    // The preset becomes what the selected track plays: a fresh engine of the preset's type with
-    // the preset's values, on top of the remembered sound's mixer and effect values (so one
-    // preset never leaves anything behind in the next). The remembered sound is not touched.
-    void applyPreset(const Preset& preset)
+    // The preset becomes what track `trackIdx` plays: a fresh engine of the preset's type with
+    // the preset's values, on top of the track's mixer and effect values (so one preset never
+    // leaves anything behind in the next).
+    //
+    // On the selected track (audition and LD of a single preset) "the track's values" are the
+    // remembered sound's, which is not touched: the track's own engine is set aside on the first
+    // audition and comes back on leaving. `asMember` (a member of a multi, loaded for good into
+    // any track): the track's values are what it holds now, nothing is set aside, and the keyboard
+    // is left alone. A member brings its input (TRK FX page IN) with it; a single preset never
+    // does, and leaves the track's input as it is.
+    void applyPreset(const Preset& preset, int trackIdx, bool asMember = false)
     {
-        const int trackIdx = sequencer.getSelectedTrack();
+        if (trackIdx < 0 || trackIdx >= sequencer.getPattern().getTrackCount())
+            return;
         auto& track = sequencer.getPattern().getTrack(trackIdx);
         const bool engineChanged = (track.engineType != preset.engineType);
 
         if (audioEngine == nullptr)
         {
+            // (no engine: the stored data is all there is)
+            ParamMap input;
+            if (!asMember)
+                for (auto& [id, value] : track.soundParams)
+                    if (TrackInParam::contains(id))
+                        input[id] = value;
             PresetManager::applyToTrack(preset, track);
+            if (!asMember)
+            {
+                MultiPreset::stripTrackInput(track.soundParams);
+                for (auto& [id, value] : input)
+                    track.soundParams[id] = value;
+            }
             return;
         }
 
-        // Stored parameters: the remembered sound's without its engine values, plus the preset's.
-        ParamMap stored = snapshotStored;
+        // What the preset is laid over: the remembered sound (the selected track), or the track as
+        // it is (a member of a multi).
+        const bool remembered = !asMember && trackIdx == snapshotTrack;
+        ParamMap baseStored = snapshotStored, baseSaved = snapshotSaved;
+        std::vector<float> baseArp = snapshotArp;
+        if (!remembered)
+        {
+            baseStored = track.soundParams;
+            baseSaved = ProjectBridge::captureTrackSound(ProjectBridge::Live { sequencer, *audioEngine }, trackIdx, track.soundParams);
+            baseArp.clear();
+            if (auto* arp = arpOf(trackIdx))
+                baseArp = ProjectBridge::captureArp(*arp);
+        }
+
+        // Stored parameters: the base's without its engine values, plus the preset's.
+        ParamMap stored = std::move(baseStored);
         for (auto it = stored.begin(); it != stored.end();)
         {
             const bool engineParam = EngineParamRange::contains(it->first);
@@ -891,21 +1052,23 @@ private:
                                      && EngineParamRange::contains(RangeParam::targetOf(it->first));
             it = (engineParam || engineRange) ? stored.erase(it) : std::next(it);
         }
-        ParamMap trackLevel = snapshotSaved;
+        ParamMap trackLevel = std::move(baseSaved);
         // The preset's values, its sample found by name (its place in the bank may have moved).
-        const ParamMap sound = PresetManager::soundOf(preset);
+        ParamMap sound = PresetManager::soundOf(preset);
+        if (!asMember)
+            MultiPreset::stripTrackInput(sound);
         // A preset is the whole of a track's sound: its effects take the place of the track's.
         // One that stores none (the built-in presets, user presets from before 2026-11-14) leaves
-        // the track without insert effects and with the DIRT / TALK / MODFX blocks as they come.
+        // the track without insert effects (DIRT/TALK/MODFX are now insert types too).
         // The mixer (volume, pan, sends) is the track's and stays unless the preset stores it.
         eraseInsertValues(trackLevel);
         eraseInsertValues(stored);
         if (sound.count(ProjectBridge::INSERT_TYPE_BASE) == 0)
         {
-            const TrackFx defaults;
+            // Clear any old TrackFx params from the track level.
             for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
             {
-                trackLevel[id] = defaults.get(id);
+                trackLevel[id] = 0.0f;
                 stored.erase(id);
             }
         }
@@ -918,9 +1081,9 @@ private:
         // Always a new engine, exactly as a load: an engine nudged over from another sound keeps
         // what no parameter reaches (the owner heard "the existing patch plus the preset"). The
         // track's own engine is set aside on the first audition and comes back on leaving.
-        const bool sameType = audioEngine->getEngine(trackIdx) != nullptr
-                              && audioEngine->getEngineTypeOf(trackIdx) == preset.engineType;
-        if (!auditioned && !parkedEngine)
+        // (Where pad pressure goes is part of a sound: the preset's pressure slots, or - a preset
+        // that stores none - the routes its engine is made with.)
+        if (remembered && !auditioned && !parkedEngine)
             parkedEngine = audioEngine->parkEngine(trackIdx, preset.engineType);
         else
             audioEngine->setEngineType(trackIdx, preset.engineType, true);
@@ -934,17 +1097,17 @@ private:
         setInsertChain(trackIdx, trackLevel);
         applyTrackLevelValues(trackIdx, trackLevel);
         // The preset's arpeggiator, or (a preset without one) the track's own again.
-        setArp(trackIdx, preset.arp.empty() ? snapshotArp : preset.arp);
-        // The preset's keyboard; what it does not store is the keyboard from before the audition.
-        ownKeyboardFollowsHand();
-        setKeyboard({ preset.keyboard.split >= 0 ? preset.keyboard.split : snapshotKeyboard.split,
-                      preset.keyboard.octave != KeyboardSetup::UNKNOWN ? preset.keyboard.octave : snapshotKeyboard.octave });
-        // Back on the remembered sound's engine type: its pressure routes, not the type's defaults.
-        if (!sameType && preset.engineType == snapshotType)
-            audioEngine->setPressureRouter(trackIdx, snapshotRoutes);
-        ownEngine = audioEngine->getEngine(trackIdx);
+        setArp(trackIdx, preset.arp.empty() ? baseArp : preset.arp);
+        if (remembered)
+        {
+            // The preset's keyboard; what it does not store is the keyboard from before the audition.
+            ownKeyboardFollowsHand();
+            setKeyboard({ preset.keyboard.split >= 0 ? preset.keyboard.split : snapshotKeyboard.split,
+                          preset.keyboard.octave != KeyboardSetup::UNKNOWN ? preset.keyboard.octave : snapshotKeyboard.octave });
+            ownEngine = audioEngine->getEngine(trackIdx);
+        }
 
-        if (engineChanged && loadCallback)
+        if (engineChanged && loadCallback && !asMember)
             loadCallback(trackIdx, preset.engineType);
     }
 
@@ -957,7 +1120,7 @@ private:
             return false;
         const auto& kept = presetManager.getPreset(filteredIndices[(size_t) selectedIndex]);
         if (!(auditioned && heardKey == key))
-            applyPreset(kept);
+            applyPreset(kept, sequencer.getSelectedTrack());
         trackPresets.set(sequencer.getSelectedTrack(), kept.name, kept.engineType);
         takeSnapshot();
         rebuildFilteredList();
@@ -966,73 +1129,493 @@ private:
         return true;
     }
 
-    void saveCurrentTrackAsPreset()
+    // The first "User N" that neither a preset nor a multi has (names are also the file names).
+    juce::String freeUserName() const
     {
-        int trackIdx = sequencer.getSelectedTrack();
-        auto& track = sequencer.getPattern().getTrack(trackIdx);
-
         int userCount = 0;
         for (int i = 0; i < presetManager.getPresetCount(); ++i)
             if (!presetManager.getPreset(i).isFactory)
                 ++userCount;
-
-        // "User N" with the first N not already taken (names are also the file names on disk).
         auto taken = [this](const juce::String& n)
         {
             for (int i = 0; i < presetManager.getPresetCount(); ++i)
                 if (presetManager.getPreset(i).name == n) return true;
-            return false;
+            return presetManager.isMultiNameTaken(n);
         };
         int number = userCount + 1;
         while (taken("User " + juce::String(number))) ++number;
-        juce::String name = "User " + juce::String(number);
+        return "User " + juce::String(number);
+    }
+
+    // Is track `t` the one whose own sound is remembered while a preset is heard on it?
+    bool heardOn(int t) const { return auditioned && t == snapshotTrack && !snapshotIsStale(); }
+
+    // Track `t`'s OWN sound as a preset, complete: every value as the engine, the mixer and the
+    // effects hold it (not the stored parameters, which need not have them all), with the insert
+    // effects themselves and the arpeggiator. While a preset is being auditioned on the track that
+    // is the remembered sound, never the preset being listened to (the owner's saves came back as
+    // the factory preset the highlight happened to be on).
+    Preset presetOfTrack(int trackIdx, const juce::String& name) const
+    {
+        auto& track = sequencer.getPattern().getTrack(trackIdx);
         auto preset = PresetManager::fromTrack(track, name, "INIT");
-        if (audioEngine != nullptr)
+        if (audioEngine == nullptr)
+            return preset;
+        if (heardOn(trackIdx))
         {
-            // What is saved is the track's OWN sound, complete: every value as the engine, the mixer
-            // and the effects hold it (not the stored parameters, which need not have them all),
-            // with the insert effects themselves. While a preset is being auditioned that is the
-            // remembered sound, never the preset being listened to (the owner's saves came back as
-            // the factory preset the highlight happened to be on).
-            if (auditioned && !snapshotIsStale())
+            preset.engineType = snapshotType;
+            preset.soundParams = snapshotSaved;
+            for (auto& [id, value] : snapshotEngine)
+                if (preset.soundParams.count(id) != 0)
+                    preset.soundParams[id] = value;
+            preset.arp = snapshotArp;
+        }
+        else
+        {
+            preset.engineType = audioEngine->getEngineTypeOf(trackIdx);
+            preset.soundParams = ProjectBridge::captureTrackSound(ProjectBridge::Live { sequencer, *audioEngine },
+                                                                  trackIdx, track.soundParams);
+            // A step lock may be holding a parameter away from its own value right now.
+            for (int id : lockedIds(track))
+                if (auto it = track.soundParams.find(id); it != track.soundParams.end())
+                    preset.soundParams[id] = it->second;
+            if (auto* arp = arpOf(trackIdx))
+                preset.arp = ProjectBridge::captureArp(*arp);
+        }
+        // "This preset says what the track's effects are" (none, when slot 1 is 0).
+        if (preset.soundParams.count(ProjectBridge::INSERT_TYPE_BASE) == 0)
+            preset.soundParams[ProjectBridge::INSERT_TYPE_BASE] = 0.0f;
+        preset.sampleName = PresetManager::sampleNameOf(preset.engineType, preset.soundParams);
+        return preset;
+    }
+
+    // The tracks (0-based) that track `t` listens to: its input source and the KEY / SRC of every
+    // keyed insert in its chain (DUCK, CMP, TRNS, WAH, every LFO effect, FilterEffect).
+    // Read from the track's own sound, as SV would save it.
+    std::vector<int> sourcesOfTrack(int t) const
+    {
+        const auto& track = sequencer.getPattern().getTrack(t);
+        ParamMap sound = heardOn(t) ? snapshotSaved
+                       : (audioEngine != nullptr ? ProjectBridge::captureTrackSound(ProjectBridge::Live { sequencer, *audioEngine }, t, track.soundParams)
+                                                 : track.soundParams);
+        // (the input is the engine's to say once it applies it; until then the stored value is it)
+        if (audioEngine != nullptr && !heardOn(t))
+            if (const float src = audioEngine->getTrackParameter(t, TrackInParam::SRC); src >= 0.5f)
+                sound[TrackInParam::SRC] = src;
+        std::vector<int> out;
+        for (int number : MultiPreset::sourcesOf(sound))
+            if (number - 1 != t && number - 1 < sequencer.getPattern().getTrackCount())
+                out.push_back(number - 1);
+        return out;
+    }
+
+public:
+    // The tracks SV on `trackIdx` would save together, ascending: the track, every track it listens
+    // to or that listens to it, and so on through those (the whole connected set). One track = an
+    // ordinary single preset.
+    std::vector<int> connectedTracks(int trackIdx) const
+    {
+        const int count = sequencer.getPattern().getTrackCount();
+        if (trackIdx < 0 || trackIdx >= count)
+            return {};
+        std::vector<std::vector<int>> listensTo((size_t) count);
+        for (int t = 0; t < count; ++t)
+            listensTo[(size_t) t] = sourcesOfTrack(t);
+        std::vector<bool> in((size_t) count, false);
+        in[(size_t) trackIdx] = true;
+        for (bool grew = true; grew;)
+        {
+            grew = false;
+            for (int t = 0; t < count; ++t)
+                for (int src : listensTo[(size_t) t])
+                    if (in[(size_t) t] != in[(size_t) src])
+                    {
+                        in[(size_t) t] = true;
+                        in[(size_t) src] = true;
+                        grew = true;
+                    }
+        }
+        std::vector<int> out;
+        for (int t = 0; t < count; ++t)
+            if (in[(size_t) t])
+                out.push_back(t);
+        // (more than a multi holds: the highest tracks other than the selected one are left out)
+        for (int i = (int) out.size() - 1; i >= 0 && (int) out.size() > MultiPreset::MAX_MEMBERS; --i)
+            if (out[(size_t) i] != trackIdx)
+                out.erase(out.begin() + i);
+        return out;
+    }
+
+    // The tracks the last SV saved (one for a single preset), for the save box's words.
+    const std::vector<int>& getSavedTracks() const { return savedTracks; }
+
+    // Loads a multi: see the class comment. False (and nothing changed, the name bar saying how
+    // many empty tracks it needs) when there are fewer empty tracks than members.
+    bool loadMulti(const MultiPreset& given)
+    {
+        const MultiPreset multi = given;        // (the list it came from may be rebuilt meanwhile)
+        if (!multi.isValid())
+            return false;
+        restoreSnapshot();                      // (no audition goes on under a load)
+        const auto tracks = emptyTracks.landing(sequencer, audioEngine, &trackPresets, multi.memberCount());
+        if (tracks.empty())
+        {
+            flash = MultiLanding::needText(multi.memberCount());
+            TurnNotice::post(flash);
+            return false;
+        }
+
+        const int playTrack = tracks[(size_t) multi.playIndex()];
+        {
+            const UndoMark mark(*this, multiUndoPoint(tracks, sequencer.getActivePatternIndex()));
+            for (int m = 0; m < multi.memberCount(); ++m)
             {
-                preset.engineType = snapshotType;
-                preset.soundParams = snapshotSaved;
-                for (auto& [id, value] : snapshotEngine)
-                    if (preset.soundParams.count(id) != 0)
-                        preset.soundParams[id] = value;
+                const auto& member = multi.members[(size_t) m];
+                const int t = tracks[(size_t) m];
+                Preset preset = member.preset;
+                MultiPreset::membersToTracks(preset.soundParams, tracks);
+                applyPreset(preset, t, true);
+                // One sound per track, in every pattern (as a project load and an undo leave it).
+                for (int p = 0; p < SequencerCore::MAX_PATTERNS; ++p)
+                    if (p != sequencer.getActivePatternIndex() && t < sequencer.getPattern(p).getTrackCount())
+                    {
+                        sequencer.getPattern(p).getTrack(t).engineType = sequencer.getPattern().getTrack(t).engineType;
+                        sequencer.getPattern(p).getTrack(t).soundParams = sequencer.getPattern().getTrack(t).soundParams;
+                    }
+                if (member.hasPattern)
+                    writeStarterPattern(t, member);
+                trackPresets.set(t, preset.name.isNotEmpty() ? preset.name : multi.name, preset.engineType);
+            }
+            sequencer.setSelectedTrack(playTrack);
+            // The keyboard the play member was saved with, where it stores one.
+            const auto& keys = multi.members[(size_t) multi.playIndex()].preset.keyboard;
+            if (getKeyboard && applyKeyboard && (keys.split >= 0 || keys.octave != KeyboardSetup::UNKNOWN))
+            {
+                const auto now = getKeyboard();
+                applyKeyboard({ keys.split >= 0 ? keys.split : now.split,
+                                keys.octave != KeyboardSetup::UNKNOWN ? keys.octave : now.octave });
+            }
+        }
+        afterTracksReplaced();
+        flash = "OK " + MultiLanding::text(tracks, barRoom() - 3);
+        if (loadCallback)
+            loadCallback(playTrack, multi.members[(size_t) multi.playIndex()].preset.engineType);
+        return true;
+    }
+
+    // Where the multi would land now (0-based tracks, ascending); empty = not enough empty tracks.
+    std::vector<int> landingOf(const MultiPreset& multi) const
+    {
+        return emptyTracks.landing(sequencer, audioEngine, &trackPresets, multi.memberCount());
+    }
+    EmptyTracks& getEmptyTracks() const { return emptyTracks; }
+
+private:
+    bool multiListed() const
+    {
+        const auto cats = PresetManager::getCategories();
+        return categoryIndex >= 0 && categoryIndex < cats.size() && cats[categoryIndex] == MultiPreset::categoryName();
+    }
+
+    const MultiPreset* highlightedMulti() const
+    {
+        if (!multiListed() || selectedIndex < 0 || selectedIndex >= (int) filteredIndices.size())
+            return nullptr;
+        return &presetManager.getMulti(filteredIndices[(size_t) selectedIndex]);
+    }
+
+    // How many characters the name bar has for this screen's text ("PRESET T3" and a space are taken).
+    int barRoom() const
+    {
+        const int total = (DisplayRenderer::WIDTH - 4) / BitmapFont::TOTAL_CHAR_WIDTH;
+        return total - (getName() + " T" + juce::String(sequencer.getSelectedTrack() + 1)).length() - 1;
+    }
+
+    // With a multi highlighted: where it would land, or that it has no room.
+    juce::String landingText() const
+    {
+        const auto* multi = highlightedMulti();
+        if (multi == nullptr)
+            return MultiPreset::categoryName();
+        const auto tracks = landingOf(*multi);
+        return tracks.empty() ? MultiLanding::needText(multi->memberCount()) : MultiLanding::text(tracks, barRoom());
+    }
+
+    void loadHighlightedMulti()
+    {
+        if (const auto* multi = highlightedMulti())
+        {
+            const auto key = highlightedKey();
+            loadMulti(*multi);
+            selectByKey(key);
+            shownKey = highlightedKey();
+        }
+        else
+            flash = "LOAD FAIL";
+    }
+
+    // The list of multis changed (one named, replaced or taken away): the highlight stays on `key`
+    // where that is still in the list. Nothing is auditioned under MULT, so nothing else follows.
+    void multisChanged(const juce::String& key)
+    {
+        rebuildFilteredList();
+        if (multiListed())
+        {
+            selectByKey(key);
+            shownKey = highlightedKey();
+        }
+    }
+
+    bool savedIsMulti(const juce::String& name) const { return presetManager.findUserMulti(name) >= 0; }
+
+    // The audio thread is kept out while a track's steps are replaced (no engine: nothing to keep out).
+    StructureLockFn structureLock() const { return audioEngine != nullptr ? GrammarHooks::structureLock(*audioEngine) : StructureLockFn(); }
+
+    // The save box's answer for a multi saved as `from` (`name` is cleaned already): it gets the
+    // name; a multi of the player's that has it is replaced, a built-in multi's name is refused.
+    bool nameSavedMulti(const juce::String& from, const juce::String& name)
+    {
+        if (name.isEmpty())
+            return false;
+        if (name.equalsIgnoreCase(from))
+            return true;                        // (the name it has: kept)
+        for (int i = 0; i < presetManager.getMultiCount(); ++i)
+            if (presetManager.getMulti(i).isFactory && presetManager.getMulti(i).name.equalsIgnoreCase(name))
+                return false;
+        const auto highlighted = highlightedKey();
+        const auto oldKey = multiKey(presetManager.getMulti(presetManager.findUserMulti(from)));
+        juce::String replacedKey;
+        for (int i = presetManager.getMultiCount() - 1; i >= 0; --i)
+            if (presetManager.getMulti(i).name.equalsIgnoreCase(name))
+            {
+                replacedKey = multiKey(presetManager.getMulti(i));
+                presetManager.removeMulti(i);
+            }
+        const int index = presetManager.findUserMulti(from);
+        if (!presetManager.renameMulti(index, name))
+            return false;
+        const auto newKey = multiKey(presetManager.getMulti(index));
+        multisChanged(highlighted == oldKey || highlighted == replacedKey ? newKey : highlighted);
+        if (onUserPresetsChanged) onUserPresetsChanged();
+        return true;
+    }
+
+    // A member's starter pattern becomes the track's steps in the ACTIVE pattern (no other pattern
+    // is touched). The audio thread is kept out while the steps are replaced.
+    void writeStarterPattern(int trackIdx, const MultiPreset::Member& member)
+    {
+        auto write = [&]
+        {
+            auto& track = sequencer.getPattern().getTrack(trackIdx);
+            track.clearAllSteps();
+            track.setLength(member.length);
+            for (int i = 0; i < (int) member.steps.size() && i < (int) track.steps.size(); ++i)
+                ProjectBridge::applyStep(member.steps[(size_t) i], track.steps[(size_t) i]);
+            // (a member of before the DIRT / TALK / MODFX blocks became inserts: its locks follow its sound)
+            ProjectBridge::convertStepLocks(member.preset.soundParams, track);
+        };
+        underStructure(structureLock(), write);
+    }
+
+    // ---- One undo step for a whole multi load -----------------------------------------------------
+    // Everything a load changes on the tracks it lands on, and who is selected. The undo history
+    // swaps numbers (Scope::Custom): the number is a ticket for a state kept here, so that undo
+    // puts back engine types, sounds (pressure slots included), steps, names and arpeggiators of every track at once,
+    // and redo puts the loaded state back the same way.
+    struct TrackState
+    {
+        EngineType type = EngineType::UnifiedVoice;
+        ParamMap sound;
+        std::vector<Step> steps;
+        int length = 16;
+        float speed = 1.0f;
+        TrackPresetNames::Origin origin;
+        std::vector<float> arp;
+    };
+    struct MultiState
+    {
+        std::vector<TrackState> tracks;
+        int selected = 0;
+        KeyboardSetup keyboard;
+    };
+    struct MultiStates
+    {
+        std::map<int, MultiState> kept;
+        int next = 1;
+    };
+
+    MultiState captureMultiState(const std::vector<int>& tracks, int pattern) const
+    {
+        MultiState state;
+        state.selected = sequencer.getSelectedTrack();
+        if (getKeyboard)
+            state.keyboard = getKeyboard();
+        for (int t : tracks)
+        {
+            TrackState ts;
+            const auto& track = sequencer.getPattern(pattern).getTrack(t);
+            ts.type = audioEngine != nullptr ? audioEngine->getEngineTypeOf(t) : track.engineType;
+            ts.sound = audioEngine != nullptr
+                           ? ProjectBridge::captureTrackSound(ProjectBridge::Live { sequencer, *audioEngine }, t,
+                                                              sequencer.getPattern().getTrack(t).soundParams)
+                           : sequencer.getPattern().getTrack(t).soundParams;
+            ts.steps = track.steps;
+            ts.length = track.length;
+            ts.speed = track.speedMultiplier;
+            ts.origin = trackPresets.get(t);
+            if (auto* arp = arpOf(t))
+                ts.arp = ProjectBridge::captureArp(*arp);
+            state.tracks.push_back(std::move(ts));
+        }
+        return state;
+    }
+
+    void applyMultiState(const MultiState& state, const std::vector<int>& tracks, int pattern)
+    {
+        for (size_t i = 0; i < tracks.size() && i < state.tracks.size(); ++i)
+        {
+            const int t = tracks[i];
+            const auto& ts = state.tracks[i];
+            if (t < 0 || t >= sequencer.getPattern().getTrackCount())
+                continue;
+            if (audioEngine != nullptr)
+            {
+                // The same steps as loading a project does for one track (a fresh engine, the insert
+                // chain, every value); then what a sound does not hold.
+                GrammarHooks::make(sequencer, *audioEngine).applySound(t, ts.type, ts.sound);
+                if (auto* arp = arpOf(t); arp != nullptr && !ts.arp.empty() && ProjectBridge::captureArp(*arp) != ts.arp)
+                    ProjectBridge::applyArp(ts.arp, *arp);
             }
             else
             {
-                preset.engineType = audioEngine->getEngineTypeOf(trackIdx);
-                preset.soundParams = ProjectBridge::captureTrackSound(ProjectBridge::Live { sequencer, *audioEngine },
-                                                                      trackIdx, track.soundParams);
-                // A step lock may be holding a parameter away from its own value right now.
-                for (int id : lockedIds(track))
-                    if (auto it = track.soundParams.find(id); it != track.soundParams.end())
-                        preset.soundParams[id] = it->second;
+                sequencer.getPattern().getTrack(t).engineType = ts.type;
+                sequencer.getPattern().getTrack(t).soundParams = ts.sound;
             }
-            // The arpeggiator: the track's own (the remembered one while a preset is auditioned).
-            if (auditioned && !snapshotIsStale())
-                preset.arp = snapshotArp;
-            else if (auto* arp = arpOf(trackIdx))
-                preset.arp = ProjectBridge::captureArp(*arp);
-            // "This preset says what the track's effects are" (none, when slot 1 is 0).
-            if (preset.soundParams.count(ProjectBridge::INSERT_TYPE_BASE) == 0)
-                preset.soundParams[ProjectBridge::INSERT_TYPE_BASE] = 0.0f;
-            preset.sampleName = PresetManager::sampleNameOf(preset.engineType, preset.soundParams);
+            auto put = [&]
+            {
+                auto& track = sequencer.getPattern(pattern).getTrack(t);
+                track.steps = ts.steps;
+                track.length = ts.length;
+                track.speedMultiplier = ts.speed;
+            };
+            underStructure(structureLock(), put);
+            trackPresets.set(t, ts.origin.name, ts.origin.engine);
         }
-        // The keyboard as it is, or (a preset is being heard and may have moved it) as it was.
-        if (getKeyboard)
+        sequencer.setSelectedTrack(state.selected);
+        if (getKeyboard && applyKeyboard && getKeyboard() != state.keyboard)
+            applyKeyboard(state.keyboard);
+    }
+
+    UndoPoint multiUndoPoint(const std::vector<int>& tracks, int pattern)
+    {
+        auto states = std::make_shared<MultiStates>();
+        UndoPoint point;
+        point.scope = UndoPoint::Scope::Custom;
+        point.verb = "LOAD";
+        point.names = { "MULTI " + MultiLanding::text(tracks, 8), "MULTI" };
+        point.capture = [this, states, tracks, pattern]
         {
-            ownKeyboardFollowsHand();
-            preset.keyboard = (auditioned && !snapshotIsStale()) ? snapshotKeyboard : getKeyboard();
-        }
-        presetManager.addPreset(preset);
-        savedTrack = trackIdx;
+            restoreSnapshot();                  // (a preset being heard is not the track's sound)
+            const int ticket = states->next++;
+            states->kept[ticket] = captureMultiState(tracks, pattern);
+            return std::vector<float> { (float) ticket };
+        };
+        point.apply = [this, states, tracks, pattern](const std::vector<float>& blob)
+        {
+            const int ticket = blob.empty() ? 0 : (int) blob[0];
+            auto it = states->kept.find(ticket);
+            if (it == states->kept.end())
+                return;
+            applyMultiState(it->second, tracks, pattern);
+            states->kept.erase(it);
+            afterTracksReplaced();
+            if (loadCallback)
+                loadCallback(sequencer.getSelectedTrack(), sequencer.getPattern().getTrack(sequencer.getSelectedTrack()).engineType);
+        };
+        return point;
+    }
+
+    // Tracks were rebuilt under the screen (a multi loaded, undone or redone): what is remembered
+    // is the selected track as it is now, and nothing is being heard.
+    void afterTracksReplaced()
+    {
+        const auto key = highlightedKey();
+        auditioned = false;
+        heardKey.clear();
+        takeSnapshot();
         rebuildFilteredList();
+        selectByKey(key);
+        shownKey = highlightedKey();
+    }
+
+    // SV. True when a multi was saved (the track is connected to others), false for a single preset.
+    bool saveCurrentTrackAsPreset()
+    {
+        const int trackIdx = sequencer.getSelectedTrack();
+        const juce::String name = freeUserName();
+        const auto set = connectedTracks(trackIdx);
+        const bool asMulti = set.size() > 1;
+
+        if (asMulti)
+        {
+            // The connected tracks in ascending order (sources stay ahead of their listeners where
+            // they were), their routings by member number, the active pattern's steps as their
+            // starter patterns; the keys play the track SV was turned on.
+            MultiPreset multi;
+            multi.name = name;
+            for (size_t m = 0; m < set.size(); ++m)
+            {
+                const int t = set[m];
+                MultiPreset::Member member;
+                const auto origin = trackPresets.get(t);
+                member.preset = presetOfTrack(t, {});
+                member.preset.name = origin.name.isNotEmpty() && origin.engine == member.preset.engineType
+                                         ? origin.name : "Part " + juce::String((int) m + 1);
+                // (the input comes from the stored value until the engine applies it)
+                MultiPreset::tracksToMembers(member.preset.soundParams, set);
+                const auto& track = sequencer.getPattern().getTrack(t);
+                member.hasPattern = true;
+                member.length = track.length;
+                for (int i = 0; i < track.length && i < (int) track.steps.size(); ++i)
+                    member.steps.push_back(ProjectBridge::captureStep(track.steps[(size_t) i]));
+                if (t == trackIdx)
+                {
+                    multi.playMember = (int) m + 1;
+                    if (getKeyboard)
+                    {
+                        ownKeyboardFollowsHand();
+                        member.preset.keyboard = heardOn(t) ? snapshotKeyboard : getKeyboard();
+                    }
+                }
+                multi.members.push_back(std::move(member));
+            }
+            presetManager.addMulti(multi);
+        }
+        else
+        {
+            auto preset = presetOfTrack(trackIdx, name);
+            // Which track feeds this one is not a single preset's to say.
+            MultiPreset::stripTrackInput(preset.soundParams);
+            // The keyboard as it is, or (a preset is being heard and may have moved it) as it was.
+            if (getKeyboard)
+            {
+                ownKeyboardFollowsHand();
+                preset.keyboard = heardOn(trackIdx) ? snapshotKeyboard : getKeyboard();
+            }
+            presetManager.addPreset(preset);
+        }
+        savedTrack = trackIdx;
+        savedTracks = asMulti ? set : std::vector<int> { trackIdx };
+        const auto key = highlightedKey();
+        rebuildFilteredList();
+        if (multiListed())
+        {
+            selectByKey(key);
+            shownKey = highlightedKey();
+        }
         if (onUserPresetsChanged) onUserPresetsChanged();
         if (onPresetSaved) onPresetSaved(name);
+        return asMulti;
     }
 
     bool deleteSelectedPreset()
@@ -1040,6 +1623,16 @@ private:
         if (filteredIndices.empty() || selectedIndex >= (int) filteredIndices.size())
             return false;
         int index = filteredIndices[(size_t) selectedIndex];
+        if (multiListed())
+        {
+            if (presetManager.getMulti(index).isFactory)
+                return false;
+            presetManager.removeMulti(index);
+            rebuildFilteredList();
+            shownKey = highlightedKey();        // (the highlight is on another multi: nothing is heard)
+            if (onUserPresetsChanged) onUserPresetsChanged();
+            return true;
+        }
         if (presetManager.getPreset(index).isFactory)
             return false;
         presetManager.removePreset(index);
@@ -1052,6 +1645,8 @@ private:
     AudioEngine* audioEngine;
     PresetManager& presetManager;
     std::vector<int> filteredIndices;
+    juce::StringArray tabCategories;    // the categories `tabs` was laid out for
+    std::vector<Tab> tabs;
     int selectedIndex = 0;
     int categoryIndex = 0;
     bool anyEngine = false;
@@ -1059,6 +1654,8 @@ private:
     bool auditioned = false;            // a preset is being heard for listening only
     TrackPresetNames trackPresets;      // per track: the preset its sound was loaded from or saved as
     int savedTrack = -1;                // the track SV last saved
+    std::vector<int> savedTracks;       // ... and every track that save took (several: a multi)
+    mutable EmptyTracks emptyTracks;    // which tracks are empty (keeps each engine type's defaults)
     juce::String shownKey;              // the preset the highlight was on when last looked at
     juce::String heardKey;              // the preset being heard
     // The remembered sound of `snapshotTrack`.
@@ -1071,6 +1668,7 @@ private:
     const EngineBase* ownEngine = nullptr;      // the track's engine as this screen last left it
     std::shared_ptr<EngineBase> parkedEngine;   // the track's own engine while a preset is heard
     std::vector<float> snapshotArp;             // the track's own arpeggiator
+    std::vector<float> snapshotArchMem;         // the unified-voice ARCH memory
     KeyboardSetup snapshotKeyboard;             // the keyboard when the sound was remembered
     KeyboardSetup lastKeyboard;                 // the keyboard as an audition last left it
     bool keyboardSet = false;                   // an audition has set the keyboard since the snapshot

@@ -1,8 +1,12 @@
 #pragma once
 
 #include "../src/project/FactoryPresets.h"
+#include "../src/project/presets/FusionPresets.h"
+#include "../src/project/presets/ResonatorPresets.h"
+#include "../src/project/presets/ResonatorKits.h"
 #include "../src/project/PresetManager.h"
 #include "../src/engine/DrumEngine.h"
+#include "../src/engine/ParamSpec.h"
 #include <juce_core/juce_core.h>
 #include <set>
 
@@ -31,6 +35,7 @@ public:
             engineCounts[EngineType::WaveSeq] = 0;
             engineCounts[EngineType::Sampler] = 0;
             engineCounts[EngineType::Drum] = 0;
+            engineCounts[EngineType::Resonator] = 0;
 
             for (int i = 0; i < count; ++i)
             {
@@ -60,6 +65,9 @@ public:
             expect(engineCounts[EngineType::Drum] >= 3,
                    "Drum should have >= 3 presets, got "
                    + juce::String(engineCounts[EngineType::Drum]));
+            expect(engineCounts[EngineType::Resonator] >= 3,
+                   "Resonator should have >= 3 presets, got "
+                   + juce::String(engineCounts[EngineType::Resonator]));
         }
 
         // ============================================================
@@ -96,6 +104,9 @@ public:
         beginTest("All presets round-trip through serialization");
         {
             auto presets = FactoryPresets::getAll();
+            for (auto& p : FusionPresets::getAll()) presets.push_back(p);
+            for (auto& p : resonatorPresets()) presets.push_back(p);
+            for (auto& p : resonatorKits()) presets.push_back(p);
             for (const auto& original : presets)
             {
                 juce::String json = original.toJSON();
@@ -139,21 +150,30 @@ public:
 
         beginTest("No preset uses param IDs outside valid range");
         {
+            // Check all factory presets: getAll() plus the fusion and resonator presets.
             auto presets = FactoryPresets::getAll();
+            for (auto& p : FusionPresets::getAll()) presets.push_back(p);
+            for (auto& p : resonatorPresets()) presets.push_back(p);
+            for (auto& p : resonatorKits()) presets.push_back(p);
             for (const auto& preset : presets)
             {
-                int maxValidId = getMaxParamId(preset.engineType);
-
                 for (const auto& [id, value] : preset.soundParams)
                 {
                     expect(id >= 0,
                            "Negative param ID " + juce::String(id)
                            + " in preset: " + preset.name);
-                    // (A drum kit may also set its pads' kick-machine and cymbal-machine pages.)
-                    expect(id <= maxValidId
-                           || (preset.engineType == EngineType::Drum && (DrumEngine::isKickParam(id) || DrumEngine::isCymbalParam(id))),
-                           "Param ID " + juce::String(id) + " exceeds max ("
-                           + juce::String(maxValidId) + ") for "
+                    // Every engine uses the four engine-param blocks (EngineParamRange).
+                    // A drum kit may also set its pads' kick-machine and cymbal-machine pages.
+                    // The unified voice has its own MAX_ID.
+                    // A preset is the whole of a track's sound: it may store the track's insert
+                    // effects (their types at 232-239, their cells, switches and extra cells).
+                    const bool insert = AudioEngine::isInsertParam(id)
+                                        || (id >= ProjectBridge::INSERT_TYPE_BASE && id < ProjectBridge::INSERT_TYPE_BASE + AudioEngine::MAX_INSERTS_PER_TRACK);
+                    const bool valid = EngineParamRange::contains(id) || insert
+                                       || (preset.engineType == EngineType::Drum && (DrumEngine::isKickParam(id) || DrumEngine::isSoundParam(id)))
+                                       || (preset.engineType == EngineType::UnifiedVoice && id < UnifiedParam::MAX_ID);
+                    expect(valid,
+                           "Param ID " + juce::String(id) + " outside engine blocks for "
                            + engineTypeName(preset.engineType)
                            + " in preset: " + preset.name);
                 }
@@ -213,6 +233,9 @@ public:
         beginTest("All factory presets are marked isFactory");
         {
             auto presets = FactoryPresets::getAll();
+            for (auto& p : FusionPresets::getAll()) presets.push_back(p);
+            for (auto& p : resonatorPresets()) presets.push_back(p);
+            for (auto& p : resonatorKits()) presets.push_back(p);
             for (const auto& p : presets)
             {
                 expect(p.isFactory,
@@ -234,6 +257,9 @@ public:
             };
 
             auto presets = FactoryPresets::getAll();
+            for (auto& p : FusionPresets::getAll()) presets.push_back(p);
+            for (auto& p : resonatorPresets()) presets.push_back(p);
+            for (auto& p : resonatorKits()) presets.push_back(p);
             for (const auto& p : presets)
             {
                 for (const auto& brand : banned)
@@ -247,26 +273,6 @@ public:
     }
 
 private:
-    // Maximum valid param ID for each engine type
-    static int getMaxParamId(EngineType type)
-    {
-        switch (type)
-        {
-            case EngineType::UnifiedVoice: return UnifiedParam::MAX_ID - 1;
-            // These four have the per-voice filter (FILTR / F ENV pages, ids 100-115), where a
-            // preset keeps its cutoff and its mod strip amount (WHL), ...
-            case EngineType::FM:
-            case EngineType::MacroOsc:
-            case EngineType::Wavetable:
-            case EngineType::WaveSeq:      return EngineLfoSection::STRIP_BASE - 1;   // ... and with the two LFOs
-                                                                                      // (158-173), not the STRIP page
-            case EngineType::Sampler:      return EngineLfoSection::STRIP_BASE - 1;   // its cells (0-55) and its two LFOs
-            case EngineType::Drum:         return 127; // 15 voices * 8 + 7
-            case EngineType::MIDITrack:    return 29;
-            default:                       return 29;
-        }
-    }
-
     static juce::String engineTypeName(EngineType type)
     {
         switch (type)
@@ -279,6 +285,7 @@ private:
             case EngineType::Sampler:      return "Sampler";
             case EngineType::Drum:         return "Drum";
             case EngineType::MIDITrack:    return "MIDITrack";
+            case EngineType::Resonator:    return "Resonator";
             default:                       return "Unknown";
         }
     }

@@ -1,153 +1,82 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "FxBlocks.h"
-#include "../filters/SVFilter.h"
+#include "SweptFilter.h"
 
-// Wah: a resonant band-pass swept by the input's envelope (auto-wah) and / or a sine LFO.
-// Structure: Zoelzer, "DAFX", filters chapter (wah-wah = swept band-pass) with a peak envelope
-// follower; the filter is the project's trapezoidal state-variable filter (SVFilter.h, Simper /
-// Zavalishin), which stays tuned and stable while its cutoff is modulated every sample.
+// Wah: a setting of the swept filter (SweptFilter.h). A resonant band-pass swept by a level's
+// envelope (auto-wah) and / or an LFO (dsp/LFO.h, any of its shapes). Structure: Zoelzer, "DAFX",
+// filters chapter (wah-wah = swept band-pass) with a peak envelope follower; the filter is the
+// project's trapezoidal state-variable filter, which stays tuned while its cutoff is moved.
 //
 // FREQ  resting centre frequency
-// RESO  0..1 -> Q 1..12 (output scaled so the peak gain is sqrt(Q): about 0 to +11 dB)
+// RESO  0..1 -> Q 1..12 on the state-variable filter (its band-pass scaled so the peak gain is
+//       sqrt(Q): about 0 to +11 dB); the resonance of any other filter, the phaser's feedback, how
+//       sharp the vowels are
 // SENS  envelope amount: a full-level input raises the centre by up to 4 octaves
 // RATE  LFO rate; 0 = LFO off, otherwise the centre swings +/- one octave
-class Wah : public EffectBase
+// FX2:
+// SHPE  the LFO's shape: SQR is two vowels in turn, RND a new one every cycle, USR the track's
+//       eight-step shape as a filter sequence, EXPD a "wow" on every cycle
+// FILT  what is swept (swp::filt): the band-pass it always was (S.BP), any other type and mode of
+//       the filter set (state-variable, SEM, ladder, diode, comb), a phaser of two, four or six
+//       stages (heard with the dry sound, so its notches are there at any WET), or the vowels A to U
+// TRIG  what a beginning sound does to the LFO (dsp/LFO.h): FREE nothing, KEY starts the cycle
+//       again, ONE one cycle and stop, HALF half of one, HOLD the value it has is kept. With EXPD
+//       and ONE: one "wow" for every note, or (KEY at IN) for every hit of another track
+// KEY   whose level SENS follows and whose onsets TRIG hears: SELF, or IN = the track's input (the
+//       source of the track's IN page). With no input: as SELF.
+// The slot's WET leaves the dry sound beside the filtered one (1 = the filter alone).
+// The cells are CellEffect's (every continuous one moves with modulateCell); FREQ, RESO and SENS
+// glide to where they are put, so one thrown under sound is a sweep and not a click.
+class Wah : public swp::Effect
 {
 public:
     enum Param { Freq = 0, Reso, Sens, Rate };
+    enum Extra { Shape = 0, Filt, Trig };
+    static constexpr int KEY_EXTRA = MAX_EXTRAS - 1;
 
-    Wah() { prepare(44100.0, 0); }
+    Wah() { seed(); }
 
-    ParamSpec getParamSpec(int index) const override
+    int keyCell() const override { return 4 + KEY_EXTRA; }
+
+protected:
+    const ParamSpec* cells() const override
     {
         using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "FREQ", 0, 150.0f, 2500.0f, 400.0f, K::Log, "Hz" };
-            case 1: return { "RESO", 1, 0, 1, 0.5f };
-            case 2: return { "SENS", 2, 0, 1, 0.5f };
-            case 3: return { "RATE", 3, 0.0f, 10.0f, 0.0f, K::Linear, "Hz" };
-            default: return {};
-        }
+        static const ParamSpec c[CELLS] = {
+            { "FREQ", 0, 150.0f, 2500.0f, 400.0f, K::Log, "Hz" },
+            { "RESO", 1, 0, 1, 0.5f },
+            { "SENS", 2, 0, 1, 0.5f },
+            { "RATE", 3, 0.0f, 10.0f, 0.0f, K::Linear, "Hz" },
+            fxm::Lfo::shapeSpec("SHPE", Shape),
+            { "FILT", Filt, 0, (float) (swp::filt::COUNT - 1), 0, K::Choice, "", swp::filt::names(), swp::filt::COUNT },
+            fxm::Lfo::triggerSpec("TRIG", Trig),
+            dyn::keySpec(KEY_EXTRA) };
+        return c;
     }
 
-    void setParameter(int id, float value) override
+    swp::Core::Voicing voicing() const override
     {
-        switch (id)
-        {
-            case Freq: freq = std::clamp(value, 150.0f, 2500.0f); break;
-            case Reso: reso = std::clamp(value, 0.0f, 1.0f); break;
-            case Sens: sens = std::clamp(value, 0.0f, 1.0f); break;
-            case Rate: rate = std::clamp(value, 0.0f, 10.0f); break;
-            default: break;
-        }
+        swp::Core::Voicing v;
+        v.peakLevel = true;
+        v.cascadeSum = true;
+        return v;
     }
 
-    float getParameter(int id) const override
+    void configure(const float* v) override
     {
-        switch (id)
-        {
-            case Freq: return freq;
-            case Reso: return reso;
-            case Sens: return sens;
-            case Rate: return rate;
-            default:   return 0.0f;
-        }
-    }
-
-    void prepare(double sr, int /*maxBlockSize*/) override
-    {
-        sampleRate = sr;
-        for (auto* f : { &filterL, &filterR })
-        {
-            f->setSampleRate(sr);
-            f->setMode(SVFilter::Mode::BandPass);
-        }
-        follower.setTimes(sr, 3.0f, 150.0f);
-        freqSmooth.setTime(sr, 20.0f);
-        lfoDepthSmooth.setTime(sr, 30.0f);
-        reset();
-    }
-
-    void reset() override
-    {
-        filterL.reset();
-        filterR.reset();
-        follower.reset();
-        freqSmooth.snap(freq);
-        lfoDepthSmooth.snap(rate > LFO_OFF ? 1.0f : 0.0f);
-        lfoPhase = 0.0;
-        quietCount = 0;
-    }
-
-    // Centre frequency the filter is at right now (after envelope and LFO), for meters and tests.
-    float getCurrentFrequency() const { return currentHz; }
-
-    void process(float& left, float& right) override
-    {
-        if (!enabled) return;
-
-        float env = std::min(1.0f, 2.0f * follower.process(std::max(std::abs(left), std::abs(right))));
-
-        float octaves = sens * ENV_OCTAVES * env;
-        float lfoDepth = lfoDepthSmooth.next(rate > LFO_OFF ? 1.0f : 0.0f);
-        if (lfoDepth > 0.0f)
-        {
-            octaves += lfoDepth * (float) std::sin(lfoPhase * dsp::TWO_PI_D);
-            lfoPhase += (double) rate / sampleRate;
-            if (lfoPhase >= 1.0) lfoPhase -= 1.0;
-        }
-
-        float hz = freqSmooth.next(freq) * std::exp2(octaves);
-        hz = std::clamp(hz, 60.0f, std::min(12000.0f, (float) sampleRate * 0.45f));
-        currentHz = hz;
-
-        float q = std::pow(12.0f, reso);
-        float gain = 1.0f / std::sqrt(q);   // band output peaks at Q; leave sqrt(Q) of it
-
-        filterL.setResonance(q);
-        filterR.setResonance(q);
-        filterL.setCutoff(hz);
-        filterR.setCutoff(hz);
-
-        float inL = left, inR = right;
-        left = filterL.process(inL) * gain;
-        right = filterR.process(inR) * gain;
-
-        // The filter's states are private: once input and output have both been at nothing for a
-        // while, clear them so a ringing tail cannot linger in the denormal range.
-        if (std::abs(inL) + std::abs(inR) + std::abs(left) + std::abs(right) < 1.0e-12f)
-        {
-            if (++quietCount >= QUIET_SAMPLES)
-            {
-                filterL.reset();
-                filterR.reset();
-                left = right = 0.0f;
-                quietCount = QUIET_SAMPLES;
-            }
-        }
-        else
-        {
-            quietCount = 0;
-        }
+        const auto& filter = swp::filt::entry((int) v[4 + Filt]);
+        core.setFilter(filter.type, filter.mode);
+        core.setBase(v[Freq]);
+        // (Just over 1: a state-variable resonance of 1 or less is taken as a knob's 0..1.)
+        core.setResonance(filter.type == 0 ? std::max(1.0001f, std::pow(12.0f, v[Reso]))
+                                           : filter.type == swp::filt::Phaser ? 0.9f * v[Reso] : v[Reso]);
+        core.setEnvelope(v[Sens] * ENV_OCTAVES);
+        core.setLfo(v[Rate], (int) v[4 + Shape], v[Rate] > LFO_OFF ? 1.0f : 0.0f, 0.0f);
+        core.setTrigger((int) v[4 + Trig], 0.0f, 0.0f);
+        core.setBite(2.8f);
     }
 
 private:
     static constexpr float ENV_OCTAVES = 4.0f;
     static constexpr float LFO_OFF = 0.005f;
-    static constexpr int QUIET_SAMPLES = 64;
-
-    float freq = 400.0f;
-    float reso = 0.5f;
-    float sens = 0.5f;
-    float rate = 0.0f;
-
-    SVFilter filterL, filterR;
-    fxb::EnvelopeFollower follower;
-    fxb::Smoother freqSmooth, lfoDepthSmooth;
-    double lfoPhase = 0.0;
-    float currentHz = 400.0f;
-    int quietCount = 0;
 };

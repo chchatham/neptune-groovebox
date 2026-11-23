@@ -1,203 +1,75 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "../DSPUtils.h"
-#include <array>
-#include <cmath>
-#include <algorithm>
+#include "DelayCore.h"
 
-// Reverse delay effect.
-// Records input into a buffer, then plays chunks back in reverse.
-// Uses two alternating grains with crossfade for seamless reverse playback.
-// All buffers pre-allocated. No heap on audio thread.
-class ReverseDelay : public EffectBase
+// Reverse delay: a setting of dly::Core (DelayCore.h) with its heads running backwards. Each
+// stretch of TIME is heard backwards as soon as it is complete; a head crossfades into the next
+// over a tenth of the stretch (no gap between two stretches).
+//
+// TIME  the length of a stretch
+// FDBK  feedback: what was heard backwards goes round again (and so comes back forwards)
+// HCUT  low-pass on everything that comes back
+// MIX   dry / wet
+// FX2:
+// TAPS  1..4 heads, TIME / TAPS apart: each plays its own stretches backwards, so everything is heard that
+//       many times on a grid of TIME / TAPS, quieter and to alternate sides
+// DRIV  the tape stage in the loop: 0 = clean; up, every round is squashed, thickened and duller
+// SAT   the curve DRIV works: any of src/dsp/Saturation.h
+// READ  REV to start with; FWD makes it a plain echo, OCT+ / 5TH+ / OCT- shift every repeat instead
+class ReverseDelay : public dly::Family
 {
 public:
-    ParamSpec getParamSpec(int index) const override
+    enum Param { Time = 0, Feedback, HighCut, Mix };
+    enum Extra { Taps = 0, Drive, Sat, Read };
+
+    static constexpr float MIN_TIME = 0.1f, MAX_TIME = 2.0f;
+    static constexpr int MAX_TAPS = 4;
+
+    ReverseDelay() { seed(); }
+
+protected:
+    const ParamSpec* cells() const override
     {
         using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "TIME", 0, 0.1f, 2, 0.5f, K::Log, "s" };
-            case 1: return { "FDBK", 1, 0, 0.95f, 0.3f };
-            case 2: return { "HCUT", 2, 500, 20000, 8000, K::Log, "Hz" };
-            case 3: return { "MIX", 3, 0, 1, 0.5f };
-            default: return {};
-        }
+        static const ParamSpec c[CELLS] = {
+            { "TIME", 0, MIN_TIME, MAX_TIME, 0.5f, K::Log, "s" },
+            { "FDBK", 1, 0, 0.95f, 0.3f },
+            { "HCUT", 2, 500, 20000, 8000, K::Log, "Hz" },
+            { "MIX", 3, 0, 1, 0.5f },
+            { "TAPS", 0, 1, (float) MAX_TAPS, 1, K::Int },
+            { "DRIV", 1, 0, 1, 0 },
+            { "SAT", 2, 0, (float) (sat::Count - 1), (float) sat::Fast, K::Choice, "", sat::names(), sat::Count },
+            { "READ", 3, 0, (float) (dly::read::Count - 1), (float) dly::read::Reverse, K::Choice, "", dly::read::names(), dly::read::Count } };
+        return c;
     }
-
-    enum Param
+    int mixCell() const override { return Mix; }
+    dly::Core::Setup setup() const override
     {
-        Time = 0,       // 0.1 - 2.0 seconds (reverse chunk length)
-        Feedback,       // 0 - 0.95
-        HighCut,        // 500 - 20000 Hz
-        Mix             // 0 - 1
-    };
-
-    void prepare(double sr, int /*maxBlockSize*/) override
-    {
-        sampleRate = sr;
-        recalcFilterCoeff();
-        reset();
+        dly::Core::Setup s;
+        s.hermite = false;
+        s.emphasis = s.makeup = true;
+        s.glideMs = 60.0f;
+        return s;
     }
+    float lineSeconds() const override { return dly::roomFor(MAX_TIME, MAX_TIME); }
 
-    void reset() override
+    void configure(const float* v) override
     {
-        bufferL.fill(0.0f);
-        bufferR.fill(0.0f);
-        writePos = 0;
-        grainCounter = 0;
-        activeGrain = 0;
-        for (auto& g : grains)
+        const float time = v[Time];
+        const int n = std::clamp((int) std::lround(v[4 + Taps]), 1, MAX_TAPS);
+        core.setTapCount(n);
+        for (int i = 0; i < n; ++i)
         {
-            g.readPos = 0;
-            g.length = 0;
-            g.active = false;
+            // The first in the middle and feeding back, the rest quieter and to alternate sides.
+            const float level = n > 1 ? 1.0f - 0.5f * (float) i / (float) (n - 1) : 1.0f;
+            const float far = i == 0 ? level : 0.4f * level;
+            core.setTap(i, time * (float) (i + 1) / (float) n, i % 2 == 1 ? level : far, i % 2 == 1 ? far : level, i == 0 ? 1.0f : 0.0f);
         }
-        lpStateL = 0.0f;
-        lpStateR = 0.0f;
-    }
-
-    void process(float& left, float& right) override
-    {
-        if (!enabled) return;
-
-        float dryL = left;
-        float dryR = right;
-
-        int chunkSamples = std::clamp((int)(time * (float)sampleRate), 1, MAX_SAMPLES / 2);
-
-        // Write input (plus feedback) to circular buffer
-        bufferL[(size_t)writePos] = left;
-        bufferR[(size_t)writePos] = right;
-
-        // Manage grain triggering
-        grainCounter++;
-        if (grainCounter >= chunkSamples)
-        {
-            grainCounter = 0;
-            // Start a new reverse grain from current write position
-            activeGrain = 1 - activeGrain;
-            grains[activeGrain].readPos = writePos;
-            grains[activeGrain].length = chunkSamples;
-            grains[activeGrain].active = true;
-            grains[activeGrain].progress = 0;
-        }
-
-        float wetL = 0.0f;
-        float wetR = 0.0f;
-
-        // Process both grains with crossfade
-        for (int g = 0; g < 2; ++g)
-        {
-            if (!grains[g].active) continue;
-
-            float progress = (float)grains[g].progress / (float)grains[g].length;
-            if (progress >= 1.0f)
-            {
-                grains[g].active = false;
-                continue;
-            }
-
-            // Reverse read: start from grain's start position, go backwards
-            int reverseOffset = (int)((1.0f - progress) * (float)grains[g].length);
-            int readIdx = grains[g].readPos - (grains[g].length - reverseOffset);
-            if (readIdx < 0) readIdx += MAX_SAMPLES;
-            if (readIdx >= MAX_SAMPLES) readIdx -= MAX_SAMPLES;
-
-            float sampleL = bufferL[(size_t)readIdx];
-            float sampleR = bufferR[(size_t)readIdx];
-
-            // Crossfade envelope: half-cosine window
-            float fade = 1.0f;
-            float fadeIn = 0.05f;   // 5% fade in
-            float fadeOut = 0.05f;  // 5% fade out
-            if (progress < fadeIn)
-                fade = 0.5f - 0.5f * std::cos(progress / fadeIn * dsp::PI_F);
-            else if (progress > (1.0f - fadeOut))
-                fade = 0.5f - 0.5f * std::cos((1.0f - progress) / fadeOut * dsp::PI_F);
-
-            wetL += sampleL * fade;
-            wetR += sampleR * fade;
-
-            grains[g].progress++;
-        }
-
-        // Filter the wet signal
-        lpStateL += cachedLpCoeff * (wetL - lpStateL);
-        lpStateR += cachedLpCoeff * (wetR - lpStateR);
-        wetL = lpStateL;
-        wetR = lpStateR;
-
-        // Write feedback back into buffer
-        bufferL[(size_t)writePos] += wetL * feedback;
-        bufferR[(size_t)writePos] += wetR * feedback;
-
-        // Clamp buffer to prevent runaway
-        bufferL[(size_t)writePos] = std::clamp(bufferL[(size_t)writePos], -4.0f, 4.0f);
-        bufferR[(size_t)writePos] = std::clamp(bufferR[(size_t)writePos], -4.0f, 4.0f);
-
-        writePos = (writePos + 1) % MAX_SAMPLES;
-
-        left  = dryL * (1.0f - mix) + wetL * mix;
-        right = dryR * (1.0f - mix) + wetR * mix;
-    }
-
-    void setParameter(int id, float value) override
-    {
-        switch (id)
-        {
-            case Time:     time     = std::clamp(value, 0.1f, 2.0f);     break;
-            case Feedback: feedback = std::clamp(value, 0.0f, 0.95f);    break;
-            case HighCut:
-                highCut = std::clamp(value, 500.0f, 20000.0f);
-                recalcFilterCoeff();
-                break;
-            case Mix:      mix      = std::clamp(value, 0.0f, 1.0f);     break;
-        }
-    }
-
-    float getParameter(int id) const override
-    {
-        switch (id)
-        {
-            case Time:     return time;
-            case Feedback: return feedback;
-            case HighCut:  return highCut;
-            case Mix:      return mix;
-            default:       return 0.0f;
-        }
-    }
-
-private:
-    static constexpr int MAX_SAMPLES = 96000 * 2; // 2 seconds at 96kHz
-
-    float time     = 0.5f;
-    float feedback = 0.3f;
-    float highCut  = 8000.0f;
-    float cachedLpCoeff = 0.5f;
-
-    struct Grain
-    {
-        int readPos = 0;
-        int length = 0;
-        int progress = 0;
-        bool active = false;
-    };
-
-    std::array<Grain, 2> grains {};
-    int activeGrain = 0;
-    int grainCounter = 0;
-
-    std::array<float, MAX_SAMPLES> bufferL {};
-    std::array<float, MAX_SAMPLES> bufferR {};
-    int writePos = 0;
-    float lpStateL = 0.0f;
-    float lpStateR = 0.0f;
-
-    void recalcFilterCoeff()
-    {
-        if (sampleRate > 0.0)
-            cachedLpCoeff = 1.0f - std::exp(-dsp::TWO_PI_F * highCut / (float)sampleRate);
+        core.silenceTapsFrom(n);
+        core.setFeedback(v[Feedback]);
+        core.setFilter(v[HighCut], 0.0f);
+        core.setTransport(0.0f);
+        dly::driven(core, v[4 + Drive], v[4 + Sat]);
+        setRead(v[4 + Read], time);
     }
 };

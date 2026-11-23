@@ -1,141 +1,63 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "FxBlocks.h"
+#include "DelayCore.h"
 
-// Tape-style echo. Structure (the usual tape-echo model, e.g. Zoelzer, "DAFX", delay chapter, and
-// Zavalishin-style bounded feedback loops): a delay line read with Hermite interpolation at a
-// position that glides when TIME changes (pitch slides like a tape changing speed) and wobbles
-// with wow (0.6 Hz) and flutter (7 Hz); the repeats pass a one-pole low-pass and high-pass each
-// time round; the signal going onto the "tape" is soft-saturated, which also bounds the loop.
+// Tape-style echo: a setting of dly::Core (DelayCore.h). Each side has its own line, read with a
+// Hermite curve at a position that glides when TIME changes (pitch slides like a tape changing
+// speed) and wobbles with wow (0.6 Hz) and flutter (7 Hz); the repeats pass a low-pass and a
+// high-pass each time round; the signal going onto the tape is saturated, which also holds the loop.
 //
 // TIME  echo time
 // FDBK  0..1 -> loop gain 0..1.1: the top of the range self-oscillates, held by the saturation
 // AGE   0..1: more wow and flutter, harder saturation, duller and thinner repeats
 // MIX   dry / wet
-class TapeDelay : public EffectBase
+// FX2:
+// HEAD  1..4 playback heads, evenly spaced up to TIME (the last one feeds back; the earlier ones are a little quieter)
+// WIDE  the right side's heads sit up to 20 ms later than the left's
+// SAT   the tape's saturation curve: any of src/dsp/Saturation.h (FAST = the tape as it always was)
+// READ  FWD, REV (each stretch of TIME comes back backwards), OCT+ / 5TH+ / OCT- (every repeat higher or lower)
+class TapeDelay : public dly::Family
 {
 public:
     enum Param { Time = 0, Feedback, Age, Mix };
+    enum Extra { Head = 0, Wide, Sat, Read };
 
     static constexpr float MIN_TIME = 0.02f;
     static constexpr float MAX_TIME = 1.5f;
-
-    TapeDelay()
-    {
-        mix = 0.35f;
-        prepare(44100.0, 0);
-    }
-
-    ParamSpec getParamSpec(int index) const override
-    {
-        using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "TIME", 0, MIN_TIME, MAX_TIME, 0.3f, K::Log, "s" };
-            case 1: return { "FDBK", 1, 0, 1, 0.45f };
-            case 2: return { "AGE", 2, 0, 1, 0.4f };
-            case 3: return { "MIX", 3, 0, 1, 0.35f };
-            default: return {};
-        }
-    }
-
-    void setParameter(int id, float value) override
-    {
-        switch (id)
-        {
-            case Time:     timeSec = std::clamp(value, MIN_TIME, MAX_TIME); break;
-            case Feedback: feedback = std::clamp(value, 0.0f, 1.0f); break;
-            case Age:      age = std::clamp(value, 0.0f, 1.0f); break;
-            case Mix:      setMix(value); break;
-            default: break;
-        }
-    }
-
-    float getParameter(int id) const override
-    {
-        switch (id)
-        {
-            case Time:     return timeSec;
-            case Feedback: return feedback;
-            case Age:      return age;
-            case Mix:      return mix;
-            default:       return 0.0f;
-        }
-    }
-
-    void prepare(double sr, int /*maxBlockSize*/) override
-    {
-        sampleRate = sr;
-        int maxSamples = (int) ((double) MAX_TIME * 1.02 * sr) + 16;
-        lineL.prepare(maxSamples);
-        lineR.prepare(maxSamples);
-        timeSmooth.setTime(sr, 80.0f);
-        appliedAge = -1.0f;
-        reset();
-    }
-
-    void reset() override
-    {
-        lineL.clear();
-        lineR.clear();
-        for (auto* f : { &lpL, &lpR, &hpL, &hpR })
-            f->reset();
-        timeSmooth.snap(timeSec);
-        transport.reset();
-    }
-
-    void process(float& left, float& right) override
-    {
-        if (!enabled) return;
-
-        if (age != appliedAge)
-            updateAge();
-
-        float mod = 0.0f;
-        if (age > 0.0f)
-            mod = age * transport.next(sampleRate);      // (full depth at AGE 1)
-
-        float d = timeSmooth.next(timeSec) * (float) sampleRate * (1.0f + mod);
-
-        float wetL = hpL.highPass(lpL.lowPass(lineL.readHermite(d)));
-        float wetR = hpR.highPass(lpR.lowPass(lineR.readHermite(d)));
-
-        float loopGain = feedback * MAX_LOOP_GAIN;
-        lineL.write(fxb::flushDenormal(record(left + wetL * loopGain)));
-        lineR.write(fxb::flushDenormal(record(right + wetR * loopGain)));
-
-        left = lerp(left, wetL, mix);
-        right = lerp(right, wetR, mix);
-    }
-
-private:
+    static constexpr int MAX_HEADS = 4;
     static constexpr float MAX_LOOP_GAIN = 1.1f;
 
-    // What goes onto the tape: soft saturation, unity gain for small signals, never beyond
-    // +/- 1 / drive.
-    float record(float x) const { return fxb::softSat(x * drive) / drive; }
+    TapeDelay() { seed(); }
 
-    void updateAge()
+protected:
+    const ParamSpec* cells() const override
     {
-        appliedAge = age;
-        drive = 1.0f + 2.0f * age;
-        float lpHz = 9000.0f * std::pow(2200.0f / 9000.0f, age);
-        float hpHz = 40.0f * std::pow(180.0f / 40.0f, age);
-        lpL.setCutoff(sampleRate, lpHz);
-        lpR.setCutoff(sampleRate, lpHz);
-        hpL.setCutoff(sampleRate, hpHz);
-        hpR.setCutoff(sampleRate, hpHz);
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "TIME", 0, MIN_TIME, MAX_TIME, 0.3f, K::Log, "s" },
+            { "FDBK", 1, 0, 1, 0.45f },
+            { "AGE", 2, 0, 1, 0.4f },
+            { "MIX", 3, 0, 1, 0.35f },
+            { "HEAD", 0, 1, (float) MAX_HEADS, 1, K::Int },
+            { "WIDE", 1, 0, 1, 0 },
+            { "SAT", 2, 0, (float) (sat::Count - 1), (float) sat::Fast, K::Choice, "", sat::names(), sat::Count },
+            { "READ", 3, 0, (float) (dly::read::Count - 1), 0, K::Choice, "", dly::read::names(), dly::read::Count } };
+        return c;
     }
+    int mixCell() const override { return Mix; }
+    dly::Core::Setup setup() const override { return {}; }      // (the core's own: two lines, Hermite, the filter before the line)
+    float lineSeconds() const override { return dly::roomFor(MAX_TIME, MAX_TIME); }
 
-    float timeSec = 0.3f;
-    float feedback = 0.45f;
-    float age = 0.4f;
-    float appliedAge = -1.0f;
-    float drive = 1.0f;
-
-    fxb::DelayLine lineL, lineR;
-    fxb::OnePole lpL, lpR, hpL, hpR;
-    fxb::Smoother timeSmooth;
-    fxb::TapeTransport transport;
+    void configure(const float* v) override
+    {
+        const float time = v[Time], age = v[Age];
+        dly::heads(core, time, (int) std::lround(v[4 + Head]), MAX_HEADS);
+        core.setFeedback(v[Feedback] * MAX_LOOP_GAIN);
+        core.setWide(v[4 + Wide] * dly::MAX_WIDE);
+        core.setTransport(age);                                 // (full depth at AGE 1)
+        core.setFilter(9000.0f * std::pow(2200.0f / 9000.0f, age), 40.0f * std::pow(180.0f / 40.0f, age));
+        core.setDrive(1.0f, 1.0f + 2.0f * age);
+        core.setCurve((int) std::lround(v[4 + Sat]), 0.0f);
+        setRead(v[4 + Read], time);
+    }
 };

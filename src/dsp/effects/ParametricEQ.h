@@ -1,53 +1,28 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "../DSPUtils.h"
+#include "CellEffect.h"
+#include "EqBand.h"
 #include <cmath>
 #include <array>
 
-// 5-band parametric EQ: low shelf, 3 parametric mids, high shelf.
-// Biquad filters using Robert Bristow-Johnson Audio EQ Cookbook formulas.
-// No heap allocation. All buffers pre-allocated as member arrays.
-class ParametricEQ : public EffectBase
+// Parametric EQ, EQ (and the master section's): low shelf, three peaks, high shelf, each a
+// fxb::EqBand (EqBand.h: RBJ cookbook biquads that glide to their settings and are not run at
+// 0 dB). The cells reach the two shelves and the middle peak; the two outer peaks (400 Hz and
+// 4 kHz, flat) are there for setParametric.
+//
+//   FX    LOW   low shelf gain          MID   middle peak gain
+//         MFRQ  middle peak frequency   HIGH  high shelf gain
+//   FX2   LFRQ  where the low shelf turns      MIDQ  width of the middle peak (0.1 wide .. 20 narrow)
+//         HFRQ  where the high shelf turns
+//
+// The cells are CellEffect's: every one moves with modulateCell, and glides (a swept MFRQ is a filter sweep, not a staircase).
+// Flat, the sound passes untouched, sample for sample: the master EQ of a project that has not
+// set it costs nothing and is part of the "P01 Keyboard" pin.
+// The slot's WET is not used.
+class ParametricEQ : public CellEffect
 {
 public:
-    ParamSpec getParamSpec(int index) const override
-    {
-        using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "LOW", 0, -18, 18, 0, K::Linear, "dB" };
-            case 1: return { "MID", 1, -18, 18, 0, K::Linear, "dB" };
-            case 2: return { "MFRQ", 2, 100, 8000, 1000, K::Log, "Hz" };
-            case 3: return { "HIGH", 3, -18, 18, 0, K::Linear, "dB" };
-            default: return {};
-        }
-    }
-
-    // FX-page view of the EQ: low shelf gain, middle band gain and frequency, high shelf gain.
-    void setParameter(int id, float value) override
-    {
-        switch (id)
-        {
-            case 0: setLowShelf(params[LowFreq], value); break;
-            case 1: setParametric(1, params[Mid2Freq], value, params[Mid2Q]); break;
-            case 2: setParametric(1, value, params[Mid2Gain], params[Mid2Q]); break;
-            case 3: setHighShelf(params[HighFreq], value); break;
-            default: break;
-        }
-    }
-
-    float getParameter(int id) const override
-    {
-        switch (id)
-        {
-            case 0: return params[LowGain];
-            case 1: return params[Mid2Gain];
-            case 2: return params[Mid2Freq];
-            case 3: return params[HighGain];
-            default: return 0.0f;
-        }
-    }
+    enum Cell { LowCell = 0, MidCell, MidFreqCell, HighCell, LowFreqCell, MidQCell, HighFreqCell };
 
     // Parameter indices matching the spec
     enum Param
@@ -70,205 +45,110 @@ public:
 
     ParametricEQ()
     {
-        // Default band settings
-        setLowShelf(80.0f, 0.0f);
-        setParametric(0, 400.0f, 0.0f, 1.0f);
-        setParametric(1, 1000.0f, 0.0f, 1.0f);
-        setParametric(2, 4000.0f, 0.0f, 1.0f);
-        setHighShelf(8000.0f, 0.0f);
+        bands[0].setShape(fxb::EqBand::LowShelf);
+        bands[4].setShape(fxb::EqBand::HighShelf);
+        seed();
     }
 
-    void prepare(double sr, int /*maxBlockSize*/) override
-    {
-        sampleRate = sr;
-        recalcAll();
-    }
-
-    void reset() override
-    {
-        for (auto& band : bands)
-            band.reset();
-    }
-
+    // ---- by name (the master section, tests) -------------------------------------------------
     // Low shelf: frequency (Hz), gain (dB)
     void setLowShelf(float freq, float gainDb)
     {
-        params[LowFreq] = std::clamp(freq, 20.0f, 2000.0f);
-        params[LowGain] = std::clamp(gainDb, -18.0f, 18.0f);
-        calcLowShelf();
+        if (! std::isfinite(freq) || ! std::isfinite(gainDb)) return;
+        setCell(LowFreqCell, freq);
+        setCell(LowCell, gainDb);
     }
 
     // High shelf: frequency (Hz), gain (dB)
     void setHighShelf(float freq, float gainDb)
     {
-        params[HighFreq] = std::clamp(freq, 2000.0f, 20000.0f);
-        params[HighGain] = std::clamp(gainDb, -18.0f, 18.0f);
-        calcHighShelf();
+        if (! std::isfinite(freq) || ! std::isfinite(gainDb)) return;
+        setCell(HighFreqCell, freq);
+        setCell(HighCell, gainDb);
     }
 
-    // Parametric band (index 0-2): frequency, gain (dB), Q
+    // Parametric band (index 0-2): frequency, gain (dB), Q. The middle one is the cells' (held to
+    // their ranges); the outer two have no cell and are set here alone.
     void setParametric(int idx, float freq, float gainDb, float q)
     {
         if (idx < 0 || idx > 2) return;
-        int base = Mid1Freq + idx * 3;
-        params[base] = std::clamp(freq, 20.0f, 20000.0f);
-        params[base + 1] = std::clamp(gainDb, -18.0f, 18.0f);
-        params[base + 2] = std::clamp(q, 0.1f, 20.0f);
-        calcParametric(idx);
+        if (! std::isfinite(freq) || ! std::isfinite(gainDb) || ! std::isfinite(q)) return;
+        if (idx == 1)
+        {
+            setCell(MidFreqCell, freq);
+            setCell(MidCell, gainDb);
+            setCell(MidQCell, q);
+            return;
+        }
+        outer[(size_t) (idx / 2)] = { std::clamp(freq, 20.0f, 20000.0f), std::clamp(gainDb, -18.0f, 18.0f), std::clamp(q, 0.1f, 20.0f) };
+        touch();
     }
 
     float getParam(int p) const
     {
-        if (p >= 0 && p < NumParams) return params[p];
-        return 0.0f;
+        switch (p)
+        {
+            case LowFreq:  return cell(LowFreqCell);
+            case LowGain:  return cell(LowCell);
+            case Mid2Freq: return cell(MidFreqCell);
+            case Mid2Gain: return cell(MidCell);
+            case Mid2Q:    return cell(MidQCell);
+            case HighFreq: return cell(HighFreqCell);
+            case HighGain: return cell(HighCell);
+            case Mid1Freq: case Mid1Gain: case Mid1Q: return outer[0][(size_t) (p - Mid1Freq)];
+            case Mid3Freq: case Mid3Gain: case Mid3Q: return outer[1][(size_t) (p - Mid3Freq)];
+            default:       return 0.0f;
+        }
     }
 
-    void process(float& left, float& right) override
+protected:
+    const ParamSpec* cells() const override
     {
-        if (!enabled) return;
+        using K = ParamKind;
+        static const ParamSpec c[CELLS] = {
+            { "LOW", 0, -18, 18, 0, K::Linear, "dB" },
+            { "MID", 1, -18, 18, 0, K::Linear, "dB" },
+            { "MFRQ", 2, 100, 8000, 1000, K::Log, "Hz" },
+            { "HIGH", 3, -18, 18, 0, K::Linear, "dB" },
+            { "LFRQ", 0, 20, 2000, 80, K::Log, "Hz" },
+            { "MIDQ", 1, 0.1f, 20, 1, K::Log, "" },
+            { "HFRQ", 2, 2000, 20000, 8000, K::Log, "Hz" },
+            {} };
+        return c;
+    }
+
+    void prepareCore() override
+    {
         for (auto& band : bands)
-        {
-            left = band.processL(left);
-            right = band.processR(right);
-        }
+            band.prepare(sampleRate);
+    }
+
+    void resetCore() override
+    {
+        for (auto& band : bands)
+            band.reset();
+    }
+
+    // The bands' targets from the cells (modulation included) and the two outer peaks.
+    void configure(const float* v) override
+    {
+        bands[0].set(v[LowFreqCell], SHELF_Q, v[LowCell]);
+        bands[1].set(outer[0][0], outer[0][2], outer[0][1]);
+        bands[2].set(v[MidFreqCell], v[MidQCell], v[MidCell]);
+        bands[3].set(outer[1][0], outer[1][2], outer[1][1]);
+        bands[4].set(v[HighFreqCell], SHELF_Q, v[HighCell]);
+    }
+
+    bool coasting() const override { return true; }     // (nothing here waits for controlCore(): the bands glide by themselves)
+    void runCore(float* left, float* right, int n, float, float) override
+    {
+        fxb::processBands(bands, left, right, n);
     }
 
 private:
     static constexpr int NUM_BANDS = 5;
-    static constexpr float PI = dsp::PI_F;
+    static constexpr float SHELF_Q = 0.707f;
 
-    // Biquad filter state for one channel
-    struct BiquadState
-    {
-        float x1 = 0.0f, x2 = 0.0f;
-        float y1 = 0.0f, y2 = 0.0f;
-    };
-
-    // Stereo biquad band
-    struct Band
-    {
-        float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
-        float a1 = 0.0f, a2 = 0.0f;
-        BiquadState stateL, stateR;
-
-        void reset()
-        {
-            stateL = {};
-            stateR = {};
-        }
-
-        float processL(float in) { return processSample(in, stateL); }
-        float processR(float in) { return processSample(in, stateR); }
-
-        float processSample(float in, BiquadState& s) const
-        {
-            float out = b0 * in + b1 * s.x1 + b2 * s.x2
-                                - a1 * s.y1 - a2 * s.y2;
-            s.x2 = s.x1;
-            s.x1 = in;
-            s.y2 = s.y1;
-            s.y1 = out;
-            return out;
-        }
-    };
-
-    std::array<Band, NUM_BANDS> bands;
-    std::array<float, NumParams> params {};
-
-    void recalcAll()
-    {
-        calcLowShelf();
-        calcParametric(0);
-        calcParametric(1);
-        calcParametric(2);
-        calcHighShelf();
-    }
-
-    // RBJ low-shelf biquad
-    void calcLowShelf()
-    {
-        float freq = params[LowFreq];
-        float gainDb = params[LowGain];
-        auto& b = bands[0];
-
-        if (std::abs(gainDb) < 0.01f)
-        {
-            b.b0 = 1.0f; b.b1 = 0.0f; b.b2 = 0.0f;
-            b.a1 = 0.0f; b.a2 = 0.0f;
-            return;
-        }
-
-        float A = std::pow(10.0f, gainDb / 40.0f);
-        float w0 = 2.0f * PI * freq / (float)sampleRate;
-        float cosw0 = std::cos(w0);
-        float sinw0 = std::sin(w0);
-        float alpha = sinw0 / (2.0f * 0.707f);
-        float sqrtA = std::sqrt(A);
-
-        float a0 = (A + 1.0f) + (A - 1.0f) * cosw0 + 2.0f * sqrtA * alpha;
-        b.b0 = A * ((A + 1.0f) - (A - 1.0f) * cosw0 + 2.0f * sqrtA * alpha) / a0;
-        b.b1 = 2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosw0) / a0;
-        b.b2 = A * ((A + 1.0f) - (A - 1.0f) * cosw0 - 2.0f * sqrtA * alpha) / a0;
-        b.a1 = -2.0f * ((A - 1.0f) + (A + 1.0f) * cosw0) / a0;
-        b.a2 = ((A + 1.0f) + (A - 1.0f) * cosw0 - 2.0f * sqrtA * alpha) / a0;
-    }
-
-    // RBJ high-shelf biquad
-    void calcHighShelf()
-    {
-        float freq = params[HighFreq];
-        float gainDb = params[HighGain];
-        auto& b = bands[4];
-
-        if (std::abs(gainDb) < 0.01f)
-        {
-            b.b0 = 1.0f; b.b1 = 0.0f; b.b2 = 0.0f;
-            b.a1 = 0.0f; b.a2 = 0.0f;
-            return;
-        }
-
-        float A = std::pow(10.0f, gainDb / 40.0f);
-        float w0 = 2.0f * PI * freq / (float)sampleRate;
-        float cosw0 = std::cos(w0);
-        float sinw0 = std::sin(w0);
-        float alpha = sinw0 / (2.0f * 0.707f);
-        float sqrtA = std::sqrt(A);
-
-        float a0 = (A + 1.0f) - (A - 1.0f) * cosw0 + 2.0f * sqrtA * alpha;
-        b.b0 = A * ((A + 1.0f) + (A - 1.0f) * cosw0 + 2.0f * sqrtA * alpha) / a0;
-        b.b1 = -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cosw0) / a0;
-        b.b2 = A * ((A + 1.0f) + (A - 1.0f) * cosw0 - 2.0f * sqrtA * alpha) / a0;
-        b.a1 = 2.0f * ((A - 1.0f) - (A + 1.0f) * cosw0) / a0;
-        b.a2 = ((A + 1.0f) - (A - 1.0f) * cosw0 - 2.0f * sqrtA * alpha) / a0;
-    }
-
-    // RBJ peakingEQ biquad
-    void calcParametric(int idx)
-    {
-        int base = Mid1Freq + idx * 3;
-        float freq = params[base];
-        float gainDb = params[base + 1];
-        float q = params[base + 2];
-        auto& b = bands[1 + idx];
-
-        if (std::abs(gainDb) < 0.01f)
-        {
-            b.b0 = 1.0f; b.b1 = 0.0f; b.b2 = 0.0f;
-            b.a1 = 0.0f; b.a2 = 0.0f;
-            return;
-        }
-
-        float A = std::pow(10.0f, gainDb / 40.0f);
-        float w0 = 2.0f * PI * freq / (float)sampleRate;
-        float cosw0 = std::cos(w0);
-        float sinw0 = std::sin(w0);
-        float alpha = sinw0 / (2.0f * q);
-
-        float a0 = 1.0f + alpha / A;
-        b.b0 = (1.0f + alpha * A) / a0;
-        b.b1 = (-2.0f * cosw0) / a0;
-        b.b2 = (1.0f - alpha * A) / a0;
-        b.a1 = (-2.0f * cosw0) / a0;
-        b.a2 = (1.0f - alpha / A) / a0;
-    }
+    std::array<fxb::EqBand, NUM_BANDS> bands;
+    std::array<std::array<float, 3>, 2> outer {{ { 400.0f, 0.0f, 1.0f }, { 4000.0f, 0.0f, 1.0f } }};    // frequency, gain, Q
 };

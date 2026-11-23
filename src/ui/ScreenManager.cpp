@@ -348,28 +348,35 @@ void ScreenManager::controlChangeReceived(int channel, int cc, int value)
         return;
     }
 
-    // ---- Scale: scale lock; Shift + Scale = the SCALE screen ---------------------------------------
+    // ---- Scale: tap toggles lock; hold + Up / Down steps scale pages; Shift = SCALE screen --------
     if (channel == FEATURE_CHANNEL && cc == CC_SCALE)
     {
-        scaleHeld = pressed;
         if (pressed)
         {
+            scaleHeld = true;
+            scaleLayerUsed = false;
             lastEdit = Edit::None;
             if (shiftHeld)
             {
                 setActiveScreen(roleScreen(scaleScreenIndex, "SCALE"));
+                scaleLayerUsed = true;      // Shift + Scale = screen, not a lock toggle on release
             }
-            else
+        }
+        else
+        {
+            scaleHeld = false;
+            if (!scaleLayerUsed)
             {
+                // A plain tap (nothing used while held): toggle the scale lock.
                 scaleLocked = !scaleLocked;
                 if (scaleToggleCallback)
                     scaleToggleCallback(scaleLocked);
                 juce::Logger::writeToLog("[Scale] " + juce::String(scaleLocked ? "ON" : "OFF"));
                 scaleLockChanged();
             }
-            needsRedraw = true;
-            redrawIfNeeded();
         }
+        needsRedraw = true;
+        redrawIfNeeded();
         return;
     }
 
@@ -411,6 +418,30 @@ void ScreenManager::controlChangeReceived(int channel, int cc, int value)
         if (pressed)
         {
             lastEdit = Edit::None;
+            // Scale + Up / Down: step through scale pages.
+            if (scaleHeld && scalePageStep)
+            {
+                scaleLayerUsed = true;
+                const auto name = scalePageStep(up ? -1 : 1);
+                // Turn on the lock if it was off, so the stepped page takes effect at once.
+                if (!scaleLocked)
+                {
+                    scaleLocked = true;
+                    if (scaleToggleCallback)
+                        scaleToggleCallback(true);
+                }
+                juce::StringArray texts;
+                if (name.isNotEmpty())
+                {
+                    texts.add("SCALE " + name);
+                    texts.add(name);
+                }
+                texts.add("SCALE PAGE");
+                showMessage(texts, LONG_MESSAGE_MS);
+                needsRedraw = true;
+                redrawIfNeeded();
+                return;
+            }
             if (shiftHeld)
                 selectTrack(currentTrack() + (up ? -1 : 1));
             else if (funcHeld)
@@ -730,6 +761,8 @@ void ScreenManager::leaveRecording()
     if (!isRecordArmed())
         return;
     setRecordArmed(false);
+    // A pinned pad screen (DRUMS, SCALE) is unpinned: the pads go to STEP now.
+    pinnedIndex = -1;
     showMessage("REC OFF");
 
     if (sequencer == nullptr)
@@ -791,11 +824,17 @@ void ScreenManager::handleRecord(bool pressed)
                 sequencer->setFillActive(false);
         }
         // Plain Record acts when it is let go, so that Record + Play is not also a plain Record.
+        // A hold that showed the help card and was not used for anything else does nothing on
+        // release (the reader held it to read the card). A tap still toggles.
         if (recordHeld)
         {
+            // The card was showing, undismissed, at the moment of release: the user held it to read.
+            const bool cardUp = helpKey == HelpKey::Record && !helpDismissed
+                             && helpMode != HelpMode::Off
+                             && nowMs() - helpPressMs >= helpDelayMs;
             recordHeld = false;
-            helpKeyChanged(HelpKey::Record, false);     // (its card never takes the release: see the table)
-            if (!recordUsed)
+            helpKeyChanged(HelpKey::Record, false);
+            if (!recordUsed && !cardUp)
             {
                 if (isRecordArmed())
                     leaveRecording();
@@ -1996,6 +2035,23 @@ std::vector<std::pair<int, int>> ScreenManager::getHeldKeys() const
     return keys;
 }
 
+std::vector<std::pair<int, int>> ScreenManager::getPhysicallyHeldKeys() const
+{
+    std::vector<std::pair<int, int>> keys;
+    for (int i = 0; i < physicallyHeldCount; ++i)
+    {
+        const int note = physicallyHeldNotes[i];
+        if (note < 0 || note >= 128) continue;
+        const int sounding = keySounding[(size_t) note] >= 0 ? (int) keySounding[(size_t) note] : note;
+        bool found = false;
+        for (auto& k : keys)
+            if (k.first == sounding) { found = true; break; }
+        if (!found)
+            keys.push_back({ sounding, juce::jmax(1, (int) keyVelocity[(size_t) note]) });
+    }
+    return keys;
+}
+
 void ScreenManager::addPhysicalNote(int note)
 {
     for (int i = 0; i < physicallyHeldCount; ++i)
@@ -2371,8 +2427,8 @@ const ScreenManager::HelpKeyDef& ScreenManager::helpKeyDef(HelpKey key)
         // Up / Down: a tap pages on release; a hold that showed the card does not.
         { HelpKey::Track,   "Up / Down", HELP_DELAY_MS, false, { { "UP DOWN: TRACKS",  &ScreenManager::buildTrackPads },
                                                                  { "UP DOWN: KNOBS",   &ScreenManager::buildTrackKnobs } } },
-        // Record: one chord, not a layer; letting go switches recording on / off as always.
-        { HelpKey::Record,  "Record",    HELP_DELAY_MS, true,  { { "RECORD",           &ScreenManager::buildRecord } } },
+        // Record: one chord, not a layer; a hold that showed the card does NOT arm recording.
+        { HelpKey::Record,  "Record",    HELP_DELAY_MS, false, { { "RECORD",           &ScreenManager::buildRecord } } },
     };
     static const HelpKeyDef none { HelpKey::None, "", HELP_DELAY_MS, false, {} };
     for (auto& row : table)

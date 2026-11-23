@@ -38,6 +38,18 @@ namespace GrammarHooks
         return juce::String(names[root]) + " " + juce::String(scales.getPageName(scales.getActivePage())).toUpperCase();
     }
 
+    // Whatever replaces steps wholesale or makes a step vector longer keeps the audio thread out
+    // (it only tries the lock, and skips a block): AudioEngine::structure(), as the sequencer, the
+    // length knob and the screens are handed it (StructureLockFn, sequencer/Track.h).
+    inline StructureLockFn structureLock(AudioEngine& audio)
+    {
+        return [eng = &audio](const std::function<void()>& work)
+        {
+            const AudioEngine::StructureLock lock(eng->structure());
+            work();
+        };
+    }
+
     inline ScreenManager::EngineHooks make(SequencerCore& sequencer, AudioEngine& audio,
                                            std::function<void(float)> tempoChanged = nullptr)
     {
@@ -82,29 +94,36 @@ namespace GrammarHooks
                 const int type1 = juce::jlimit(1, (int) EffectType::NumEffectTypes, (int) std::lround(it->second));
                 eng->addInsertEffect(t, static_cast<EffectType>(type1 - 1));
             }
+            // A sound captured before tracks had an input has none.
+            for (int id : AudioEngine::TRACK_IN_IDS)
+                if (params.find(id) == params.end())
+                    eng->setTrackParameter(t, id, AudioEngine::trackInDefault(id));
             eng->applyAllTrackParameters(t, params);
         };
 
         // The effects part of a sound (Func + Record / Play / > on TRK FX): the insert slots (their
-        // parameters, types and switches), the DIRT / TALK / MODFX blocks, the arp locks, and the
-        // pressure ranges set on any of those. Not the mixer: VOL, PAN and the sends stay.
+        // parameters, types and switches), the DIRT / TALK / MODFX blocks, the arp locks, the track's
+        // input (page IN), and the pressure ranges set on any of those. Not the mixer: VOL, PAN and
+        // the sends stay.
         h.isFxParam = [](int id)
         {
             const int target = RangeParam::isRangeParam(id) ? RangeParam::targetOf(id) : id;
             return (target >= AudioEngine::EFFECT_PARAM_BASE
                     && target < ProjectBridge::INSERT_TYPE_BASE + AudioEngine::MAX_INSERTS_PER_TRACK)
                 || TrackFxParam::isTrackFxParam(target) || AudioEngine::isArpLockParam(target)
-                || AudioEngine::isInsertSwitchParam(target) || AudioEngine::isInsertExtraParam(target);
+                || AudioEngine::isInsertSwitchParam(target) || AudioEngine::isInsertExtraParam(target)
+                || TrackInParam::contains(target);
         };
-        // Cleared: the three blocks at their defaults (off), no insert slots, the arp locks off.
+        // Cleared: no insert slots, the old TrackFx params zeroed, the arp locks off, no input.
         h.fxDefaults = [](ParamMap& sound)
         {
-            const TrackFx defaults;
             for (int id = TrackFxParam::DIRT_BASE; id < TrackFxParam::END; ++id)
-                sound[id] = defaults.get(id);
+                sound[id] = 0.0f;
             sound[AudioEngine::ARP_LOCK_BASE + 0] = -0.02f;     // gate: follow the arpeggiator
             sound[AudioEngine::ARP_LOCK_BASE + 1] = -0.02f;     // velocity
             sound[AudioEngine::ARP_LOCK_BASE + 2] = 0.0f;       // ratchet count
+            for (int id : AudioEngine::TRACK_IN_IDS)
+                sound[id] = AudioEngine::trackInDefault(id);
         };
         h.engineType = [seq, eng](int t)
         {
@@ -114,11 +133,7 @@ namespace GrammarHooks
                                                                    : EngineType::UnifiedVoice;
         };
         // Whatever replaces steps wholesale (a pattern cleared, an undo) keeps the audio thread out.
-        h.structureLocked = [eng](const std::function<void()>& work)
-        {
-            const AudioEngine::StructureLock lock(eng->structure());
-            work();
-        };
+        h.structureLocked = structureLock(audio);
 
         h.tempoChanged = std::move(tempoChanged);
         return h;

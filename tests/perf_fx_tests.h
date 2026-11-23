@@ -401,7 +401,9 @@ public:
 
             frozen(1.0f, heldSpiral, releasedSpiral, 8.0f);
             frozen(0.0f, held, released, 8.0f);
-            const float plain = brightness(released, 48000, 96000), climbing = brightness(releasedSpiral, 48000, 96000);
+            // (Where it is heard: within half a second of the release everything has climbed out, and a
+            // second later what is left is a residue 100 dB down, old FRZ and new alike.)
+            const float plain = brightness(released, 4800, 28800), climbing = brightness(releasedSpiral, 4800, 28800);
             expect(climbing > 1.5f * plain, "SPRL: the tail climbs away (" + juce::String(plain) + " -> " + juce::String(climbing) + ")");
 
             // Everything up, loud, for a long time.
@@ -917,7 +919,7 @@ public:
             PerfFxRack& rack = r.rack();
             const auto good = rack.toFlat();
             const size_t head = 6, perLayer = (size_t) LAYER_FIELDS, perPad = (size_t) PAD_FIELDS + (size_t) LAYERS * perLayer;
-            expectEquals((int) good.size(), (int) (head + PADS * perPad));
+            expectEquals((int) good.size(), (int) (head + PADS * PerfFx::NUM_BANKS * perPad));
             expect(! rack.fromFlat({}) && ! rack.fromFlat({ 7.0f, 1.0f, 16.0f, 4.0f, 3.0f, 20.0f }) && rack.toFlat() == good, "not a list of pads: nothing changes");
             auto bad = good;
             for (size_t i = head; i < bad.size(); ++i)
@@ -971,13 +973,26 @@ public:
             expectEquals(r.mgr.getActiveScreen()->getName(), juce::String("OTHER"));
             r.shift(true); r.padOn(14); r.padOff(14); r.shift(false);
             expectEquals(r.mgr.getActiveScreen()->getName(), juce::String("PERF"));
-            expectEquals(r.screen->getSubPage(), juce::String("DUB>MSTR"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 FX"), "the bank and the knob page");
+            // In the name bar it is there whole, on every page ("B1 DUB>MSTR" and "B1 PRESSURE" were
+            // cut to "B1": eight characters are what the bar has beside "PERF T1" and the page mark).
+            UiClock::advance(3000);
+            for (const char* page : { "B1 FX", "B1 PRESS", "B1 PRES", "B1 MORE" })
+            {
+                expectEquals(r.mgr.composeNameBar().text, juce::String(page));
+                expectEquals(r.mgr.composeNameBar().left, juce::String("PERF T1"));
+                r.tap(52);
+            }
+            expectEquals(r.mgr.composeNameBar().pages, juce::String("1/4"), "once round");
 
             r.seq.setSelectedTrack(2);
             r.padOn(10);
             expect(r.rack().isDown(10));
             expectEquals(r.rack().actingOn(10), 2, "a SEL pad takes the selected track");
-            expectEquals(r.screen->getSubPage(), juce::String("RPT>SEL"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 FX"), "the pad just pressed is on the knobs, on the same page");
+            expectEquals(juce::String(AudioEngine::perfKindName(r.rack().get(10, 0).kind)) + ">" + PerfFxScreen::targetName(r.rack().get(10, 0).target), juce::String("RPT>SEL"));
+            expectEquals(r.screen->getEncoderName(0), juce::String("TRK"));
+            expectEquals(r.screen->getEncoderName(1), juce::String("FX"), "what the layer is and acts on are the page's first two cells");
             expectEquals(r.screen->getEncoderName(4), juce::String("DIV"), "the effect's own cells are on knobs 5 to 8");
             r.padOff(10);
             expect(! r.rack().isDown(10));
@@ -1005,7 +1020,7 @@ public:
             auto lay = [&r]() -> const PerfFx::Layer& { return r.rack().get(0, 0); };
             r.padOn(0); r.padOff(0);                    // an empty pad, shown
             UiClock::advance(2000);
-            expectEquals(r.screen->getSubPage(), juce::String("A EMPTY"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 FX"));
             r.turn(2, 1);
             expectEquals(r.screen->getSubPage(), juce::String("NO EFFECT"));
             UiClock::advance(2000);
@@ -1018,7 +1033,8 @@ public:
             expectEquals(lay().target, (int) MASTER);
             r.turn(0, 3);
             expectEquals(lay().target, TRACK_BASE + 2);
-            expectEquals(r.screen->getSubPage(), juce::String("FRZ>T3"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 FX"));
+            expectEquals(PerfFxScreen::targetName(lay().target), juce::String("T3"));
             r.turn(0, 60);
             expectEquals(lay().target, TRACK_BASE + r.seq.getPattern().getTrackCount() - 1, "no further than the last track");
 
@@ -1044,11 +1060,29 @@ public:
             const int division = lay().division;
             r.turn(4, 1);
             expectEquals(lay().division, division + 1, "TIME turns the division while SYNC is on");
+            r.turn(4, 60);
+            expectEquals(lay().division, FxSync::NUM_DIVISIONS - 1, "and reaches the table's last division, 16BAR");
+            {
+                // and names it: the value text of knob 5 reads "16BAR" (a cell offering fewer names
+                // than the table would show another name)
+                DisplayRenderer shown, expected;
+                r.screen->render(shown);
+                ParamGrid::drawCell(expected, 4, { "TIME", 4, 0, (float) (FxSync::NUM_DIVISIONS - 1), 0.0f, ParamKind::Choice, "",
+                                                   FxSync::divisionLabels(), FxSync::NUM_DIVISIONS },
+                                    (float) (FxSync::NUM_DIVISIONS - 1), "TIME");
+                bool same = true;
+                for (int y = ParamGrid::ROW2_Y + 13; y < ParamGrid::ROW2_Y + 21; ++y)
+                    for (int x = 0; x < ParamGrid::CELL_W; ++x)
+                        same = same && shown.getPixel(x, y) == expected.getPixel(x, y);
+                expect(same, "knob 5 reads 16BAR");
+            }
+            r.turn(4, -60);
+            expectEquals(lay().division, 0, "and its first, 1/128");
 
             // PRESS: the pad's latch and grid, then an amount for WET (knob 4) and each value (knobs 5 - 8).
             r.tap(52);
             expectEquals(r.screen->getPageIndex(), 1);
-            expectEquals(r.screen->getSubPage(), juce::String("PRESS"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 PRESS"));
             for (int knob = 3; knob < 8; ++knob)
             {
                 static const char* const names[] = { "WET", "TIME", "FDBK", "TONE", "DRIV" };
@@ -1064,12 +1098,15 @@ public:
             expectWithinAbsoluteError(lay().press[3], -0.2f, 0.011f);
             r.turn(3, -10);
             expectWithinAbsoluteError(lay().press[WET_VALUE], -0.1f, 0.011f);
+            // Knob 2 is the LY cell: it changes the layer. Turn to layer B and back to A.
             r.turn(2, 1);
-            expectEquals(r.screen->getSubPage(), juce::String("PRESS"), "a knob with nothing over it does nothing");
+            expectEquals(r.screen->getShownLayer(), 1, "LY cell on PRESS page switches layer");
+            r.turn(2, -1);  // back to A
+            expectEquals(r.screen->getShownLayer(), 0);
 
             // PRES: the curve, and the same five amounts for pressure. A press and pressure can both move one value.
             r.tap(52);
-            expectEquals(r.screen->getSubPage(), juce::String("PRESSURE"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 PRES"));
             expectEquals(r.screen->getEncoderName(5), juce::String("FDBK"));
             r.turn(0, 2);
             expectEquals(r.rack().get(0).pressureCurve, (int) HARD);
@@ -1084,7 +1121,7 @@ public:
 
             // MORE: SYNC and DIV; an effect with no time of its own cannot be put in time.
             r.tap(52);
-            expectEquals(r.screen->getSubPage(), juce::String("MORE"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 MORE"));
             r.turn(0, -1);
             expect(! lay().sync);
             r.rack().setKind(0, 0, insert(EffectType::DriveEffect));
@@ -1103,25 +1140,29 @@ public:
             expectEquals(lay().kind, insert(EffectType::DriveEffect), "and undo brings it back");
         }
 
-        beginTest("Layers: Up / Down choose the layer on the knobs; one press plays every layer of the pad");
+        beginTest("Layers: the LY cell on PRESS chooses the layer on the knobs; one press plays every layer of the pad");
         {
             Rig r;
             r.audio.loadFactoryPerfPads();
             r.mgr.setActiveScreen(1);
             r.padOn(0); r.padOff(0);                    // DUB on the mix
             expectEquals(r.screen->getShownLayer(), 0);
-            r.tap(107);                                 // Down: layer B
+            // Go to PRESS page (bank down = ArrowRight = next page), turn LY (knob 2) to layer B.
+            r.tap(52);                                  // ArrowRight: PRESS page
+            r.turn(2, 1);                               // LY: layer B
             expectEquals(r.screen->getShownLayer(), 1);
-            expectEquals(r.screen->getSubPage(), juce::String("B EMPTY"));
+            expectEquals(r.screen->getSubPage(), juce::String("B1 PRESS"));
             UiClock::advance(2000);
+            r.tap(51);                                  // ArrowLeft: back to FX page
             r.turn(1, 3);                               // FX: RPT on layer B
             expectEquals(r.rack().get(0, 1).kind, (int) RPT);
             expectEquals(r.rack().get(0, 0).kind, (int) DUB, "layer A is as it was");
             r.turn(0, 2);                               // TRK: T1, for this layer alone
             expectEquals(r.rack().get(0, 1).target, (int) TRACK_BASE);
             expectEquals(r.rack().get(0, 0).target, (int) MASTER);
-            expectEquals(r.screen->getSubPage(), juce::String("RPT>T1"));
-            r.tap(52);                                  // PRESS: this layer's amounts
+            expectEquals(r.screen->getSubPage(), juce::String("B1 FX"));
+            expectEquals(PerfFxScreen::targetName(r.rack().get(0, 1).target), juce::String("T1"));
+            r.tap(52);                                  // ArrowRight: PRESS page
             expectEquals(r.screen->getEncoderName(4), juce::String("DIV"));
             r.turn(4, 50);
             expectWithinAbsoluteError(r.rack().get(0, 1).press[0], 0.5f, 0.011f);
@@ -1133,9 +1174,10 @@ public:
             expectEquals(r.screen->getShownLayer(), 1, "playing the shown pad keeps its layer on the knobs");
             r.padOff(0);
 
-            r.tap(106);                                 // Up: back to A
+            // Switch layer via LY cell back to A, and then to D.
+            r.turn(2, -1);                              // LY: back to A
             expectEquals(r.screen->getShownLayer(), 0);
-            r.tap(106);                                 // and round to D
+            r.turn(2, 3);                               // LY: to D
             expectEquals(r.screen->getShownLayer(), 3);
             // Another pad: its first effect is shown.
             r.rack().clear(6);
@@ -1152,7 +1194,7 @@ public:
             r.mgr.setActiveScreen(1);
             using Edit = ScreenManager::Edit;
             r.padOn(1); r.padOff(1);
-            expect(r.mgr.getEditPlan(Edit::Clear).names.contains("PERF PAD 2"), r.mgr.getEditPlan(Edit::Clear).names.joinIntoString("|"));
+            expect(r.mgr.getEditPlan(Edit::Clear).names.contains("PERF B1 PAD 2"), r.mgr.getEditPlan(Edit::Clear).names.joinIntoString("|"));
             r.edit(117);                                // Func + Record: copy
             UiClock::advance(3000);
             r.padOn(12); r.padOff(12);

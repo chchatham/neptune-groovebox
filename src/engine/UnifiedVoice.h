@@ -6,7 +6,7 @@
 #include "../dsp/EnvelopeChain.h"
 #include "../dsp/LFO.h"
 #include "../dsp/filters/FilterSlot.h"
-#include "../dsp/ModMatrix.h"
+#include "ModRouter.h"
 #include "WavetableEngine.h"       // Wavetable, WavetableFactory: the tables an oscillator slot can play
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <algorithm>
@@ -106,8 +106,13 @@ namespace UnifiedParam
     static constexpr int srcA(int osc) { return osc == 0 ? SRC_A1 : (osc == 1 ? SRC_A2 : SRC_A3); }
     static constexpr int srcB(int osc) { return osc == 0 ? SRC_B1 : (osc == 1 ? SRC_B2 : SRC_B3); }
 
-    // One past the last id (EngineParamRange: 0..149 and 158..189). Unused: 148, 149,
-    // 158..173; 150..157 are not engine ids at all.
+    // The track's input at audio rate (TRK FX page IN; the XIN page). XIN is a stored index, append
+    // only: 0 OFF, 1 PM, 2 RING, 3 SYNC (UnifiedVoice::XinMode).
+    static constexpr int XIN = 148;
+    static constexpr int XIN_DEPTH = 149;      // 0..1 (XDPT)
+
+    // One past the last id (EngineParamRange: 0..149 and 158..189). Unused: 158..173; 150..157
+    // are not engine ids at all.
     static constexpr int MAX_ID = 190;
 }
 
@@ -201,6 +206,7 @@ public:
         filterSlot.setSampleRate(sr);
         envChain.setSampleRate(sr);
         lfoBank.setSampleRate(sr);
+        rm.prepare(sr);
         lfoAmpSlew.setSampleRate(sr);
         lfoPanSlew.setSampleRate(sr);
         declick.setSampleRate(sr);
@@ -324,6 +330,39 @@ public:
         return names.text.data();
     }
 
+    // What the DEST cell of an LFO page offers: the list above, then the cells of the effects on
+    // the track (E4, mod::TrackDest: the engine hands such an LFO to the router's slot, whatever
+    // its WHL / VEL / PRES amounts). Stored by index: both parts only grow at the end, and the
+    // first must not grow again before a DEST is stored by name (format 3).
+    static constexpr int NUM_LFO_CELL_DESTS = (int) LfoDest::Count + mod::TrackDest::COUNT;
+    static const char* const* lfoDestCellLabels()
+    {
+        struct Names
+        {
+            std::array<const char*, (size_t) NUM_LFO_CELL_DESTS> text {};
+            std::array<int, (size_t) LfoDest::Count + mod::TrackDest::GROUPS> starts {};
+            int numStarts = 0;
+        };
+        static const Names names = []
+        {
+            Names n;
+            const char* const* own = lfoDestLabels();
+            for (int i = 0; i < (int) LfoDest::Count; ++i)
+                n.text[(size_t) i] = own[i];
+            if (const auto* groups = ChoiceGroups::find(own))
+                for (int g = 0; g < groups->count; ++g)
+                    n.starts[(size_t) n.numStarts++] = groups->starts[g];
+            for (int g = 0; g < mod::TrackDest::GROUPS; ++g)
+                n.starts[(size_t) n.numStarts++] = (int) LfoDest::Count + mod::TrackDest::groupStart(g);
+            for (int i = 0; i < mod::TrackDest::COUNT; ++i)
+                n.text[(size_t) ((int) LfoDest::Count + i)] = mod::TrackDest::labels()[i];
+            return n;
+        }();
+        static const bool registered = (ChoiceGroups::add(names.text.data(), names.starts.data(), names.numStarts), true);
+        juce::ignoreUnused(registered);
+        return names.text.data();
+    }
+
     // ---- What the extra envelopes (MENV) can be sent to -----------------------------------------
     // Their DEST keeps its four original values (AMP, CUT, PTCH as they always worked, and OFF)
     // and goes on with the LFOs' list without the three it already has: the envelopes then act
@@ -373,6 +412,34 @@ public:
         return d == LfoDest::CrossMod || d == LfoDest::FilterFM;
     }
 
+    // ---- The modulation router's table (UnifiedVoiceEngine::routerDests) -------------------------
+    // Its first LfoDest::Count entries ARE the LFOs' list above, index for index (an LFO's stored
+    // DEST means the same entry on either path), in the same units: PTCH and PIT2 in octaves
+    // (an LFO at depth d moves them d octaves, 12 d semitones, as it always did: not squared), CUT
+    // and CUTB in octaves (4 a unit), RESO / MIX / PW in their old shares (0.5, 0.5, 0.4 a unit),
+    // the levels as gains (1 + sum), XMOD / FFM / PAN as amounts; RAT1 .. DPT4 are the router's
+    // lfoCell entries; the page cells are the cells themselves, except the six SRC cells, which are
+    // offsets of -1 .. 1 that the voice turns into its own cells by the oscillator's kind (a slot's
+    // WT table moves by TABLE_ROUTE_SPAN, an FM ratio by 11, everything else by its range).
+    // After them, new: PM / RING / SYNC (what the old XIN cell did, now any slot's: the track input
+    // through the XIN page above all) and ETIM / FTIM (the envelopes' time, Envelope::setTimeScale).
+    //   PM    oscillator 1's phase along the cross-modulation path: the leaky running sum of the
+    //         buffer, in carrier cycles (the input at amount d is the old XIN PM at XDPT d)
+    //   RING  the mixer's output (before DRIV) times the buffer, a gain of 1 + sum: XIN at d and
+    //         ONE at -d is the old ring at XDPT d, (1 - d) + d x
+    //   SYNC  oscillator 1 starts its cycle again when the buffer rises through +SYNC_LEVEL after
+    //         having been below -SYNC_LEVEL: the amount is the sensitivity
+    enum RouterDest
+    {
+        RPitch = (int) LfoDest::Pitch, RCutoff, RReso, RMix, RAmp, RPw, RXmod, RCutoffB, RPan,
+        RLevel1, RLevel2, RLevel3, RNoise, RFilterFm, RPitch2,
+        RFirstParam = (int) LfoDest::FirstParam,
+        RSrcA1 = RFirstParam + 5, RSrcB1, RSrcA2, RSrcB2, RSrcA3, RSrcB3,
+        RPm = (int) LfoDest::Count, RRing, RSync, REnvTime, RFilterTime,
+        NUM_ROUTER_DESTS
+    };
+    static constexpr float SYNC_LEVEL = 0.005f;     // = xinSyncThreshold(1): XDPT 100 of the old cell at amount 1
+
     enum class GlideMode { Always, Legato };
 
     void setNote(int note, float velocity)
@@ -403,6 +470,7 @@ public:
         baseFrequency = pitchToHz(currentPitch);
         for (int i = 0; i < LFOBank::MAX_LFOS; ++i)
             lfoBank.getLFO(i).setKeyNote((float) note);
+        // (The router's KEY stays the note that started the voice: mod::Voice has no legato note.)
     }
 
     void noteOn()
@@ -418,6 +486,7 @@ public:
             gainDeclick.arm();
         }
         finishLfoClosings();        // a new note takes every destination as it stands
+        routerNote = true;          // (the router's side of the note: at the next render, before its tick)
         struck = true;              // ... and every glided value (glide)
         // Per-note component spread: pitch, cutoff and envelope times are each a little different
         // on every note, as on a polysynth whose voices are never identical.
@@ -428,11 +497,15 @@ public:
             auto& rng = juce::Random::getSystemRandom();
             noteSlopSemis = (rng.nextFloat() * 2.0f - 1.0f) * analog.slopCents / 100.0f;
             noteFilterOct = (rng.nextFloat() * 2.0f - 1.0f) * analog.filterVariance;
+            // EVAR: the envelopes' times x this for the note, through Envelope::setTimeScale (the
+            // same product, time x factor, then the 1 ms floor, as the scaled copy of the params
+            // it replaces). Drawn exactly when the copy was, so the system random's draws keep
+            // their order (P01's seeded family pins it).
             if (haveBaseEnvelopes && (analog.envVariance > 0.0f || envelopesScaled))
             {
-                float scale = std::exp2((rng.nextFloat() * 2.0f - 1.0f) * analog.envVariance);
-                ampEnv.setParams(scaledEnvelope(baseAmpEnv, scale));
-                filterEnv.setParams(scaledEnvelope(baseFilterEnv, scale));
+                noteEnvScale = std::exp2((rng.nextFloat() * 2.0f - 1.0f) * analog.envVariance);
+                ampEnv.setTimeScale(noteEnvScale * ampTimeMod);
+                filterEnv.setTimeScale(noteEnvScale * filterTimeMod);
                 envelopesScaled = analog.envVariance > 0.0f;
             }
         }
@@ -483,37 +556,14 @@ public:
     bool isActive() const { return active; }
     bool isGateOpen() const { return active && ampEnv.getStage() != Envelope::Stage::Release; }
 
-    // Feed all modulation sources into the ModMatrix and read modulated values
-    // for key voice parameters. Called once per sample inside process().
+    // One sample of what the LFOs, the mod slots and the extra envelopes add to the voice's fixed
+    // destinations (the five outputs start at zero). Called once per sample inside process().
     void processModulation(float& pitchOffsetSemitones, float& cutoffMod,
                            float& resonanceMod, float& oscMixMod, float& ampMod)
     {
-        // Feed LFO outputs into ModMatrix sources (on their leads: a matrix route to a level or
-        // the cutoff may not jump either)
+        juce::ignoreUnused(cutoffMod);
         int lfoCount = lfoBank.getActiveCount();
-        for (int i = 0; i < lfoCount && i < 5; ++i)
-            modMatrix.setSourceValue(static_cast<ModSource>(static_cast<int>(ModSource::LFO1) + i),
-                                     i < LFOBank::MAX_LFOS ? lfoHeard[(size_t) i] : lfoBank.getOutput(i));
-
-        // Feed envelope chain output
         float envOutput = envChain.getLastOutput();
-        modMatrix.setSourceValue(ModSource::Env1, envOutput);
-
-        // Set performance sources
-        modMatrix.setSourceValue(ModSource::Velocity, currentVelocity);
-        modMatrix.setSourceValue(ModSource::KeyTrack, (currentNote - 60) / 60.0f);
-
-        // Read modulated values: base is 0 so we get pure modulation offset
-        // ParamId 3 = Osc Pitch (semitone offset)
-        pitchOffsetSemitones = modMatrix.getModulatedValue(3, 0.0f);
-        // ParamId 10 = Filter Cutoff
-        cutoffMod = modMatrix.getModulatedValue(10, 0.0f);
-        // ParamId 11 = Filter Resonance
-        resonanceMod = modMatrix.getModulatedValue(11, 0.0f);
-        // ParamId 2 = Osc Mix
-        oscMixMod = modMatrix.getModulatedValue(2, 0.0f);
-        // ParamId 24 = Amp Level
-        ampMod = modMatrix.getModulatedValue(24, 0.0f);
 
         // LFO destinations (each LFO's output is already scaled by its depth).
         lfoCutoffOct = 0.0f;
@@ -565,6 +615,7 @@ public:
             if (asItIs ? i < lfoCount : lfoHeard[(size_t) i] != 0.0f)
                 route(d, asItIs ? lfoBank.getOutput(i) : lfoHeard[(size_t) i]);
         }
+        // (The mod slots are the router's: UnifiedVoice::render.)
         // A ramp, square or random LFO may not step the level or the pan (dsp::GainSlew); the
         // envelopes' own share of the level is left as it is.
         ampMod += lfoAmpSlew.process(routedAmp);
@@ -584,20 +635,218 @@ public:
         }
     }
 
-    float process()
+    // ---- The old XIN cell (its mode numbers; the engine maps a stored one onto the XIN page) -----
+    // XIN was a cell of this voice: OFF, PM, RING, SYNC, with XDPT. Its three behaviours are the
+    // router's destinations PM, RING and SYNC now (RouterDest), reached by the XIN page's routes
+    // or any slot; UnifiedVoiceEngine::setLegacyXin turns a stored XIN / XDPT into those routes.
+    // The numbers are stored: append only.
+    enum XinMode { XinOff = 0, XinPm, XinRing, XinSync, NUM_XIN_MODES };
+    // The old SYNC threshold at XDPT `depth` (of full scale): -12 dB at 50, -46 dB at 100.
+    static float xinSyncThreshold(float depth)
+    {
+        const float away = 1.0f - std::clamp(depth, 0.0f, 1.0f);
+        return 0.005f + 0.995f * away * away;
+    }
+
+    // What the router moves in this voice for the sub-block being rendered: the per-sample buffers
+    // of the destinations that are moved (nullptr: not moved; the voice is what it is without).
+    struct Routed
+    {
+        const float* pitch = nullptr;
+        const float* pitch2 = nullptr;
+        const float* cutoff = nullptr;
+        const float* cutoffB = nullptr;
+        const float* mix = nullptr;
+        const float* amp = nullptr;
+        const float* pw = nullptr;
+        const float* xmod = nullptr;
+        const float* pan = nullptr;
+        const float* level[3] = { nullptr, nullptr, nullptr };
+        const float* noise = nullptr;
+        const float* filterFm = nullptr;
+        const float* srcA[3] = { nullptr, nullptr, nullptr };
+        const float* pm = nullptr;
+        const float* ring = nullptr;
+        const float* sync = nullptr;
+    };
+
+    // One sample with nothing routed (tests; the engine renders by sub-blocks: render()).
+    float process() { return processSample(Routed(), 0); }
+
+    // One sub-block of n samples through the router: out[i] the voice's sample, pan[i] where it
+    // sits (-1..1). Returns how many samples it made (fewer than n where the note ended within the
+    // sub-block: as the engine's old loop, a voice is asked for a sample while it is active).
+    // pressure: this voice's pad (the router's PRES).
+    int render(const mod::Router& r, int n, float* out, float* pan)
+    {
+        if (routerNote)
+        {
+            routerNote = false;
+            rm.noteOn(r, currentNote, currentVelocity);
+        }
+        // ENV2 .. ENV5: the extra envelopes, as they stand.
+        const int stages = envChain.getStageCount();
+        for (int k = 0; k < mod::Src::MAX_ENVELOPES; ++k)
+            rm.setEnvelope(k, k < stages ? envChain.getEnvelope(k).getCurrentLevel() : 0.0f);
+        Routed m;
+        if (rm.tick(r, n, ampEnv.getCurrentLevel(), filterEnv.getCurrentLevel(), lfoPressure))
+        {
+            rm.forEachControl([this](int dest, float value) { setControl(dest, value); });
+            m.pitch = rm.buffer(RPitch);
+            m.pitch2 = rm.buffer(RPitch2);
+            m.cutoff = rm.buffer(RCutoff);
+            m.cutoffB = rm.buffer(RCutoffB);
+            m.mix = rm.buffer(RMix);
+            m.amp = rm.buffer(RAmp);
+            m.pw = rm.buffer(RPw);
+            m.xmod = rm.buffer(RXmod);
+            m.pan = rm.buffer(RPan);
+            m.level[0] = rm.buffer(RLevel1);
+            m.level[1] = rm.buffer(RLevel2);
+            m.level[2] = rm.buffer(RLevel3);
+            m.noise = rm.buffer(RNoise);
+            m.filterFm = rm.buffer(RFilterFm);
+            m.srcA[0] = rm.buffer(RSrcA1);
+            m.srcA[1] = rm.buffer(RSrcA2);
+            m.srcA[2] = rm.buffer(RSrcA3);
+            m.pm = rm.buffer(RPm);
+            m.ring = rm.buffer(RRing);
+            m.sync = rm.buffer(RSync);
+        }
+        // An oscillator's A cell the router has let go of goes back to its set value.
+        for (int k = 0; k < MAX_OSCS; ++k)
+            if (m.srcA[k] == nullptr && srcAMoved[(size_t) k])
+            {
+                srcAMoved[(size_t) k] = false;
+                oscs[(size_t) k].a = srcSetA[(size_t) k];
+            }
+        if (m.sync == nullptr || ! syncLive)
+            syncArmed = false;
+        int i = 0;
+        for (; i < n && active; ++i)
+        {
+            out[i] = processSample(m, i);
+            pan[i] = panNow;
+        }
+        return i;
+    }
+
+    // A voice that is not sounding, for a sub-block: the router's LFOs keep time, and a cell the
+    // router was holding goes back to its set value.
+    void idle(const mod::Router& r, int n)
+    {
+        if (rm.idle(r, n))
+            rm.restore(r, [this](int dest, float value) { setControl(dest, value); });
+    }
+
+    // RING: how much of the dry mixer the slots that bring the track input to RING take away
+    // (the engine sums their amounts once a block, while the track has an input).
+    void setRingDry(float d) { ringDry = std::isfinite(d) ? std::clamp(d, -2.0f, 2.0f) : 0.0f; }
+    // SYNC: false while nothing is aimed there any more (what the router still fades out of a route
+    // that went restarts nothing, and the arming of one route is not carried to the next).
+    void setSyncLive(bool live) { syncLive = live; }
+
+    mod::Voice& getRouterVoice() { return rm; }
+    const mod::Voice& getRouterVoice() const { return rm; }
+
+    // The set value of an oscillator's SRC cell (the engine's; the router's offsets and the old
+    // LFO routes move the voice's own copy around it).
+    void setSrcCell(int id, float value)
+    {
+        for (int k = 0; k < MAX_OSCS; ++k)
+        {
+            if (id == UnifiedParam::srcA(k))
+            {
+                srcSetA[(size_t) k] = value;
+                oscs[(size_t) k].a = value;
+            }
+            else if (id == UnifiedParam::srcB(k))
+            {
+                srcSetB[(size_t) k] = value;
+                oscs[(size_t) k].b = srcBMoved[(size_t) k] ? movedSrcB(k, srcOffsetB[(size_t) k]) : value;
+            }
+        }
+    }
+
+private:
+    // A control-rate destination of the router, as it stands (or its set value, once, when let go).
+    void setControl(int dest, float value)
+    {
+        if (dest == RReso)
+        {
+            routerReso = value;
+            return;
+        }
+        if (dest == REnvTime)
+        {
+            ampTimeMod = value;
+            ampEnv.setTimeScale(noteEnvScale * ampTimeMod);
+            return;
+        }
+        if (dest == RFilterTime)
+        {
+            filterTimeMod = value;
+            filterEnv.setTimeScale(noteEnvScale * filterTimeMod);
+            return;
+        }
+        for (int k = 0; k < MAX_OSCS; ++k)
+            if (dest == RSrcB1 + 2 * k)
+            {
+                srcOffsetB[(size_t) k] = value;
+                srcBMoved[(size_t) k] = value != 0.0f;
+                oscs[(size_t) k].b = srcBMoved[(size_t) k] ? movedSrcB(k, value) : srcSetB[(size_t) k];
+                return;
+            }
+        if (dest >= RFirstParam && dest < RPm)
+        {
+            const int id = paramOfDest(dest);
+            if (id >= 0)
+                setParam(id, value);
+        }
+    }
+
+    // An oscillator's SRC cell moved by an offset of the router (-1..1 = its whole span), by the
+    // kind it plays: what the old routes did (UnifiedVoiceEngine::destRange, tableRouteSpan).
+    float movedSrcA(int k, float offset) const
+    {
+        const auto w = oscs[(size_t) k].waveform;
+        if (isAnalog(w))
+            return srcSetA[(size_t) k];
+        return std::clamp(srcSetA[(size_t) k] + offset, 0.0f, 1.0f);
+    }
+    float movedSrcB(int k, float offset) const
+    {
+        const auto w = oscs[(size_t) k].waveform;
+        const float set = srcSetB[(size_t) k];
+        switch (w)
+        {
+            case OscWaveform::Wavetable:
+                return std::clamp(set + offset * TABLE_ROUTE_SPAN, 0.0f, (float) (WavetableFactory::builtInCount() - 1));
+            case OscWaveform::FM:
+                return std::clamp(set + offset * 11.0f, 1.0f, 12.0f);
+            case OscWaveform::Formant: case OscWaveform::Harmonic:
+                return std::clamp(set + offset, 0.0f, 1.0f);
+            default:
+                return set;
+        }
+    }
+
+    // One sample. m: what the router moves (UnifiedVoice::render), i: the sample of the sub-block.
+    float processSample(const Routed& m, int i)
     {
         if (!active)
             return 0.0f;
 
         // Wheel, velocity and this voice's pressure move each LFO's depth.
-        for (int i = 0; i < LFOBank::MAX_LFOS; ++i)
+        for (int l = 0; l < LFOBank::MAX_LFOS; ++l)
         {
-            const auto& c = lfoControl[(size_t) i];
-            lfoBank.getLFO(i).setDepthOffset(c.wheel * lfoWheel + c.velocity * lfoNoteVelocity + c.pressure * lfoPressure);
+            const auto& c = lfoControl[(size_t) l];
+            lfoBank.getLFO(l).setDepthOffset(c.wheel * lfoWheel + c.velocity * lfoNoteVelocity + c.pressure * lfoPressure);
         }
 
         // Process LFO bank
         lfoBank.processAll();
+        const bool firstSample = struck;
         glide();
 
         // Process envelope chain (needed for mod matrix feed)
@@ -610,6 +859,19 @@ public:
                           modOscMixOffset, modAmpOffset);
         if (anyParamRoute)
             applyParamRoutes(chainMod);
+
+        // The router's per-sample destinations that the processing below reads as fields.
+        for (int k = 0; k < MAX_OSCS; ++k)
+            if (m.srcA[k] != nullptr)
+            {
+                oscs[(size_t) k].a = movedSrcA(k, m.srcA[k][i]);
+                srcAMoved[(size_t) k] = true;
+            }
+        if (m.level[0] != nullptr) lfoOscGain[0] *= m.level[0][i];
+        if (m.level[1] != nullptr) lfoOscGain[1] *= m.level[1][i];
+        if (m.level[2] != nullptr) lfoOscGain[2] *= m.level[2][i];
+        if (m.noise != nullptr)    lfoNoiseGain *= m.noise[i];
+        if (routerReso != 0.0f)    modResonanceOffset += routerReso;
 
         // Update analog drift (slow filtered noise — one-pole lowpass on white noise)
         float driftSemitones = 0.0f;
@@ -642,6 +904,8 @@ public:
 
         // Apply mod matrix pitch offset (semitones)
         driftSemitones += modPitchOffset;
+        if (m.pitch != nullptr)
+            driftSemitones += m.pitch[i] * 12.0f;       // (the router's PTCH is in octaves)
 
         // Glide towards the target note.
         if (currentPitch != targetPitch)
@@ -669,11 +933,18 @@ public:
         driftSemitones += tuneSemitones + bendSemitones + unisonDetune + noteSlopSemis;
 
         // Poly-mod: the filter envelope bends oscillator 2 (its value from the previous sample).
-        const float polyModSemis = polyMod * lastFilterEnv * 24.0f + lfoOsc2Semis;
+        float polyModSemis = polyMod * lastFilterEnv * 24.0f + lfoOsc2Semis;
+        if (m.pitch2 != nullptr)
+            polyModSemis += m.pitch2[i] * 12.0f;
 
-        const float pwMod = lfoPwMod + atTimbreNow * 0.4f + pwLag;
-        const float xmodNow = std::clamp(crossModNow + lfoXmodMod + atFmNow, 0.0f, 1.0f);
+        float pwMod = lfoPwMod + atTimbreNow * 0.4f + pwLag;
+        if (m.pw != nullptr)
+            pwMod += m.pw[i];
+        const float xmodNow = m.xmod != nullptr ? std::clamp(crossModNow + lfoXmodMod + atFmNow + m.xmod[i], 0.0f, 1.0f)
+                                                : std::clamp(crossModNow + lfoXmodMod + atFmNow, 0.0f, 1.0f);
         modOscMixOffset += atWavePosNow * 0.5f;
+        if (m.mix != nullptr)
+            modOscMixOffset += m.mix[i];
 
         // Cross-modulation is through-zero linear FM: oscillator 2 moves oscillator 1's FREQUENCY in
         // proportion to that frequency, and far enough the phase runs backwards. Its effect on the
@@ -691,48 +962,87 @@ public:
             xmodPhase = (double) xmodNow * XMOD_INDEX * xmodSum;
         }
 
+        // PM: what the router sends there on the same path (its own running sum, so XMOD and PM
+        // add). The input at amount d is the old XIN PM at XDPT d. Once nothing is sent the sum
+        // leaks away by itself (no step in the phase).
+        double pmPhase = 0.0;
+        if (m.pm != nullptr || pmSum != 0.0)
+        {
+            const double carrierInc = baseFrequency * std::exp2((oscs[0].detune + driftSemitones) / 12.0) / sampleRate;
+            pmSum = pmSum * (1.0 - 50.3 / sampleRate) + (double) (m.pm != nullptr ? m.pm[i] : 0.0f) * carrierInc;
+            if (! (std::abs(pmSum) < 1.0e6)) pmSum = 0.0;         // (also what is not a number)
+            else if (std::abs(pmSum) < 1.0e-12) pmSum = 0.0;
+            pmPhase = XMOD_INDEX * pmSum;
+        }
+        // SYNC: armed below -SYNC_LEVEL, fired on the way up through +SYNC_LEVEL. `syncSince` is
+        // how much of this sample had passed when the buffer crossed it. The cycle starts again
+        // just past the stretch where the band-limited waves round off their own wrap (the first
+        // step of the cycle as generateOsc counts it, `syncStart`: about one sample late, the same
+        // for every restart): half of that rounding on a jump of another size is a click of its own.
+        bool syncFired = false;
+        double syncSince = 0.0, syncStart = 0.0;
+        if (m.sync != nullptr && syncLive)
+        {
+            const float x = m.sync[i];
+            if (x <= -SYNC_LEVEL)
+                syncArmed = true;
+            else if (syncArmed && x >= SYNC_LEVEL)
+            {
+                syncArmed = false;
+                syncFired = true;
+                const float rise = x - syncPrev;
+                syncSince = rise > 0.0f ? (double) std::clamp((x - SYNC_LEVEL) / rise, 0.0f, 1.0f) : 0.0;
+                syncStart = baseFrequency * std::exp2(oscs[0].detune / 12.0) / sampleRate;
+            }
+            syncPrev = x;
+        }
+
         float oscMix = 0.0f;
-        for (int i = 0; i < MAX_OSCS; ++i)
+        for (int k = 0; k < MAX_OSCS; ++k)
         {
             // (An oscillator that has just been taken out of the mix is heard until it has faded.)
-            const float setLevel = oscLevelNow[(size_t) i];
-            if (!oscs[i].enabled && setLevel <= 0.0f)
+            const float setLevel = oscLevelNow[(size_t) k];
+            if (!oscs[k].enabled && setLevel <= 0.0f)
                 continue;
 
             // Apply osc mix modulation: scale level of osc 1 up / osc 0 down (or vice versa)
             float levelScale = setLevel;
             if (MAX_OSCS >= 2 && modOscMixOffset != 0.0f)
             {
-                if (i == 0)
+                if (k == 0)
                     levelScale = std::clamp(setLevel - modOscMixOffset, 0.0f, 2.0f);
-                else if (i == 1)
+                else if (k == 1)
                     levelScale = std::clamp(setLevel + modOscMixOffset, 0.0f, 2.0f);
             }
-            levelScale *= lfoOscGain[(size_t) i];
+            levelScale *= lfoOscGain[(size_t) k];
 
             int numStackVoices = waveStack.voiceCount();
 
             if (numStackVoices <= 1)
             {
                 // No stacking: single oscillator
-                double freq = baseFrequency * std::exp2((oscs[i].detune + driftSemitones
-                                                         + (i == 1 ? polyModSemis : 0.0f)) / 12.0);
+                double freq = baseFrequency * std::exp2((oscs[k].detune + driftSemitones
+                                                         + (k == 1 ? polyModSemis : 0.0f)) / 12.0);
                 double phaseInc = freq / sampleRate;
                 // (wrapped for any step: one subtraction let the phase run away once a pitch passed
                 // the sample rate - a high key with PMOD or TUNE and BEND up - and the level with it)
-                oscs[i].phase = dsp::wrapPhase(oscs[i].phase + phaseInc);
+                oscs[k].phase = dsp::wrapPhase(oscs[k].phase + phaseInc);
+                if (k == 0 && syncFired)
+                    oscs[k].phase = dsp::wrapPhase(syncStart + phaseInc * syncSince);
 
-                OscState shaped = oscs[i];
+                OscState shaped = oscs[k];
                 shaped.pulseWidth = std::clamp(shaped.pulseWidth + pwMod, 0.05f, 0.95f);
                 shaped.aMod = pwMod;
-                if (i == 0 && xmodNow > 0.0f)
+                if (k == 0 && xmodNow > 0.0f)
                 {
-                    double pm = shaped.phase + xmodPhase;
-                    shaped.phase = pm - std::floor(pm);
+                    double pmv = shaped.phase + xmodPhase;
+                    shaped.phase = pmv - std::floor(pmv);
                 }
+                if (k == 0 && pmPhase != 0.0)
+                    shaped.phase = dsp::wrapPhase(shaped.phase + pmPhase);
 
-                float sample = generateOsc(shaped, oscWaveshapeOffset[i]);
-                if (i == 1)
+                float sample = generateOsc(shaped, oscWaveshapeOffset[k]);
+                if (k == 1)
                     lastOsc2 = sample;
                 oscMix += sample * levelScale;
             }
@@ -753,26 +1063,30 @@ public:
                     }
 
                     double freq = baseFrequency * std::exp2(
-                        (oscs[i].detune + driftSemitones + voiceDetune + (i == 1 ? polyModSemis : 0.0f)) / 12.0);
+                        (oscs[k].detune + driftSemitones + voiceDetune + (k == 1 ? polyModSemis : 0.0f)) / 12.0);
                     double phaseInc = freq / sampleRate;
 
-                    stackPhases[i][v] = dsp::wrapPhase(stackPhases[i][v] + phaseInc);
+                    stackPhases[k][v] = dsp::wrapPhase(stackPhases[k][v] + phaseInc);
+                    if (k == 0 && syncFired)
+                        stackPhases[k][v] = dsp::wrapPhase(syncStart + phaseInc * syncSince);
 
                     // Create a temporary OscState for generation with the stacked phase
-                    OscState tempOsc = oscs[i];
-                    tempOsc.phase = stackPhases[i][v];
+                    OscState tempOsc = oscs[k];
+                    tempOsc.phase = stackPhases[k][v];
                     tempOsc.pulseWidth = std::clamp(tempOsc.pulseWidth + pwMod, 0.05f, 0.95f);
                     tempOsc.aMod = pwMod;
-                    if (i == 0 && xmodNow > 0.0f)
+                    if (k == 0 && xmodNow > 0.0f)
                     {
-                        double pm = tempOsc.phase + xmodPhase;
-                        tempOsc.phase = pm - std::floor(pm);
+                        double pmv = tempOsc.phase + xmodPhase;
+                        tempOsc.phase = pmv - std::floor(pmv);
                     }
-                    float sample = generateOsc(tempOsc, oscWaveshapeOffset[i]);
+                    if (k == 0 && pmPhase != 0.0)
+                        tempOsc.phase = dsp::wrapPhase(tempOsc.phase + pmPhase);
+                    float sample = generateOsc(tempOsc, oscWaveshapeOffset[k]);
                     stackMix += sample * gain;
                 }
 
-                if (i == 1)
+                if (k == 1)
                     lastOsc2 = stackMix;
                 oscMix += stackMix * levelScale;
             }
@@ -787,6 +1101,16 @@ public:
             oscMix += noiseState * noiseLevelNow * noiseMakeup * lfoNoiseGain;
         }
 
+        // RING: the mixer's output times the router's gain (1 + sum), less the dry share a slot
+        // bringing the track input there takes away (setRingDry): the input at d is the old ring,
+        // (1 - d) + d x, from none of it to all of it.
+        if (m.ring != nullptr || ringDryNow != 0.0f || ringDry != 0.0f)
+        {
+            if (firstSample || ringDryNow == ringDry)   ringDryNow = ringDry;
+            else                                    ringDryNow = dsp::towards(ringDryNow, ringDry, levelStep);
+            oscMix *= (m.ring != nullptr ? m.ring[i] : 1.0f) - ringDryNow;
+        }
+
         if (mixDriveNow > 0.0f)
         {
             const float g = 1.0f + mixDriveNow * 5.0f;
@@ -797,7 +1121,9 @@ public:
         // around the base frequency; mod-matrix routings add Hz on top.
         float filterEnvVal = filterEnv.process();
         lastFilterEnv = filterEnvVal;
-        const float filterFmNow = lfoFilterFmMod != 0.0f ? std::clamp(filterFm + lfoFilterFmMod, 0.0f, 1.0f) : filterFm;
+        float filterFmNow = lfoFilterFmMod != 0.0f ? std::clamp(filterFm + lfoFilterFmMod, 0.0f, 1.0f) : filterFm;
+        if (m.filterFm != nullptr)
+            filterFmNow = std::clamp(filterFm + lfoFilterFmMod + m.filterFm[i], 0.0f, 1.0f);
         float cutoffOct = filterFmNow * lastOsc2 * 2.0f     // audio-rate cutoff modulation from oscillator 2
                         + filterEnvVal * filterEnvAmountNow * FILTER_ENV_OCTAVES
                         + filterKeyTrack * (currentPitch - 60.0f) / 12.0f
@@ -805,12 +1131,16 @@ public:
                         + lfoCutoffOct
                         + atCutoffNow * 4.0f
                         + noteFilterOct;
+        if (m.cutoff != nullptr)
+            cutoffOct += m.cutoff[i];
         float cutoff = filterCutoffNow * (cutoffOct != 0.0f ? std::exp2(cutoffOct) : 1.0f) + modCutoffOffset;
         // Filter B follows that modulation fully, partly or not at all.
         float cutoffB = filterCutoffNow * (cutoffOct != 0.0f ? std::exp2(cutoffOct * filterBTrack) : 1.0f)
                         * filterBRatio + modCutoffOffset * filterBTrack;
         if (lfoCutoffBOct != 0.0f)
             cutoffB *= std::exp2(lfoCutoffBOct);
+        if (m.cutoffB != nullptr)
+            cutoffB *= std::exp2(m.cutoffB[i]);
 
         // Apply chain modulation to filter cutoff if targeted there
         if (envChain.getStageCount() > 0 && envChain.getTarget() == EnvelopeChain::Target::FilterCutoff)
@@ -847,13 +1177,20 @@ public:
         if (!ampEnv.isActive())
             active = false;
 
-        // Apply amp modulation (mod matrix, LFOs, pressure) AFTER filter
+        // Apply amp modulation (mod matrix, LFOs, pressure) AFTER filter; the router's AMP (a gain,
+        // 1 + its sum) adds its sum to theirs, as the slots and LFOs always added on the level (an
+        // LFO on AMP under pad pressure on VOL is the sum, not the product), and may take it below
+        // 0 (an audio-rate slot: ring modulation of the voice).
         float ampScale = std::clamp(1.0f + modAmpOffset + atVolumeNow, 0.0f, 2.0f);
+        if (m.amp != nullptr)
+            ampScale = std::clamp(ampScale + (m.amp[i] - 1.0f), -2.0f, 2.0f);
+        panNow = m.pan != nullptr ? std::clamp(lfoPan + m.pan[i], -1.0f, 1.0f) : lfoPan;
 
         // Velocity sensitivity: 0 = every note at full level, 1 = level follows velocity (velGainNow).
         return gainDeclick.process(filtered * ampVal * velGainNow * ampScale * levelNow);
     }
 
+public:
     // The engine's LEVL (each voice applies it, so that a note takes it whole).
     void setLevel(float l) { level = l; }
 
@@ -867,6 +1204,7 @@ public:
         declick.reset();
         gainDeclick.reset();
         finishLfoClosings();
+        routerNote = false;
         active = false;
         for (auto& osc : oscs)
             osc.phase = 0.0;
@@ -877,6 +1215,9 @@ public:
         softStartSamples = 0.0f;
         lastOsc2 = 0.0f;
         xmodSum = 0.0;
+        pmSum = 0.0;
+        syncArmed = false;
+        syncPrev = 0.0f;
         lastFilterEnv = 0.0f;
         vibratoPhase = 0.0;
         currentPitch = targetPitch;
@@ -889,8 +1230,6 @@ public:
     AnalogCharacter& getAnalogCharacter() { return analog; }
     EnvelopeChain& getEnvelopeChain() { return envChain; }
     LFOBank& getLFOBank() { return lfoBank; }
-    ModMatrix& getModMatrix() { return modMatrix; }
-    const ModMatrix& getModMatrix() const { return modMatrix; }
     WaveStackConfig& getWaveStack() { return waveStack; }
     const WaveStackConfig& getWaveStack() const { return waveStack; }
 
@@ -925,9 +1264,10 @@ public:
         noiseMakeup = 1.0f + 5.0f * c;      // darker noise is quieter: keep it usable
     }
 
-    // The envelopes as set by the user; per-note variation is applied on top of these.
-    void setAmpEnvParams(const Envelope::Params& p) { baseAmpEnv = p; ampEnv.setParams(p); haveBaseEnvelopes = true; }
-    void setFilterEnvParams(const Envelope::Params& p) { baseFilterEnv = p; filterEnv.setParams(p); haveBaseEnvelopes = true; }
+    // The envelopes as set by the user; the per-note variation (EVAR) and the router's ETIM / FTIM
+    // scale their times (Envelope::setTimeScale) and leave them as set.
+    void setAmpEnvParams(const Envelope::Params& p) { ampEnv.setParams(p); haveBaseEnvelopes = true; }
+    void setFilterEnvParams(const Envelope::Params& p) { filterEnv.setParams(p); haveBaseEnvelopes = true; }
     void setMixDrive(float d) { mixDrive = std::clamp(d, 0.0f, 1.0f); }
     void setCrossMod(float x) { crossMod = std::clamp(x, 0.0f, 1.0f); }
     void setPulseWidth(float pw)
@@ -1102,8 +1442,8 @@ public:
     void setLfoPressureAmount(int lfoIndex, float a) { if (validLfo(lfoIndex)) lfoControl[(size_t) lfoIndex].pressure = a; }
     void setLfoPerformance(float wheel, float pressure) { lfoWheel = wheel; lfoPressure = pressure; }
 
-    // -1..1 from LFOs routed to the pan (as of the last processed sample); the engine places the voice.
-    float getPanMod() const { return lfoPan; }
+    // -1..1: where the voice sits (the LFOs and the router on PAN, as of the last processed sample).
+    float getPanMod() const { return panNow; }
 
     // Called once per block while the voice is silent, so free-running LFOs stay in time.
     void advanceIdleLfos(int numSamples) { lfoBank.advanceIdle(numSamples); }
@@ -1312,14 +1652,6 @@ private:
         pwLag = pulseWidthNow - oscs[0].pulseWidth;
     }
 
-    static Envelope::Params scaledEnvelope(Envelope::Params p, float scale)
-    {
-        p.attack *= scale;
-        p.decay *= scale;
-        p.release *= scale;
-        return p;
-    }
-
     static double pitchToHz(float pitch)
     {
         return 440.0 * std::exp2(((double) pitch - 69.0) / 12.0);
@@ -1477,7 +1809,21 @@ private:
     EnvelopeChain envChain;
     LFOBank lfoBank;
 
-    ModMatrix modMatrix;
+    // This voice's side of the modulation router (UnifiedVoiceEngine::router), and what it holds
+    mod::Voice rm;
+    bool routerNote = false;                    // a note-on the router has not been told of yet
+    float routerReso = 0.0f;                    // RESO, a control-rate offset (0.5 a unit)
+    float ampTimeMod = 1.0f, filterTimeMod = 1.0f;      // ETIM, FTIM
+    float noteEnvScale = 1.0f;                  // EVAR: this note's factor on the envelopes' times
+    std::array<float, MAX_OSCS> srcSetA {}, srcSetB {}, srcOffsetB {};   // the SRC cells as set; B's offset
+    std::array<bool, MAX_OSCS> srcAMoved {}, srcBMoved {};
+    double pmSum = 0.0;                         // PM: leaky running sum, in carrier cycles
+    bool syncArmed = false;                     // SYNC: the buffer has been below -SYNC_LEVEL
+    float syncPrev = 0.0f;                      // SYNC: the buffer one sample ago
+    float panNow = 0.0f;                        // where the voice sits, as of the last sample
+    float ringDry = 0.0f, ringDryNow = 0.0f;    // RING: the dry share the input's slots take away (set, heard)
+    bool syncLive = false;                      // SYNC: something is aimed there (setSyncLive)
+
     float filterBaseCutoff = 20000.0f;
     float filterBaseResonance = 0.0f;
     float filterEnvAmount = 0.0f;
@@ -1495,7 +1841,6 @@ private:
     // Per-note analog spread
     float noteSlopSemis = 0.0f;
     float noteFilterOct = 0.0f;
-    Envelope::Params baseAmpEnv, baseFilterEnv;
     bool haveBaseEnvelopes = false;
     bool envelopesScaled = false;
     float noiseState = 0.0f;

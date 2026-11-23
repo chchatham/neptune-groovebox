@@ -656,26 +656,28 @@ public:
         {
             auto e = makeEngine(1);
             const auto pages = e->getParamPages();
-            expect(pages.size() == 13);
-            expect(pages[4].name == "KEYS" && pages[5].name == "K SMP" && pages[6].name == "K POS" && pages[7].name == "K PLC");
-            expect(pages[8].name == "FILTR");
+            // (ANLG after OSC, XIN after the filter's three, and the mod slots' SLT1 and LSHP in front of STRIP)
+            expect(pages.size() == 19);    // +1: VOICE page (VOX cell, empty cells are legal)
+            const size_t K = 5;             // where the four key pages start
+            expect(pages[K].name == "KEYS" && pages[K + 1].name == "K SMP" && pages[K + 2].name == "K POS" && pages[K + 3].name == "K PLC");
+            expect(pages[K + 4].name == "VOICE" && pages[K + 5].name == "FILTR");
             expect(pages[pages.size() - 3].name == "STRIP" && pages[pages.size() - 2].name == "LFO1" && pages.back().name == "LFO2");
             static const char* const labels[8] = { "ALGO", "KFRM", "BIAS", "WRAP", "ALGN", "NORM", "TILT", "HARM" };
             for (int c = 0; c < 8; ++c)
             {
-                expectEquals(juce::String(pages[4].params[(size_t) c].label), juce::String(labels[c]));
-                expectEquals(pages[4].params[(size_t) c].id, 33 + c);
-                expectEquals(pages[5].params[(size_t) c].id, 41 + c);
-                expectEquals(pages[6].params[(size_t) c].id, 49 + c);
-                expectEquals(pages[7].params[(size_t) c].id, 57 + c);
-                expectEquals(juce::String(pages[5].params[(size_t) c].label), "SMP" + juce::String(c + 1));
-                expectEquals(juce::String(pages[6].params[(size_t) c].label), "POS" + juce::String(c + 1));
-                expectEquals(juce::String(pages[7].params[(size_t) c].label), "PLC" + juce::String(c + 1));
+                expectEquals(juce::String(pages[K].params[(size_t) c].label), juce::String(labels[c]));
+                expectEquals(pages[K].params[(size_t) c].id, 33 + c);
+                expectEquals(pages[K + 1].params[(size_t) c].id, 41 + c);
+                expectEquals(pages[K + 2].params[(size_t) c].id, 49 + c);
+                expectEquals(pages[K + 3].params[(size_t) c].id, 57 + c);
+                expectEquals(juce::String(pages[K + 1].params[(size_t) c].label), "SMP" + juce::String(c + 1));
+                expectEquals(juce::String(pages[K + 2].params[(size_t) c].label), "POS" + juce::String(c + 1));
+                expectEquals(juce::String(pages[K + 3].params[(size_t) c].label), "PLC" + juce::String(c + 1));
             }
-            const auto& smpCell = pages[5].params[0];
+            const auto& smpCell = pages[K + 1].params[0];
             expectEquals(smpCell.numChoices, SampleBank::get().size() + 1, "OFF and every sample of the bank");
             expect(smpCell.format(0.0f) == "OFF" && smpCell.format((float) (smp.a + 1)) == juce::String(SampleBank::get().entry(smp.a)->name));
-            expect(pages[4].params[0].format(4.0f) == "TRNS" && pages[4].params[0].format(5.0f) == "VOC");
+            expect(pages[K].params[0].format(4.0f) == "TRNS" && pages[K].params[0].format(5.0f) == "VOC");
             expect(pages[0].find(P::InterpMode)->format(4.0f) == "CLSC" && pages[0].find(P::InterpMode)->numChoices == 5);
 
             for (int id = 33; id <= 64; ++id)
@@ -703,7 +705,7 @@ public:
             setUp();
             const auto base = e->getTable(WavetableEngine::KEY_TABLE).frames[0];
             expectEquals((int) base.size(), 64);
-            for (int page = 4; page <= 7; ++page)
+            for (int page = (int) K; page <= (int) K + 3; ++page)
                 for (auto& p : pages[(size_t) page].params)
                 {
                     double least = 10.0;

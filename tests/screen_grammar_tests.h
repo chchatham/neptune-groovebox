@@ -682,6 +682,174 @@ public:
             for (int i = 0; i < 8; ++i) expect(screen.getEncoderReadout(i).isNotEmpty());
             expect(screen.getSubPage().startsWith("P4 "));
         }
+
+        beginTest("DRUMS: the bank buttons go round the selected pad's own pages, the ones PARAM shows for it; every knob has "
+                  "two letters and a readout whose value is in the name bar");
+        {
+            // Through ScreenManager, as the controller sends it. The pad's pages are the engine's
+            // (DrumEngine::padPages): DR, what the type adds, PLFO, PSLT - eight cells each.
+            SequencerCore seq;
+            AudioEngine audio;
+            audio.addEngine(0, AudioEngine::createEngine(EngineType::Drum));
+            seq.getPattern().getTrack(0).engineType = EngineType::Drum;
+            auto* engine = dynamic_cast<DrumEngine*>(audio.getEngine(0));
+            expect(engine != nullptr);
+            if (engine == nullptr) return;
+            ScreenManager mgr;
+            DisplayRenderer display;
+            mgr.setDisplay(&display);
+            auto* screen = new DrumPadScreen(engine);
+            mgr.addScreen(std::unique_ptr<Screen>(screen));
+            ParamPageScreen param(seq, &audio);
+            const auto bank = [&](bool down)
+            {
+                mgr.controlChangeReceived(ScreenManager::BUTTON_CHANNEL, down ? ScreenManager::CC_BANK_DOWN : ScreenManager::CC_BANK_UP, 127);
+                mgr.controlChangeReceived(ScreenManager::BUTTON_CHANNEL, down ? ScreenManager::CC_BANK_DOWN : ScreenManager::CC_BANK_UP, 0);
+            };
+            const auto turn = [&](int knob, int clicks) { mgr.controlChangeReceived(16, 0x15 + knob, enc(clicks)); };
+
+            struct Want { int pad; const char* pages; };
+            // The starting kit: the lower left pad a kick machine, top pad 7 a resonator drum (the
+            // crash), bottom pad 7 an oscillator bank (the hat), top pad 1 a sub-bass.
+            for (const auto& want : { Want { 8, "DR 9 KICK KCK2 PLFO PSLT" }, Want { 6, "DR 7 RSN PLFO PSLT" },
+                                      Want { 14, "DR 15 BANK PLFO PSLT" }, Want { 0, "DR 1 PLFO PSLT" } })
+            {
+                screen->selectPad(want.pad);
+                const auto pages = engine->padPages(want.pad);
+                juce::StringArray names;
+                for (auto& page : pages) names.add(page.name);
+                expectEquals(names.joinIntoString(" "), juce::String(want.pages));
+                expectEquals(screen->getPageCount(), (int) pages.size());
+                // PARAM begins with the same pages for the same pad (then the kit's own).
+                param.setCurrentPageIndex(0);
+                for (int p = 0; p < (int) pages.size(); ++p)
+                {
+                    param.setCurrentPageIndex(p);
+                    expectEquals(param.getPageName(), names[p], "PARAM, pad " + juce::String(want.pad + 1));
+                }
+                param.setCurrentPageIndex((int) pages.size());
+                expectEquals(param.getPageName(), juce::String("WAV1"), "then the kit's pages");
+
+                for (int i = 0; i < (int) pages.size() && screen->getPageIndex() != 0; ++i)
+                    bank(false);
+                expectEquals(screen->getPageIndex(), 0);
+                bank(false);
+                expectEquals(screen->getPageIndex(), (int) pages.size() - 1, "the upper button from the first page: the last");
+                bank(true);
+                for (int p = 0; p < (int) pages.size(); ++p)
+                {
+                    UiClock::advance(3000);
+                    expectEquals(screen->getPageIndex(), p);
+                    const auto bar = mgr.composeNameBar();
+                    expectEquals(bar.pages, juce::String(p + 1) + "/" + juce::String((int) pages.size()));
+                    // The name bar: the pad, and the type on the DR page, the page's name on the others. Whole.
+                    expectEquals(bar.text, screen->getSubPage(), "nothing of it is cut");
+                    expect(bar.text.startsWith(want.pad < 9 ? "P" + juce::String(want.pad + 1) + " " : juce::String(want.pad + 1) + " "), bar.text);
+                    if (p > 0)
+                        expect(bar.text.endsWith(" " + names[p]), bar.text);
+
+                    juce::StringArray twos;
+                    for (int k = 0; k < 8; ++k)
+                    {
+                        const auto spec = pages[(size_t) p].params[(size_t) k];
+                        const auto two = screen->getEncoderName(k);
+                        const juce::String where = names[p] + " " + spec.label;
+                        expectEquals(two.length(), 2, where);
+                        expect(!twos.contains(two), where + ": " + two + " twice on one page");
+                        twos.add(two);
+                        if (juce::String(spec.label) == "TYPE")
+                            continue;                   // (another type is other pages)
+                        const float was = engine->getParameter(spec.id);
+                        turn(k, 1);
+                        const auto text = mgr.composeNameBar().text;
+                        if (const char* why = engine->padModIdleReason(spec.id))
+                        {
+                            // A depth or an amount with no destination: it says so and stays.
+                            expectEquals(text, juce::String(why), where);
+                            expectEquals(engine->getParameter(spec.id), was, where);
+                        }
+                        else
+                        {
+                            expect(engine->getParameter(spec.id) != was, where + " turns");
+                            expect(text.endsWith(" " + spec.format(engine->getParameter(spec.id))), where + ": the value is in the name bar: " + text);
+                            expect(text != screen->getSubPage());
+                        }
+                        UiClock::advance(3000);
+                        turn(k, -1);
+                        UiClock::advance(3000);
+                    }
+                    bank(true);
+                }
+                expectEquals(screen->getPageIndex(), 0, "once round");
+            }
+
+            // Another pad keeps the page where it has one of that kind.
+            screen->selectPad(8);
+            bank(true);
+            expectEquals(screen->getSubPage(), juce::String("P9 KICK"));
+            screen->selectPad(6);
+            expectEquals(screen->getSubPage(), juce::String("P7 RSN"), "a kick's first page: the resonator drum's own");
+            expectEquals(screen->getPageIndex(), 1);
+            screen->selectPad(0);
+            expectEquals(screen->getPageIndex(), 0, "a pad with no page of its type: its DR page");
+            screen->selectPad(8);
+            expectEquals(screen->getSubPage(), juce::String("P9 KICK"), "and back");
+            bank(true); bank(true);
+            expectEquals(screen->getSubPage(), juce::String("P9 PLFO"));
+            screen->selectPad(15);
+            expectEquals(screen->getSubPage(), juce::String("16 PLFO"), "a pad of two digits goes without its P: the page stays readable");
+            expectEquals(mgr.composeNameBar().text, juce::String("16 PLFO"));
+
+            // PLFO on DRUMS as on PARAM: DPTH with no destination says so; with one it moves.
+            const int depth = PadModParam::id(15, PadModParam::LFO_DEPTH), dest = PadModParam::id(15, PadModParam::LFO_DEST);
+            UiClock::advance(3000);
+            turn(1, 5);
+            expectEquals(engine->getParameter(depth), 0.0f);
+            expectEquals(screen->getSubPage(), juce::String("SET DEST"));
+            UiClock::advance(3000);
+            turn(3, 1);
+            expectEquals(engine->getParameter(dest), 1.0f);
+            turn(1, 5);
+            expectWithinAbsoluteError(engine->getParameter(depth), 0.1f, 1.0e-4f, "five clicks of a hundredth of -100 .. +100");
+            UiClock::advance(3000);
+        }
+
+        beginTest("A drum pad's WAVE: CYCL, which had no sample to read there, is not offered; the list keeps its places");
+        {
+            DrumEngine engine;
+            const ParamSpec w = DrumEngine::waveSpec(8);
+            expectEquals(w.numChoices, phaseosc::waveCount(), "no index moves");
+            expectEquals(juce::String(w.choices[phaseosc::WAVE_SINE]), juce::String("SINE"));
+            expectEquals(juce::String(w.choices[phaseosc::WAVE_CYCLES]), juce::String(), "the place CYCL had: kept, unnamed");
+            expectEquals(juce::String(w.choices[phaseosc::FIRST_TABLE_WAVE]), juce::String(phaseosc::waveLabels()[phaseosc::FIRST_TABLE_WAVE]));
+            // A knob passes over it, both ways, at every speed.
+            for (auto mode : { TurnStep::Plain, TurnStep::Fine, TurnStep::Coarse })
+            {
+                expectEquals(w.turned(0.0f, 1, mode), mode == TurnStep::Coarse ? 4.0f : (float) phaseosc::FIRST_TABLE_WAVE);
+                expectEquals(w.turned((float) phaseosc::FIRST_TABLE_WAVE, -1, mode), 0.0f);
+                for (int from = 0; from < w.numChoices; ++from)
+                    for (int clicks : { -3, -1, 1, 3 })
+                        expect((int) w.turned((float) from, clicks, mode) != phaseosc::WAVE_CYCLES);
+            }
+            // A sound stored with it plays the sine it played, and shows it.
+            engine.setParameter(DrumEngine::WAVE_BASE + 8, (float) phaseosc::WAVE_CYCLES);
+            expectEquals(engine.getParameter(DrumEngine::WAVE_BASE + 8), (float) phaseosc::WAVE_SINE);
+            expectEquals(w.format(engine.getParameter(DrumEngine::WAVE_BASE + 8)), juce::String("SINE"));
+            engine.setParameter(DrumEngine::WAVE_BASE + 8, 3.0f);
+            expectEquals(engine.getParameter(DrumEngine::WAVE_BASE + 8), 3.0f, "every other place is what it was");
+            // The other engines' WAVE cells keep CYCL: they have a sample for it.
+            expectEquals(juce::String(phaseosc::waveLabels()[phaseosc::WAVE_CYCLES]), juce::String("CYCL"));
+            // A list without unnamed places turns as it always did.
+            static const char* const three[] = { "A", "B", "C" };
+            const ParamSpec plain { "X", 0, 0, 2, 0, ParamKind::Choice, "", three, 3 };
+            expectEquals(plain.turned(0.0f, 1, TurnStep::Plain), 1.0f);
+            expectEquals(plain.turned(2.0f, 1, TurnStep::Plain), 2.0f);
+            // An unnamed place at an end: the knob stays where it is.
+            static const char* const ends[] = { "A", "B", "" };
+            const ParamSpec last { "X", 0, 0, 2, 0, ParamKind::Choice, "", ends, 3 };
+            expectEquals(last.turned(1.0f, 1, TurnStep::Plain), 1.0f);
+            expectEquals(last.turned(0.0f, 5, TurnStep::Plain), 1.0f);
+        }
     }
 
     // ======================================= ARP and SETTINGS =====================================
@@ -963,7 +1131,7 @@ public:
 
             // Each track starts with the engine's default: pressure -> level.
             expect(audio.getPressureRouter(0).effectiveRoute(0).dest == AftertouchRouter::Destination::Volume);
-            expect(&audio.getPressureRouter(0) != &audio.getPressureRouter(1), "one router per track");
+            // (The old "one router per track" address test is gone: routers are now on the engine.)
 
             // Track 1: pressure raises the level. Track 2: pressure takes it away.
             audio.setPressureRoute(0, 0, { AftertouchRouter::Destination::Volume, 1.0f, false });
@@ -998,13 +1166,19 @@ public:
 
             expect(audio.getPressureRouter(0).effectiveRoute(0).dest == D::Volume);
             expect(audio.getPressureRouter(1).effectiveRoute(0).dest == D::DrumDecay, "drums: pressure -> decay");
-            expect(audio.getPressureRouter(2).effectiveRoute(0).dest == D::Off, "the sampler has no pressure response");
+            expect(audio.getPressureRouter(2).effectiveRoute(0).dest == D::Off, "the sampler has no default pressure route");
 
-            // A destination the engine does not respond to is refused.
+            // An old route (a project from before the pressure slots had cells) to something AT
+            // ROUTE did not offer the engine then is refused, as it was.
             audio.setPressureRoute(2, 0, { D::Volume, 1.0f, false });
-            expect(audio.getPressureRouter(2).effectiveRoute(0).dest == D::Off);
+            expect(audio.getPressureRouter(2).effectiveRoute(0).dest == D::Off, "an old project's route never reached a sampler");
             audio.setPressureRoute(0, 1, { D::DrumSnap, 1.0f, false });
             expect(audio.getPressureRouter(0).effectiveRoute(1).dest == D::Off);
+            // The slots themselves take anything of the engine's list: a sampler's level, too.
+            audio.setPressureSlot(2, 0, SamplerEngine::lfoDests().indexOfLabel("AMP"), 1.0f, false);
+            expect(audio.getPressureRouter(2).effectiveRoute(0).dest == D::Volume, "the sampler's slot on its level, read as a route");
+            audio.resetPressureRouter(2);
+            expect(audio.getPressureRouter(2).effectiveRoute(0).dest == D::Off, "and back as a sampler is made");
 
             // A drum track's route reaches every pad's voice.
             audio.setPressureRoute(1, 0, { D::DrumPitch, 0.5f, false });
@@ -1014,24 +1188,21 @@ public:
             expect(drum->getVoice(5).getAftertouchDest() == DrumVoiceATDest::Pitch);
             expectWithinAbsoluteError(drum->getVoice(5).getAftertouchDepth(), 0.5f, 0.001f);
 
-            // Changing the engine gives the new engine's default; rebuilding the same engine keeps the routes.
+            // Changing the engine type gives the new engine's default.
+            // Rebuilding the same type (force, as a preset load) also gives the defaults: the routes
+            // are cells of the engine (part of its sound), and whoever loads a sound sets them.
             audio.setPressureRoute(0, 0, { D::FilterCutoff, 0.3f, false });
             audio.setEngineType(0, EngineType::UnifiedVoice, true);
-            expect(audio.getPressureRouter(0).effectiveRoute(0).dest == D::FilterCutoff);
+            expect(audio.getPressureRouter(0).effectiveRoute(0).dest == D::Volume, "same-type rebuild gives defaults");
             audio.setEngineType(0, EngineType::Drum);
             expect(audio.getPressureRouter(0).effectiveRoute(0).dest == D::DrumDecay);
             audio.setEngineType(0, EngineType::FM);
             expect(audio.getPressureRouter(0).effectiveRoute(0).dest == D::Volume);
 
-            // Legacy: an edit to the one router given to setAftertouchRouter reaches every track
-            // that uses a router (not the drum kit).
+            // EngineBase::setAftertouchRouter loads old routes into the engine's pressure slots, once.
             AftertouchRouter legacy;
-            audio.setAftertouchRouter(&legacy);
-            std::vector<float> l(256), r(256);
-            audio.renderBlock(l.data(), r.data(), 256);
-            expect(audio.getPressureRouter(0).effectiveRoute(0).dest == D::Volume, "setting it changes nothing by itself");
             legacy.setRoute(0, { D::FilterCutoff, 0.8f, false });
-            audio.renderBlock(l.data(), r.data(), 256);
+            audio.getEngine(0)->setAftertouchRouter(&legacy);
             expect(audio.getPressureRouter(0).effectiveRoute(0).dest == D::FilterCutoff);
             expectWithinAbsoluteError(audio.getPressureRouter(0).effectiveRoute(0).depth, 0.8f, 0.001f);
             expect(audio.getPressureRouter(1).effectiveRoute(0).dest == D::DrumPitch, "the drum track keeps its own");
@@ -1050,23 +1221,30 @@ public:
             int track = 0;
             AftertouchScreen screen(audio, [&] { return track; });
 
-            // How many choices each engine's DEST cell has (OFF + its destinations), and one label.
-            const int counts[] = { 7, 4, 6, 5, 3, 1, 8, 1 };
-            const int slots[]  = { 4, 4, 4, 4, 4, 0, 1, 0 };
+            // Every engine on the router has 4 pressure slots; drums have 1; MIDI has 0.
+            // The DEST choices: OFF, what only pressure reaches (BOW on the macro oscillator, VIB
+            // everywhere), then the engine's whole table, then the track's effect cells.
+            const int slots[]  = { 4, 4, 4, 4, 4, 4, 1, 0 };
+            const char* const second[] = { "VIB", "VIB", "BOW", "VIB", "VIB", "VIB", "VIB", "" };
             for (track = 0; track < 8; ++track)
             {
-                expectEquals(screen.getDestCount(), counts[track], "destinations of engine " + juce::String(track));
+                const int count = screen.getDestCount();
                 expectEquals(screen.getRouteSlots(), slots[track]);
-                expectEquals(screen.getDestLabel(0), juce::String("OFF"));
-                for (int i = 1; i < screen.getDestCount(); ++i)
-                    expect(AudioEngine::pressureDestinationValid(types[track], screen.getDestAt(i)));
+                const char* const* labels = screen.getDestLabels();
+                if (track != 7)     // (a MIDI track has none)
+                {
+                    const auto& table = audio.getEngine(track)->modRouter()->dests();
+                    expectEquals(count, table.size() + 1 + mod::TrackDest::COUNT, "engine " + juce::String(track));
+                    expectEquals(juce::String(labels[0]), juce::String("OFF"));
+                    expectEquals(juce::String(labels[1]), juce::String(second[track]), "first after OFF, engine " + juce::String(track));
+                    expectEquals(juce::String(labels[count - 1]), juce::String("RO.D"), "the track's effect cells last");
+                    // (every value has its place in the menu and back)
+                    for (int v = 0; v < count; ++v)
+                        expectEquals(table.pressureValueAt(table.pressurePlaceOf(v)), v);
+                }
                 DisplayRenderer display;
-                screen.render(display);         // every engine draws without touching a missing route
+                screen.render(display);
             }
-            track = 0; expectEquals(screen.getDestLabel(6), juce::String("XMOD"));
-            track = 1; expectEquals(screen.getDestLabel(3), juce::String("FM"));
-            track = 3; expectEquals(screen.getDestLabel(4), juce::String("POS"));
-            track = 6; expectEquals(screen.getDestLabel(1), juce::String("DEC"));
 
             // Cells: DEST on top, DPTH below.
             track = 0;
@@ -1076,46 +1254,155 @@ public:
                 expectEquals(screen.getEncoderName(4 + i), juce::String("DPTH"));
             }
 
-            // Wave-sequence track: turning DEST all the way never leaves its two destinations.
+            const auto slotDest = [&](int t, int slot) { return (int) audio.getTrackParameter(t, PressureSlotParam::id(slot, PressureSlotParam::DEST_OFFSET)); };
+            const auto slotAmount = [&](int t, int slot) { return audio.getTrackParameter(t, PressureSlotParam::id(slot, PressureSlotParam::AMT_OFFSET)); };
+            const auto slotBipolar = [&](int t, int slot) { return audio.getTrackParameter(t, PressureSlotParam::id(slot, PressureSlotParam::BIPOLAR_OFFSET)); };
+
+            // Wave-sequence track: one click from OFF is VIB, the vibrato the pad brings in (the
+            // old route, one turn away); the next is the table's first entry.
             track = 4;
-            screen.onEncoderChange(1, enc(20));
-            expect(audio.getPressureRouter(4).effectiveRoute(1).dest == D::FilterCutoff);
-            expectEquals(screen.getEncoderReadout(1), juce::String("DEST 2 CUT"));
-            expect(audio.getPressureRouter(0).effectiveRoute(1).dest == D::Off, "the other tracks are untouched");
-            expect(audio.getPressureRouter(3).effectiveRoute(1).dest == D::Off);
+            const auto& seqTable = audio.getEngine(4)->modRouter()->dests();
+            screen.onEncoderChange(1, enc(1));
+            expectEquals(slotDest(4, 1), seqTable.pressureVibrato());
+            expectEquals(screen.getEncoderReadout(1), juce::String("DEST 2 VIB"));
+            expect(audio.getPressureRouter(4).effectiveRoute(1).dest == D::Vibrato, "read as a route: the old VIB");
+            expectEquals(slotAmount(4, 1), 0.5f, "a route that is chosen starts at half");
+            screen.onEncoderChange(1, enc(1));
+            expectEquals(slotDest(4, 1), seqTable.indexOfLabel("PTCH"));
+            expectEquals(screen.getEncoderReadout(1), juce::String("DEST 2 PTCH"));
+            expectEquals(slotDest(0, 1), 0, "the other tracks are untouched");
+            expectEquals(slotDest(3, 1), 0);
+            // Func + turn goes from group to group, and ends on the track's effect cells.
+            screen.setModifiers(false, true);
+            for (int i = 0; i < 40; ++i)
+                screen.onEncoderChange(1, enc(1));
+            screen.setModifiers(false, false);
+            expectEquals(slotDest(4, 1), seqTable.pressureChoices() - 1);
+            screen.onEncoderChange(1, enc(-60));
+            screen.onEncoderChange(1, enc(-60));
+            screen.onEncoderChange(1, enc(-60));
+            screen.onEncoderChange(1, enc(-60));
+            expectEquals(slotDest(4, 1), 0, "all the way back: OFF");
 
             // The same knob on another track edits that track.
             track = 0;
-            screen.onEncoderChange(1, enc(3));
-            expect(audio.getPressureRouter(0).effectiveRoute(1).dest == D::Vibrato);
-            expect(audio.getPressureRouter(4).effectiveRoute(1).dest == D::FilterCutoff);
+            screen.onEncoderChange(1, enc(2));
+            expectEquals(slotDest(0, 1), (int) UnifiedVoice::RPitch);
 
             // Depth: plain 1 % of the -100..+100 range, Shift a tenth, Func to the snap points.
-            audio.setPressureRoute(0, 1, { D::Vibrato, 0.2f, false });
+            audio.setTrackParameter(0, PressureSlotParam::id(1, PressureSlotParam::AMT_OFFSET), 0.2f);
             screen.onEncoderChange(5, enc(1));
-            expectWithinAbsoluteError(audio.getPressureRouter(0).effectiveRoute(1).depth, 0.22f, 0.0005f);
+            expectWithinAbsoluteError(slotAmount(0, 1), 0.22f, 0.0005f);
             screen.setModifiers(true, false);
             screen.onEncoderChange(5, enc(1));
-            expectWithinAbsoluteError(audio.getPressureRouter(0).effectiveRoute(1).depth, 0.222f, 0.0005f);
+            expectWithinAbsoluteError(slotAmount(0, 1), 0.222f, 0.0005f);
             screen.setModifiers(false, true);
             screen.onEncoderChange(5, enc(1));
-            expectWithinAbsoluteError(audio.getPressureRouter(0).effectiveRoute(1).depth, 0.5f, 0.0005f);
+            expectWithinAbsoluteError(slotAmount(0, 1), 0.5f, 0.0005f);
             screen.onEncoderChange(5, enc(-3));
-            expectWithinAbsoluteError(audio.getPressureRouter(0).effectiveRoute(1).depth, -1.0f, 0.0005f);
+            expectWithinAbsoluteError(slotAmount(0, 1), -1.0f, 0.0005f);
             screen.setModifiers(false, false);
 
-            // Sampler: nothing to route; the knobs do nothing.
-            track = 5;
-            for (int k = 0; k < 8; ++k) screen.onEncoderChange(k, enc(3));
+            // Page 2 (the bank buttons go round): BIP, the pad read both ways, clockwise = on.
+            expectEquals(screen.getPageCount(), 2);
+            expectEquals(screen.getPageIndex(), 0);
+            screen.onArrowRight();
+            expectEquals(screen.getPageIndex(), 1);
+            expectEquals(screen.getSubPage(), juce::String("BIP"));
             for (int i = 0; i < 4; ++i)
-                expect(audio.getPressureRouter(5).effectiveRoute(i).dest == D::Off);
+            {
+                expectEquals(screen.getEncoderName(i), juce::String("BIP"));
+                expectEquals(screen.getEncoderName(4 + i), juce::String("---"));
+            }
+            screen.onEncoderChange(1, enc(1));
+            expectEquals(slotBipolar(0, 1), 1.0f);
+            expectEquals(screen.getEncoderReadout(1), juce::String("BIPOLAR 2 ON"));
+            screen.onEncoderChange(1, enc(1));
+            expectEquals(slotBipolar(0, 1), 1.0f, "clockwise again: still on");
+            screen.onEncoderChange(1, enc(-1));
+            expectEquals(slotBipolar(0, 1), 0.0f);
+            {
+                const float depth = slotAmount(0, 1);
+                const int said = TurnNotice::count();
+                screen.onEncoderChange(5, enc(3));      // (nothing under the bottom knobs of this page)
+                expectEquals(slotAmount(0, 1), depth);
+                expectEquals(TurnNotice::count(), said, "and they stay silent");
+                screen.onEncoderChange(2, enc(1));      // route 3 is off: it has no way to be read
+                expectEquals(slotBipolar(0, 2), 0.0f);
+                expectEquals(screen.getSubPage(), juce::String("ROUTE OFF"));
+                DisplayRenderer display;
+                screen.render(display);
+            }
+            screen.onArrowRight();
+            expectEquals(screen.getPageIndex(), 0, "round to the first page");
+            screen.onArrowLeft();
+            expectEquals(screen.getPageIndex(), 1, "and up from the first is the last");
+            screen.onArrowLeft();
+
+            // Sampler: four slots, nothing routed as it is made; its level is one of its destinations.
+            track = 5;
+            expectEquals(screen.getRouteSlots(), 4);
+            for (int s = 0; s < 4; ++s)
+                expectEquals(slotDest(5, s), 0);
 
             // Drum kit: one route; the second column is empty.
             track = 6;
+            const auto& kit = audio.getEngine(6)->modRouter()->dests();
+            auto* drums = dynamic_cast<DrumEngine*>(audio.getEngine(6));
             screen.onEncoderChange(1, enc(3));
-            expect(audio.getPressureRouter(6).effectiveRoute(1).dest == D::Off);
+            expectEquals(slotDest(6, 1), 0);
+            expectEquals(slotDest(6, 0), kit.indexOfLabel("DEC"), "as a kit is made: squeezing a pad lengthens it");
             screen.onEncoderChange(0, enc(1));
-            expect(audio.getPressureRouter(6).effectiveRoute(0).dest == D::DrumPitch, "DEC -> TUNE");
+            expectEquals(slotDest(6, 0), kit.indexOfLabel("TONE"), "DEC -> TONE");
+            expect(drums->getVoice(3).getAftertouchDest() == DrumVoiceATDest::Filter, "the turn on the screen reaches every drum");
+            // A drum's own destinations take the pad one way: 0 .. 1, and BIP says so.
+            screen.onEncoderChange(4, enc(-60));
+            screen.onEncoderChange(4, enc(-60));
+            expectEquals(slotAmount(6, 0), 0.0f, "no negative depth on a drum's own destination");
+            screen.onEncoderChange(4, enc(30));
+            expectWithinAbsoluteError(drums->getVoice(3).getAftertouchDepth(), 0.3f, 0.001f);
+            screen.onArrowRight();
+            screen.onEncoderChange(0, enc(1));
+            expectEquals(slotBipolar(6, 0), 0.0f);
+            expectEquals(screen.getSubPage(), juce::String("KIT ONE WAY"));
+            screen.onArrowLeft();
+            {
+                // In the name bar, through ScreenManager: the page's name and the notice are there
+                // whole ("PRESSURE" and "BIPOLAR" were shown as "SURE" and "OLAR": four characters
+                // are what the bar has beside "AT ROUTE T1" and the page mark; "KIT: ONE WAY" lost
+                // its last letter).
+                ScreenManager mgr;
+                DisplayRenderer display;
+                mgr.setDisplay(&display);
+                int shown = 0;
+                mgr.addScreen(std::make_unique<AftertouchScreen>(audio, [&] { return shown; }));
+                TurnNotice::setSink([&mgr](const juce::String& text) { mgr.showStatus(text); });    // (as the app has it)
+                const auto bank = [&] { mgr.controlChangeReceived(ScreenManager::BUTTON_CHANNEL, ScreenManager::CC_BANK_DOWN, 127);
+                                        mgr.controlChangeReceived(ScreenManager::BUTTON_CHANNEL, ScreenManager::CC_BANK_DOWN, 0); };
+                UiClock::advance(3000);
+                expectEquals(mgr.composeNameBar().left, juce::String("AT ROUTE T1"));
+                expectEquals(mgr.composeNameBar().text, juce::String("DEST"));
+                expectEquals(mgr.composeNameBar().pages, juce::String("1/2"));
+                bank();
+                expectEquals(mgr.composeNameBar().text, juce::String("BIP"));
+                expectEquals(mgr.composeNameBar().pages, juce::String("2/2"));
+                bank();
+                expectEquals(mgr.composeNameBar().text, juce::String("DEST"), "the bank buttons go round");
+                shown = 6;      // the kit, its one route on DEC: BIP says why it does not turn
+                bank();
+                mgr.controlChangeReceived(16, 0x15, enc(1));
+                expectEquals(mgr.composeNameBar().text, juce::String("KIT ONE WAY"));
+                UiClock::advance(3000);
+                shown = 7;      // a MIDI track: no routes, one page, and the picture says what happens
+                expectEquals(mgr.composeNameBar().text, juce::String());
+                expectEquals(mgr.composeNameBar().pages, juce::String());
+                TurnNotice::setSink({});
+            }
+            // Aimed at something that is not a drum's own (VIB), the route is the kit router's:
+            // the drums' own path is off.
+            audio.setTrackParameter(6, PressureSlotParam::id(0, PressureSlotParam::DEST_OFFSET), (float) kit.pressureVibrato());
+            expect(drums->getVoice(3).getAftertouchDest() == DrumVoiceATDest::Off);
+            expect(! audio.getEngine(6)->modRouter()->pressureIsOwn(0));
 
             // Pads play the track; all are lit, the Cs marked.
             std::vector<int> on;
@@ -1169,8 +1456,36 @@ public:
             auto* drum = dynamic_cast<DrumEngine*>(audio2.getEngine(1));
             expect(drum != nullptr && drum->getVoice(0).getAftertouchDest() == DrumVoiceATDest::Snap);
 
-            // An old project: no per-track lists, one global list.
-            auto old = reloaded;
+            // An old project: no per-track lists, one global list (and, as every project from
+            // before the pressure slots had cells, none of their ids among a track's parameters).
+            const auto withoutSlots = [](ProjectData data)
+            {
+                for (auto& pattern : data.patterns)
+                    for (auto& track : pattern.tracks)
+                        for (int id = PressureSlotParam::BASE; id < PressureSlotParam::END; ++id)
+                            track.soundParams.erase(id);
+                return data;
+            };
+            {
+                // What was saved holds the slots, and they are what a load reads: the lists beside
+                // them are for an older build. (Changed lists, the same slots: nothing changes.)
+                const auto& params = reloaded.patterns[(size_t) reloaded.activePattern].tracks[0].soundParams;
+                expect(params.count(PressureSlotParam::id(0, PressureSlotParam::DEST_OFFSET)) == 1);
+                auto lists = reloaded;
+                lists.trackAftertouch[0].routes[0].destination = (int) D::Volume;
+                SequencerCore seq4;
+                AudioEngine audio4;
+                ProjectBridge::apply(lists, { seq4, audio4 });
+                expect(audio4.getPressureRouter(0).effectiveRoute(0).dest == D::FilterCutoff, "the slots are the truth");
+                // And without the slots the lists are read, as an older project's.
+                SequencerCore seq5;
+                AudioEngine audio5;
+                ProjectBridge::apply(withoutSlots(lists), { seq5, audio5 });
+                expect(audio5.getPressureRouter(0).effectiveRoute(0).dest == D::Volume, "an older project: its list");
+                expect(audio5.getPressureRouter(0).effectiveRoute(2).dest == D::Vibrato);
+                expect(audio5.getPressureRouter(1).effectiveRoute(0).dest == D::DrumSnap);
+            }
+            auto old = withoutSlots(reloaded);
             old.trackAftertouch.clear();
             old.aftertouchRouting.routes = { { (int) D::FilterCutoff, 0.7f, false }, { (int) D::Volume, 0.2f, false } };
             const auto oldReloaded = ProjectData::fromVar(old.toVar());
@@ -1179,7 +1494,6 @@ public:
             SequencerCore seq3;
             AudioEngine audio3;
             AftertouchRouter legacy;
-            audio3.setAftertouchRouter(&legacy);
             ProjectBridge::apply(oldReloaded, { seq3, audio3, nullptr, nullptr, &legacy });
             for (int t : { 0, 2 })
             {
@@ -1191,7 +1505,7 @@ public:
             expect(legacy.getRoute(0).dest == D::FilterCutoff, "the legacy router shows it too");
 
             // A project with neither (a new one): every track back to its engine's default.
-            auto blank = reloaded;
+            auto blank = withoutSlots(reloaded);
             blank.trackAftertouch.clear();
             blank.aftertouchRouting.routes.clear();
             ProjectBridge::apply(blank, { seq2, audio2 });

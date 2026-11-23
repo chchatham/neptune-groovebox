@@ -49,6 +49,8 @@ in the owner's manual (`docs/Neptune-Groovebox-Manual.pdf`). The sections before
 
 Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 4 PRESET, 5 SETTINGS, 6 FLTR, 7 ARP,
 8 SCALE, 9 SONG, 10 AT ROUTE, 11 WAVE, 12 TRK FX, 13 CHORD, 14 PERF. ARP is reached by the Arp button only.
+Engines (`EngineType`, TRACKS → ENG; the number is stored): 0 synth (VA), 1 FM, 2 macro (MO), 3 wavetable (WT),
+4 wave sequencer (WS), 5 sampler (SP), 6 drums (DR), 7 MIDI (MD), 8 resonator (RS).
 
 ## ARP, SCALE AND LATCH (app side)
 - Internally the app still identifies the Arp and Scale buttons as (channel 7, CC 0x49) and (channel 7, CC 0x4A); the Mac window's keyboard shortcuts and the tests use that identity. `ScreenManager::controlChangeReceived` translates the hardware messages CC 109 / CC 110 (ch1) to it and opens SETTINGS on CC 108.
@@ -65,8 +67,8 @@ Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 
 - Feature controls are CC messages on **channel 7** sent to the DAW port (`B6 <cc> <value>`); enabled with NoteOn ch16 note 11 vel 127 (`9F 0B 7F`)
 - At connect the app sends, in order (`main.cpp`): `enableFeatureControls()`, `setPadMode(PAD_MODE_DAW)` (0x1D = 2), `disableFirmwareArp()` (0x49 = 0), `disableFirmwareScale()` (0x4A = 0), `setEncoderMode(ENCODER_MODE_PLUGIN)` (0x1E = 2), `configureNeptuneFirmware()` (0x64 = 0 keys on channel 1, 0x6C = 2 polyphonic pad aftertouch, 0x6E = 0 device MIDI clock output off, 0x45 = 127 relative encoders)
 - 0x45 is volatile and must be sent on every connect; 0x64, 0x6C and 0x6E are non-volatile
-- **MIDI clock:** the device's "MIDI Clock Out" setting (0x6E) is on by default; it then sends `F8` on the MIDI port all the time (24 a beat at its own tempo, 120 BPM), app or no app. The app switches it off. The controller's ports are never a clock or transport source for the app: `LaunchkeyController` drops system messages (`F1`–`FF`) from them, and clock from a MIDI input goes through `MIDIClock::handleMidiMessageFromPort`, which refuses a Launchkey port in every CLK mode (nothing calls it yet: the app opens no MIDI input but the controller, so CLK = EXT / AUTO has no clock source). The app's own clock goes to the first MIDI output that is not a Launchkey port. Play is CC 115; in DAW mode the device sends no Start / Stop
-- **Clock in:** the app makes a virtual MIDI input, "Neptune Clock In". With CLK = EXT or AUTO the sequencer follows clock sent there (Start / Stop, tempo, position). No physical MIDI input is opened for clock, and the Launchkey's ports never count as one
+- **MIDI clock:** the device's "MIDI Clock Out" setting (0x6E) is on by default; it then sends `F8` on the MIDI port all the time (24 a beat at its own tempo, 120 BPM), app or no app. The app switches it off. The controller's ports are never a clock or transport source for the app: `LaunchkeyController` drops system messages (`F1`–`FF`) from them, and `MIDIClock::handleMidiMessageFromPort`, the way in for clock from a named MIDI input, refuses a Launchkey port in every CLK mode (nothing calls it: the app opens no physical MIDI input but the controller). The clock source for CLK = EXT / AUTO is the app's own virtual port (next bullet). The app's own clock goes to the first MIDI output that is not a Launchkey port. Play is CC 115; in DAW mode the device sends no Start / Stop
+- **Clock in:** the app makes a virtual MIDI input, "Neptune Clock In" (`MIDIRouter`: clock, Start / Stop / Continue and song position go to `MIDIClock::handleMidiMessage`, everything else on the port is ignored). With CLK = EXT or AUTO the sequencer follows clock sent there (`AudioEngine::followExternalClock`: Start / Stop, tempo, position). No physical MIDI input is opened for clock, and the Launchkey's ports never count as one
 - **Button lights:** after the connect messages the app lights Up, Down, > and Func white: the debug SysEx on the MIDI port calling the firmware's `led_set(id, 0x3F3F3F)` for ids 0x22, 0x23, 0x10, 0x11 *(not yet seen on the device)*
 - **Octave and split:** the app reads the firmware's octave every 2 s while idle (debug SysEx) and writes it, with the split, when a preset or project that stores the keyboard is loaded (`KeyboardSplit.h`)
 - Full list of registered feature controls: `docs/launchkey-mk4-firmware-map.md` section 0.9 and the Programmer's Reference
@@ -86,9 +88,16 @@ Screen indices (`main.cpp`, `ScreenIndex`): 0 TRACKS, 1 STEP, 2 PARAM, 3 DRUMS, 
 - Bottom row pads: notes 112–119 (`PAD_BOTTOM_ROW_START + 0..7`)
 
 ## PARAMETER ID SPACE
-Parameter id ranges in use (engine ids 0–149, 158–189 and 400–655, send types 150–157, mixer 190–199, insert effects
-200–239, track effect blocks 240–263, arp locks 270–272, insert ON / WET / SYNC / division 280–311, screen-only cells
-900–909, pressure ranges 1000+ / 2000+). Do not add a range that collides with them.
+Parameter id ranges in use. Engine ids are five blocks (`EngineParamRange`): 0–149, 158–189, 400–655, 700–784 and
+4000–4255. 158–189 and 700–784 are the modulation router's on every engine (158–165 LFO1, 166–173 LFO2, 174–181
+STRIP, 182–189 XIN; 700–763 the sixteen free slots, 764–771 the custom LFO shape, 772 the slots shown, 773–784 the
+four pressure slots: DEST, AMT, BIPOLAR each); the synth shows STRIP and XIN at 158–165 / 166–173 and keeps its own
+LFO cells at 40–89, 130–145 and 174–189. 400–423 are the stage curves on every engine but the drum kit, whose
+kick pages (KICK, and KCK2 / RSN / BANK on the pad's sound-page ids from 528) fill 400–655; 4000–4255 are the drum
+pads' own modulation (PLFO, PSLT: 16 ids a pad). Send types 150–157, mixer 190–199, insert effects 200–239, the
+retired effect blocks 240–263 (read 0, ignored on set; a stored value is converted on load), arp locks 270–272,
+insert ON / WET / SYNC / division 280–311, insert extra cells 312–343, screen-only cells 900–909, 950 (IN's SRC) and 3200 up (the
+sends' pages), pressure ranges 1000+ / 2000+. Do not add a range that collides with them.
 
 ## VIRTUAL CONTROLLER
 - `VirtualControllerComponent.h` draws the panel in the Mac window as it looks with the printed overlay on: from the top edge down to just above the keys (no keys in the picture), laid out at 4 px per mm from `src/ui/PanelDimensions.h`. That table and the `DIM` table of `docs/overlay/overlay.html` must hold the same numbers, and `PanelOverlay.h` the overlay's words ("Panel Dimensions" test): change the overlay first, then the two headers
@@ -103,7 +112,7 @@ Shift = where, and how finely. Func = bigger, or secondary. The same gesture mea
 
 | Modifier | Turn a knob | Press a pad | Up / Down (beside the pads) | Bank up / down (beside the knobs) |
 |---|---|---|---|---|
-| plain | edit the shown cell, one step | the screen's pad action | what the pads address: step page (STEP, PARAM), scale page, SONG row, PRESET list | encoder page ±1, on every screen, nothing else; the pages go round (back from the first = the last, on from the last = the first) |
+| plain | edit the shown cell, one step | the screen's pad action | what the pads address: step page (STEP, PARAM), scale page, SONG row, PRESET list, the bank on CHORD and PERF | encoder page ±1, on every screen, nothing else; the pages go round (back from the first = the last, on from the last = the first) |
 | Shift + | fine; on an envelope's ATK, DEC or REL cell: that stage's curve (below) | top / bottom row: go to screen (an unassigned pad does nothing) | track ±1 | encoder page ±1, as plain; while Shift's help card shows: its cards (**Help cards**, below) |
 | Func + | coarse / snap | top row: page key; bottom row on TRACKS: solo; any other pad: the screen's own pad action (also while another screen's pads are pinned) | PARAM, TRK FX, FLTR: set the low (Down) / high (Up) pressure-range end of the knob turned last; again = clear it. Elsewhere: nothing | section jump (PARAM, TRK FX, FLTR), first / last page (TRACKS, SETTINGS, ARP), encoder page ±1 as plain on the other screens; while Func's help card shows: its cards |
 | hold a step + | lock on that step (Shift fine, Func coarse); the hold alone shows that step's values (**Held step**, below) | — | — | lock page ±1 |
@@ -130,12 +139,119 @@ the engine): saved with the sound, lockable per step (hold a step + Shift + turn
 removes that lock), and Track + Shift + turn sets them on every track with the same engine. Where the envelope has a
 CURV cell, CURV still bends all three stages and each stage's own curve adds to it (limited to ±100).
 
+**Modulation pages** (`src/engine/ModRouter.h`). Every sound engine is on the one router and its PARAM ends with
+the router's pages: XIN (DST1 AMT1 FLT1 LPF | DST2 AMT2 FLT2 HPF: the track input, sample by sample, on two
+destinations; FLT RAW / LP / HP / BP; LPF 2 kHz and HPF 200 Hz by default, open on the wavetable: 20 kHz / 20 Hz),
+SLT1 … SLT8 (two free slots a page: SRC DEST AMT VIA | SRC DEST AMT VIA; one page more appears as soon as a slot on
+the last shown page is used), LSHP (L1–L8, the custom LFO shape that SHPE USR / USRS plays), STRIP (DST1 AMT1 DST2
+AMT2 | DST3 AMT3 WVIB VRAT), LFO1, LFO2 (RATE DPTH SHPE TRIG | SYNC DIV FADE DEST). The synth has XIN, SLT, LSHP and
+STRIP and then the screen's own MOD / MOD2 / MENV instead of LFO1 / LFO2. On the drum kit the pages are the kit's
+(one router, each drum its own values), after WAV1 / WAV2. Func + turn on SRC, VIA and every DEST list jumps to
+the next group.
+- SRC / VIA (a stored place in the engine's list, which only grows at its end): OFF LFO1 LFO2 ENV FENV | VEL PRES
+  STRP KEY RAND | IN XIN XLP XHP XBP | VIB ONE | RND2 RND3 RND4 | ONST BND1 … BN16 | the engine's own: FM OP1–OP6
+  (audio rate, one sub-block late), macro OSC (audio rate, one sub-block late), wavetable SCAN (control) XRCT XFLT
+  (audio rate, no delay), wave sequencer PLAN SLAN LLAN TLAN (control), sampler POS GRN SLEV (control). The synth
+  has LFO3 LFO4 ENV2 ENV3 ENV4 ENV5 after ONE; the drum kit and the resonator have none of their own.
+- A page DEST (LFO, STRIP, XIN) is the engine's destination table, then the track's effect cells
+  (1:C1 … 8:WT, 72 of them) and eight reserved places (CH.R … RO.D: the retired MODFX block's, moving nothing). A
+  slot's DEST is the table, then L1RT L1DP L2RT L2DP (the synth to L4DP) and AMT1 … AM16, then the same 80. A
+  pressure route's DEST has its own order (**Pad pressure routes**, below).
+  Destinations added since the engines were ported: ETIM FTIM (the sampler ETIM only), PM on the wavetable, the
+  wave sequencer, the drum kit and the synth's router lists, PM1–PM6 PMAL on FM, RING and SYNC on the synth's router
+  lists, WPOS on the drum kit, BMIX … BKTK and BCNT … BWIR (BODY and BDY2) on the macro oscillator and the wave
+  sequencer. The wave sequencer's BDY2 entries sit BEFORE its ETIM FTIM PM, the macro's after its ETIM FTIM.
+- LFO TRIG: FREE KEY ONE HALF HOLD XKEY XONE XHLF XHLD on LFO1 / LFO2 and a drum pad's PLFO (restart on an onset of
+  the track input, every voice together; a note does not restart them); the synth's MOD page has the first five.
+- LFO DIV: 22 divisions (`dsp/TempoDivisions.h`): the seventeen old ones in their places (8BAR … 1/32), then 1/32T
+  1/64 1/128 16BAR 1/32D.
+- Wave sequencer LOOP: FWD REV PING RAND ONCE ORND (RAND is drawn per note from the seeded generator; ORND is the
+  random loop as it was before the port, kept until the owner has heard both).
+- FM's old XIN / XDPT ids 64 / 65 are still taken on set and written to the XIN page (DST1 = PM1 … PMAL, AMT1 =
+  depth), and the synth's 148 / 149 likewise (PM, RING or SYNC at that depth); they are on no page. The
+  wavetable's old XIN cells (65–72) are not taken.
+- **Format 3** (`Project::FORMAT_VERSION`, `Preset`, `MultiPreset`; `mod::NamedList`): a DEST of an LFO page, STRIP,
+  XIN or a slot, a slot's SRC and VIA, an LFO's SHPE, TRIG and DIV are stored with the entry's name ("n") beside the
+  place ("v"); a file of version 3 is resolved by name (an unknown name keeps the place), an older file place for
+  place. A pressure route's DEST is stored by name too (its own list, `DestTable::pressureLabels`). Not by name:
+  the synth's MOD / MENV DEST (`LfoDestList`), a drum pad's PLFO / PSLT, effect and filter types.
+- Not built: per-sample modulation from a pad's own slots (control rate); the synth's additive LFO depth cells
+  (WHL / VEL / PRES) as slots; a gesture that locks a pressure slot's DPTH on a step (a lock on ids 773–784 in a
+  pattern is applied, nothing on the controller makes one).
+
+**Pad pressure routes (AT ROUTE).** Shift + top pad 8. A route is a pressure slot of the track's modulation router
+(`ModRouter.h`, THE PRESSURE SLOTS): its source is the pad of each voice, and its three cells are parameters of the
+track's sound (`PressureSlotParam`, ids 773–784: DEST, AMT, BIPOLAR; set through `AudioEngine::setTrackParameter`),
+so a preset saved with SV, a project, a multi and an undo step carry them. Four routes a track, one on a drum kit
+(it goes to every pad), none on a MIDI track (its pressure is sent on as poly pressure).
+- Page 1 (name bar DEST): top row DEST 1–4, bottom row DPTH 1–4. Page 2 (name bar BIP; the bank buttons go round):
+  top row BIP 1–4 (the pad read both ways: half pressure is the middle), the bottom knobs empty and silent. A DPTH
+  or a BIP whose route has no destination shows `---` and says ROUTE OFF when turned.
+- DEST, in the order the knob goes through it (`DestTable::pressureMenu`; Func + turn goes from group to group):
+  OFF; what only pressure reaches (EXC on the resonator, BOW on the macro oscillator, then VIB on every engine: a
+  vibrato the pad brings in, ± DPTH semitones at full pressure, its rate VRAT of the STRIP page); every
+  destination of the engine's LFOs, in their order, the level as AMP; last the cells of the track's effects
+  (`mod::TrackDest`, shown by the label the effect in that slot has now; summed by the leading voice). The cell
+  stores a value of `DestTable::pressureLabels` (the table by index, then VIB, then the effect cells), not the
+  place in this order, and files store it by name.
+- DPTH −100…+100 (the cell holds −8…8; a slot gives pressure × depth in the destination's own scale, never
+  squared: at 100 a gain of 1 + pressure on the level, four octaves of cutoff, an octave of pitch). A destination
+  chosen for a route whose depth is 0 starts at 50.
+- An engine is made with its routes (`DestTable::pressureRoute`): AMP +100 on synth, FM, macro, wavetable and wave
+  sequencer; EXC +100 on the resonator; DEC +100 on a drum kit; none on the sampler. So a preset decides where
+  pressure goes: one that stores slots brings them, one that stores none (every built-in preset, a user preset
+  from before 22 November 2026) is heard with its engine's own; the track's routes return when an audition is
+  left without LD.
+- A drum kit: DEC, PTCH, TONE, AMP, DRIV, SNAP and PAN are each drum's own response to its pad
+  (`DrumEngine::applyKitPressure`: depth 0…100, and BIP says KIT ONE WAY); any other destination is a route of
+  the kit's router like a synth's. The synth plays AMP, CUT, PW, MIX, XMOD and VIB on its own path
+  (`Router::setOwnPressure`).
+- Files: the slots are stored with the track's sound. A project also writes the routes in the words of older
+  builds (`trackAftertouch`, `AftertouchRouter::Destination`), read only for a track whose sound holds no slot
+  ids: each engine says what an old destination is here (`EngineBase::pressureDestOf`; an old Vibrato route is VIB).
+- The pads play the track from note 60; the strip at the bottom shows the pressure.
+
+**Drum kit.** TYPE offers FMKK KICK MKIK CLAP SHKR SUB KSYN CYMB RSN BANK (stored numbers; the folded types TOM
+SNAR FMSN CSYN RIM CLAV and the two hats keep their numbers and load as the resonator drum or the oscillator
+bank). A pad's pages on PARAM: DR (TUNE DEC TONE DRIV | SNAP LEVL PAN TYPE); on a kick (KSYN and the three points
+FMKK / KICK / MKIK) KICK (SWEP SWPT SCRV SHAP | KNCK KTON HOLD ACRV) and KCK2 (KIND LIN RES LPSW | LPKT SAT EDGE
+PATH; all 0 = the kick machine as it was); on RSN the RSN page (SND MRPH XMPH ENRG | DAMP WIRE MEET DIR: SND one of
+33 sounds, the rest offsets); on BANK the BANK page (MODL PING COLR EXC | DAMP BLOM COUP LOFI; MODL HAT OHAT METL
+RING); then PLFO (RATE DPTH SHPE DEST | TRIG SYNC DIV FADE) and PSLT (SRC1 DST1 AMT1 VIA1 | SRC2 DST2 AMT2 VIA2):
+the pad's own LFO and two slots, added to the kit's modulation, "SET DEST" when turned with the destination OFF.
+After the pad's pages the kit's: WAV1 / WAV2 (W1–W16: each pad's oscillator wave, SINE or a built-in table; ids
+128–143), then the router's pages. DRUMS shows the same pages of the selected pad on its bank buttons, going round
+(`DrumEngine::padPages`: DR, then KICK and KCK2, or RSN, or BANK, then PLFO and PSLT), two letters a knob: DR = TN
+DC TO DV SN LV PN TY, KICK = SW ST SC SH KN KT HD AC, KCK2 = KD LN RS LS LK SA ED PA, RSN = SN MR XM EN DP WR MT
+DR, BANK = MD PG CL EX DP BL CP LF, PLFO = RT DP SH DS TG SY DV FD, PSLT = S1 D1 A1 V1 S2 D2 A2 V2. Its name bar
+says the pad and its type on the DR page and the pad and the page on the others ("P9 KSYN", "P9 KCK2"; a pad of
+two digits without its P, "16 KCK2"); the readout of a turned knob keeps its value in the bar (a name too long
+for that gives way to the cell's own label). Another pad keeps the page where it has one of that kind (a kick's
+KICK becomes a resonator drum's RSN or a bank's BANK), else its DR page. The CYM page (cymbal machine) is gone.
+- A pad's wave list is the oscillators' list without CYCL: a drum has no sample whose cycles it could read (no
+  cell chooses one), and the choice played the sine. The list keeps its places (`DrumEngine::waveNames`: the
+  label at 1 is empty, and a knob passes over an unnamed choice, `ParamSpec::turned`); a sound stored with 1
+  loads as SINE, which is what it played.
+
+**Effects.** One list of 33 types (`EffectType`, stored numbers; DIRT and TALK are the last two) wherever an effect
+sits: a track's eight insert slots (TRK FX → FX / FX2), a send bus's chain (S1FX .. S2FX2: up to eight in a row;
+an effect put on a send starts with WET 100, a send with no effect returns nothing), a PERF pad's layer, the
+master. The master is a chain of EQ, CMP and LMT whose eight cells are SETTINGS → MASTR; its content cannot be
+changed from the controller (not built). KEY (CMP TRNS FLT PHS TRM PAN WAH; DUCK's SRC): SELF, T1–T16, IN, on a
+track or on a send; a track that is listened to keeps feeding while muted. THRU (FLG CHR ENS VIB, on FX2): the dry
+sound delayed by TIME (through zero). RVB, HALL, SPRG and SHIM share PDLY, SHIM and MODE (OCT+ 5TH+ O+5 OCT- REV
+SUB HOLD); HOLD (RVB, HALL) or MODE = HOLD holds the tail. The DIRT / TALK / MODFX pages of TRK FX are gone: a
+stored block is converted to inserts at the front of the chain on load (`ProjectBridge::convertTrackFxParams`;
+MODFX's locks are dropped), and the eight MODFX destinations are reserved places.
+
 **Buttons.** Arp: opens the ARP screen; pressed again on that screen it switches the selected track's arp on / off
 (an ARP tag in the name bar shows it is on). Shift + Arp: latch — the arp's latch when the arp is on, the key latch
-when it is off. A latched arp with no key down is transposed by the single-note pads (SCALE, PRESET, AT ROUTE): its lowest note becomes the pad's note, the pattern carries on (`Arpeggiator::transposeLatched`); keys and chord pads start a new chord. LATCH tag in the name bar on every screen (and ROLL, letter O, while pad rolls are on with ROL2's LTCH). Scale: scale lock (keys on pitched tracks play the
+when it is off. A latched arp with no key down is transposed by the single-note pads (SCALE, PRESET, AT ROUTE): its lowest note becomes the pad's note, the pattern carries on (`Arpeggiator::transposeLatched`); keys and chord pads start a new chord. SCALE pads follow the key latch (like keys and chord pads): a released pad keeps sounding under the latch until a new chord starts or the latch goes off; serviced by the strum timer (`CustomScaleScreen::serviceScaleLatch`). PRESET and AT ROUTE pads do not follow the latch (they are audition pads: a latch would leave drones while browsing). LATCH tag in the name bar on every screen (and ROLL, letter O, while pad rolls are on with ROL2's LTCH). Scale: scale lock (keys on pitched tracks play the
 nearest note of the active scale page, arps stay in it); the name bar says "SCALE LOCK ON C MAJOR" / "SCALE LOCK
-OFF" for 2 s (shortened to fit: "SCALE ON C MAJOR", "SCALE ON") and a SCALE tag stays while it is on; Shift + Scale:
-SCALE screen. Play: start / stop; Shift + Play: stop and return to the start (when already stopped: reset the
+OFF" for 2 s (shortened to fit: "SCALE ON C MAJOR", "SCALE ON") and a SCALE tag stays while it is on. The toggle is
+on release (not press), so that the hold can serve Scale + Up / Down: step the active scale page forward / backward
+(wrapping); if the lock was off, it turns on with the first step. Scale + Up / Down shows "SCALE <page name>" in
+the name bar. Shift + Scale: SCALE screen. Play: start / stop; Shift + Play: stop and return to the start (when already stopped: reset the
 position), and silence: every note is let go and every effect's tail (inserts, send buses) is cut - the way out
 of anything that rings on. Shift + Record held: FILL while held. Func + Settings: tap tempo.
 
@@ -149,7 +265,8 @@ of anything that rings on. Shift + Record held: FILL while held. Func + Settings
 | STEP, no step held | the selected track's steps, length and speed | the selected track's steps |
 | TRACKS | the pattern: every track's steps, lengths and speeds, and the swing — **paste: hold 0.5 s** | every track's steps — **hold 0.5 s** |
 | PARAM, FLTR, no step held | the selected track's whole sound: engine and its parameters, mixer, sends, effects | **the engine's parameters only**, back to their defaults (with their pressure ranges); mixer and effects stay ("RESET T3 ENGINE") |
-| TRK FX, no step held | the selected track's **effects**: the DIRT / TALK / MODFX blocks, the insert slots (types, ON / WET / SYNC / division, parameters), the ARPLK values, and pressure ranges set on any of those | the same set: blocks to their defaults (off), no insert slots, arp locks off ("CLEAR T3 FX") |
+| TRK FX, no step held | the selected track's **effects**: the insert slots (types, ON / WET / SYNC / division, parameters), the ARPLK values, and pressure ranges set on any of those | the same set: no insert slots, arp locks off ("CLEAR T3 FX") |
+| TRK FX on a send's page (S1FX .. S2FX2), no step held | that send's chain: its effects and all their values (one clipboard for the sends; paste works on another send) | the send's chain: a send with nothing on it ("CLEAR SND1 FX"); the track's effects are not touched |
 | any other screen | nothing | nothing |
 
 TRK FX never touches the TRACK page's VOL, PAN, SND1 / SND2, BUS1 / BUS2, LEN or SPD (mix and sequencing, not
@@ -223,9 +340,10 @@ rule for all five (`ScreenManager::getHelpCardKey`, `helpKeyChanged`):
 - **A hold that showed a card has no other effect when the key is let go.** That matters for Up / Down, whose tap
   acts on release: a quick press pages as always (also with HELP on INST, where the card flashes up at the press:
   a press shorter than 0.35 s is still a tap), a hold that showed the card does not page — the same as a hold that
-  had a pad or knob used under it. With HELP OFF every press pages, however long. The one exception is in the
-  table (`releaseActsAfterCard`): **Record still switches recording on / off when it is let go**, card or no card.
-- No card: Play, Settings, Arp and Scale (they act at the press and are not layers; their Shift / Func forms are on
+  had a pad or knob used under it. With HELP OFF every press pages, however long. **Record is the same now**: a hold
+  that showed the card does nothing on release (a tap still toggles). If another control is used under Record's card
+  (dismissing it), the hold was a chord and the release acts as usual.
+- No card: Play, Settings and Arp (they act at the press and are not layers; their Shift / Func forms are on
   the Shift and Func cards), a held step (on STEP the hold itself shows that step's pages; what else it accepts is
   on the > and Func cards while it is held), the octave buttons (they never reach the app), and any two keys
   held together (Shift + Func is not a layer: Func's coarse turn wins, Shift's pads win).
@@ -265,14 +383,18 @@ still acts after a card, and its cards (`helpCardsFor`). A new hold layer needs 
 `Screen::getEditScope`, `getPageKeyName` and `getHelpFacts` (`tapUpDown`, `allTracksTurn`, `stepLocks` for the new
 cards). The screen audit holds every key on every screen (`ScreenAudit::auditHelpCards`).
 
-**CHORD (chord pads).** Shift + bottom pad 3. Keys held (physically, or kept by the key latch; with the arp on and
-latched, the arp's notes) + a pad: the pad takes that chord, replacing what it had (undo step "STORE CHORD PAD n");
-nothing is played by the press. A pad pressed with no key held plays its chord on the selected track through the
+**CHORD (chord pads).** Shift + bottom pad 3. Keys PHYSICALLY held + a pad: the pad takes that chord, replacing what
+it had (undo step "STORE CHORD PAD n"); nothing is played by the press. Latched notes alone do NOT count: under a
+latch a pad press plays, so the player can use the chord pads while the latch keeps the keys sounding. A pad pressed
+with no physical key held plays its chord on the selected track through the
 note-pad path (`notePadDown`, one pad slot per note: recording, arp, rolls), pad velocity scaling the chord and pad
 pressure going to every note. Four banks of sixteen (BK, Up / Down), TR / OC move all pads, VL = PAD (all notes at the pad's
 velocity) / BALANCE (loudest note at the pad's velocity, the rest in the keys' proportion; the default) / AS KEYS
 (each note exactly its key's velocity), CL (four clicks) clears the bank. Pinnable. Saved in the project (`chordPads`,
-`ChordPads::toFlat`). Second knob page STRUM (bank buttons), one setting for all pads, saved with them: TM 0-1000 ms
+`ChordPads::toFlat`). Third knob page SETS: knob 1 SL (the slot, 1–32; the readout marks one that holds a set with
+"*"), knob 3 LD (load), knob 8 SV (save; four clicks each): the four banks as a file
+`~/Music/Neptune/Chords/C01.json` … `C32.json`, independent of projects (`ChordSetManager.h`); the name bar reads
+"SETS C1". Second knob page STRUM (bank buttons), one setting for all pads, saved with them: TM 0-1000 ms
 from first note to last (0 = together), DR up / down / alternate, HU uneven timing (stroke length +-30 %, unequal
 gaps), VR changing pattern (a stroke reversed, neighbours swapped; no note dropped), FL later notes softer
 (`ChordPads::strum`). The later notes are started by `ChordPadScreen::serviceStrum`, called every millisecond by a
@@ -287,10 +409,14 @@ and audio), `src/dsp/effects/PerfEffects.h` (the pads' own effects), `src/ui/scr
 - *A pad* holds up to four effects, layers A - D, that one press plays together. A layer is FX (the effect), TRK
   (what it acts on), MODE, WET and the effect's own four values. An empty pad says `EMPTY: TURN FX`. The pad
   touched last is the one on the knobs and is lit a little brighter; holding it and turning changes it while it is
-  heard. **Up / Down choose the layer on the knobs** (round and round); the strip at the bottom left shows the four
-  (a letter where a layer holds an effect, a dash where it is empty, the shown one inverted). Touching another pad
-  shows its first effect. The name bar on the FX page says what the shown layer does (`DUB>T2`, `B EMPTY`).
-  Pinnable.
+  heard. The strip at the bottom left shows the four layers (a letter where a layer holds an effect, a dash where
+  it is empty, the shown one inverted); the **LY cell on the PRESS page** (knob 3) chooses which layer the knobs
+  show. Touching another pad shows its first effect. The name bar says the bank and the knob page (`B1 FX`, `B1 PRESS`,
+  `B1 PRES`, `B1 MORE`: eight characters are what it has beside the page mark); what the shown layer is and acts
+  on are the FX page's cells TRK and FX. Pinnable.
+- *Banks.* Four banks of sixteen pads (B1 - B4). **Up / Down switch the bank** (wrapping), the same gesture as
+  CHORD. The name bar shows the bank (`B1`, `B2`, ...). A ringing or latched layer on a bank you leave keeps
+  sounding: the layers are absolute pads in the rack, unaffected by which bank the screen shows.
 - *What the press and the pressure control.* Each of a layer's five values (its four and its WET) has two
   amounts, -100 .. +100 of the value's range: how far the **press** moves it for as long as the pad is down, and
   how far full **pressure** moves it. They add up. So one pad can move any number of values on any of its
@@ -309,7 +435,7 @@ and audio), `src/dsp/effects/PerfEffects.h` (the pads' own effects), `src/ui/scr
   and costs nothing). DUB and FRZ are
   throws only, RPT and STOP punches only, echoes and reverbs of the insert list both, every other insert type a
   punch (the knob says `THROW ONLY` / `PUNCH ONLY`).
-- *FX*: nothing, the pads' own four, then the insert types (all but DUCK). Turning FX gives the layer that
+- *FX*: nothing, the pads' own four, then the insert types (all but DUCK and VOC). Turning FX gives the layer that
   effect's starting values, its usual MODE and a starting pressure amount (one undo step for a turn through the
   list). Turning it to `--` empties the layer.
   - DUB: tape echo with a band filter and the tape in its loop: record pre-emphasis, a lopsided saturation and
@@ -327,23 +453,38 @@ and audio), `src/dsp/effects/PerfEffects.h` (the pads' own effects), `src/ui/scr
 - *Knob pages* (bank buttons): **FX** = TRK FX MODE WET and the four values (a value in time with the tempo
   shows and turns its division). **PRESS** = LTCH (a press switches the pad on, the next off), QNT (OFF 1/16 1/8
   1/4 BAR: while the sequencer plays a press takes hold on the next of these, to the sample; stopped, at once),
-  then the press amounts for WET and the four values. **PRES** (name bar: PRESSURE) = CURV (LIN / SOFT / HARD)
+  LY (the layer on the knobs: A B C D),
+  then the press amounts for WET and the four values. **PRES** = CURV (LIN / SOFT / HARD)
   and the pressure amounts for WET and the four values. **MORE** = SYNC + DIV (the layer's TIME or RATE as a
   division of the tempo; `NO TIME CELL` where the effect has none), knobs 3-6 = the effect's cells beyond its
-  four (DUB: SAT, the tape's saturation curve), CLR (four clicks: empties the pad, all
+  four (DUB: SAT, the tape's saturation curve, HEAD, WIDE, READ; an insert type: its FX2 cells), TAKE (four clicks: clears the recorded
+  pad moves in this pattern; `NO TAKE` when nothing is recorded), CLR (four clicks: empties the pad, all
   layers). LTCH, QNT and CURV belong to the pad; everything else to the shown layer. A knob with nothing drawn
   over it does nothing.
 - *Edits*: Func + Record / Play / > copy, clear and paste the shown pad (all layers, targets and all); FX, CLR,
-  clear and paste are undo steps. Shift + Play's silence lets go of every pad, latched ones too, and empties
+  TAKE, clear and paste are undo steps. Shift + Play's silence lets go of every pad, latched ones too, and empties
   their effects.
 - *Lights*: the colour of the pad's first effect (echoes amber, reverbs blue, FRZ violet, RPT green, STOP red,
   movement cyan, filters yellow, dirt magenta); dim = waiting, full = down, half = let go and ringing.
-- *Saved* in the project and the session (`perfPads`, `PerfFxRack::toFlat`: version 2, banks, pads, layers per
-  pad, fields per pad, fields per layer).
+- *Recording.* Pad presses, pressure and releases while the sequencer plays and records (REC) are stored per
+  pattern as a take. On playback the recorded moves fire the same press / pressure / release calls. A live finger
+  on a pad wins over playback (the playback skips that pad's moves while the finger is down). Transport stop
+  releases every pad playback holds down. TAKE on the MORE page (four clicks) clears the take; it is an undo step.
+- *Saved* in the project and the session (`perfPads`, `PerfFxRack::toFlat`: version 2, 4 banks, pads, layers per
+  pad, fields per pad, fields per layer; `perfMoves` per pattern, `PerfFx::MoveLane::toFlat`).
   A project without them gets the starting layout (`AudioEngine::loadFactoryPerfPads`): DUB FRZ RPT STOP FLT PHS
   RED HALL on the whole mix (top row) and again on the selected track (bottom row), one layer each.
-- Not built: recording pad moves into the pattern, more than one bank, more than four layers, a send bus as a
-  target, pad velocity as a source, copy / paste of one layer.
+- Not built: more than four layers, a send bus as a target, pad velocity as a source, copy / paste of one layer.
+
+**Multi presets** (`MultiPreset.h`, `FactoryMultis.h`; PRESET, category MULT, the last). Several connected tracks
+as one preset: each member's sound and starter pattern, the routing between them by member number (a track's
+input, DUCK's SRC, any KEY). Never auditioned; the name bar says where it would land ("3TRK>T7-9": the earliest
+empty tracks, `EmptyTracks`: no trig in any pattern, no preset named, the engine's default sound, no insert, no
+input) or "NEED 3 EMPTY". LD loads every member as one undo step. SV on a track that listens to another or is
+listened to saves the connected tracks as one multi (`<name>.multi.json`). Fifteen are built in
+(`FactoryMultis.h`; the manual lists what each shows). The category row of PRESET shows all ten categories at once,
+each by as many letters as tell it from the others: A I B PA L KE FX PE KI M (`PresetScreen::tabLayout`). The
+resonator's drum sounds are presets of the category PERC.
 
 **Presets.** SV saves the track's own sound read from the engine, mixer and effects (`ProjectBridge::captureTrackSound`,
 with the insert chain's types); while a preset is auditioned, the remembered sound. A preset that has the insert
@@ -384,7 +525,7 @@ free <-> quantized (REC FREE: nearest step, timing kept as micro-timing; REC QUA
 mode is kept for the next recording. Play pressed a moment before Record counts as Record + Play when that Play
 started the transport. Play (or Shift + Play) stops and ends recording; Record alone ends recording and keeps
 playing. When recording ends and something was recorded, STEP opens with the track recorded last selected, on the
-step page of its first recorded step (a pad pin is kept: unpin to get the step pads). The name bar shows a REC FREE
+step page of its first recorded step (a pad pin is cleared, so the pads are the step pads). The name bar shows a REC FREE
 / REC QUANT tag on every screen while recording is on ("R" / "Q" when room is short). While recording runs, a red
 light on the pads follows the selected track's step (step modulo 16), drawn over the screen's own pad colours
 without changing what the pads do (white on a pad that is already red); hold layers are not drawn over; STEP
@@ -446,20 +587,28 @@ goes white and the name bar puts the step first ("S12 FILTR"; when room is short
 Pad pin: Shift + **hold for half a
 second** the bottom-row pad of the screen you are already on (DRUMS, CHORD or SCALE) pins those playing pads; they keep
 playing with pressure on every other screen until the same gesture unpins them. A quick press does nothing (it was
-too easy to do by accident). A PIN tag shows in the name bar.
+too easy to do by accident). A PIN tag shows in the name bar. When recording ends the pin is cleared (the pads go
+to STEP with the recorded steps).
 
 **Saturation curves** (`src/dsp/Saturation.h`; the index is stored, the list only grows at the end): SOFT HARD
 FOLD ASYM TANH FAST ATAN ALGB SLOW CUBE DIOD TUBE TRI RECT HALF XOVR EVEN CHB3. Offered by the waveshaper insert
-(CURV; ASYM works any curve off-centre for even harmonics), the DIRT block (TYPE), the amp insert (SAT on FX2,
-both stages; starts on TANH) and the dub echo (SAT on PERF's MORE page; starts on FAST). What each does to a
+(CURV; ASYM works any curve off-centre for even harmonics), the DIRT insert (TYPE), the amp insert (SAT on FX2,
+both stages; starts on TANH), the echoes DLY, TAPE, LCR, MTAP and RVSE (SAT on FX2: the loop's curve when DRIV is
+up; starts on FAST), the dub echo (SAT on PERF's MORE page; starts on FAST) and the resonator's EXC page (CURV:
+PHYS, then the eighteen). What each does to a
 sine is printed by the "Saturation" tests.
 
-**Screens.** Shift + top row: 1 PARAM (the engine's own pages only; a drum track shows one DR page that follows the
-selected pad), 2 TRACKS (paged mixer: VOL, PAN, SND1, SND2, ENG — knob N = track N; on ENG the knob chooses a pending
-engine and that track's top pad commits it), 3 TRK FX (TRACK, ARPLK, DIRT, TALK, MODFX, FX, FX2 — the same seven pages on
-every track; FX2 = SLOT, TYPE and, under knobs 5-8, the slot's cells beyond its four: the amp's SAT), 4 STEP, 5 PRESET (pads play the track; with AU on, scrolling auditions and the previous sound returns
-unless LD is used), 6 SONG, 7 SETTINGS, 8 AT ROUTE (per track; destinations from that track's engine). Bottom row:
-1 STEP, 2 DRUMS, 3 CHORD, 4 SCALE, 5 WAVE, 6 FLTR. The name bar shows "T n" on every screen. Bar screens show the full
+**Screens.** Shift + top row: 1 PARAM (MAIN, then the engine's own pages; a drum track shows the pages of the pad
+selected on DRUMS - DR, the pad's KICK and KCK2 / RSN / BANK, PLFO, PSLT - then the kit's WAV1, WAV2 and router
+pages: **Drum kit**, above), 2 TRACKS (paged mixer: VOL, PAN, SND1, SND2, ENG — knob N = track N; the name bar says the page and the pattern, "VOL P1", the send pages as "S1 P1" / "S2 P1"; on ENG the knob chooses a pending
+engine, one of nine, and that track's top pad commits it), 3 TRK FX (TRACK, ARPLK, FX, FX2, IN, S1FX, S1FX2, S2FX, S2FX2: each send bus's chain as FX and FX2 show a track's; Func + top pad 1–8 are the first eight pages, S2FX2 is reached by the bank buttons — the same pages on
+every track; IN = SRC LEVL MODE, FATK FREL: the track input; FX2 = SLOT, TYPE and, under knobs 5-8, the slot's cells beyond its four: the amp's SAT), 4 STEP, 5 PRESET (pads play the track; with AU on, scrolling auditions and the previous sound returns
+unless LD is used; category MULT: multi presets), 6 SONG, 7 SETTINGS (SETUP, MASTR, PROJ = SLOT LOAD SAVE SVAS | NEW,
+CLICK), 8 AT ROUTE (per track, part of the track's sound: page 1 DEST over DPTH for
+routes 1-4, page 2 BIP; DEST = OFF, then what only pressure reaches on the engine (EXC on the resonator, BOW on the
+macro oscillator, VIB everywhere), then every destination of the engine's LFOs, then the cells of the track's
+effects; a drum kit has one route, a MIDI track none). Bottom row:
+1 STEP, 2 DRUMS, 3 CHORD, 4 SCALE, 5 WAVE, 6 FLTR, 7 PERF. The name bar shows "T n" on every screen. Bar screens show the full
 name and value of the knob just turned in the name bar. The 4 × 2 grid stays.
 
 **Filter picture.** While a filter parameter is being turned on any page, the response curve is drawn over the half

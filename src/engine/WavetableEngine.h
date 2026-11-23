@@ -3,13 +3,15 @@
 #include "EngineBase.h"
 #include "VoiceAllocator.h"
 #include "VoiceFilterSection.h"
-#include "EngineLfoSection.h"
+#include "VoiceSpread.h"
+#include "ModRouter.h"
 #include "SampleBank.h"
 #include "../dsp/Envelope.h"
 #include "../dsp/EnvelopeChain.h"
 #include "../dsp/DSPUtils.h"
-#include "../dsp/WaveMorph.h"
-#include "../dsp/WaveTables.h"
+#include "../dsp/Wavetable.h"
+#include "../dsp/PhaseOsc.h"
+#include "../dsp/filters/SVFilter.h"
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <array>
 #include <atomic>
@@ -17,1219 +19,69 @@
 #include <vector>
 
 // ============================================================================
-// Wavetable — a collection of single-cycle waveforms (frames) that can be
-// scanned with a position parameter.  Each frame is 256 samples.  Up to 256
-// frames per table.  Mip-mapped at construction for bandlimited playback.
-// ============================================================================
-
-struct Wavetable
-{
-    static constexpr int kFrameSize = 256;
-    static constexpr int kMaxFrames = 256;
-    static constexpr int kMaxMipLevels = 10; // covers down to ~43 Hz at 44100
-
-    juce::String name;
-
-    // frames[mipLevel][frameIndex][sample]
-    // mipLevel 0 = full bandwidth, each successive level halves the harmonics
-    std::vector<std::vector<std::array<float, kFrameSize>>> frames;
-    int numFrames = 0;
-
-    // Build mip-map chain from the base frames (level 0).
-    // Each successive level removes the top half of harmonics via simple
-    // spectral truncation in the frequency domain (rectangular window).
-    void buildMipMaps()
-    {
-        if (frames.empty() || frames[0].empty())
-            return;
-
-        numFrames = (int) frames[0].size();
-        int levels = 1;
-        int harmonics = kFrameSize / 2;
-        while (harmonics > 1 && levels < kMaxMipLevels)
-        {
-            harmonics /= 2;
-            ++levels;
-        }
-
-        frames.resize((size_t) levels);
-
-        for (int level = 1; level < levels; ++level)
-        {
-            frames[(size_t) level].resize((size_t) numFrames);
-            int maxHarmonic = (kFrameSize / 2) >> level;
-
-            for (int f = 0; f < numFrames; ++f)
-            {
-                const auto& src = frames[0][(size_t) f];
-                auto& dst = frames[(size_t) level][(size_t) f];
-
-                // Additive resynthesis with truncated harmonics
-                // Analyse base frame via DFT of each harmonic, then resynthesize
-                // with only the allowed harmonics.  This is O(N*H) but done once.
-                dst.fill(0.0f);
-
-                for (int h = 1; h <= maxHarmonic; ++h)
-                {
-                    // DFT bin h
-                    float cosSum = 0.0f, sinSum = 0.0f;
-                    for (int n = 0; n < kFrameSize; ++n)
-                    {
-                        float angle = 2.0f * juce::MathConstants<float>::pi * h * n / kFrameSize;
-                        cosSum += src[(size_t) n] * std::cos(angle);
-                        sinSum += src[(size_t) n] * std::sin(angle);
-                    }
-                    cosSum *= 2.0f / kFrameSize;
-                    sinSum *= 2.0f / kFrameSize;
-
-                    // Resynthesize
-                    for (int n = 0; n < kFrameSize; ++n)
-                    {
-                        float angle = 2.0f * juce::MathConstants<float>::pi * h * n / kFrameSize;
-                        dst[(size_t) n] += cosSum * std::cos(angle) + sinSum * std::sin(angle);
-                    }
-                }
-            }
-        }
-    }
-
-    // The same mip chain (level L keeps harmonics 1 .. 128 >> L of the base frame), built from one
-    // DFT per frame with a sine table instead of a DFT per level: about fifty times less work, which
-    // matters for 128- and 256-frame tables made from a sample. The values differ from
-    // buildMipMaps() only by rounding, so the factory tables and the classic 64-frame USER table
-    // keep using that one and sound exactly as they always did.
-    void buildMipMapsFast()
-    {
-        if (frames.empty() || frames[0].empty())
-            return;
-
-        numFrames = (int) frames[0].size();
-        int levels = 1;
-        int harmonics = kFrameSize / 2;
-        while (harmonics > 1 && levels < kMaxMipLevels)
-        {
-            harmonics /= 2;
-            ++levels;
-        }
-        frames.resize((size_t) levels);
-        for (int level = 1; level < levels; ++level)
-            frames[(size_t) level].resize((size_t) numFrames);
-
-        std::array<float, kFrameSize> cosT {}, sinT {};
-        for (int n = 0; n < kFrameSize; ++n)
-        {
-            const double a = 2.0 * juce::MathConstants<double>::pi * n / kFrameSize;
-            cosT[(size_t) n] = (float) std::cos(a);
-            sinT[(size_t) n] = (float) std::sin(a);
-        }
-
-        std::array<float, kFrameSize> acc {};
-        for (int f = 0; f < numFrames; ++f)
-        {
-            const auto& src = frames[0][(size_t) f];
-            acc.fill(0.0f);
-            int h = 1;
-            for (int level = levels - 1; level >= 1; --level)       // fewest harmonics first
-            {
-                const int maxHarmonic = (kFrameSize / 2) >> level;
-                for (; h <= maxHarmonic; ++h)
-                {
-                    float c = 0.0f, sn = 0.0f;
-                    for (int n = 0; n < kFrameSize; ++n)
-                    {
-                        const size_t k = (size_t) ((h * n) & (kFrameSize - 1));
-                        c += src[(size_t) n] * cosT[k];
-                        sn += src[(size_t) n] * sinT[k];
-                    }
-                    c *= 2.0f / kFrameSize;
-                    sn *= 2.0f / kFrameSize;
-                    for (int n = 0; n < kFrameSize; ++n)
-                    {
-                        const size_t k = (size_t) ((h * n) & (kFrameSize - 1));
-                        acc[(size_t) n] += c * cosT[k] + sn * sinT[k];
-                    }
-                }
-                frames[(size_t) level][(size_t) f] = acc;
-            }
-        }
-    }
-
-    // The same mip chain once more, by Fourier transform: one analysis per frame and one
-    // synthesis per level. Level 0 is left exactly as it is. For the tables built while playing
-    // (the key-frame table is rebuilt at every turn of one of its knobs) and the newer built-in ones.
-    void buildMipMapsFFT()
-    {
-        if (frames.empty() || frames[0].empty())
-            return;
-
-        numFrames = (int) frames[0].size();
-        int levels = 1;
-        int harmonics = kFrameSize / 2;
-        while (harmonics > 1 && levels < kMaxMipLevels)
-        {
-            harmonics /= 2;
-            ++levels;
-        }
-        frames.resize((size_t) levels);
-        for (int level = 1; level < levels; ++level)
-            frames[(size_t) level].resize((size_t) numFrames);
-        for (int f = 0; f < numFrames; ++f)
-        {
-            const wavemorph::Spectrum spectrum = wavemorph::analyse(frames[0][(size_t) f]);
-            for (int level = 1; level < levels; ++level)
-                frames[(size_t) level][(size_t) f] = wavemorph::synthesise(spectrum, (kFrameSize / 2) >> level);
-        }
-    }
-
-    int getMipLevelCount() const { return (int) frames.size(); }
-};
-
-// ============================================================================
-// Factory wavetable generation — built-in tables from mathematical functions.
-// No external data files, no trademarked names.
-// ============================================================================
-
-struct WavetableFactory
-{
-    static constexpr int N = Wavetable::kFrameSize;
-    static constexpr float twoPi = dsp::TWO_PI_F;
-
-    // Normalize a single wavetable frame to peak amplitude 1.0
-    static void normalizeFrame(std::array<float, Wavetable::kFrameSize>& frame)
-    {
-        float peak = 0.0f;
-        for (int n = 0; n < N; ++n)
-            peak = std::max(peak, std::abs(frame[(size_t) n]));
-        if (peak > 0.0f)
-            for (int n = 0; n < N; ++n)
-                frame[(size_t) n] /= peak;
-    }
-
-    // Saw sweep: increasing harmonic content across frames
-    static Wavetable createSaw(int numFrames = 64)
-    {
-        Wavetable wt;
-        wt.name = "Saw";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            int maxHarmonic = 1 + (f * (N / 2 - 1)) / std::max(numFrames - 1, 1);
-            auto& frame = wt.frames[0][(size_t) f];
-            frame.fill(0.0f);
-
-            for (int h = 1; h <= maxHarmonic; ++h)
-            {
-                float amp = 1.0f / (float) h;
-                float sign = (h % 2 == 0) ? 1.0f : -1.0f;
-                for (int n = 0; n < N; ++n)
-                    frame[(size_t) n] += sign * amp * std::sin(twoPi * h * n / N);
-            }
-
-            normalizeFrame(frame);
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // Square sweep: odd harmonics only, increasing content
-    static Wavetable createSquare(int numFrames = 64)
-    {
-        Wavetable wt;
-        wt.name = "Square";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            int maxHarmonic = 1 + (f * (N / 2 - 1)) / std::max(numFrames - 1, 1);
-            auto& frame = wt.frames[0][(size_t) f];
-            frame.fill(0.0f);
-
-            for (int h = 1; h <= maxHarmonic; h += 2)
-            {
-                float amp = 1.0f / (float) h;
-                for (int n = 0; n < N; ++n)
-                    frame[(size_t) n] += amp * std::sin(twoPi * h * n / N);
-            }
-
-            normalizeFrame(frame);
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // Triangle: odd harmonics, alternating sign, 1/h^2 amplitude
-    static Wavetable createTriangle(int numFrames = 32)
-    {
-        Wavetable wt;
-        wt.name = "Triangle";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            int maxHarmonic = 1 + (f * (N / 2 - 1)) / std::max(numFrames - 1, 1);
-            auto& frame = wt.frames[0][(size_t) f];
-            frame.fill(0.0f);
-
-            for (int h = 1; h <= maxHarmonic; h += 2)
-            {
-                float amp = 1.0f / ((float) h * (float) h);
-                float sign = (((h - 1) / 2) % 2 == 0) ? 1.0f : -1.0f;
-                for (int n = 0; n < N; ++n)
-                    frame[(size_t) n] += sign * amp * std::sin(twoPi * h * n / N);
-            }
-
-            normalizeFrame(frame);
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // Sine: single frame, pure sine
-    static Wavetable createSine()
-    {
-        Wavetable wt;
-        wt.name = "Sine";
-        wt.frames.resize(1);
-        wt.frames[0].resize(1);
-        auto& frame = wt.frames[0][0];
-        for (int n = 0; n < N; ++n)
-            frame[(size_t) n] = std::sin(twoPi * n / N);
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // PWM sweep: pulse width from ~5% to ~95%
-    static Wavetable createPWM(int numFrames = 64)
-    {
-        Wavetable wt;
-        wt.name = "PWM";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            float pw = 0.05f + 0.9f * ((float) f / std::max(numFrames - 1, 1));
-            auto& frame = wt.frames[0][(size_t) f];
-            for (int n = 0; n < N; ++n)
-            {
-                float phase = (float) n / N;
-                frame[(size_t) n] = phase < pw ? 1.0f : -1.0f;
-            }
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // Formant sweep: formant peak frequency moves across frames
-    static Wavetable createFormant(int numFrames = 64)
-    {
-        Wavetable wt;
-        wt.name = "Formant";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            float formantPos = (float) f / std::max(numFrames - 1, 1);
-            float formantFreq = 2.0f + formantPos * 30.0f; // harmonics 2-32
-            auto& frame = wt.frames[0][(size_t) f];
-            frame.fill(0.0f);
-
-            for (int h = 1; h <= N / 2; ++h)
-            {
-                float dist = std::abs((float) h - formantFreq);
-                float amp = std::exp(-dist * dist * 0.05f);
-                for (int n = 0; n < N; ++n)
-                    frame[(size_t) n] += amp * std::sin(twoPi * h * n / N);
-            }
-
-            normalizeFrame(frame);
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // Harmonic series: frames progressively add harmonics (1, 1+2, 1+2+3, ...)
-    static Wavetable createHarmonicSeries(int numFrames = 64)
-    {
-        Wavetable wt;
-        wt.name = "Harmonics";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            int maxHarmonic = 1 + (f * 63) / std::max(numFrames - 1, 1);
-            auto& frame = wt.frames[0][(size_t) f];
-            frame.fill(0.0f);
-
-            for (int h = 1; h <= maxHarmonic; ++h)
-            {
-                // Equal amplitude harmonics (organ-like)
-                float amp = 1.0f / (float) maxHarmonic;
-                for (int n = 0; n < N; ++n)
-                    frame[(size_t) n] += amp * std::sin(twoPi * h * n / N);
-            }
-
-            normalizeFrame(frame);
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // Spectral sweep: a resonant peak sweeps from low to high harmonics
-    static Wavetable createSpectralSweep(int numFrames = 64)
-    {
-        Wavetable wt;
-        wt.name = "Spectral";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            float centerHarmonic = 1.0f + ((float) f / std::max(numFrames - 1, 1)) * 60.0f;
-            float bandwidth = 3.0f + centerHarmonic * 0.2f;
-            auto& frame = wt.frames[0][(size_t) f];
-            frame.fill(0.0f);
-
-            for (int h = 1; h <= N / 2; ++h)
-            {
-                float dist = std::abs((float) h - centerHarmonic) / bandwidth;
-                float amp = std::exp(-dist * dist);
-                for (int n = 0; n < N; ++n)
-                    frame[(size_t) n] += amp * std::sin(twoPi * h * n / N);
-            }
-
-            normalizeFrame(frame);
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // Digital/bitcrush: progressively reduced bit depth
-    static Wavetable createDigital(int numFrames = 32)
-    {
-        Wavetable wt;
-        wt.name = "Digital";
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            float crushFactor = 1.0f + ((float) f / std::max(numFrames - 1, 1)) * 31.0f;
-            auto& frame = wt.frames[0][(size_t) f];
-
-            for (int n = 0; n < N; ++n)
-            {
-                float sine = std::sin(twoPi * n / N);
-                // Quantize to crushFactor levels
-                float levels = std::max(2.0f, 256.0f / crushFactor);
-                frame[(size_t) n] = std::round(sine * levels) / levels;
-            }
-        }
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // ========================================================================
-    // Sample-to-wavetable conversion
-    //
-    // Chops an audio buffer into numFrames equal-length chunks, resamples each
-    // chunk to kFrameSize samples via linear interpolation, normalizes, and
-    // builds mip-maps.  Called on the main thread, not the audio thread.
-    // ========================================================================
-    static Wavetable createFromSamples(const float* samples, int numSamples, int numFrames = 64)
-    {
-        Wavetable wt;
-        wt.name = "Sample";
-        numFrames = juce::jlimit(1, Wavetable::kMaxFrames, numFrames);
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-
-        // Each frame covers (numSamples / numFrames) source samples
-        float samplesPerFrame = (float) numSamples / (float) numFrames;
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            auto& frame = wt.frames[0][(size_t) f];
-            float frameStart = (float) f * samplesPerFrame;
-            float chunkLen = samplesPerFrame;
-
-            for (int n = 0; n < Wavetable::kFrameSize; ++n)
-            {
-                // Map frame sample n to source position
-                float srcPos = frameStart + ((float) n / (float) Wavetable::kFrameSize) * chunkLen;
-
-                // Linear interpolation from source
-                int srcIdx0 = (int) srcPos;
-                int srcIdx1 = srcIdx0 + 1;
-                float frac = srcPos - (float) srcIdx0;
-
-                // Clamp to valid range
-                srcIdx0 = juce::jlimit(0, numSamples - 1, srcIdx0);
-                srcIdx1 = juce::jlimit(0, numSamples - 1, srcIdx1);
-
-                frame[(size_t) n] = samples[srcIdx0] * (1.0f - frac) + samples[srcIdx1] * frac;
-            }
-
-            normalizeFrame(frame);
-        }
-
-        wt.buildMipMaps();
-        return wt;
-    }
-
-    // ========================================================================
-    // Period-aligned sample-to-wavetable conversion
-    //
-    // createFromSamples() cuts pieces of arbitrary length, so a frame holds some odd number of
-    // cycles starting at an arbitrary phase: the pitch of a frame is not the pitch of the note, and
-    // neighbouring frames cancel while the scan crossfades between them. Here each piece is
-    // reduced to ONE period of the source at that point in time, and each such cycle is rotated to
-    // the phase of the one before it, so a scan glides through the recording's timbre at the pitch
-    // of the key (pitch-synchronous analysis, as in PSOLA: Moulines & Charpentier, "Pitch-
-    // synchronous waveform processing techniques for text-to-speech synthesis using diphones",
-    // Speech Communication 9, 1990).
-    //
-    // The period comes from the normalised square difference function, the autocorrelation-based
-    // time-domain pitch estimate of McLeod & Wyvill, "A Smarter Way to Find Pitch", Proc. ICMC
-    // 2005 (autocorrelation pitch detection itself: Rabiner, "On the Use of Autocorrelation
-    // Analysis for Pitch Detection", IEEE Trans. ASSP 25(1), 1977):
-    //     n(tau) = 2 * sum x[j] x[j + tau] / sum (x[j]^2 + x[j + tau]^2),   -1 .. 1
-    // with their peak picking (the first peak that reaches 90 % of the highest one, which avoids
-    // octave errors) and parabolic interpolation of the peak. The search runs on a copy of the
-    // sample decimated to about 8 kHz and is then refined at the full rate around the lag found.
-    // A piece whose best peak is below kPitchClarity (noise, silence, chords, drums) is not
-    // pitched: it is cut exactly as createFromSamples() cuts it.
-    //
-    // Message thread only (it allocates).
-    // ========================================================================
-    static constexpr float kPitchClarity = 0.85f;
-    static constexpr double kPitchMinHz = 50.0;
-    static constexpr double kPitchMaxHz = 1500.0;
-
-    class PeriodFinder
-    {
-    public:
-        PeriodFinder(const float* samples, int numSamples, double sampleRate)
-            : x(samples), n(numSamples)
-        {
-            if (sampleRate <= 0.0)
-                sampleRate = 44100.0;
-            decim = juce::jmax(1, (int) (sampleRate / 8000.0));
-            dec.resize((size_t) (n / decim));
-            for (size_t i = 0; i < dec.size(); ++i)
-            {
-                float sum = 0.0f;
-                for (int k = 0; k < decim; ++k)
-                    sum += x[i * (size_t) decim + (size_t) k];
-                dec[i] = sum / (float) decim;
-            }
-            minLag = juce::jmax(2, (int) (sampleRate / kPitchMaxHz));
-            maxLag = juce::jmin((int) (sampleRate / kPitchMinHz), n / 3);
-            nsdf.resize((size_t) (maxLag / decim + 2));
-        }
-
-        // The period in samples of the sound around `centre`, or 0 when it has no clear pitch there.
-        float periodAt(double centre, float* clarityOut = nullptr)
-        {
-            if (clarityOut != nullptr)
-                *clarityOut = 0.0f;
-
-            // Coarse search on the decimated copy.
-            const int maxLd = maxLag / decim;
-            const int minLd = juce::jmax(2, minLag / decim);
-            const int window = 2 * maxLd;
-            if (maxLd <= minLd + 1 || (int) dec.size() < window)
-                return 0.0f;
-            const int start = juce::jlimit(0, (int) dec.size() - window, (int) (centre / decim) - window / 2);
-            for (int lag = 0; lag <= maxLd; ++lag)
-                nsdf[(size_t) lag] = nsdfAt(dec.data() + start, window, lag);
-
-            int from = 1;                                   // past the peak at lag 0
-            while (from < maxLd && nsdf[(size_t) from] <= nsdf[(size_t) from - 1])
-                ++from;
-            from = juce::jmax(from, minLd);
-            float best = -1.0f;
-            for (int lag = from; lag < maxLd; ++lag)
-                best = juce::jmax(best, nsdf[(size_t) lag]);
-            if (best < 0.5f)
-                return 0.0f;
-            int coarse = -1;
-            for (int lag = from; lag < maxLd; ++lag)
-            {
-                const float v = nsdf[(size_t) lag];
-                if (v >= 0.9f * best && v >= nsdf[(size_t) lag - 1] && v >= nsdf[(size_t) lag + 1])
-                {
-                    coarse = lag;
-                    break;
-                }
-            }
-            if (coarse < 0)
-                return 0.0f;
-
-            // Refinement at the full rate.
-            const int fullWindow = juce::jmin(2 * maxLag, n);
-            const int fullStart = juce::jlimit(0, n - fullWindow, (int) centre - fullWindow / 2);
-            const int lo = juce::jmax(2, coarse * decim - decim - 1);
-            const int hi = juce::jmin(fullWindow - 2, coarse * decim + decim + 1);
-            if (hi <= lo)
-                return 0.0f;
-            int bestLag = lo;
-            float bestValue = -2.0f;
-            for (int lag = lo; lag <= hi; ++lag)
-            {
-                const float v = nsdfAt(x + fullStart, fullWindow, lag);
-                if (v > bestValue)
-                {
-                    bestValue = v;
-                    bestLag = lag;
-                }
-            }
-            if (clarityOut != nullptr)
-                *clarityOut = bestValue;
-            if (bestValue < kPitchClarity)
-                return 0.0f;
-
-            const float a = nsdfAt(x + fullStart, fullWindow, bestLag - 1);
-            const float c = nsdfAt(x + fullStart, fullWindow, bestLag + 1);
-            const float denom = a - 2.0f * bestValue + c;
-            float shift = denom < -1.0e-9f ? 0.5f * (a - c) / denom : 0.0f;
-            shift = juce::jlimit(-0.5f, 0.5f, shift);
-            return (float) bestLag + shift;
-        }
-
-    private:
-        static float nsdfAt(const float* s, int window, int lag)
-        {
-            double r = 0.0, m = 0.0;
-            for (int j = 0; j + lag < window; ++j)
-            {
-                const double a = s[j], b = s[j + lag];
-                r += a * b;
-                m += a * a + b * b;
-            }
-            return m > 1.0e-12 ? (float) (2.0 * r / m) : 0.0f;
-        }
-
-        const float* x;
-        int n;
-        int decim = 1, minLag = 2, maxLag = 2;
-        std::vector<float> dec, nsdf;
-    };
-
-    // numFrames frames from a sample. aligned = false: equal pieces, as createFromSamples(), for
-    // any frame count. aligned = true: one phase-aligned period per frame where the sample is
-    // pitched (see above), the equal piece where it is not. pitchedFrames, if given, receives how
-    // many frames were taken as single periods.
-    static Wavetable createFromSamplesEx(const float* samples, int numSamples, double sampleRate,
-                                         int numFrames, bool aligned, int* pitchedFrames = nullptr)
-    {
-        Wavetable wt;
-        wt.name = "Sample";
-        numFrames = juce::jlimit(1, Wavetable::kMaxFrames, numFrames);
-        wt.frames.resize(1);
-        wt.frames[0].resize((size_t) numFrames);
-        if (pitchedFrames != nullptr)
-            *pitchedFrames = 0;
-
-        auto at = [samples, numSamples](float srcPos)
-        {
-            int i0 = (int) srcPos;
-            int i1 = i0 + 1;
-            const float frac = srcPos - (float) i0;
-            i0 = juce::jlimit(0, numSamples - 1, i0);
-            i1 = juce::jlimit(0, numSamples - 1, i1);
-            return samples[i0] * (1.0f - frac) + samples[i1] * frac;
-        };
-
-        PeriodFinder finder(samples, numSamples, sampleRate);
-        const float samplesPerFrame = (float) numSamples / (float) numFrames;
-        const std::array<float, N>* previous = nullptr;      // the last single-period frame
-        std::array<float, N> cycle {};
-
-        for (int f = 0; f < numFrames; ++f)
-        {
-            auto& frame = wt.frames[0][(size_t) f];
-            const float frameStart = (float) f * samplesPerFrame;
-            const float period = aligned ? finder.periodAt((double) frameStart + 0.5 * samplesPerFrame) : 0.0f;
-
-            if (period < 2.0f || period + 2.0f > (float) numSamples)
-            {
-                for (int n = 0; n < N; ++n)
-                    frame[(size_t) n] = at(frameStart + ((float) n / (float) N) * samplesPerFrame);
-                normalizeFrame(frame);
-                previous = nullptr;
-                continue;
-            }
-
-            // One period around the middle of the piece.
-            const float start = juce::jlimit(0.0f, (float) numSamples - 1.0f - period,
-                                             frameStart + 0.5f * samplesPerFrame - 0.5f * period);
-            for (int n = 0; n < N; ++n)
-                cycle[(size_t) n] = at(start + ((float) n / (float) N) * period);
-            // A real period does not end exactly where it began (the level and the pitch drift):
-            // spread that step over the cycle so the frame loops without a click.
-            const float seam = at(start + period) - cycle[0];
-            for (int n = 0; n < N; ++n)
-                cycle[(size_t) n] -= seam * ((float) n / (float) N - 0.5f);
-
-            // Rotate it: to the phase of the frame before, or, for the first of a run, so that its
-            // fundamental starts like a sine.
-            int rotate = 0;
-            if (previous != nullptr)
-            {
-                float bestCorr = -1.0e30f;
-                for (int r = 0; r < N; ++r)
-                {
-                    float corr = 0.0f;
-                    for (int n = 0; n < N; ++n)
-                        corr += cycle[(size_t) ((n + r) & (N - 1))] * (*previous)[(size_t) n];
-                    if (corr > bestCorr)
-                    {
-                        bestCorr = corr;
-                        rotate = r;
-                    }
-                }
-            }
-            else
-            {
-                float c = 0.0f, s = 0.0f;
-                for (int n = 0; n < N; ++n)
-                {
-                    c += cycle[(size_t) n] * std::cos(twoPi * (float) n / (float) N);
-                    s += cycle[(size_t) n] * std::sin(twoPi * (float) n / (float) N);
-                }
-                const float phi = std::atan2(c, s);        // cycle ~ sin(theta + phi)
-                rotate = (int) std::lround(-phi / twoPi * (float) N);
-                rotate = ((rotate % N) + N) % N;
-            }
-            for (int n = 0; n < N; ++n)
-                frame[(size_t) n] = cycle[(size_t) ((n + rotate) & (N - 1))];
-            normalizeFrame(frame);
-            previous = &frame;
-            if (pitchedFrames != nullptr)
-                ++*pitchedFrames;
-        }
-
-        wt.buildMipMapsFast();
-        return wt;
-    }
-
-    // The built-in tables, built once and shared (read only): a wavetable engine starts from a
-    // copy of them (building them takes far longer than copying them), the unified voice's
-    // oscillator slots read them where they are.
-    static const std::vector<Wavetable>& sharedFactoryTables()
-    {
-        static const std::vector<Wavetable> tables = createAllFactoryTables();
-        return tables;
-    }
-
-    // The newer built-in tables (src/dsp/WaveTables.h), built once and shared like the first nine.
-    // They are a list of their own, so the first nine keep their numbers; builtInTables() is the
-    // two lists one after the other.
-    static const std::vector<Wavetable>& sharedMoreTables()
-    {
-        static const std::vector<Wavetable> tables = []
-        {
-            std::vector<Wavetable> list;
-            for (auto& def : wavetables::definitions())
-            {
-                Wavetable wt;
-                wt.name = def.label;
-                wt.frames.resize(1);
-                wt.frames[0] = def.make();
-                wt.buildMipMapsFFT();
-                list.push_back(std::move(wt));
-            }
-            return list;
-        }();
-        return tables;
-    }
-
-    // ---- The built-in set: the one list of tables every oscillator in the program reads ----------
-    // The first nine, then the newer ones in the order of wavetables::definitions(); read only,
-    // built on first use (call it from the message thread before audio runs: both engines'
-    // constructors do). The wavetable engine's TABL puts its own USER and KEYS tables after the
-    // first nine; the unified voice's oscillator slots offer exactly this list (nTBL is an index
-    // into it). Both orders are stored in projects: new tables go at the end.
-    static constexpr int NUM_FIRST_TABLES = 9;
-    static const std::vector<const Wavetable*>& builtInTables()
-    {
-        static const std::vector<const Wavetable*> list = []
-        {
-            std::vector<const Wavetable*> l;
-            for (auto& t : sharedFactoryTables())
-                l.push_back(&t);
-            for (auto& t : sharedMoreTables())
-                l.push_back(&t);
-            return l;
-        }();
-        return list;
-    }
-    static int builtInCount() { return NUM_FIRST_TABLES + (int) wavetables::definitions().size(); }
-    // What a table cell shows for each of them, in the same order.
-    static const char* const* builtInLabels()
-    {
-        static const std::vector<const char*> labels = []
-        {
-            std::vector<const char*> l { "SAW", "SQR", "TRI", "SIN", "PWM", "FORM", "HARM", "SPEC", "DIGI" };
-            for (auto& def : wavetables::definitions())
-                l.push_back(def.label);
-            return l;
-        }();
-        return labels.data();
-    }
-
-    // Returns the first nine built-in tables
-    static std::vector<Wavetable> createAllFactoryTables()
-    {
-        std::vector<Wavetable> tables;
-        tables.push_back(createSaw());
-        tables.push_back(createSquare());
-        tables.push_back(createTriangle());
-        tables.push_back(createSine());
-        tables.push_back(createPWM());
-        tables.push_back(createFormant());
-        tables.push_back(createHarmonicSeries());
-        tables.push_back(createSpectralSweep());
-        tables.push_back(createDigital());
-        return tables;
-    }
-};
-
-// ============================================================================
-// Key frames: a table made from a few single cycles taken out of samples.
-//
-// The player picks up to eight waves (KEY 1 .. 8: a sample and a place in it), puts them along
-// the table, and the frames between two neighbouring keys are computed by one of the algorithms
-// of wavemorph::morph(). The frames AT the keys are the key waves themselves.
-//
-// extract()  one cycle out of a sample, as its harmonics. Where the sample has a clear pitch at
-//            that place (WavetableFactory::PeriodFinder, as for the aligned USER table) the cycle
-//            is exactly one period, so the wave plays at the pitch of the key whatever the pitch
-//            of the recording; where it has none (noise, a drum, a chord) it is a piece of about
-//            12 ms. The period is read with cubic interpolation at 256 points or more (the next
-//            power of two above its length), the step where its end meets its start is spread over
-//            the cycle, and only harmonics 1 .. 127 are kept: a long period is band-limited on its
-//            way into a frame instead of aliasing.
-// build()    the table. Each key is limited to HARM harmonics, tilted by TILT, turned to a common
-//            phase (ALGN) and brought to a peak of 1; the keys are put in the order of their
-//            places, the first at the first frame and the last at the last (WRAP adds the first
-//            key once more at the end), each on the frame nearest to its place.
-//
-// Message thread only (both allocate).
-// ============================================================================
-
-struct WavetableKeys
-{
-    static constexpr int MAX_KEYS = 8;
-    static constexpr int NUM_FRAME_OPTIONS = 6;
-    static int frameCount(int option)
-    {
-        static const int counts[NUM_FRAME_OPTIONS] = { 8, 16, 32, 64, 128, 256 };
-        return counts[(size_t) juce::jlimit(0, NUM_FRAME_OPTIONS - 1, option)];
-    }
-
-    enum Norm { NormOff, NormPeak, NormRms, NumNorms };
-
-    struct Settings
-    {
-        wavemorph::Algo algo = wavemorph::Algo::Linear;
-        int frames = 64;
-        float bias = 0.0f;          // -1 .. 1: the in-between frames lean towards the earlier / the later key
-        bool wrap = false;          // after the last key the table goes back to the first
-        bool align = true;          // keys turned to a common phase
-        int norm = NormRms;         // level of the frames: as computed, each to a peak of 1, all equally loud
-        float tilt = 0.0f;          // dB per octave on every key
-        int harmonics = wavemorph::H;   // highest harmonic of a key
-    };
-
-    struct Key
-    {
-        wavemorph::Spectrum spectrum;
-        float place = 0.0f;         // 0 .. 1 along the table (only the order and the spacing count)
-    };
-
-    // One cycle of the sample around `position` (0 .. 1 of its length). right may be null (mono).
-    // False when there is nothing to take.
-    static bool extract(const float* left, const float* right, int numSamples, double sampleRate, float position,
-                        wavemorph::Spectrum& out, bool* pitched = nullptr)
-    {
-        if (pitched != nullptr)
-            *pitched = false;
-        if (left == nullptr || numSamples < 64)
-            return false;
-        if (sampleRate <= 0.0)
-            sampleRate = 44100.0;
-
-        // A window of about 0.19 s around the place is all the pitch search needs.
-        const int window = juce::jmin(numSamples, juce::jmax(256, (int) (sampleRate * 0.1858)));
-        const double centre = (double) juce::jlimit(0.0f, 1.0f, position) * (double) (numSamples - 1);
-        const int windowStart = juce::jlimit(0, numSamples - window, (int) centre - window / 2);
-        std::vector<float> x((size_t) window);
-        for (int i = 0; i < window; ++i)
-            x[(size_t) i] = right != nullptr ? 0.5f * (left[windowStart + i] + right[windowStart + i]) : left[windowStart + i];
-        const double local = centre - (double) windowStart;
-
-        WavetableFactory::PeriodFinder finder(x.data(), window, sampleRate);
-        float period = finder.periodAt(local);
-        const bool isPitched = period >= 2.0f && period + 4.0f < (float) window;
-        if (! isPitched)
-            period = juce::jmin((float) window - 4.0f, (float) (sampleRate * 512.0 / 44100.0));
-        if (pitched != nullptr)
-            *pitched = isPitched;
-
-        auto at = [&x, window](double pos)         // cubic (Catmull-Rom) interpolation
-        {
-            const int i = (int) std::floor(pos);
-            const float f = (float) (pos - (double) i);
-            auto s = [&x, window](int k) { return x[(size_t) juce::jlimit(0, window - 1, k)]; };
-            const float a = s(i - 1), b = s(i), c = s(i + 1), d = s(i + 2);
-            return b + 0.5f * f * (c - a + f * (2.0f * a - 5.0f * b + 4.0f * c - d + f * (3.0f * (b - c) + d - a)));
-        };
-
-        int points = wavemorph::N;
-        while ((float) points < period && points < 4096)
-            points *= 2;
-        const double start = juce::jlimit(0.0, (double) window - 1.0 - (double) period, local - 0.5 * (double) period);
-        std::vector<float> cycle((size_t) points);
-        for (int n = 0; n < points; ++n)
-            cycle[(size_t) n] = at(start + (double) n / (double) points * (double) period);
-        // A real period does not end exactly where it began: spread that step over the cycle.
-        const float seam = at(start + (double) period) - cycle[0];
-        for (int n = 0; n < points; ++n)
-            cycle[(size_t) n] -= seam * ((float) n / (float) points - 0.5f);
-
-        out = wavemorph::analyse(cycle.data(), points);
-        return out.energy() > 1.0e-12;
-    }
-
-    // The frame each key sits on, for keys at `place` (ascending) in a table of `frames` frames:
-    // the nearest frame, and never two keys on one.
-    static std::vector<int> keyFrames(const std::vector<float>& place, int frames)
-    {
-        const int count = (int) place.size();
-        std::vector<int> index((size_t) count, 0);
-        if (count < 2)
-            return index;
-        const float span = place.back() - place.front();
-        for (int k = 0; k < count; ++k)
-        {
-            const float u = span > 1.0e-6f ? (place[(size_t) k] - place.front()) / span : (float) k / (float) (count - 1);
-            index[(size_t) k] = juce::roundToInt(u * (float) (frames - 1));
-        }
-        for (int k = 1; k < count; ++k)
-            index[(size_t) k] = juce::jmax(index[(size_t) k], index[(size_t) k - 1] + 1);
-        for (int k = count - 1; k >= 0; --k)
-            index[(size_t) k] = juce::jmin(index[(size_t) k], frames - 1 - (count - 1 - k));
-        return index;
-    }
-
-    // keyFrameIndices, if given, receives the frame of each key in the order of their places (with
-    // WRAP one more: the first key again, on the last frame).
-    static Wavetable build(std::vector<Key> keys, const Settings& s, std::vector<int>* keyFrameIndices = nullptr)
-    {
-        Wavetable wt;
-        wt.name = "KEYS";
-        wt.frames.resize(1);
-        if (keyFrameIndices != nullptr)
-            keyFrameIndices->clear();
-
-        if (keys.empty())           // nothing chosen yet: a sine
-        {
-            wt.frames[0].resize(1);
-            for (int n = 0; n < wavemorph::N; ++n)
-                wt.frames[0][0][(size_t) n] = std::sin(dsp::TWO_PI_F * (float) n / (float) wavemorph::N);
-            wt.buildMipMapsFFT();
-            return wt;
-        }
-
-        const bool classic = s.algo == wavemorph::Algo::Classic;
-        auto frameOf = [classic](const wavemorph::Spectrum& sp)
-        {
-            return classic ? wavemorph::classicFrame(sp) : wavemorph::synthesise(sp);
-        };
-
-        // The keys as they go into the table.
-        std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.place < b.place; });
-        for (auto& key : keys)
-        {
-            wavemorph::tiltAndLimit(key.spectrum, (double) s.tilt, juce::jlimit(1, wavemorph::H, s.harmonics));
-            if (s.align)
-                wavemorph::alignToFundamental(key.spectrum);
-            const float peak = wavemorph::peakOf(wavemorph::synthesise(key.spectrum));
-            if (peak > 1.0e-9f)
-                wavemorph::scale(key.spectrum, 1.0 / (double) peak);
-        }
-
-        std::vector<float> place;
-        for (auto& key : keys)
-            place.push_back(key.place);
-        if (s.wrap && keys.size() > 1)
-        {
-            // The way back to the first key is as long as the average step between two keys.
-            keys.push_back(keys.front());
-            const float span = place.back() - place.front();
-            place.push_back(place.back() + (span > 1.0e-6f ? span / (float) (place.size() - 1) : 1.0f));
-        }
-
-        const int count = (int) keys.size();
-        const int frames = count == 1 ? 1 : juce::jlimit(count, Wavetable::kMaxFrames, s.frames);
-        const std::vector<int> index = keyFrames(place, frames);
-        if (keyFrameIndices != nullptr)
-            *keyFrameIndices = index;
-
-        wt.frames[0].resize((size_t) frames);
-        const double exponent = std::pow(4.0, -(double) juce::jlimit(-1.0f, 1.0f, s.bias));
-        int segment = 0;
-        for (int f = 0; f < frames; ++f)
-        {
-            while (segment < count - 2 && f >= index[(size_t) segment + 1])
-                ++segment;
-            const int a = index[(size_t) segment];
-            const int b = count > 1 ? index[(size_t) segment + 1] : a;
-            if (f <= a || count == 1)
-                wt.frames[0][(size_t) f] = frameOf(keys[(size_t) segment].spectrum);
-            else if (f >= b)
-                wt.frames[0][(size_t) f] = frameOf(keys[(size_t) segment + 1].spectrum);
-            else
-            {
-                const double t = std::pow((double) (f - a) / (double) (b - a), exponent);
-                wt.frames[0][(size_t) f] = frameOf(wavemorph::morph(s.algo, keys[(size_t) segment].spectrum,
-                                                                    keys[(size_t) segment + 1].spectrum, t));
-            }
-        }
-
-        // The level of the frames.
-        if (s.norm == NormPeak)
-        {
-            for (auto& frame : wt.frames[0])
-                WavetableFactory::normalizeFrame(frame);
-        }
-        else if (s.norm == NormRms)
-        {
-            // Every frame as loud as the others: as loud as the peakiest of them can be with its
-            // peak at 1 (but not below 0.25: a frame peakier than that is held at a peak of 1).
-            float target = 1.0f;
-            for (auto& frame : wt.frames[0])
-            {
-                const float peak = wavemorph::peakOf(frame);
-                if (peak > 1.0e-9f)
-                    target = juce::jmin(target, wavemorph::rmsOf(frame) / peak);
-            }
-            target = juce::jmax(0.25f, target);
-            for (auto& frame : wt.frames[0])
-            {
-                const float rms = wavemorph::rmsOf(frame);
-                if (rms <= 1.0e-9f)
-                    continue;
-                wavemorph::scale(frame, target / rms);
-                const float peak = wavemorph::peakOf(frame);
-                if (peak > 1.0f)
-                    wavemorph::scale(frame, 1.0f / peak);
-            }
-        }
-
-        wt.buildMipMapsFFT();
-        return wt;
-    }
-};
-
-// ============================================================================
-// Interpolation modes for scanning between wavetable frames.
-// ============================================================================
-
-enum class WavetableInterpMode
-{
-    Linear,     // Crossfade between adjacent frames (default)
-    Spectral,   // FFT-based interpolation (expensive, highest quality)
-    Stepped,    // No interpolation — snaps to nearest frame (lo-fi)
-    Vintage,    // Stepped with short crossfade (8-sample xfade, retro character)
-    // The whole read-out of an early digital wavetable instrument, from what is publicly known of
-    // how those worked: a table was 64 waves of 128 samples of 8 bits; the wave was read by a
-    // phase counter with no interpolation between samples, the scan went from one wave to the
-    // next in whole steps, and nothing was band-limited to the pitch being played. So here: the
-    // position is taken to the nearest of 64 places, the frame is read at 128 samples per cycle
-    // with each held, rounded to 8 bits, and ALWAYS from the full-bandwidth copy (never a mip
-    // level). On high notes the harmonics above half the sample rate fold back as tones that are
-    // not harmonics of the note: the glassy top such instruments are known for.
-    // Next to the two older lo-fi modes: STEP also holds samples and frames but reads the band-
-    // limited copy (grainy, no aliasing); VINT interpolates samples and softens each frame step
-    // (smooth, no aliasing); this one leaves everything raw.
-    Classic,
-    Count
-};
-
-// ============================================================================
-// The timed scan ("stretch"): each voice runs the scan position through the
-// table in a set time from its own note-on, whatever the pitch of the note.
-// See the SCAN page of WavetableEngine for the controls and the rules.
-// ============================================================================
-
-enum class WavetableScanMode
-{
-    Off,    // POS stays where the knob is
-    Run,    // once through, then hold the last frame
-    Loop,   // wrap around
-    Ping,   // back and forth
-    Step,   // once through in STEP plateaus, then hold
-    Rand,   // a random frame, a new one STEP times per pass
-    Count
-};
-
-// ============================================================================
-// WavetableRead — how a table is read: the one read-out in the program.
-//
-// One sample of a table is a function of the table, the position along it, the
-// phase within the cycle, the pitch (as phase advance per sample, which picks the
-// band-limited copy) and the INTP mode, and of nothing else: there is no memory
-// between samples. The wavetable engine's voices call it with their own phase,
-// and so do the unified voice's oscillator slots set to WT (UnifiedVoice::
-// generateOsc, where every oscillator kind has to be a function of the slot's
-// phase). What needs memory - the timed scan, glide, the position motion - is in
-// WavetableVoice and decides only WHICH position and phase are asked for.
-// ============================================================================
-
-struct WavetableRead
-{
-    // The copy whose harmonics all stay under half the sample rate when the phase advances by
-    // phaseInc (cycles per sample): each level halves the harmonics.
-    static int mipLevel(const Wavetable& table, double phaseInc)
-    {
-        const int last = table.getMipLevelCount() - 1;
-        int level = 0;
-        for (double ratio = phaseInc * 2.0 * Wavetable::kFrameSize; ratio > 1.0 && level < last; ratio *= 0.5)
-            ++level;
-        return level;
-    }
-
-    // position 0 .. 1 along the table, phase 0 .. 1 within the cycle.
-    static float sample(const Wavetable& table, int mipLevel, float position, double phase,
-                        WavetableInterpMode interpMode = WavetableInterpMode::Linear)
-    {
-        if (mipLevel < 0 || mipLevel >= table.getMipLevelCount())
-            return 0.0f;
-
-        const auto& levelFrames = table.frames[(size_t) mipLevel];
-        int nFrames = (int) levelFrames.size();
-        if (nFrames == 0) return 0.0f;
-
-        // Frame position from the position parameter
-        float framePos = position * (float) (nFrames - 1);
-        int frameA = juce::jlimit(0, nFrames - 1, (int) framePos);
-        int frameB = juce::jlimit(0, nFrames - 1, frameA + 1);
-        float frameFrac = framePos - (float) frameA;
-
-        // Sample position within frame
-        float samplePos = (float) phase * Wavetable::kFrameSize;
-        int sampleA = ((int) samplePos) % Wavetable::kFrameSize;
-        int sampleB = (sampleA + 1) % Wavetable::kFrameSize;
-        float sampleFrac = samplePos - std::floor(samplePos);
-
-        switch (interpMode)
-        {
-            case WavetableInterpMode::Count:
-            case WavetableInterpMode::Spectral:
-                // Falls through to Linear (true FFT interpolation not yet implemented;
-                // mip-mapped tables already provide spectral quality).
-                [[fallthrough]];
-            case WavetableInterpMode::Linear:
-            {
-                float valA = dsp::lerp(levelFrames[(size_t) frameA][(size_t) sampleA],
-                                       levelFrames[(size_t) frameA][(size_t) sampleB],
-                                       sampleFrac);
-                float valB = dsp::lerp(levelFrames[(size_t) frameB][(size_t) sampleA],
-                                       levelFrames[(size_t) frameB][(size_t) sampleB],
-                                       sampleFrac);
-                return dsp::lerp(valA, valB, frameFrac);
-            }
-
-            case WavetableInterpMode::Stepped:
-            {
-                // Nearest frame, nearest sample — lo-fi digital character
-                int nearestFrame = juce::jlimit(0, nFrames - 1, (int) std::round(framePos));
-                int nearestSample = ((int) std::round(samplePos)) % Wavetable::kFrameSize;
-                return levelFrames[(size_t) nearestFrame][(size_t) nearestSample];
-            }
-
-            case WavetableInterpMode::Classic:
-            {
-                const auto& raw = table.frames[0];
-                const int place = (int) std::lround(position * 63.0f);
-                const int frame = juce::jlimit(0, nFrames - 1, (int) std::lround((float) place * (float) (nFrames - 1) / 63.0f));
-                const float v = raw[(size_t) frame][(size_t) (sampleA & ~1)];
-                return std::round(v * 127.0f) * (1.0f / 127.0f);
-            }
-
-            case WavetableInterpMode::Vintage:
-            {
-                // Stepped frames with short crossfade (retro digital character)
-                int nearestFrame = juce::jlimit(0, nFrames - 1, (int) std::round(framePos));
-
-                // Within-frame: linear interpolation on samples
-                float val = dsp::lerp(levelFrames[(size_t) nearestFrame][(size_t) sampleA],
-                                      levelFrames[(size_t) nearestFrame][(size_t) sampleB],
-                                      sampleFrac);
-
-                // Short crossfade near frame boundaries (8 samples worth)
-                float crossfadeZone = 8.0f / Wavetable::kFrameSize;
-                float distToEdge = frameFrac < 0.5f ? frameFrac : (1.0f - frameFrac);
-                if (distToEdge < crossfadeZone && frameA != frameB)
-                {
-                    int otherFrame = frameFrac < 0.5f
-                        ? juce::jlimit(0, nFrames - 1, nearestFrame - 1)
-                        : juce::jlimit(0, nFrames - 1, nearestFrame + 1);
-                    float otherVal = dsp::lerp(levelFrames[(size_t) otherFrame][(size_t) sampleA],
-                                               levelFrames[(size_t) otherFrame][(size_t) sampleB],
-                                               sampleFrac);
-                    float xfade = distToEdge / crossfadeZone;
-                    val = dsp::lerp(otherVal, val, xfade);
-                }
-
-                return val;
-            }
-        }
-
-        return 0.0f;
-    }
-};
-
-// ============================================================================
 // WavetableVoice — a single voice that reads from a wavetable.
 //
 // Supports optional EnvelopeChain for multi-stage envelope architectures.
 // When envChainEnabled is true, the chain output replaces the simple ADSR.
+// Each voice ends in the shared filter section (VoiceFilter: two filters, routing, filter FM
+// from the table's own sound) and takes its note's share of the per-note spread (VoiceSpread).
+//
+// Its oscillators are dsp/PhaseOsc.h's: the table and its copy a little off pitch (SPRD) read one
+// phaseosc::Wave (the table with its INTP, the vintage read-outs included: they are modes of the
+// one read-out, WavetableRead) at the phases of two PhaseOsc, the sine an octave below (SUB) is
+// the sine of that file. Under phase modulation (the destination PM) the table is read at the
+// band-limited copy for the PITCH, as this engine always read it, not with PhaseOsc's swing rule
+// (a duller copy the deeper the modulation): that rule takes brightness away from what PM on
+// this engine sounded like (measured on the PWM table at full depth: the mean frequency of the
+// sound falls to 0.83 of what it was), so it is not taken here. To take it: osc.readCycles(wave,
+// phaseInc, pm, readPosition) in process(), and copyFor(.., osc.getSwing()) for the copy.
+// Everything that moves the voice comes from the modulation router (mod::Voice): the voice is
+// rendered a sub-block at a time and reads, per sample, the pitch, the level, the pan, the
+// cutoff, the table position, the phase (PM) and three cells of the second filter; the rest at
+// control rate. A voice nothing moves runs the plain loop, which is the engine as it was.
 // ============================================================================
 
 class WavetableVoice
 {
 public:
-    // LFO destinations (EngineLfoSection), in the order of the DEST cell.
+    // The destinations the voice reads by name: indices of the engine's table
+    // (WavetableEngine::lfoDests), in the order of the DEST cells. The first eight are what the
+    // engine always had, at the numbers they always had (a stored DEST keeps its meaning).
     enum LfoDest
     {
         LfoOff = 0,
-        LfoPitch,       // +-12 semitones, depth squared
-        LfoAmp,         // gain 0..2
-        LfoPan,         // +-1
-        LfoCutoff,      // +-4 octaves
+        LfoPitch,       // per sample: a frequency ratio (+-12 semitones, amount squared)
+        LfoAmp,         // per sample: a gain, 0..4 (an audio-rate slot may take it to -4)
+        LfoPan,         // per sample: +-1
+        LfoCutoff,      // per sample: octaves (+-4 at full depth)
         LfoResonance,   // +-0.5
-        LfoPosition,    // scan position, +-1 (the whole table) around POS
-        LfoSpread,      // +-1 around SPRD (0..1)
-        LfoSub,         // +-1 around SUB (0..1)
+        LfoPosition,    // per sample: the scan position, +-1 (the whole table) around where it stands
+        LfoSpread,      // the SPRD cell
+        LfoSub,         // the SUB cell
         NumLfoDests
     };
 
-    static const char* const* lfoDestLabels()
+    // The ones further down the table, which the engine looks up once (WavetableEngine::dests()).
+    struct Dests
     {
-        static const char* const names[NumLfoDests] = {
-            "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "POS", "SPRD", "SUB" };
-        return names;
-    }
+        int balance = -1, filterFm = -1, offsetB = -1;     // the second filter's three per-sample cells
+        int envTime = -1, filterTime = -1;                  // ETIM, FTIM
+        int phase = -1;                                     // PM: added to the read phase, in cycles, per sample
+    };
+
+    // The voice's own sources, in the order the engine publishes them (WavetableEngine::sources).
+    enum Published
+    {
+        PubScan = 0,    // SCAN: where the timed scan is between POS (0) and the end of the table (1)
+        PubRect,        // XRCT: the track input (as XFLT has it) rectified, at audio rate
+        PubFiltered     // XFLT: the track input through the engine's two-pole filters, at audio rate
+    };
+    // The engine's samples of the two audio-rate sources for a sub-block (nullptr: nobody reads it).
+    struct InputSources { const float* rect = nullptr; const float* filtered = nullptr; };
+
+    // PM at full depth: the phase swings this many cycles each way (4 pi radians); the amount
+    // counts squared, so the low half of the cell is fine.
+    static constexpr float PM_CYCLES = 2.0f;
 
     void setSampleRate(double sr)
     {
@@ -1237,14 +89,17 @@ public:
         ampEnv.setSampleRate(sr);
         envChain.setSampleRate(sr);
         filter.setSampleRate(sr);
-        lfos.setSampleRate(sr);
+        mods.prepare(sr);
+        osc.setSampleRate(sr);
+        osc2.setSampleRate(sr);
+        subOsc.setSampleRate(sr);
         declick.setSampleRate(sr);
         gainDeclick.setSampleRate(sr);
-        positionStep = (float) (1.0 / (0.003 * sr));    // the whole table in 3 ms (a STEP of a sixteenth: 0.2 ms)
+        positionStep = (float) (1.0 / (phaseosc::POSITION_GLIDE_SECONDS * sr));     // the whole table in 3 ms (a STEP of a sixteenth: 0.2 ms)
         levelStep = (float) (1.0 / (0.004 * sr));       // a level's whole range in 4 ms
     }
 
-    void setWavetable(const Wavetable* wt) { wavetable = wt; }
+    void setWavetable(const Wavetable* wt) { wavetable = wt; wave.table = wt; }
 
     void setNote(int note, float velocity)
     {
@@ -1256,30 +111,52 @@ public:
             baseFrequency = targetFrequency;
     }
 
-    void noteOn()
+    // `own`: what this note takes of the per-note spread (VoiceSpread, the ANLG page): with every
+    // amount at 0 it is nothing, and the note is sample for sample what it was without the page.
+    // The voice's generator has been advanced to this note (VoiceSpread::next): the router's
+    // randoms (RAND, RND2 ..) and the RAND scan's places are draws of it, so SEED repeats them.
+    void noteOn(const mod::Router& router, const VoiceSpread::Note& own = {})
     {
+        const bool wasActive = active;
         if (active)
         {
             declick.arm();      // struck again while sounding: the phase restart must not jump,
             gainDeclick.arm();  // nor the step to the new velocity
         }
-        else
-            lfos.snapSlews();
-        // An LFO on a page cell is read before the first sample (the engine sets the cell then).
-        if (lfos.keyed()) lfos.noteOnAndSample(); else lfos.noteOn();
-        filter.noteOn(currentNote, currentVelocity, active);
+        // (Whatever is routed is read before the note's first sample: mod::Voice::tick.)
+        mods.noteOn(router, currentNote, currentVelocity, spreadGenerator);
+        // EVAR: this note's envelopes (amp, the chain's stages, the filter's) are all longer or
+        // shorter by the same factor.
+        if (own.timeScale != envScale)
+        {
+            envScale = own.timeScale;
+            applyEnvTimeScale();
+            filter.setEnvTimeScale(filterTime * envScale);
+        }
+        filter.noteOn(currentNote, currentVelocity, active, own.cutoffOctaves);
         if (envChainEnabled && envChain.getStageCount() > 0)
             envChain.noteOn();
         else
             ampEnv.noteOn();
         active = true;
         struck = true;          // the new note takes every glided value as it stands
-        phase = 0.0;
-        phase2 = 0.25;
-        subPhase = 0.0;
+        positionCarry = 0.0f;
+        spreadSemis = own.semitones;
+        spreadPosition = own.wave * SPREAD_POSITION;
+        // (A voice struck again while it sounds is carried to its new place: the two declicks
+        // above work on the voice's one signal, before the engine places it.)
+        spreadPan = own.pan;
+        if (! wasActive)
+            spreadPanNow = spreadPan;
+        spreadGain = own.gain;
+        osc.reset((double) own.phase(0));
+        osc2.reset(0.25 + (double) own.phase(1));
+        subOsc.reset((double) own.phase(2));
         // Every note-on starts this voice's own scan run again (like its envelope and its phase).
         scanPhase = 0.0;
         scanHeldStep = -1;
+        scanDraws.start(spreadGenerator, spread::Scan);
+        scanRun = scanMode != WavetableScanMode::Off && scanReverse ? 1.0f : 0.0f;
     }
 
     void noteOff()
@@ -1294,15 +171,13 @@ public:
     bool isActive() const { return active; }
 
     void setPosition(float pos) { position = juce::jlimit(0.0f, 1.0f, pos); }
-    void setInterpMode(WavetableInterpMode m) { interpMode = m; }
+    void setInterpMode(WavetableInterpMode m) { interpMode = m; wave.interp = m; }
     void setDetune(float cents) { detuneCents = cents; }
     void setSubLevel(float lvl) { subLevel = juce::jlimit(0.0f, 1.0f, lvl); }
     void setMorphSpeed(float speed) { morphSpeed = speed; }
     void setOctave(int oct) { octaveShift = juce::jlimit(-4, 4, oct); }
     void setSpread(float s) { spread = juce::jlimit(0.0f, 1.0f, s); }          // second, detuned copy
-    void setPitchOffset(float semitones) { pitchOffset = semitones; }           // tune, bend, vibrato
-    void setPositionMod(float m) { positionMod = m; }                           // pressure
-    void setGainMod(float g) { gainMod = g; }
+    void setPitchOffset(float semitones) { pitchOffset = semitones; }           // tune, bend, the VIBR cell's vibrato
     void setLevel(float l) { level = l; }                                       // the engine's LEVL
     void setMorphDepth(float d) { morphDepth = juce::jlimit(0.0f, 1.0f, d); }
     void setEnvToPosition(float a) { envToPos = juce::jlimit(-1.0f, 1.0f, a); }
@@ -1312,14 +187,36 @@ public:
     {
         glideCoeff = seconds > 0.0005f ? 1.0f - std::exp(-3.0f / (seconds * (float) sampleRate)) : 1.0f;
     }
+    // This voice's own value of three cells the engine works out per voice (a slot on VIBR, TIME
+    // or SPD moves them): the VIBR cell's depth, and the scan's time and speed.
+    void setVibrato(float depth) { vibratoDepth = depth; }
+    float getVibrato() const { return vibratoDepth; }
+    void setScanTimeCell(float seconds) { scanTimeCell = seconds; }
+    void setScanSpeedCell(float speed) { scanSpeedCell = speed; }
+    float getScanTimeCell() const { return scanTimeCell; }
+    float getScanSpeedCell() const { return scanSpeedCell; }
+
+    // The position the table was read at in the last sample (with what the router adds).
+    float getReadPosition() const { return readPosition; }
+
+    // A position beyond an end of the table comes back in from that end (mirrored): bounded, and
+    // without the corner a hard stop would cut into the wave.
+    static float foldPosition(float p)
+    {
+        if (! std::isfinite(p))
+            return 0.0f;
+        p = std::abs(p);
+        p -= 2.0f * std::floor(p * 0.5f);
+        return p > 1.0f ? 2.0f - p : p;
+    }
 
     // --- Timed scan ---
     void setScanMode(WavetableScanMode m) { scanMode = m; }
     void setScanPassSeconds(double seconds) { scanInc = 1.0 / (juce::jmax(0.001, seconds) * sampleRate); }
     void setScanSteps(int n) { scanSteps = juce::jlimit(2, 256, n); }
     void setScanReverse(bool r) { scanReverse = r; }
-    void setScanSeed(uint32_t seed) { scanRng = seed != 0 ? seed : 0x9E3779B9u; }
     double getScanPhase() const { return scanPhase; }                   // passes since the note-on
+    float getScanRun() const { return scanRun; }                        // the source SCAN, as of the last sample
     float getEffectivePosition() const { return effectivePosition; }    // as of the last sample
 
     // --- EnvelopeChain support ---
@@ -1327,38 +224,121 @@ public:
     bool isEnvelopeChainEnabled() const { return envChainEnabled; }
     EnvelopeChain& getEnvelopeChain() { return envChain; }
 
-    float process()
+    // One sub-block of n samples, added to left / right. pressure: this voice's pad. input: the
+    // engine's two audio-rate sources for these n samples. foldAtEnds: an audio-rate slot is aimed
+    // at POS and its input is heard (see process()). setCell(voice, dest, value) sets a page cell of this voice (a
+    // control-rate destination of the router).
+    template <typename SetCell>
+    void render(const mod::Router& router, const Dests& d, float* left, float* right, int n, float pressure,
+                const InputSources& input, bool foldAtEnds, const SetCell& setCell)
+    {
+        // The voice's own sources, only while a slot reads them. SCAN: where the run stood at the
+        // last sample. XRCT and XFLT: the input's samples for THIS sub-block (they exist before
+        // the voice renders, so the slots hear them with no delay).
+        if (router.wants(PubScan))
+            mods.publish(PubScan, scanMode != WavetableScanMode::Off ? scanRun : 0.0f);   // (0 while MODE is OFF, under a held note too)
+        if (input.rect != nullptr || input.filtered != nullptr)
+        {
+            mods.publishAudio(PubRect, input.rect, n);
+            mods.publishAudio(PubFiltered, input.filtered, n);
+            inputHanded = true;
+        }
+        else if (inputHanded)
+        {
+            mods.publishAudio(PubRect, nullptr, 0);
+            mods.publishAudio(PubFiltered, nullptr, 0);
+            inputHanded = false;
+        }
+
+        const float envNow = envChainEnabled && envChain.getStageCount() > 0 ? lastEnv : ampEnv.getCurrentLevel();
+        const bool moving = mods.tick(router, n, envNow, filter.getEnvelope().getCurrentLevel(), pressure);
+        if (! moving)
+        {
+            // Nothing moves this voice: the engine as it is without any modulation.
+            if (filterMoved)
+                letFilterGo(router, d, nullptr, nullptr, nullptr, nullptr);
+            for (int i = 0; i < n && active; ++i)
+            {
+                const float s = process();
+                const float pan = spreadPanNow;
+                left[i] += pan > 0.0f ? s * (1.0f - pan) : s;
+                right[i] += pan < 0.0f ? s * (1.0f + pan) : s;
+            }
+            return;
+        }
+
+        mods.forEachControl([&](int dest, float value) { setControl(d, dest, value, setCell); });
+        const float* pitch = mods.buffer(LfoPitch);
+        const float* amp = mods.buffer(LfoAmp);
+        const float* pan = mods.buffer(LfoPan);
+        const float* cutoff = mods.buffer(LfoCutoff);
+        const float* pos = mods.buffer(LfoPosition);
+        const float* pm = mods.buffer(d.phase);
+        const float* bal = mods.buffer(d.balance);
+        const float* ffm = mods.buffer(d.filterFm);
+        const float* ofsb = mods.buffer(d.offsetB);
+        if (filterMoved || cutoff || bal || ffm || ofsb)
+            letFilterGo(router, d, cutoff, bal, ffm, ofsb);
+
+        // (PM is a phase, mod::Phase: the router brings it in and lets it go without a step.)
+        for (int i = 0; i < n && active; ++i)
+        {
+            if (cutoff) filter.setLfoOctaves(cutoff[i]);
+            if (bal)    filter.setBalanceNow(bal[i]);
+            if (ffm)    filter.setFmNow(ffm[i]);
+            if (ofsb)   filter.setOffsetBNow(ofsb[i]);
+            const double phaseMod = pm ? (double) pm[i] : 0.0;
+            const float s = process(phaseMod, pos ? pos[i] : 0.0f, foldAtEnds,
+                                    pitch ? (double) pitch[i] : 1.0, amp ? amp[i] : 1.0f, true);
+            // PAN moves its own voice between the channels (balance law: the centre is unchanged,
+            // so a sound without that routing is exactly as before), with the note's own place.
+            float p = pan ? pan[i] : 0.0f;
+            if (spreadPanNow != 0.0f)
+                p = juce::jlimit(-1.0f, 1.0f, p + spreadPanNow);
+            left[i] += p > 0.0f ? s * (1.0f - p) : s;
+            right[i] += p < 0.0f ? s * (1.0f + p) : s;
+        }
+    }
+
+    // A control-rate destination of the router: the resonance, an envelope's time, or one of this
+    // voice's page cells.
+    template <typename SetCell>
+    void setControl(const Dests& d, int dest, float value, const SetCell& setCell)
+    {
+        if (dest == LfoResonance)
+            filter.setResonanceMod(value);
+        else if (dest == d.envTime)
+        {
+            envTime = value;
+            applyEnvTimeScale();
+        }
+        else if (dest == d.filterTime)
+        {
+            filterTime = value;
+            filter.setEnvTimeScale(filterTime * envScale);
+        }
+        else
+            setCell(*this, dest, value);
+    }
+
+    // One sample.
+    //   pm        added to the read phase, in cycles (the destination PM: the track input on it
+    //             is phase modulation)
+    //   posMod    added to the table position (the destination POS). Without `fold` it is one
+    //             more term of the sum that stops at the ends of the table, as an LFO on POS
+    //             always was. With `fold` (an audio-rate slot is aimed at POS) it is added after
+    //             the position's glide, which would hold an audio-rate movement back, and past an
+    //             end of the table it comes back in from that end, so the wave is not cut by a
+    //             corner (as XIN POS always was)
+    //   pitch     a frequency ratio (the destination PTCH)
+    //   amp       a gain (the destination AMP)
+    //   routed    the router moves this voice (render()'s second loop): only then can `fold`
+    //             change under a note with something on POS, and the position is carried across
+    // With the defaults it is the voice without any modulation.
+    float process(double pm = 0.0, float posMod = 0.0f, bool fold = false, double pitch = 1.0, float amp = 1.0f, bool routed = false)
     {
         if (!active || wavetable == nullptr || wavetable->numFrames == 0)
             return 0.0f;
-
-        // LFOs: spread and sub level are moved for this sample only (the set values stay).
-        const bool lfoOn = lfos.anyOn();
-        const float setSpreadValue = spread, setSubValue = subLevel;
-        if (lfoOn)
-        {
-            lfos.tick();
-            lfoApplied = true;
-            lfoPosition = lfos.amount(LfoPosition);
-            lfoSemis = lfos.pitchSemitones(LfoPitch);
-            spread = juce::jlimit(0.0f, 1.0f, spread + lfos.amount(LfoSpread));
-            subLevel = juce::jlimit(0.0f, 1.0f, subLevel + lfos.amount(LfoSub));
-            filter.setLfoOctaves(lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES);
-            filter.setResonanceMod(lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE);
-            lfoGain = lfos.gain(LfoAmp);
-            lfoPan = juce::jlimit(-1.0f, 1.0f, lfos.panAmount(LfoPan));
-        }
-        else if (lfoApplied)
-        {
-            lfoPosition = 0.0f;
-            lfoSemis = 0.0f;
-            filter.setLfoOctaves(0.0f);
-            filter.setResonanceMod(0.0f);
-            lfoGain = 1.0f;
-            lfoPan = 0.0f;
-            lfos.snapSlews();
-            lfoApplied = false;
-        }
 
         // The timed scan sets the base position (the knob's value when it is off).
         const bool scanning = scanMode != WavetableScanMode::Off;
@@ -1379,18 +359,25 @@ public:
         {
             effectivePosition = basePosition;
         }
-        // Envelope, velocity and pressure move the scan position.
-        float posOffset = positionMod + envToPos * lastEnv + velToPos * currentVelocity + lfoPosition;
+        // Envelope, velocity, the router and the note's own share (WVAR) move the scan position.
+        // (The sum in the order and shape it always had, so that it rounds as it always did:
+        // `none` stands where the pad's pressure was, which comes through the router now.)
+        const float none = 0.0f, slow = fold ? 0.0f : posMod;
+        float posOffset = none + envToPos * lastEnv + velToPos * currentVelocity + slow + spreadPosition;
         if (posOffset != 0.0f || scanning)
             effectivePosition = juce::jlimit(0.0f, 1.0f, effectivePosition + posOffset);
 
         // Nothing that is set or stepped under a sounding note is jumped to (a jump of the frame
         // read, or of a level, is a click): the position, the sub level, the spread coming in or
-        // going out, velocity's share, pressure's and the LEVL cell move on at a limited rate: the
-        // whole table in three milliseconds, a level's whole range in four. A change that is slower than that - any knob sweep,
-        // any smooth LFO, a running scan - passes exactly. STEP and RAND still step to the ear.
-        // The first sample of a note takes everything as it stands.
-        const float velGain = 1.0f - velSens + velSens * currentVelocity;
+        // going out, velocity's share and the LEVL cell move on at a limited rate: the whole
+        // table in three milliseconds, a level's whole range in four. A change that is slower
+        // than that - any knob sweep, a running scan - passes exactly. STEP and RAND still step
+        // to the ear. The first sample of a note takes everything as it stands.
+        const float velGain = (1.0f - velSens + velSens * currentVelocity) * spreadGain;
+        if (spreadPanNow != spreadPan)
+            spreadPanNow = dsp::towards(spreadPanNow, spreadPan, levelStep);
+        const bool first = struck;
+        const float readBefore = readPosition;
         if (struck)
         {
             struck = false;
@@ -1398,7 +385,6 @@ public:
             subNow = subLevel;
             spreadMix = spread > 0.0f ? 1.0f : 0.0f;
             velGainNow = velGain;
-            gainModNow = gainMod;
             levelNow = level;
         }
         else
@@ -1407,10 +393,35 @@ public:
             subNow = dsp::towards(subNow, subLevel, levelStep);
             spreadMix = dsp::towards(spreadMix, spread > 0.0f ? 1.0f : 0.0f, levelStep);
             velGainNow = dsp::towards(velGainNow, velGain, levelStep);
-            gainModNow = dsp::towards(gainModNow, gainMod, 2.0f * levelStep);
             levelNow = dsp::towards(levelNow, level, levelStep);
         }
         effectivePosition = positionNow;
+        readPosition = positionNow;
+        // An audio-rate movement of the position: after the glide, mirrored at the ends.
+        if (fold && posMod != 0.0f)
+            readPosition = foldPosition(positionNow + posMod);
+        // An audio-rate slot on POS that comes or goes changes how the rest of POS's modulation
+        // is taken (inside the glided sum that stops at the ends, or after it and mirrored): with
+        // an LFO, the strip or a pad on POS that is another place in the table from one sample
+        // to the next. The difference is carried and let go at the position's own rate.
+        if (routed)
+        {
+            if (first)
+            {
+                foldWas = fold;
+                positionCarry = 0.0f;
+            }
+            else if (fold != foldWas)
+            {
+                foldWas = fold;
+                positionCarry = readBefore - readPosition;
+            }
+            if (positionCarry != 0.0f)
+            {
+                positionCarry = dsp::towards(positionCarry, 0.0f, positionStep);
+                readPosition = juce::jlimit(0.0f, 1.0f, readPosition + positionCarry);
+            }
+        }
 
         if (baseFrequency != targetFrequency)
         {
@@ -1420,32 +431,32 @@ public:
         }
 
         // Compute frequency with detune, octave and pitch offset
-        double freq = baseFrequency * std::exp2((double) octaveShift + detuneCents / 1200.0 + (pitchOffset + lfoSemis) / 12.0);
+        double freq = baseFrequency * std::exp2((double) octaveShift + detuneCents / 1200.0 + (pitchOffset + spreadSemis) / 12.0);
+        if (pitch != 1.0)
+            freq *= pitch;
         double phaseInc = freq / sampleRate;
 
-        // The band-limited copy for this pitch
-        const int mipLevel = WavetableRead::mipLevel(*wavetable, phaseInc);
-
-        // Read from wavetable with position-based frame interpolation
-        float sample = readWavetable(mipLevel, phase);
+        // The table at this position, phase and INTP: the band-limited copy for the pitch
+        const phaseosc::Copy copy = phaseosc::copyFor(*wavetable, phaseInc);
+        float sample = phaseosc::readAt(wave, copy, osc.at(pm), readPosition);
 
         // Spread: a second copy up to 30 cents away, mixed equally (faded in and out where the
-        // spread starts or ends under a sounding note).
+        // spread starts or ends under a sounding note). It reads the same band-limited copy.
         if (spread > 0.0f || spreadMix > 0.0f)
         {
-            const float both = (sample + readWavetable(mipLevel, phase2)) * 0.7071f;
+            const float both = (sample + phaseosc::readAt(wave, copy, osc2.at(pm), readPosition)) * 0.7071f;
             sample = spreadMix >= 1.0f ? both : sample + spreadMix * (both - sample);
-            phase2 = dsp::wrapPhase(phase2 + phaseInc * std::exp2((double) spread * 30.0 / 1200.0));
+            osc2.advance(phaseInc * std::exp2((double) spread * 30.0 / 1200.0));
         }
 
         // Sub oscillator: a sine one octave below
         float sub = 0.0f;
         if (subNow > 0.0f)
-            sub = subNow * std::sin((float) subPhase * juce::MathConstants<float>::twoPi);
-        subPhase = dsp::wrapPhase(subPhase + phaseInc * 0.5);
+            sub = subNow * subOsc.sine(0.0f);
+        subOsc.advance(phaseInc * 0.5);
 
         // Advance phase
-        phase = dsp::wrapPhase(phase + phaseInc);       // (never a loop: a huge or infinite step must not hang)
+        osc.advance(phaseInc);          // (never a loop: a huge or infinite step must not hang)
 
         // Envelope: use chain if enabled, otherwise simple ADSR
         float envVal;
@@ -1463,12 +474,8 @@ public:
         }
 
         lastEnv = envVal;
-        if (lfoOn)
-        {
-            spread = setSpreadValue;
-            subLevel = setSubValue;
-        }
-        return gainDeclick.process(filter.process(declick.process(sample + sub)) * envVal * velGainNow * gainModNow * lfoGain * levelNow);
+        // (FFM: the table's own sound moves the cutoff; the sine below it does not.)
+        return gainDeclick.process(filter.process(declick.process(sample + sub), sample) * envVal * velGainNow * amp * levelNow);
     }
 
     void reset()
@@ -1480,19 +487,67 @@ public:
         envChain.reset();
         filter.reset();
         active = false;
-        phase = 0.0;
+        osc.reset();
         morphPhase = 0.0f;
         scanPhase = 0.0;
         scanHeldStep = -1;
+        scanRun = 0.0f;
     }
 
     Envelope& getAmpEnvelope() { return ampEnv; }
+    // The amp envelope as set (the chain's stages are copies of it). A note's EVAR and the
+    // router's ETIM are a time scale of the envelope (Envelope::setTimeScale): what is set stays.
+    const Envelope::Params& getAmpParams() const { return ampEnv.getParams(); }
+    void setAmpParams(const Envelope::Params& p)
+    {
+        ampEnv.setParams(p);
+        for (int s = 0; s < envChain.getStageCount(); ++s)
+            envChain.getEnvelopeMut(s).setParams(p);
+    }
+    // One value of it under a running note (a slot on ATK ...): 0 attack, 1 decay, 2 sustain, 3 release.
+    void setAmpStage(int stage, float value)
+    {
+        auto set = [stage, value](Envelope& e)
+        {
+            if (stage == 0)      e.setAttack(value);
+            else if (stage == 1) e.setDecay(value);
+            else if (stage == 2) e.setSustain(value);
+            else                 e.setRelease(value);
+        };
+        set(ampEnv);
+        for (int s = 0; s < envChain.getStageCount(); ++s)
+            set(envChain.getEnvelopeMut(s));
+    }
+    // ETIM x the note's EVAR on the amp envelope and on every stage of the chain (call after the
+    // chain was rebuilt: its new stages start at 1).
+    void applyEnvTimeScale()
+    {
+        const float scale = envTime * envScale;
+        ampEnv.setTimeScale(scale);
+        for (int s = 0; s < envChain.getStageCount(); ++s)
+            envChain.getEnvelopeMut(s).setTimeScale(scale);
+    }
     VoiceFilter& getFilter() { return filter; }
-    VoiceLfos& getLfos() { return lfos; }
-    // -1..1 from LFOs routed to the pan (as of the last processed sample); the engine places the voice.
-    float getLfoPan() const { return lfoPan; }
+    mod::Voice& getMod() { return mods; }
+    spread::Generator& getSpreadGenerator() { return spreadGenerator; }
+    // -1..1: the note's own place (PVAR), as of the last processed sample.
+    float getPan() const { return spreadPanNow; }
+    // WVAR at its top moves a note's table position by this much of the table either way.
+    static constexpr float SPREAD_POSITION = 0.5f;
 
 private:
+    // The filter's per-sample destinations as the router has them for this sub-block: one that
+    // is no longer moved goes back to its set value (the router hands back control-rate cells
+    // only). cutoff / bal / ffm / ofsb: the buffers, nullptr where nothing moves the cell.
+    void letFilterGo(const mod::Router& router, const Dests& d, const float* cutoff, const float* bal, const float* ffm, const float* ofsb)
+    {
+        if (cutoff == nullptr && (filterMoved & 1))  filter.setLfoOctaves(0.0f);
+        if (bal == nullptr && (filterMoved & 2))     filter.setBalanceNow(router.baseOf(d.balance));
+        if (ffm == nullptr && (filterMoved & 4))     filter.setFmNow(router.baseOf(d.filterFm));
+        if (ofsb == nullptr && (filterMoved & 8))    filter.setOffsetBNow(router.baseOf(d.offsetB));
+        filterMoved = (cutoff ? 1 : 0) | (bal ? 2 : 0) | (ffm ? 4 : 0) | (ofsb ? 8 : 0);
+    }
+
     // One sample of the scan run: where the run is between the POS knob (0) and the end of the
     // table (1), then the base position. The first sample of a note is exactly at the start.
     float advanceScan()
@@ -1526,11 +581,9 @@ private:
                 if (k != scanHeldStep)
                 {
                     scanHeldStep = k;
-                    // xorshift32 (Marsaglia, "Xorshift RNGs", J. Statistical Software 8(14), 2003)
-                    scanRng ^= scanRng << 13;
-                    scanRng ^= scanRng >> 17;
-                    scanRng ^= scanRng << 5;
-                    scanHeld = (float) (scanRng >> 8) * (1.0f / 16777215.0f);
+                    // The next draw of this note's run (spread::Sequence over the voice's
+                    // generator): the same SEED and the same notes give the same places.
+                    scanHeld = scanDraws.unipolar();
                 }
                 t = scanHeld;
                 break;
@@ -1541,6 +594,7 @@ private:
         }
         if (scanReverse)
             t = 1.0f - t;
+        scanRun = t;
         float pos = position + t * (1.0f - position);
         if (scanMode == WavetableScanMode::Rand && wavetable->numFrames > 1)
         {
@@ -1550,22 +604,20 @@ private:
         return pos;
     }
 
-    // The shared read-out (WavetableRead), at this voice's position and INTP.
-    float readWavetable(int mipLevel, double phase) const
-    {
-        return wavetable != nullptr ? WavetableRead::sample(*wavetable, mipLevel, effectivePosition, phase, interpMode) : 0.0f;
-    }
-
     double sampleRate = 44100.0;
     double baseFrequency = 440.0;
-    double phase = 0.0;
     int currentNote = 60;
     float currentVelocity = 1.0f;
     bool active = false;
 
+    // The oscillators (dsp/PhaseOsc.h): the table, its copy a little off pitch, the sine below
+    phaseosc::PhaseOsc osc, osc2, subOsc;
+    phaseosc::Wave wave;            // the table and its INTP
+
     const Wavetable* wavetable = nullptr;
     float position = 0.0f;          // 0.0 - 1.0 scan through frames
     float effectivePosition = 0.0f; // after morph modulation
+    float readPosition = 0.0f;      // where the table is read: effectivePosition, moved by the router's POS
     WavetableInterpMode interpMode = WavetableInterpMode::Linear;
     float detuneCents = 0.0f;
     float subLevel = 0.0f;
@@ -1574,12 +626,11 @@ private:
     int octaveShift = 0;
     float spread = 0.0f;
     float pitchOffset = 0.0f;
-    float positionMod = 0.0f;
-    float gainMod = 1.0f;
     float level = 1.0f;
+    float vibratoDepth = 0.0f, scanTimeCell = 2.0f, scanSpeedCell = 1.0f;
     // The values above as they are heard: moved to, never jumped to, under a sounding note.
     bool struck = true;
-    float positionNow = 0.0f, subNow = 0.0f, spreadMix = 0.0f, velGainNow = 1.0f, gainModNow = 1.0f, levelNow = 1.0f;
+    float positionNow = 0.0f, subNow = 0.0f, spreadMix = 0.0f, velGainNow = 1.0f, levelNow = 1.0f;
     float positionStep = 0.007f, levelStep = 0.005f;
     float morphDepth = 1.0f;
     float envToPos = 0.0f;
@@ -1588,8 +639,6 @@ private:
     float lastEnv = 0.0f;
     float glideCoeff = 1.0f;
     double targetFrequency = 440.0;
-    double phase2 = 0.25;
-    double subPhase = 0.0;
 
     // Timed scan
     WavetableScanMode scanMode = WavetableScanMode::Off;
@@ -1599,22 +648,27 @@ private:
     bool scanReverse = false;
     juce::int64 scanHeldStep = -1;
     float scanHeld = 0.0f;
-    uint32_t scanRng = 0x9E3779B9u;
+    float scanRun = 0.0f;           // the run, 0 (POS) .. 1 (the end of the table): the source SCAN
+    spread::Sequence scanDraws;     // RAND's places for this note
 
     Envelope ampEnv;
+    // The per-note spread (VoiceSpread): this voice's generator, and what its present note took
+    spread::Generator spreadGenerator;
+    float envScale = 1.0f, spreadSemis = 0.0f, spreadPosition = 0.0f, spreadPan = 0.0f, spreadPanNow = 0.0f, spreadGain = 1.0f;
+    float envTime = 1.0f, filterTime = 1.0f;    // the router's ETIM and FTIM for this voice
     dsp::Declick declick;       // on the oscillators, before the filter (whose state smears a jump)
     dsp::Declick gainDeclick;   // on the output
 
     // Filter (after the oscillators and sub, before the amp envelope)
     VoiceFilter filter;
 
-    // LFOs
-    VoiceLfos lfos;
-    bool lfoApplied = false;
-    float lfoPosition = 0.0f;
-    float lfoSemis = 0.0f;
-    float lfoGain = 1.0f;
-    float lfoPan = 0.0f;
+    // This voice's side of the modulation router
+    mod::Voice mods;
+    int filterMoved = 0;        // which of the filter's per-sample cells the router holds (letFilterGo)
+    // POS across a change of `fold` (process()): how it was taken, the difference still carried
+    bool foldWas = false;
+    float positionCarry = 0.0f;
+    bool inputHanded = false;   // the sources XRCT / XFLT are handed over
 
     // EnvelopeChain support — replaces ampEnv when enabled
     EnvelopeChain envChain;
@@ -1677,13 +731,23 @@ public:
         KeySampleBase = 41,    // 41-48: key n's sample, 0 = OFF, else SampleBank index + 1
         KeyPositionBase = 49,  // 49-56: where in its sample key n is taken, 0 .. 1
         KeyPlaceBase = 57,     // 57-64: where along the table key n sits, 0 .. 1
-        FilterBase = 100       // 100-115: the per-voice filter (VoiceFilterSection offsets)
+        // (65-72 were the XIN page's own cells until phase U4: the track input is the router's now,
+        // its XIN page and slots. The numbers are left free.)
+        VoiceCountParam = 73,  // VOX: polyphony 1..16 (default 8); 65-72 reserved (old XIN cells, must be inert)
+        FilterBase = 100,      // 100-115: the per-voice filter (VoiceFilterSection offsets)
+        FilterDualBase = 116,  // 116-124: its second filter, routing, balance and FM (the section's dual block)
+        SpreadBase = 125       // 125-132: the per-note spread (VoiceSpread offsets; the ANLG page)
+        // 158-189 and 700-772 are the modulation router's (mod::Router: LFO1, LFO2, STRIP, XIN,
+        // the slots, the custom LFO shape): everything that moves this engine's sound goes
+        // through it, the pad's pressure routes and the track input at audio rate included.
     };
 
+    static constexpr int MAX_VOICES = 16;
+
     explicit WavetableEngine(int maxVoices = 8)
-        : allocator(maxVoices)
+        : allocator(MAX_VOICES)
     {
-        voices.resize((size_t) maxVoices);
+        voices.resize((size_t) MAX_VOICES);
 
         // The built-in tables are shared by every engine (built once, read only); the engine owns
         // the two made from samples. USER (a recording made in the app, or a file, cut into frames)
@@ -1707,12 +771,15 @@ public:
             v.setWavetable(tables[0]);
             v.setLevel(masterLevel);
         }
-        setScanSeed(0x4E455054u);
+        seedSpread();
 
         allocator.setNoteOnCallback([this](int voiceIdx, const Voice& v)
         {
             voices[(size_t) voiceIdx].setNote(v.note, v.velocity);
-            voices[(size_t) voiceIdx].noteOn();
+            auto& voice = voices[(size_t) voiceIdx];
+            // (The spread first: it advances the voice's generator to this note, and the router's
+            // randoms and the RAND scan are draws of it.)
+            voice.noteOn(router, spreadSection.next(voice.getSpreadGenerator()));
         });
 
         allocator.setNoteOffCallback([this](int voiceIdx, const Voice& /*v*/)
@@ -1728,12 +795,11 @@ public:
         });
 
         // Seed every parameter so getParameter is always the true value.
-        for (auto& page : pages())
+        for (auto& page : getParamPages())
             for (auto& p : page.params)
                 if (p.isValid())
-                    setParameter(p.id, p.defaultVal);
+                    setParameter(p.id, p.id == VoiceCountParam ? (float) maxVoices : p.defaultVal);
         filterSection.applyAll(VoiceFilterSection::each(voices));
-        lfoSection.applyAll(EngineLfoSection::each(voices));
     }
 
     // ---- The SCAN page ---------------------------------------------------------------------
@@ -1764,8 +830,9 @@ public:
     // How the run adds up with everything else that moves the position, per sample:
     //     base     = POS knob                       (MODE = OFF)
     //              = POS + run * (1 - POS)          (run = 0..1 from the mode and DIR)
-    //     position = clamp(base + MSPD/MDPT motion + pressure + ENVP + VELP + LFOs to POS, 0, 1)
-    // The run sets the base and the others add to it; the sum stops at the two ends of the table.
+    //     position = clamp(clamp(base + MSPD/MDPT motion + ENVP + VELP, 0, 1) + the router's POS, 0, 1)
+    // The run sets the base and the others add to it; the sum stops at the two ends of the table
+    // (with an audio-rate slot on POS it comes back in from the end instead: WavetableVoice::process).
     // (With MODE = OFF the MSPD motion wraps around the table as it always has; under a run it is
     // clamped like the rest, so a held last frame does not jump to the first.)
     // ---- The table list ---------------------------------------------------------------------
@@ -1842,8 +909,42 @@ public:
     }
     static bool userFramesAligned(int option) { return option >= 3; }
 
-    // WAVE (table, scan position, motion), SCAN (the timed run), OSC (pitch, thickness) and AMP
-    // (envelope, chain, level).
+    // ---- The track input at audio rate ---------------------------------------------------------
+    // The engine had a page of its own for it (XIN: OFF / PM / POS, XDPT, XENV, XVEL, XWHL, XRCT,
+    // XLP, XHP, ids 65-72). It is the router's now, as on every engine: the XIN page (two routes:
+    // DST AMT FLT, and the LPF / HPF the filtered copies use) or any free slot with the source XIN
+    // / XLP / XHP / XBP. What each old cell is there:
+    //   XIN PM    a route to the destination PM: the input is added to the phase the table is
+    //             read at, up to two cycles each way, the amount squared (as XDPT was)
+    //   XIN POS   a route to POS: the input moves the table position around where it stands, up
+    //             to the whole table each way; past an end it comes back in from that end
+    //   XDPT      the route's AMT
+    //   XENV      on a free slot n: ENV > AMTn (AMT = XDPT x (1 - XENV), the slot ENV > AMTn at
+    //             XDPT x XENV), or simply VIA = ENV for all of it
+    //   XVEL      the same with VEL          XWHL   STRP > AMTn at XWHL
+    //   XLP XHP   the source XFLT, which this engine publishes: the input through the engine's
+    //             own two-pole high-pass and low-pass, at the XIN page's HPF and LPF (which are
+    //             therefore open on this engine until set: 20 Hz and 20 kHz, the old defaults, not
+    //             the router's 200 Hz and 2 kHz). The router's own XLP / XHP / XBP (FLT = LP / HP /
+    //             BP) read the same two cells through one-pole filters: half as steep.
+    //   XRCT      the source XRCT, which this engine publishes: the absolute value of XFLT (of
+    //             the input as it is while LPF and HPF are open)
+    // ---- The engine's own sources (SRC and VIA show them after the router's) ---------------------
+    //   SCAN      where the timed scan is, 0 (at POS) .. 1 (the end of the table), with DIR; 0
+    //             while MODE is OFF. Control rate: any cell can follow the scan (SCAN > CUT: the
+    //             filter opens as the table is run through).
+    //   XRCT      the track input rectified, at audio rate (after XFLT's filters).
+    //   XFLT      the track input through a two-pole high-pass at HPF and a two-pole low-pass at
+    //             LPF (the XIN page's cells), at audio rate.
+    // Both are heard by the slots in the same sub-block (no delay): the input exists before the
+    // voices render.
+
+    // WAVE (table, scan position, motion), SCAN (the timed run), OSC (pitch, thickness), ANLG (the
+    // per-note spread: VoiceSpread.h) and AMP (envelope, chain, level); the key-frame pages; FILTR,
+    // FLT B and F ENV (the shared filter section with its dual block: VoiceFilterSection.h); XIN.
+    // The router's pages (XIN, SLT1 .., LSHP, STRIP, LFO1, LFO2) follow in getParamPages(). The
+    // filter's KTRK / EVEL / VEL / WHL stay cells of the filter pages, as on the macro oscillator
+    // (VoiceFilterSection's Routed layout, where they are default slots, is not used yet).
     static const ParamPages& pages()
     {
         static const char* const scanModes[] = { "OFF", "RUN", "LOOP", "PING", "STEP", "RAND" };
@@ -1893,6 +994,7 @@ public:
                 { "VIBR", Vibrato, 0, 1, 0, L },
                 { "SPRD", UnisonSpread, 0, 1, 0, L },
                 { "SUB",  SubLevel, 0, 1, 0, L } }} },
+            VoiceSpread::makePage(SpreadBase),
             { "AMP", "AMP", {{
                 { "ATK",  AmpAttack, 0.001f, 10, 0.01f, G, "s" },
                 { "DEC",  AmpDecay, 0.001f, 10, 0.3f, G, "s" },
@@ -1925,50 +1027,129 @@ public:
               l.push_back(pos);
               l.push_back(plc);
           }
-          VoiceFilterSection::appendPages(l, FilterBase);
-          EngineLfoSection(lfoDests(&l)).appendPages(l);
+          // VOICE: polyphony. Before the filter pages (before STRIP / LFO pages).
+          l.push_back({ "VOICE", "VOX", {{ { "VOX", VoiceCountParam, 1, MAX_VOICES, 8, I }, {}, {}, {}, {}, {}, {}, {} }} });
+          VoiceFilterSection::appendPages(l, FilterBase, FilterDualBase);
           return l;
         }();
         return list;
     }
 
-    // The LFO destinations: the original eight, then the other continuous cells of the pages and
-    // the other LFO. TIME, SPD (the scan) and VIBR are read once per block, the rest per sample.
+    // What can be moved (the modulation router's table). The original eight (pitch, level, pan,
+    // cutoff, resonance and the table position as inputs of the voice; SPRD and SUB, which are
+    // page cells), then the other continuous cells of the pages in the order they always had (a
+    // stored DEST keeps its meaning: nothing was moved or taken out), LRAT / LDPT, the second
+    // filter's cells, and new at the end: ETIM / FTIM (the envelopes' times) and PM (the read
+    // phase).
+    // Per sample (so the track input reaches them at audio rate): PTCH, AMP, PAN, CUT, POS, PM,
+    // BAL, FFM, OFSB. The rest once a sub-block.
+    // POS is an input of the voice, an offset of up to the whole table either way around where
+    // the knob, the scan, the motion, ENVP and VELP have brought the position - not the POS cell
+    // with a range of 0..1: the router would hold that to the table before the voice saw it, and
+    // an LFO could then not move a scan that has reached the end, nor the input swing past an
+    // end and come back (the mirror the voice makes).
     // Not offered: TABL, INTP, the scan's MODE / SYNC / LEN / STEP / DIR / FRMS, CHAN, STGS, COMB
     // (choices and counts), OCT, TUNE, FINE and BEND (PTCH is the pitch), LEVL (the level of the
-    // mixed voices; AMP is each voice's), and what the filter leaves out.
-    static const LfoDestList& lfoDests(const ParamPages* enginePages = nullptr)
+    // mixed voices; AMP is each voice's), the ANLG page (read once, at the note-on, before the
+    // router's first tick) and what the filter leaves out.
+    static const mod::DestTable& lfoDests()
     {
-        if (enginePages == nullptr)
-            pages();                    // the list is made on the way
-        static const LfoDestList list = makeLfoDests(*enginePages);
-        static const bool registered = (list.registerGroups(), true);
+        static const mod::DestTable table = []
+        {
+            const ParamPages& p = pages();
+            mod::DestTable t;
+            t.group();
+            t.input("PTCH", 1.0f, 1.0f, 1.0f / 1024.0f, 1024.0f, mod::Pitch);      // a ratio: one octave x the amount squared
+            t.input("AMP", 1.0f, 1.0f, 0.0f, 4.0f, mod::PerSample).audioFloor(-4.0f);  // (below 0: ring modulation)
+            t.input("PAN", 0.0f, 1.0f, -1.0f, 1.0f, mod::PerSample);
+            VoiceFilterSection::addRouterInputs(t);                                 // CUT (octaves, per sample), RESO
+            t.input("POS", 0.0f, 1.0f, -2.0f, 2.0f, mod::PerSample);
+            t.add(p, UnisonSpread);
+            t.add(p, SubLevel);
+            jassert(t.indexOfLabel("CUT") == WavetableVoice::LfoCutoff && t.indexOfLabel("SUB") == WavetableVoice::LfoSub);
+            t.group();
+            for (int id : { (int) MorphSpeed, (int) MorphDepth, (int) EnvToPosition, (int) VelToPosition })
+                t.add(p, id);
+            t.group();
+            t.add(p, ScanTime);
+            t.add(p, ScanSpeed);
+            t.group();
+            t.add(p, Glide);
+            t.add(p, Vibrato);
+            t.group();
+            for (int id : { (int) AmpAttack, (int) AmpDecay, (int) AmpSustain, (int) AmpRelease, (int) VelSens })
+                t.add(p, id);
+            VoiceFilterSection::addLfoDests(t, p, FilterBase);
+            t.addCross();
+            // (After everything that was there before: a stored destination keeps its number.)
+            VoiceFilterSection::addDualDests(t, p, FilterDualBase);
+            t.group();
+            t.envTimes();
+            t.input("PM", 0.0f, WavetableVoice::PM_CYCLES, -8.0f, 8.0f, mod::PerSample | mod::Squared | mod::Phase);    // cycles (a phase: a cycle is no change)
+            // The mod strip until the STRIP page says otherwise: 60 % of the table further on, and a
+            // quarter-tone of vibrato.
+            t.stripRoute(0, WavetableVoice::LfoPosition, 0.6f);
+            t.stripVibrato(0.25f);
+            // Pad pressure until AT ROUTE says otherwise: the level, a gain of 1 + pressure.
+            t.pressureRoute(0, "AMP", 1.0f);
+            t.finish(2);
+            return t;
+        }();
+        static const bool registered = (table.registerGroups(), true);
         juce::ignoreUnused(registered);
-        return list;
+        return table;
     }
 
-    static LfoDestList makeLfoDests(const ParamPages& p)
+    // The destinations the voice reads by number beyond the first eight.
+    static const WavetableVoice::Dests& dests()
     {
-        LfoDestList l(WavetableVoice::lfoDestLabels(), WavetableVoice::NumLfoDests);
-        l.group();
-        for (int id : { (int) MorphSpeed, (int) MorphDepth, (int) EnvToPosition, (int) VelToPosition })
-            l.add(p, id);
-        l.group();
-        l.add(p, ScanTime);
-        l.add(p, ScanSpeed);
-        l.group();
-        l.add(p, Glide);
-        l.add(p, Vibrato);
-        l.group();
-        for (int id : { (int) AmpAttack, (int) AmpDecay, (int) AmpSustain, (int) AmpRelease, (int) VelSens })
-            l.add(p, id);
-        VoiceFilterSection::addLfoDests(l, p, FilterBase);
-        l.addCross();
-        // The mod strip until the STRIP page says otherwise: 60 % of the table further on, and a
-        // quarter-tone of vibrato.
-        l.stripRoute(0, WavetableVoice::LfoPosition, 0.6f);
-        l.stripVibrato(0.25f);
-        return l;
+        static const WavetableVoice::Dests found = []
+        {
+            const auto& t = lfoDests();
+            const auto dual = [&t](VoiceFilterSection::Offset o) { return t.indexOfId(FilterDualBase + (int) o - (int) VoiceFilterSection::Count); };
+            WavetableVoice::Dests d;
+            d.balance = dual(VoiceFilterSection::Balance);
+            d.filterFm = dual(VoiceFilterSection::FilterFM);
+            d.offsetB = dual(VoiceFilterSection::OffsetB);
+            d.envTime = t.ampTime();
+            d.filterTime = t.filterTime();
+            d.phase = t.indexOfLabel("PM");
+            jassert(d.balance > 0 && d.filterFm > 0 && d.offsetB > 0 && d.envTime > 0 && d.filterTime > 0 && d.phase > 0);
+            return d;
+        }();
+        return found;
+    }
+
+    // What a slot can read here beside the router's own sources (see "The engine's own sources").
+    static const mod::SourceTable& sources()
+    {
+        static const mod::SourceTable table = []
+        {
+            mod::SourceTable t(2);
+            t.publish("SCAN", mod::Unipolar);                       // WavetableVoice::PubScan
+            t.publish("XRCT", mod::AudioRate | mod::Unipolar | mod::Immediate);    // WavetableVoice::PubRect
+            t.publish("XFLT", mod::AudioRate | mod::Immediate);                    // WavetableVoice::PubFiltered
+            return t;
+        }();
+        static const bool registered = [] { table.registerGroups(); return true; }();
+        juce::ignoreUnused(registered);
+        return table;
+    }
+
+    // What an old pressure route (AftertouchRouter::Destination) is here, as a slot's DEST.
+    // TIMBRE and WAVE are both the place in the table (POS).
+    int pressureDestOf(AftertouchRouter::Destination d) const override
+    {
+        using D = AftertouchRouter::Destination;
+        switch (d)
+        {
+            case D::Volume:         return WavetableVoice::LfoAmp;
+            case D::FilterCutoff:   return WavetableVoice::LfoCutoff;
+            case D::MacroTimbre:    return WavetableVoice::LfoPosition;
+            case D::WavePosition:   return WavetableVoice::LfoPosition;
+            case D::PanSpread:      return WavetableVoice::LfoPan;
+            default:                return 0;
+        }
     }
 
     // A key's first place in its sample and along the table: eight keys spread over both, so
@@ -1978,10 +1159,21 @@ public:
 
     bool isRebuildParam(ParamId id) const override { return id == UserSample || id == UserFrames || isKeyParam(id); }
 
+    mod::Router* modRouter() override { return &router; }
+    const mod::Router* modRouter() const override { return &router; }
+
     ParamPages getParamPages() const override
     {
         ParamPages out = pages();
         filterSection.updateModeCell(out);
+        router.appendPages(out);        // XIN, SLT1 .., LSHP, STRIP, LFO1, LFO2
+        // The input's filters are open until set (as this engine's XLP and XHP were).
+        for (auto& page : out)
+            for (auto& p : page.params)
+            {
+                if (p.id == mod::Router::xinId(mod::Router::XinLowPass))   p.defaultVal = mod::Router::MAX_XIN_HZ;
+                if (p.id == mod::Router::xinId(mod::Router::XinHighPass))  p.defaultVal = mod::Router::MIN_XIN_HZ;
+            }
         // The sample bank grows while the app runs (recordings).
         const int bank = SampleBank::get().size();
         for (auto& page : out)
@@ -2001,7 +1193,7 @@ public:
     {
         if (bpm > 0.0f)
             tempo = bpm;        // a synced scan follows it from the next block on
-        lfoSection.setTempo(bpm, EngineLfoSection::each(voices));
+        router.setTempo(bpm);
     }
 
     EngineType getType() const override { return EngineType::Wavetable; }
@@ -2012,7 +1204,19 @@ public:
         sampleRate = sr;
         for (auto& v : voices)
             v.setSampleRate(sr);
+        router.prepare(sr);
         applyParameter(Glide, getParameter(Glide));
+        for (auto* f : { &inputLowPass, &inputHighPass })
+        {
+            f->setSampleRate(sr);
+            f->setResonance(0.707f);
+            f->reset();
+        }
+        inputLowPass.setMode(SVFilter::Mode::LowPass);
+        inputHighPass.setMode(SVFilter::Mode::HighPass);
+        inputLowHz = inputHighHz = -1.0f;
+        inputRan = false;
+        foldLeft = 0;
     }
 
     void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& /*midi*/) override
@@ -2040,71 +1244,90 @@ public:
             }
         }
 
-        // The timed scan: one pass length for the block (so SYNC follows the tempo live).
+        // The timed scan: one pass length for the block (so SYNC follows the tempo live), from
+        // each voice's own TIME and SPD (a slot on them moves one voice's).
         if (scanMode != WavetableScanMode::Off)
-        {
-            const double seconds = getScanPassSeconds();
             for (auto& voice : voices)
-                voice.setScanPassSeconds(voice.getLfos().keyed() ? getScanPassSeconds(&voice.getLfos()) : seconds);
-        }
+                voice.setScanPassSeconds(scanPassSeconds(voice.getScanTimeCell(), voice.getScanSpeedCell()));
 
-        // Once per block: tuning, bend, vibrato and each voice's pressure (scan position, volume).
-        // The mod strip: the routes of the STRIP page (by default the table position and
-        // vibrato), and the cutoff by the filter's WHL amount.
+        // Once per block: tuning and bend, the strip (the cutoff by the filter's WHL amount; its
+        // routes are the router's), the track's pressure routes and the track input.
         wheelNow = smoothWheel(wheelNow, wheel, numSamples, sampleRate);
-        lfoSection.stripBlock(wheelNow, numSamples, sampleRate, EngineLfoSection::each(voices),
-                              [this](int key) { setParameter(key, getParameter(key)); });
-        vibratoPhase += 5.5 * numSamples / sampleRate;
-        vibratoPhase -= std::floor(vibratoPhase);
-        const float vib = std::sin((float) vibratoPhase * juce::MathConstants<float>::twoPi);
-        for (int v = 0; v < (int) voices.size(); ++v)
+        const float basePitch = tune + bend * bendRange;
+        const float wheelOctaves = filterSection.externalOctaves(wheelNow, 0.0f);
+        for (auto& voice : voices)
+            voice.getFilter().setExternalOctaves(wheelOctaves);
+        // (The router fades an input that ends or is shorter than the block.)
+        router.beginBlock(audioInput.left, audioInput.right != nullptr ? audioInput.right : audioInput.left,
+                          audioInput.connected() ? audioInput.frames : 0, audioInput.envelope, wheelNow, sampleRate);
+        const WavetableVoice::Dests& d = dests();
+        // An audio-rate slot on POS whose input is heard: the position's modulation is then taken
+        // after its glide and mirrored at the ends of the table; and for as long as the router
+        // fades such a slot out after it went or its input fell silent (a slot's gain is led to
+        // nothing over 4 ms), so that nothing jumps. A slot that moves nothing - its input silent,
+        // or its two sides cancelling - leaves the rest of POS as it was: stopping at the ends.
+        if (audioOnPosition() && inputHeard())
+            foldLeft = (int) (0.004 * sampleRate) + 2 * mod::Router::MAX_CHUNK + numSamples;
+        const bool foldPosition = foldLeft > 0;
+        foldLeft = std::max(0, foldLeft - numSamples);
+        // The VIBR cell: a constant vibrato from the router's vibrato sine (the STRIP page's VRAT).
+        const bool vibratoOn = vibrato != 0.0f || router.routed(router.dests().indexOfId(Vibrato));
+        const auto setCell = [this](WavetableVoice& voice, int dest, float value)
         {
-            float pressure = v < allocator.getVoiceCount() ? allocator.getAftertouch(v) : 0.0f;
-            AftertouchRouter::ModValues m;
-            if (pressure > 0.0f)
-                m = (aftertouchRouter ? *aftertouchRouter : allocator.getAftertouchRouter()).computeModulation(pressure);
-            auto& voice = voices[(size_t) v];
-            voice.setPositionMod(m.wavePosMod + m.timbreMod);
-            voice.setGainMod(juce::jlimit(0.0f, 2.0f, 1.0f + m.volumeMod));
-            voice.setPitchOffset(tune + bend * bendRange
-                                 + vib * (m.vibratoMod + voice.getLfos().value(Vibrato, vibrato) * 0.5f));
-            voice.getFilter().setExternalOctaves(filterSection.externalOctaves(wheelNow, m.cutoffMod));
-        }
+            applyVoiceParam(voice, router.dests()[dest].id, value);
+        };
 
-        for (int i = 0; i < numSamples; ++i)
+        // Sub-blocks: the router's control rate. Inside one the voices are rendered one after
+        // the other (they share the router's per-sample buffers).
+        for (int offset = 0; offset < numSamples;)
         {
-            // An LFO routed to PAN moves its own voice between the channels (balance law: the
-            // centre is unchanged, so a sound without that routing is exactly as before).
-            float sampleL = 0.0f, sampleR = 0.0f;
-            for (auto& voice : voices)
+            router.readsInput(router.wants(WavetableVoice::PubRect) || router.wants(WavetableVoice::PubFiltered));
+            const int n = router.beginChunk(offset, numSamples);
+            std::fill(mixL.begin(), mixL.begin() + n, 0.0f);
+            std::fill(mixR.begin(), mixR.begin() + n, 0.0f);
+            const float vib = vibratoOn ? router.vibrato() : 0.0f;
+            // The sources XFLT and XRCT: the input as the router takes it (the mean of its sides,
+            // held to +-1), through the two filters where they are not open, and rectified.
+            // Worked out only while a slot reads one of them.
+            WavetableVoice::InputSources input;
+            if (router.wants(WavetableVoice::PubRect) || router.wants(WavetableVoice::PubFiltered))
             {
-                if (! voice.isActive())
-                    continue;
-                // LFOs on page cells: this voice's own value of each (as of its last sample).
-                if (voice.getLfos().keyed())
-                    voice.getLfos().forEachKeyed([&voice](int key, float value) { applyVoiceParam(voice, key, value); });
-                const float s = voice.process();
-                const float pan = voice.getLfoPan();
-                sampleL += pan > 0.0f ? s * (1.0f - pan) : s;
-                sampleR += pan < 0.0f ? s * (1.0f + pan) : s;
-            }
-
-            sampleL *= 0.7f;        // LEVL is applied by each voice (so that a note takes it whole)
-            sampleR *= 0.7f;
-
-            if (right)
-            {
-                left[i] += sampleL;
-                right[i] += sampleR;
+                filterInput(n);
+                input.filtered = filteredInput.data();
+                input.rect = rectifiedInput.data();
             }
             else
+                inputRan = false;
+            for (int v = 0; v < (int) voices.size(); ++v)
             {
-                left[i] += 0.5f * (sampleL + sampleR);
+                auto& voice = voices[(size_t) v];
+                if (! voice.isActive())
+                {
+                    // Its LFOs keep time; a cell it was left holding goes back to its set value.
+                    if (voice.getMod().idle(router, n))
+                        voice.getMod().restore(router, [&](int dest, float value) { voice.setControl(d, dest, value, setCell); });
+                    continue;
+                }
+                const float pressure = v < allocator.getVoiceCount() ? allocator.getAftertouch(v) : 0.0f;
+                voice.setPitchOffset(basePitch + vib * (voice.getVibrato() * 0.5f));
+                voice.render(router, d, mixL.data(), mixR.data(), n, pressure, input, foldPosition, setCell);
             }
+            for (int i = 0; i < n; ++i)
+            {
+                const float sampleL = mixL[(size_t) i] * 0.7f;      // LEVL is applied by each voice (so that a note takes it whole)
+                const float sampleR = mixR[(size_t) i] * 0.7f;
+                if (right)
+                {
+                    left[offset + i] += sampleL;
+                    right[offset + i] += sampleR;
+                }
+                else
+                {
+                    left[offset + i] += 0.5f * (sampleL + sampleR);
+                }
+            }
+            offset += n;
         }
-
-        lfoSection.endBlock(numSamples, EngineLfoSection::each(voices));
-        lfoSection.afterLetGo([this](int key) { setParameter(key, getParameter(key)); });
     }
 
     void releaseResources() override
@@ -2155,34 +1378,42 @@ private:
             return;
         for (auto& v : voices)
         {
-            auto p = v.getAmpEnvelope().getParams();
+            auto p = v.getAmpParams();
             stageCurves.applyTo(p, 0);
-            v.getAmpEnvelope().setParams(p);
-            // Chain stages are copies of this envelope.
-            auto& chain = v.getEnvelopeChain();
-            for (int s = 0; s < chain.getStageCount(); ++s)
-                chain.getEnvelopeMut(s).setParams(p);
+            v.setAmpParams(p);      // (and the chain's stages, which are copies of this envelope)
         }
     }
 
 public:
     void setParameter(ParamId id, float value) override
     {
+        if (id == VoiceCountParam)
+        {
+            // (The allocator keeps to it: no more than VOX voices are given notes, and a lowered
+            // VOX releases the voices past it - they ring out.)
+            const int n = juce::jlimit(1, MAX_VOICES, (int) std::lround(value));
+            params[id] = (float) n;
+            allocator.setVoiceLimit(n);
+            return;
+        }
         if (filterSection.owns(id))
         {
             if (filterSection.swaps(id, value))
                 soundSwapped();
             filterSection.set(id, value, VoiceFilterSection::each(voices));
-            lfoSection.baseChanged(id, filterSection.get(id), EngineLfoSection::each(voices));
+            router.setBase(id, filterSection.get(id));
             return;
         }
-        if (lfoSection.owns(id))
+        if (spreadSection.owns(id))
         {
-            // A cell an LFO has let go of goes back to its set value on every voice.
-            const int released = lfoSection.set(id, value, EngineLfoSection::each(voices),
-                                                [this](int key) { return getParameter(key); });
-            if (released >= 0)
-                setParameter(released, getParameter(released));
+            spreadSection.set(id, value);
+            if (spreadSection.reseeds(id))
+                seedSpread();
+            return;
+        }
+        if (mod::Router::owns(id))
+        {
+            router.set(id, value);
             return;
         }
         if (StageCurveParam::owns(id))
@@ -2195,15 +1426,17 @@ public:
             soundSwapped();
         params[id] = value;
         applyParameter(id, value);
-        lfoSection.baseChanged(id, value, EngineLfoSection::each(voices));
+        router.setBase(id, value);
     }
 
     float getParameter(ParamId id) const override
     {
         if (filterSection.owns(id))
             return filterSection.get(id);
-        if (lfoSection.owns(id))
-            return lfoSection.get(id);
+        if (spreadSection.owns(id))
+            return spreadSection.get(id);
+        if (mod::Router::owns(id))
+            return router.get(id);
         if (StageCurveParam::owns(id))
             return stageCurves.get(id);
         auto it = params.find(id);
@@ -2213,9 +1446,11 @@ public:
     juce::String getParameterName(ParamId id) const override
     {
         if (filterSection.owns(id))
-            return VoiceFilterSection::name(id - FilterBase);
-        if (EngineLfoSection::owns(id))
-            return EngineLfoSection::name(id);
+            return VoiceFilterSection::name(filterSection.offsetOf(id));
+        if (spreadSection.owns(id))
+            return VoiceSpread::name(id - SpreadBase);
+        if (mod::Router::owns(id))
+            return mod::Router::name(id);
         switch (id)
         {
             case Position:       return "Position";
@@ -2361,23 +1596,27 @@ public:
     double getUserSampleSeconds() const { return userSeconds; }
 
     // Seconds one scan pass takes right now (TIME, LEN at the tempo or the natural length, over SPD).
-    // With a voice's LFOs: for that voice, whose LFOs may be moving TIME or SPD.
-    double getScanPassSeconds(const VoiceLfos* lfos = nullptr) const
+    double getScanPassSeconds() const { return scanPassSeconds(scanTime, scanSpeed); }
+    // ... with a TIME and SPD of a voice's own (a slot may be moving them).
+    double scanPassSeconds(float time, float speed) const
     {
-        double seconds = lfos != nullptr ? lfos->value(ScanTime, scanTime) : scanTime;
+        double seconds = time;
         if (scanSync == 2 && currentTableIndex == USER_TABLE && userSeconds > 0.0)
             seconds = userSeconds * (double) juce::jmax(0.0f, 1.0f - scanStart);
         else if (scanSync == 1)
             seconds = (double) scanLengthBeats(scanLength) * 60.0 / (double) tempo;
-        return seconds / (double) (lfos != nullptr ? lfos->value(ScanSpeed, scanSpeed) : scanSpeed);
+        return seconds / (double) speed;
     }
 
-    // RAND draws from one generator per voice; the same seed gives the same jumps.
-    void setScanSeed(uint32_t seed)
+    // The per-note spread, the router's randoms and the RAND scan: every voice's generator starts
+    // its sequence again, from the SEED cell and the voice's number.
+    void seedSpread()
     {
         for (size_t v = 0; v < voices.size(); ++v)
-            voices[v].setScanSeed(seed + (uint32_t) v * 0x9E3779B9u);
+            voices[v].getSpreadGenerator().seed(spreadSection.seed(), (int) v);
     }
+
+    // (RAND's places are draws of the same generators: spread::Sequence, stream spread::Scan.)
 
     void selectTable(int index)
     {
@@ -2441,38 +1680,110 @@ private:
         }
     }
 
-    // One voice's own value of a page cell: what an LFO routed to that cell sets, sample by
-    // sample (TIME, SPD and VIBR are read per block instead, where the engine works them out).
-    // Envelope times act on the stage that is running (the chain's stages are copies).
-    static void applyVoiceParam(WavetableVoice& voice, ParamId id, float value)
+    // One voice's own value of a page cell: what a slot routed to that cell sets, once a
+    // sub-block. Envelope times act on the stage that is running (the chain's stages are copies).
+    void applyVoiceParam(WavetableVoice& voice, ParamId id, float value) const
     {
-        if (id >= FilterBase)
+        if (id >= FilterBase)      // (the dual block follows the single filter's ids: one offset)
         {
             VoiceFilterSection::applyTo(voice.getFilter(), id - FilterBase, value);
             return;
         }
         switch (id)
         {
+            case UnisonSpread:  voice.setSpread(value); return;
+            case SubLevel:      voice.setSubLevel(value); return;
             case MorphSpeed:    voice.setMorphSpeed(value); return;
             case MorphDepth:    voice.setMorphDepth(value); return;
             case EnvToPosition: voice.setEnvToPosition(value); return;
             case VelToPosition: voice.setVelToPosition(value); return;
             case Glide:         voice.setGlideTime(value); return;
+            case Vibrato:       voice.setVibrato(value); return;
             case VelSens:       voice.setVelocitySensitivity(value); return;
+            case ScanTime:
+            case ScanSpeed:
+                if (id == ScanTime) voice.setScanTimeCell(value); else voice.setScanSpeedCell(value);
+                voice.setScanPassSeconds(scanPassSeconds(voice.getScanTimeCell(), voice.getScanSpeedCell()));
+                return;
             case AmpAttack: case AmpDecay: case AmpSustain: case AmpRelease: break;
             default: return;
         }
-        auto setEnvelope = [id, value](Envelope& e)
+        voice.setAmpStage(id - AmpAttack, value);
+    }
+
+    // The track input for the n samples of the sub-block, for the sources XFLT and XRCT: as the
+    // router reads it (the mean of its sides held to +-1, faded where it ends), through the
+    // high-pass and the low-pass (the project's SVF, two poles each; left out while its cell is
+    // open), and its absolute value.
+    void filterInput(int n)
+    {
+        const float* in = router.inputNow();
+        const float lowHz = router.get(mod::Router::xinId(mod::Router::XinLowPass));
+        const float highHz = router.get(mod::Router::xinId(mod::Router::XinHighPass));
+        if (lowHz != inputLowHz)   { inputLowHz = lowHz;   inputLowPass.setCutoff(lowHz); }
+        if (highHz != inputHighHz) { inputHighHz = highHz; inputHighPass.setCutoff(highHz); }
+        if (! inputRan)
         {
-            if (id == AmpAttack)       e.setAttack(value);
-            else if (id == AmpDecay)   e.setDecay(value);
-            else if (id == AmpSustain) e.setSustain(value);
-            else                       e.setRelease(value);
-        };
-        setEnvelope(voice.getAmpEnvelope());
-        auto& chain = voice.getEnvelopeChain();
-        for (int s = 0; s < chain.getStageCount(); ++s)
-            setEnvelope(chain.getEnvelopeMut(s));
+            inputLowPass.reset();
+            inputHighPass.reset();
+            inputRan = true;
+        }
+        const bool lowOn = lowHz < mod::Router::MAX_XIN_HZ, highOn = highHz > mod::Router::MIN_XIN_HZ;
+        for (int i = 0; i < n; ++i)
+        {
+            float x = in[i];
+            if (highOn) x = inputHighPass.process(x);
+            if (lowOn)  x = inputLowPass.process(x);
+            if (! std::isfinite(x))
+            {
+                x = 0.0f;
+                inputLowPass.reset();
+                inputHighPass.reset();
+            }
+            filteredInput[(size_t) i] = x;
+            rectifiedInput[(size_t) i] = std::abs(x);
+        }
+    }
+
+    // The track input of this block is heard: a sample of it (the mean of its sides) above
+    // -120 dB. An input connected but silent, or whose sides cancel, moves nothing.
+    bool inputHeard() const
+    {
+        if (! audioInput.connected())
+            return false;
+        const float* r = audioInput.right != nullptr ? audioInput.right : audioInput.left;
+        for (int i = 0; i < audioInput.frames; ++i)
+            if (std::abs(0.5f * (audioInput.left[i] + r[i])) > 1.0e-6f)
+                return true;
+        return false;
+    }
+
+    // True when a slot with an audio-rate source (the track input, XRCT, XFLT) is aimed at POS: the
+    // position then swings past the ends of the table and comes back in (WavetableVoice::process)
+    // while the input is heard (processBlock: a silent input moves nothing and changes nothing).
+    // (A slot whose amount is 0 counts only while another slot moves that amount.)
+    bool audioOnPosition() const
+    {
+        const auto& list = router.sources();
+        const int firstAmount = router.dests().visible() + 2 * router.numLfos();
+        for (int s = 0; s < mod::Router::NUM_FREE; ++s)
+        {
+            const auto& c = router.slot(s);
+            if (c.dest != WavetableVoice::LfoPosition)
+                continue;
+            const int source = list.source(c.src);
+            if (! (mod::Src::isAudio(source) || (mod::Src::isPublished(source) && list.audio(source - mod::Src::Published1))))
+                continue;
+            if (c.amount != 0.0f)
+                return true;
+            for (int other = 0; other < mod::Router::NUM_FREE; ++other)
+                if (router.slot(other).dest == firstAmount + s && router.slot(other).src != 0 && router.slot(other).amount != 0.0f)
+                    return true;
+        }
+        for (int cell : { (int) mod::Router::XinDest1, (int) mod::Router::XinDest2 })
+            if ((int) router.get(mod::Router::xinId(cell)) == WavetableVoice::LfoPosition && router.get(mod::Router::xinId(cell + 1)) != 0.0f)
+                return true;
+        return false;
     }
 
     void applyParameter(ParamId id, float value)
@@ -2495,10 +1806,18 @@ private:
                 for (auto& v : voices)
                     v.setScanMode(scanMode);
                 break;
-            case ScanTime:       scanTime = juce::jlimit(0.05f, 60.0f, value); break;
+            case ScanTime:
+                scanTime = juce::jlimit(0.05f, 60.0f, value);
+                for (auto& v : voices)
+                    v.setScanTimeCell(scanTime);
+                break;
             case ScanSync:       scanSync = juce::jlimit(0, 2, (int) std::lround(value)); break;
             case ScanLength:     scanLength = juce::jlimit(0, NUM_SCAN_LENGTHS - 1, (int) std::lround(value)); break;
-            case ScanSpeed:      scanSpeed = juce::jlimit(0.25f, 4.0f, value); break;
+            case ScanSpeed:
+                scanSpeed = juce::jlimit(0.25f, 4.0f, value);
+                for (auto& v : voices)
+                    v.setScanSpeedCell(scanSpeed);
+                break;
             case ScanSteps:
                 for (auto& v : voices)
                     v.setScanSteps(scanStepCount((int) std::lround(value)));
@@ -2541,7 +1860,11 @@ private:
 
             case TuneParam:      tune = value; break;
             case BendRangeParam: bendRange = value; break;
-            case Vibrato:        vibrato = value; break;
+            case Vibrato:
+                vibrato = value;
+                for (auto& v : voices)
+                    v.setVibrato(value);
+                break;
             case MorphDepth:     for (auto& v : voices) v.setMorphDepth(value); break;
             case EnvToPosition:  for (auto& v : voices) v.setEnvToPosition(value); break;
             case VelToPosition:  for (auto& v : voices) v.setVelToPosition(value); break;
@@ -2583,16 +1906,12 @@ private:
             {
                 for (auto& v : voices)
                 {
-                    auto p = v.getAmpEnvelope().getParams();
+                    auto p = v.getAmpParams();
                     if (id == AmpAttack) p.attack = value;
                     else if (id == AmpDecay) p.decay = value;
                     else if (id == AmpSustain) p.sustain = value;
                     else if (id == AmpRelease) p.release = value;
-                    v.getAmpEnvelope().setParams(p);
-                    // Chain stages are copies of this envelope.
-                    auto& chain = v.getEnvelopeChain();
-                    for (int s = 0; s < chain.getStageCount(); ++s)
-                        chain.getEnvelopeMut(s).setParams(p);
+                    v.setAmpParams(p);      // (and the chain's stages, which are copies of this envelope)
                 }
                 break;
             }
@@ -2638,6 +1957,7 @@ private:
                     for (int s = 0; s < stages; ++s)
                         newChain.addEnvelope(p);
                     v.getEnvelopeChain() = newChain;
+                    v.applyEnvTimeScale();      // (the new stages take the note's EVAR and the router's ETIM)
                 }
                 break;
             }
@@ -2663,7 +1983,6 @@ private:
     float unisonSpread = 0.0f;
     float tune = 0.0f, bend = 0.0f, bendRange = 2.0f, wheel = 0.0f, vibrato = 0.0f;
     float wheelNow = 0.0f;                              // the strip, smoothed per block
-    double vibratoPhase = 0.0;
     int currentTableIndex = 0;
 
     // Timed scan (SCAN page)
@@ -2672,8 +1991,16 @@ private:
     int scanSync = 0, scanLength = 4, userFrameOption = 0;
     double userSeconds = 0.0, userPendingSeconds = 0.0;
 
-    VoiceFilterSection filterSection { FilterBase };
-    EngineLfoSection lfoSection { lfoDests() };
+    VoiceFilterSection filterSection { FilterBase, FilterDualBase };
+    VoiceSpread spreadSection { SpreadBase };
+    mod::Router router { lfoDests(), 2, 0, &sources() };
+    std::array<float, mod::Router::MAX_CHUNK> mixL {}, mixR {};
+    // The sources XFLT and XRCT for the sub-block, and the filters behind them
+    std::array<float, mod::Router::MAX_CHUNK> filteredInput {}, rectifiedInput {};
+    SVFilter inputLowPass, inputHighPass;
+    float inputLowHz = -1.0f, inputHighHz = -1.0f;
+    bool inputRan = false;
+    int foldLeft = 0;           // samples for which POS is still taken as an audio-rate movement
 
     VoiceAllocator allocator;
     std::vector<WavetableVoice> voices;

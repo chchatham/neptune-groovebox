@@ -369,6 +369,15 @@ public:
             notice.say("SEM MRPH ONLY");
             return;
         }
+        // A per-pad LFO or slot cell that cannot act because its DEST is OFF.
+        // (DrumEngine::padModIdleReason: DRUMS says the same of the same cells.)
+        if (curveId < 0 && PadModParam::contains(spec.id))
+            if (auto* drums = dynamic_cast<DrumEngine*>(engineOf(trackIdx)))
+                if (const char* why = drums->padModIdleReason(spec.id))
+                {
+                    notice.say(why);
+                    return;
+                }
 
         if (isStepHeld() && canLock(spec.id))
         {
@@ -1027,76 +1036,18 @@ protected:
         if (writeVirtual(spec, trackIdx, value))
             return;
 
-        // The synth's ARCH loads a whole starting sound. Each architecture keeps what was dialled in
-        // on it: the sound being left is remembered, and one that was left earlier comes back as
-        // it was instead of the architecture's starting sound (owner, 2026-11-14: switching away
-        // and back must lose nothing).
-        auto* archEngine = (audioEngine != nullptr && spec.id == UnifiedParam::ARCH) ? engineOf(trackIdx) : nullptr;
-        if (archEngine != nullptr && archEngine->getType() != EngineType::UnifiedVoice)
-            archEngine = nullptr;
-        const int archTo = (int) std::lround(value);
-        if (archEngine != nullptr && (int) std::lround(archEngine->getParameter(UnifiedParam::ARCH)) == archTo)
-            archEngine = nullptr;                       // not a switch
-        if (archEngine != nullptr)
-            rememberArchitecture(trackIdx, *archEngine);
-
+        // (The synth's ARCH loads a whole starting sound, and each architecture keeps what was
+        // dialled in on it: that memory is the engine's, UnifiedVoiceEngine's ARCH memory, which
+        // is also what a project stores. The cells it brings back are read below.)
         sequencer->getPattern().getTrack(trackIdx).soundParams[spec.id] = value;
         if (audioEngine)
         {
             audioEngine->setTrackParameter(trackIdx, spec.id, value);
-            if (archEngine != nullptr)
-                recallArchitecture(trackIdx, *archEngine, archTo);
 
             // A switch such as the architecture preset or the filter type changes other parameters
             // and cells too: read them back so stored values match what is sounding.
             if (spec.kind == ParamKind::Choice && EngineParamRange::contains(spec.id))
                 syncStoredParams(trackIdx);
-        }
-    }
-
-    // ---- What each architecture of a track's synth was left as (for as long as that engine lives) ----
-    struct ArchMemory
-    {
-        const EngineBase* engine = nullptr;
-        std::map<int, ParamMap> sounds;             // by ARCH value: every engine parameter
-    };
-    std::map<int, ArchMemory> archMemory;           // by track
-
-    void rememberArchitecture(int trackIdx, const EngineBase& e)
-    {
-        auto& memory = archMemory[trackIdx];
-        if (memory.engine != &e)
-        {
-            memory.engine = &e;
-            memory.sounds.clear();                  // another engine: another sound's history
-        }
-        auto& sound = memory.sounds[(int) std::lround(e.getParameter(UnifiedParam::ARCH))];
-        sound.clear();
-        for (int id = 0; id < EngineParamRange::THIRD_END; ++id)
-            if (EngineParamRange::contains(id) && id != UnifiedParam::ARCH)
-                sound[id] = e.getParameter(id);
-    }
-
-    // After ARCH was set to `arch`: the sound that architecture was left with, if it was used
-    // before on this engine. (A few passes: a parameter such as an oscillator's kind resets others.)
-    void recallArchitecture(int trackIdx, const EngineBase& e, int arch)
-    {
-        auto it = archMemory.find(trackIdx);
-        if (it == archMemory.end() || it->second.engine != &e)
-            return;
-        auto found = it->second.sounds.find(arch);
-        if (found == it->second.sounds.end())
-            return;
-        for (int pass = 0; pass < 3; ++pass)
-        {
-            bool changed = false;
-            for (auto& [id, v] : found->second)
-                if (e.getParameter(id) != v)
-                {
-                    audioEngine->setTrackParameter(trackIdx, id, v);
-                    changed = true;
-                }
-            if (!changed) break;
         }
     }
 
@@ -1271,8 +1222,9 @@ protected:
         if (audioEngine && spec.id >= MixParam::SEND_BASE && spec.id < MixParam::SEND_BASE + MixParam::MAX_SENDS)
         {
             int bus = spec.id - MixParam::SEND_BASE;
-            if (bus < audioEngine->getSendCount())
-                return juce::String(AudioEngine::effectTypeName(audioEngine->getSendBusType(bus))) + juce::String(bus + 1);
+            EffectType first;       // (a send with nothing on it keeps the plain label)
+            if (audioEngine->getInsertEffectType(AudioEngine::sendTrack(bus), 0, first))
+                return juce::String(AudioEngine::effectTypeName(first)) + juce::String(bus + 1);
         }
         return juce::String(spec.label).substring(0, 5);
     }
@@ -1415,24 +1367,15 @@ protected:
             out = UnifiedVoiceEngine::basePages();   // no audio engine attached (tests, previews)
         else if (auto* drums = dynamic_cast<DrumEngine*>(e))
         {
-            // One page for the selected pad instead of sixteen; a kick machine (TYPE KSYN) or a
-            // cymbal machine (TYPE CSYN) adds its own page. Then the kit's LFO pages.
+            // The selected pad's own pages instead of all sixteen pads' (DrumEngine::padPages, the
+            // same pages DRUMS shows: its DR page, what its type adds, PLFO and PSLT), then the
+            // kit's pages.
             const auto all = drums->getParamPages();
             const int pad = shownDrumPad(drums);
-            ParamPage voice = DrumEngine::voicePage(pad);
-            voice.section = "DRUM";
-            out.push_back(voice);
-            if (drums->isKickMachine(pad))
+            for (auto page : drums->padPages(pad))
             {
-                ParamPage kick = DrumEngine::kickPage(pad);
-                kick.section = "DRUM";
-                out.push_back(kick);
-            }
-            if (drums->isCymbalMachine(pad))
-            {
-                ParamPage cymbal = DrumEngine::cymbalPage(pad);
-                cymbal.section = "DRUM";
-                out.push_back(cymbal);
+                page.section = (page.name == "PLFO" || page.name == "PSLT") ? "PAD MOD" : "DRUM";
+                out.push_back(page);
             }
             for (size_t i = (size_t) (DrumEngine::PAGES_PER_PAD * DrumEngine::NUM_VOICES); i < all.size(); ++i)
                 out.push_back(all[i]);
@@ -1505,12 +1448,27 @@ protected:
         pages.insert(pages.begin(), main);
     }
 
+    // A DEST aimed at a cell of an effect on the track (E4: mod::TrackDest) names the cell as the
+    // effect that is in the slot now has it ("1TIME", "2:MIX", "1:WET"; "1:--": nothing there to
+    // move). Read when the cell is drawn: the page's cells stay as they are.
+    juce::String cellText(const ParamSpec& spec, float shown) const override
+    {
+        if (audioEngine == nullptr || sequencer == nullptr || spec.kind != ParamKind::Choice)
+            return {};
+        const int track = sequencer->getSelectedTrack();
+        const int d = audioEngine->trackDestOfCell(track, spec, shown);
+        return d >= 0 ? audioEngine->trackDestText(track, d) : juce::String();
+    }
+
     int pageStateKey() const override
     {
-        if (auto* drums = dynamic_cast<DrumEngine*>(engine()))
-            return shownDrumPad(drums) + (drums->isKickMachine(shownDrumPad(drums)) ? 100 : 0)
-                 + (drums->isCymbalMachine(shownDrumPad(drums)) ? 200 : 0);
-        return -1;
+        // The mod-slot pages (SLT1 ...) come and go with the slots in use.
+        auto* e = engine();
+        const int slots = e != nullptr ? 1000 * EngineModSlots::pagesShown([e](int id) { return e->getParameter(id); }) : 0;
+        if (auto* drums = dynamic_cast<DrumEngine*>(e))
+            return slots + shownDrumPad(drums) + (drums->isKickMachine(shownDrumPad(drums)) ? 100 : 0)
+                 + (drums->isBank(shownDrumPad(drums)) ? 200 : 0) + (drums->isResonator(shownDrumPad(drums)) ? 400 : 0);
+        return -1 - slots;
     }
 
     // The drum pad whose page is shown: the pad selected on DRUMS, or, while STEP holds a step
@@ -1631,7 +1589,7 @@ private:
         const int l = modSelectedSource;
         const int numShapes = (int) LFO::Shape::COUNT;
         const int numTrigs = (int) LFO::TriggerMode::COUNT;
-        const int numDests = (int) UnifiedVoice::LfoDest::Count;
+        const int numDests = UnifiedVoice::NUM_LFO_CELL_DESTS;      // (the LFOs' list, then the track's effect cells)
         const bool synced = trackParam(ModParam::lfoParamId(l, ModParam::LFO_SYNC), 0.0f) > 0.5f;
 
         page.params[0] = lfoSelectCell();
@@ -1649,7 +1607,7 @@ private:
                            ParamKind::Choice, "", LFO::triggerLabels(), numTrigs };
         page.params[6] = { "SYNC", ModParam::lfoParamId(l, ModParam::LFO_SYNC), 0, 1, 0, ParamKind::Choice, "", ParamChoices::offOn, 2 };
         page.params[7] = { "DEST", ModParam::lfoParamId(l, ModParam::LFO_DEST), 0, (float) (numDests - 1), 0,
-                           ParamKind::Choice, "", UnifiedVoice::lfoDestLabels(), numDests };
+                           ParamKind::Choice, "", UnifiedVoice::lfoDestCellLabels(), numDests };
     }
 
     void fillLfoStartPage(ParamPage& page) const

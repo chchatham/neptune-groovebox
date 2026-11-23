@@ -1,17 +1,18 @@
 #pragma once
 
-#include "EffectBase.h"
-#include "FxBlocks.h"
+#include "CellEffect.h"
+#include "EqBand.h"
 #include <array>
 
-// Four-band fixed-frequency equaliser, +/- 12 dB per band:
-//   LOW   low shelf at 120 Hz
-//   LMID  peak at 500 Hz
-//   HMID  peak at 2 kHz
-//   HIGH  high shelf at 6 kHz
-// Each band is an RBJ cookbook biquad (FxBlocks.h). Gains are smoothed and the coefficients follow
-// them at control rate, so turning a band does not click. All bands at 0 dB is unity gain.
-class GraphicEQ : public EffectBase
+// Four-band equaliser, GEQ, +/- 12 dB per band, each band a fxb::EqBand (EqBand.h: an RBJ cookbook
+// biquad pair that glides to its settings, so turning a band does not click, and is not run at 0 dB):
+//   LOW   low shelf, 120 Hz to start with        LMID  peak, 500 Hz
+//   HMID  peak, 2 kHz                            HIGH  high shelf, 6 kHz
+// On FX2 each band's frequency can be moved (LFRQ, LMFQ, HMFQ, HFRQ): four gains over four
+// frequencies. All bands at 0 dB is the sound untouched. The cells are
+// CellEffect's: every one moves with modulateCell.
+// The slot's WET is not used (an equaliser beside the dry sound is a weaker equaliser).
+class GraphicEQ : public CellEffect
 {
 public:
     enum Param { Low = 0, LowMid, HighMid, High };
@@ -19,98 +20,60 @@ public:
     static constexpr int NUM_BANDS = 4;
     static constexpr float MAX_DB = 12.0f;
 
+    // Where band b sits unless its frequency cell says otherwise.
     static float bandFrequency(int band)
     {
         static constexpr float hz[NUM_BANDS] = { 120.0f, 500.0f, 2000.0f, 6000.0f };
         return hz[std::clamp(band, 0, NUM_BANDS - 1)];
     }
 
-    GraphicEQ() { prepare(44100.0, 0); }
+    GraphicEQ()
+    {
+        bands[0].setShape(fxb::EqBand::LowShelf);
+        bands[3].setShape(fxb::EqBand::HighShelf);
+        seed();
+    }
 
-    ParamSpec getParamSpec(int index) const override
+protected:
+    const ParamSpec* cells() const override
     {
         using K = ParamKind;
-        switch (index)
-        {
-            case 0: return { "LOW", 0, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" };
-            case 1: return { "LMID", 1, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" };
-            case 2: return { "HMID", 2, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" };
-            case 3: return { "HIGH", 3, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" };
-            default: return {};
-        }
+        static const ParamSpec c[CELLS] = {
+            { "LOW", 0, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" },
+            { "LMID", 1, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" },
+            { "HMID", 2, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" },
+            { "HIGH", 3, -MAX_DB, MAX_DB, 0.0f, K::Linear, "dB" },
+            { "LFRQ", 0, 40.0f, 400.0f, bandFrequency(0), K::Log, "Hz" },
+            { "LMFQ", 1, 150.0f, 1500.0f, bandFrequency(1), K::Log, "Hz" },
+            { "HMFQ", 2, 600.0f, 6000.0f, bandFrequency(2), K::Log, "Hz" },
+            { "HFRQ", 3, 2000.0f, 16000.0f, bandFrequency(3), K::Log, "Hz" } };
+        return c;
     }
 
-    void setParameter(int id, float value) override
+    void prepareCore() override
     {
-        if (id >= 0 && id < NUM_BANDS)
-            gainDb[(size_t) id] = std::clamp(value, -MAX_DB, MAX_DB);
+        for (auto& band : bands)
+            band.prepare(sampleRate);
     }
 
-    float getParameter(int id) const override
+    void resetCore() override
     {
-        return (id >= 0 && id < NUM_BANDS) ? gainDb[(size_t) id] : 0.0f;
+        for (auto& band : bands)
+            band.reset();
     }
 
-    void prepare(double sr, int /*maxBlockSize*/) override
-    {
-        sampleRate = sr;
-        for (auto& s : smooth)
-            s.setTime(sr, 20.0f);
-        reset();
-    }
-
-    void reset() override
+    void configure(const float* v) override
     {
         for (int b = 0; b < NUM_BANDS; ++b)
-        {
-            smooth[(size_t) b].snap(gainDb[(size_t) b]);
-            updateBand(b, gainDb[(size_t) b]);
-            filters[0][(size_t) b].reset();
-            filters[1][(size_t) b].reset();
-        }
-        controlCounter = 0;
+            bands[(size_t) b].set(v[NUM_BANDS + b], (b == 0 || b == NUM_BANDS - 1) ? 0.707f : 0.9f, v[b]);
     }
 
-    void process(float& left, float& right) override
+    bool coasting() const override { return true; }     // (nothing here waits for controlCore(): the bands glide by themselves)
+    void runCore(float* left, float* right, int n, float, float) override
     {
-        if (!enabled) return;
-
-        bool update = (--controlCounter <= 0);
-        if (update)
-            controlCounter = CONTROL_INTERVAL;
-
-        for (int b = 0; b < NUM_BANDS; ++b)
-        {
-            float g = smooth[(size_t) b].next(gainDb[(size_t) b]);
-            if (update && std::abs(g - applied[(size_t) b]) > 1.0e-4f)
-                updateBand(b, g);
-
-            left = filters[0][(size_t) b].process(left);
-            right = filters[1][(size_t) b].process(right);
-        }
+        fxb::processBands(bands, left, right, n);
     }
 
 private:
-    static constexpr int CONTROL_INTERVAL = 16;
-
-    void updateBand(int b, float db)
-    {
-        applied[(size_t) b] = db;
-        for (auto& chan : filters)
-        {
-            auto& f = chan[(size_t) b];
-            switch (b)
-            {
-                case 0:  f.setLowShelf(sampleRate, bandFrequency(0), 0.707, db); break;
-                case 3:  f.setHighShelf(sampleRate, bandFrequency(3), 0.707, db); break;
-                default: f.setPeaking(sampleRate, bandFrequency(b), 0.9, db); break;
-            }
-        }
-    }
-
-    std::array<float, NUM_BANDS> gainDb {};
-    std::array<float, NUM_BANDS> applied {};
-    std::array<fxb::Smoother, NUM_BANDS> smooth;
-    std::array<std::array<fxb::Biquad, NUM_BANDS>, 2> filters;
-    int controlCounter = 0;
+    std::array<fxb::EqBand, NUM_BANDS> bands;
 };

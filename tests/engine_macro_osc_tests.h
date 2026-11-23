@@ -496,19 +496,20 @@ public:
                 for (float semis : { -2000.0f, -150.0f, 150.0f, 2000.0f, std::numeric_limits<float>::infinity(),
                                      -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN() })
                 {
+                    mod::Router router(MacroOscEngine::lfoDests(model));     // (nothing routed)
                     MacroOscVoice v;
                     v.setSampleRate(48000.0);
                     v.setModel((MacroOscVoice::Model) model);
                     v.setColor(1.0f);
                     v.setNote(0, 1.0f);
                     v.setPitchOffset(semis);
-                    v.noteOn();
+                    v.noteOn(router);
                     bool finite = true;
                     for (int i = 0; i < 48000; ++i)
                     {
                         if (i == 20000) v.setPitchOffset(-semis);
-                        if (i == 30000) { v.setPitchOffset(semis); v.noteOn(); }
-                        finite = finite && std::isfinite(v.process());
+                        if (i == 30000) { v.setPitchOffset(semis); v.noteOn(router); }
+                        finite = finite && std::isfinite(v.processSample(1.0f));
                     }
                     expect(finite, "model " + juce::String(model) + " offset by " + juce::String(semis) + " semitones");
                 }

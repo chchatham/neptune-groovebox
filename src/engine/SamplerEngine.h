@@ -3,7 +3,9 @@
 #include "EngineBase.h"
 #include "../dsp/DSPUtils.h"
 #include "SampleBank.h"
-#include "EngineLfoSection.h"
+#include "ModRouter.h"
+#include "VoiceSpread.h"
+#include "../dsp/GrainScheduler.h"
 #include "../dsp/Envelope.h"
 #include "../dsp/filters/FilterSlot.h"
 #include <atomic>
@@ -115,33 +117,56 @@ public:
     static constexpr float GRAIN_SPRAY_SECONDS = 0.25f;
     static constexpr float GRAIN_PITCH_JITTER_SEMITONES = 12.0f;
 
-    // LFO destinations (EngineLfoSection), in the order of the DEST cell. Every voice has its own
-    // pair of LFOs.
+    // What can be moved (the modulation router's table, lfoDests()), in the order of the DEST cells.
+    // The first twelve are the original list (stored DEST values keep their meaning), then the
+    // page cells in the order they had, LRAT / LDPT, and ETIM. Every voice has its own LFOs.
+    //   Per sample (the track input reaches them at audio rate): PTCH, AMP, PAN, CUT, GPOS (read
+    //   at the sample a grain starts on).
+    //   Read once, at the note's first sub-block: STRT, END, LPST, LPEN, SLIC (PLAY = ONE), FADE,
+    //   SLEN, VELF, KTRK, ATK, DEC, SUS, REL, RAND. (In the SLCE stretch FADE and SLEN follow
+    //   while the note sounds: every slice it reaches reads them.)
+    //   Read when a grain starts: SIZE, DENS, SPRY, PJIT, SPRD, RVRS (and the stretch's SSIZ,
+    //   XFAD, JIT, SSPR when a cycle or grain starts).
+    //   The rest follow while the note sounds, once a sub-block: RESO, DRIV, SPD, SCAN, BITS,
+    //   RATE, LEVL, ENVF, FDRV, VEL, ETIM.
     enum LfoDest
     {
         LfoOff = 0,
-        LfoPitch,       // playback speed, +-12 semitones, depth squared
-        LfoAmp,         // gain 0..2
+        LfoPitch,       // playback speed, a ratio: one octave x the amount squared
+        LfoAmp,         // gain 0..4 (below 0 from an audio-rate source: ring modulation)
         LfoPan,         // +-1 around PAN
         LfoCutoff,      // +-4 octaves
         LfoResonance,   // +-0.5
         LfoStart,       // start point, +-1 of the region around STRT; read once, when the note starts
-        LfoDrive,       // +-1 around DRIV (0..1)
+        LfoDrive,       // the DRIV cell (0..1)
         LfoGrainPos,    // GRAN: where new grains start, +-1 of the region around the scan position (clamped to it)
-        LfoGrainSize,   // GRAN: +-1 of the SIZE knob's (logarithmic) range, read when a grain starts
-        LfoGrainDens,   // GRAN: +-1 of the DENS knob's (logarithmic) range
+        LfoGrainSize,   // GRAN: a factor on SIZE, its whole (logarithmic) range at full depth; read when a grain starts
+        LfoGrainDens,   // GRAN: a factor on DENS, its whole (logarithmic) range at full depth
         LfoSpeed,       // stretch speed (and SCAN in GRAN mode), x 2^(+-2): a quarter .. four times
-        NumLfoDests
+        NumLfoDests,    // (the original list ends here)
+        LfoEnd = NumLfoDests, LfoLoopStart, LfoLoopEnd,
+        LfoScan, LfoSpray, LfoPitchJit, LfoSpread, LfoReverse,
+        LfoSlice, LfoFade, LfoSliceLen,
+        LfoStretchSize, LfoXfade, LfoJitter, LfoStretchSpread,
+        LfoBits, LfoRate, LfoLevel,
+        LfoVelFilter, LfoFilterEnv, LfoFilterKey, LfoFilterDrive,
+        LfoAttack, LfoDecay, LfoSustain, LfoRelease, LfoVelSens, LfoStartRandom,
+        LfoCrossRate, LfoCrossDepth,
+        LfoEnvTime,     // ETIM: the envelope's three times, a factor (three octaves either way)
+        NumDests
     };
 
-    static const char* const* lfoDestLabels()
-    {
-        static const char* const names[NumLfoDests] = {
-            "OFF", "PTCH", "AMP", "PAN", "CUT", "RESO", "STRT", "DRIV", "GPOS", "SIZE", "DENS", "SPD" };
-        return names;
-    }
+    static const char* const* lfoDestLabels() { return lfoDests().labels(); }
 
-    static constexpr int MAX_VOICES = 8;
+    // The voice's own sources, in the order the engine publishes them (sources()).
+    enum Published
+    {
+        PubPos = 0,     // POS: where the playhead is in what the note plays (STRT..END of the slice or sample), 0..1
+        PubGrain,       // GRN: where the grain started last lies in what grains may read (the slice or sample), 0..1
+        PubLevel        // SLEV: the sample's own level at the playhead (the onset analysis' 23 ms mean), 0..1 of its loudest
+    };
+
+    static constexpr int MAX_VOICES = 16;
     // Voice slots: the notes that sound (VOX of them at most) and, for a few milliseconds each,
     // the ones that gave way to a new note and are fading out (see allocateVoice).
     static constexpr int POOL_VOICES = MAX_VOICES * 2;
@@ -158,12 +183,6 @@ public:
 private:
     struct Voice;
 
-    // The "every voice's LFOs" argument for the LFO section (all voices, whatever VOX is set to).
-    auto eachLfos()
-    {
-        return [this](auto&& fn) { for (auto& v : voices) fn(v.lfos); };
-    }
-
 public:
 
     SamplerEngine(int maxVoices = MAX_VOICES)
@@ -171,30 +190,33 @@ public:
     {
         for (auto& v : voices)
             v = Voice();
-        setGrainSeed(0x9E3779B9u);
-        setSliceSeed(0x2545F491u);
+        // The per-note randoms (RAND, RND2 .., the RAND start, PLAY = RAND, the grains) repeat from
+        // run to run: the same notes in the same order on a new engine draw the same values. (This
+        // engine has no ANLG page, so no SEED cell: the seed is fixed, as the macro oscillator's.)
+        setGrainSeed(0);
+        setSliceSeed(0);
         playingSlice.store(-1, std::memory_order_relaxed);
-        grainWindowTables();    // built here, not on the audio thread
         cellRanges();
         clearPlayheads();
         for (auto& p : playheadGrain)
             p.store(-1.0f, std::memory_order_relaxed);
-        static_assert((int) NumLfoDests <= EngineLfoSection::MAX_DESTS, "too many LFO destinations");
 
         // Real defaults for every parameter, so getParameter is always the true value.
         for (auto& page : pages())
             for (auto& p : page.params)
-                if (p.isValid() && ! EngineLfoSection::owns(p.id))   // the LFO section keeps its own values
+                if (p.isValid())
+                {
                     params[(size_t) p.id] = p.defaultVal;
+                    router.setBase(p.id, p.defaultVal);
+                }
         params[Pan] = 0.0f;
-        lfoSection.applyAll(eachLfos());
 
         selectBankSample(SampleBank::get().defaultIndex());
     }
 
     // SAMPL (which sample and what part of it), GRAIN (the granular play mode), SLICE (how the sample
     // is cut up and which slice a note plays), STRCH (time-stretch), TONE (pitch and colour), FILTR,
-    // AMP (envelope, voices).
+    // AMP (envelope, voices). The modulation router's pages follow (getParamPages).
     static const ParamPages& pages()
     {
         static const char* const modes[NumPlayModes] = { "FWD", "REV", "1SHT", "GATE", "LOOP", "PING", "GRAN" };
@@ -276,11 +298,10 @@ public:
                 { "SUS",  Sustain, 0, 1, 1, L },
                 { "REL",  Release, 0.001f, 5, 0.05f, G, "s" },
                 { "VEL",  VelSens, 0, 1, 0.8f, L },
-                { "VOX",  Voices, 1, MAX_VOICES, MAX_VOICES, I },
+                { "VOX",  Voices, 1, MAX_VOICES, 8, I },
                 { "PAN",  Pan, -1, 1, 0, L },
                 { "RAND", StartRandom, 0, 1, 0, L } }} },
           };
-          EngineLfoSection(lfoDests(&l)).appendPages(l);
           return l;
         }();
         return list;
@@ -302,64 +323,138 @@ public:
         return table;
     }
 
-    // The LFO destinations: the original eleven, then the other continuous cells of the pages
-    // (each voice reads its own value of them: voiceValue) and the other LFO.
-    //   Read when the note starts: END, LPST, LPEN, SLIC, FADE, SLEN, VELF, KTRK, ATK, DEC, SUS,
-    //   REL, RAND (with STRT of the original list). Read when a grain starts: SPRY, PJIT, SPRD,
-    //   RVRS. The rest follow the LFO while the note sounds.
+    // What can be moved: the modulation router's table (see LfoDest for how each entry is read).
     // Not offered: SMPL, the slicing cells and NORM (they rebuild data), MODE, SHAP, PLAY, ALGO,
     // SYNC, LEN, KEY, TYPE, VOX (choices and counts), ROOT, PTCH, FINE and BEND (PTCH of the
-    // original list is the pitch).
-    static const LfoDestList& lfoDests(const ParamPages* enginePages = nullptr)
+    // original list is the pitch). There is one envelope, so ETIM and no FTIM.
+    static const mod::DestTable& lfoDests()
     {
-        if (enginePages == nullptr)
-            pages();                    // the list is made on the way
-        static const LfoDestList list = makeLfoDests(*enginePages);
-        static const bool registered = (list.registerGroups(), true);
+        static const mod::DestTable table = []
+        {
+            const ParamPages& p = pages();
+            mod::DestTable t;
+            t.group();
+            t.input("PTCH", 1.0f, 1.0f, 1.0f / 1024.0f, 1024.0f, mod::Pitch);       // a ratio: one octave x the amount squared
+            t.input("AMP", 1.0f, 1.0f, 0.0f, 4.0f, mod::PerSample).audioFloor(-4.0f);   // (below 0: ring modulation)
+            t.input("PAN", 0.0f, 1.0f, -1.0f, 1.0f, mod::PerSample);
+            t.input("CUT", 0.0f, 4.0f, -16.0f, 16.0f, mod::PerSample);               // octaves
+            t.input("RESO", 0.0f, 0.5f, -1.0f, 1.0f);
+            t.input("STRT", 0.0f, 1.0f, -1.0f, 1.0f);
+            t.add(p, DriveAmt);
+            t.input("GPOS", 0.0f, 1.0f, -1.0f, 1.0f, mod::PerSample);
+            // (Factors: the cell's whole logarithmic range at full depth, as before the router.)
+            t.input("SIZE", 1.0f, std::log2(MAX_GRAIN_SIZE / MIN_GRAIN_SIZE), MIN_GRAIN_SIZE / MAX_GRAIN_SIZE,
+                    MAX_GRAIN_SIZE / MIN_GRAIN_SIZE, mod::Exp);
+            t.input("DENS", 1.0f, std::log2(MAX_GRAIN_DENSITY / MIN_GRAIN_DENSITY), MIN_GRAIN_DENSITY / MAX_GRAIN_DENSITY,
+                    MAX_GRAIN_DENSITY / MIN_GRAIN_DENSITY, mod::Exp);
+            t.input("SPD", 1.0f, SPEED_LFO_OCTAVES, 1.0f / 16.0f, 16.0f, mod::Exp);
+            t.group();
+            for (int id : { (int) EndPoint, (int) LoopStart, (int) LoopEnd })
+                t.add(p, id);
+            t.group();
+            for (int id : { (int) GrainScan, (int) GrainSpray, (int) GrainPitchJit, (int) GrainSpread, (int) GrainReverse })
+                t.add(p, id);
+            t.group();
+            for (int id : { (int) SliceSelect, (int) SliceFade, (int) SliceLen })
+                t.add(p, id);
+            t.group();
+            t.add(p, StretchSize, "SSIZ");
+            t.add(p, StretchXfade);
+            t.add(p, StretchJitter);
+            t.add(p, StretchSpread, "SSPR");
+            t.group();
+            for (int id : { (int) BitReduce, (int) RateReduce, (int) Volume })
+                t.add(p, id);
+            t.group();
+            for (int id : { (int) VelToFilter, (int) FilterEnv, (int) FilterKey, (int) FilterDrive })
+                t.add(p, id);
+            t.group();
+            for (int id : { (int) Attack, (int) Decay, (int) Sustain, (int) Release, (int) VelSens, (int) StartRandom })
+                t.add(p, id);
+            t.addCross();
+            // The envelope's time (after what was there before: a stored DEST keeps its meaning).
+            t.group();
+            t.envTimes(false);
+            // The mod strip until the STRIP page says otherwise: more drive (with the level taken
+            // back, see processBlock), a lower sample rate, and looser grains in GRAN mode.
+            t.stripRoute(0, LfoDrive, 0.7f);
+            t.stripRoute(1, LfoRate, 0.3f);
+            t.stripRoute(2, LfoSpray, 0.5f);
+            t.finish(2);
+            jassert(t.size() == NumDests && t.ampTime() == LfoEnvTime && t.indexOfLabel("SPD") == LfoSpeed
+                    && t.indexOfId(DriveAmt) == LfoDrive && t.indexOfId(EndPoint) == LfoEnd
+                    && t.indexOfId(GrainScan) == LfoScan && t.indexOfId(SliceSelect) == LfoSlice
+                    && t.indexOfId(StretchSize) == LfoStretchSize && t.indexOfId(BitReduce) == LfoBits
+                    && t.indexOfId(VelToFilter) == LfoVelFilter && t.indexOfId(Attack) == LfoAttack
+                    && t.indexOfId(StartRandom) == LfoStartRandom && t.indexOfLabel("LRAT") == LfoCrossRate);
+            return t;
+        }();
+        static const bool registered = (table.registerGroups(), true);
         juce::ignoreUnused(registered);
-        return list;
+        return table;
     }
 
-    static LfoDestList makeLfoDests(const ParamPages& p)
+    // What a slot can read here beside the router's own sources: the list SRC and VIA show.
+    //   POS   where the playhead is in what the note plays, 0 at STRT (of the slice, or the
+    //         sample) and 1 at END: a filter or a pan can follow where the sample is. In GRAN
+    //         mode and in a stretch it is the scan / time position.
+    //   GRN   where the grain that started last lies in what grains may read (the slice, or the
+    //         whole sample): the scan position with GPOS and SPRY on it. It keeps its last value
+    //         where no grain starts; a note begins with the place it starts at.
+    //   SLEV  the sample's own level at the playhead: the mean level over 23 ms that the transient
+    //         slicing is worked out from (analyseOnsets), as a fraction of the sample's loudest
+    //         23 ms. Nothing is analysed for it.
+    // All three are control-rate (once a sub-block, led over 4 ms) and 0..1.
+    static const mod::SourceTable& sources()
     {
-        LfoDestList l(lfoDestLabels(), NumLfoDests);
-        l.group();
-        for (int id : { (int) EndPoint, (int) LoopStart, (int) LoopEnd })
-            l.add(p, id);
-        l.group();
-        for (int id : { (int) GrainScan, (int) GrainSpray, (int) GrainPitchJit, (int) GrainSpread, (int) GrainReverse })
-            l.add(p, id);
-        l.group();
-        for (int id : { (int) SliceSelect, (int) SliceFade, (int) SliceLen })
-            l.add(p, id);
-        l.group();
-        l.add(p, StretchSize, "SSIZ");
-        l.add(p, StretchXfade);
-        l.add(p, StretchJitter);
-        l.add(p, StretchSpread, "SSPR");
-        l.group();
-        for (int id : { (int) BitReduce, (int) RateReduce, (int) Volume })
-            l.add(p, id);
-        l.group();
-        for (int id : { (int) VelToFilter, (int) FilterEnv, (int) FilterKey, (int) FilterDrive })
-            l.add(p, id);
-        l.group();
-        for (int id : { (int) Attack, (int) Decay, (int) Sustain, (int) Release, (int) VelSens, (int) StartRandom })
-            l.add(p, id);
-        l.addCross();
-        // The mod strip until the STRIP page says otherwise: more drive (with the level taken
-        // back, see processBlock), a lower sample rate, and looser grains in GRAN mode.
-        l.stripRoute(0, LfoDrive, 0.7f);
-        l.stripRoute(1, l.indexOfKey(RateReduce), 0.3f);
-        l.stripRoute(2, l.indexOfKey(GrainSpray), 0.5f);
-        return l;
+        static const mod::SourceTable table = []
+        {
+            mod::SourceTable t(2);
+            t.publish("POS", mod::Unipolar);
+            t.publish("GRN", mod::Unipolar);
+            t.publish("SLEV", mod::Unipolar);
+            return t;
+        }();
+        static const bool registered = (table.registerGroups(), true);
+        juce::ignoreUnused(registered);
+        return table;
     }
+
+    // What an old pressure route (AftertouchRouter::Destination) is here, as a slot's DEST:
+    //   VOL the level, FLT the cutoff, PAN the pan, TBR the drive (DRIV), WAV where grains are
+    //   taken from (GPOS); VIB is the router's own (vibrato on the pitch).
+    // A sampler is made with no route (its table names none): a pad's pressure moves a sample only
+    // where AT ROUTE, or a free slot from PRES, asks for it.
+    int pressureDestOf(AftertouchRouter::Destination d) const override
+    {
+        using D = AftertouchRouter::Destination;
+        switch (d)
+        {
+            case D::Volume:         return LfoAmp;
+            case D::FilterCutoff:   return LfoCutoff;
+            case D::MacroTimbre:    return LfoDrive;
+            case D::WavePosition:   return LfoGrainPos;
+            case D::PanSpread:      return LfoPan;
+            default:                return 0;
+        }
+    }
+    // (A sampler that was handed no routes had none.)
+    AftertouchRouter legacyPressureRoutes() const override
+    {
+        AftertouchRouter none;
+        none.clear();
+        return none;
+    }
+
+    mod::Router* modRouter() override { return &router; }
+    const mod::Router* modRouter() const override { return &router; }
 
     // The filter MODE cell lists the modes of the filter type currently chosen, and the SMPL cell
     // the samples the bank holds now (it grows while the app runs: recordings are appended).
     ParamPages getParamPages() const override
     {
         ParamPages out = pages();
+        router.appendPages(out);        // XIN, SLT1 .., LSHP, STRIP, LFO1, LFO2
         auto model = FilterSlot::modelFromIndex((int) params[FilterType]);
         auto& bank = SampleBank::get();
         const int bankSize = bank.size();
@@ -383,14 +478,21 @@ public:
     }
 
     void pitchBend(float amount) override { bend = std::clamp(amount, -1.0f, 1.0f); }
-    // The mod strip wears the sound down: it adds to DRIV and to RATE (sample-rate reduction) on
-    // the TONE page, and in GRAN mode to SPRY as well.
+    // Pad pressure: kept for each voice that holds the note (the source PRES and the pressure routes).
+    void aftertouch(int note, float pressure) override
+    {
+        for (auto& v : voices)
+            if (v.active && v.gateOn && v.note == note)
+                v.pressure = std::clamp(pressure, 0.0f, 1.0f);
+    }
+    // The mod strip wears the sound down until the STRIP page says otherwise: it adds to DRIV and
+    // to RATE (sample-rate reduction) on the TONE page, and in GRAN mode to SPRY as well.
     void modWheel(float value) override { wheel = std::clamp(value, 0.0f, 1.0f); }
     void setTempo(float bpm) override
     {
         if (bpm > 1.0f)
             tempoBpm = bpm;     // read once per block: a synced stretch follows the tempo while notes sound
-        lfoSection.setTempo(bpm, eachLfos());
+        router.setTempo(bpm);
     }
 
     // The sample is chosen first when a stored sound is loaded: choosing it resets the slices to
@@ -418,7 +520,9 @@ public:
         sliceCount = 0;
         samplePoolId = -1;
         bankIndex = index;
+        levelTable.clear();     // (SLEV reads 0 until the new table is handed over: no free here)
         endSampleChange();
+        analyseSample();
         followSampleMode(suggestedBefore);
 
         // A sample that suggests slices (the factory loop) gets them, and the cell shows it.
@@ -477,7 +581,9 @@ public:
         originalSampleRate = fileSampleRate;
         sliceCount = 0;
         samplePoolId = -1;
+        levelTable.clear();     // (SLEV reads 0 until the new table is handed over: no free here)
         endSampleChange();
+        analyseSample();
         followSampleMode(suggestedBefore);
         sampleChanged();
     }
@@ -498,7 +604,9 @@ public:
         originalSampleRate = fileSampleRate;
         sliceCount = 0;
         samplePoolId = -1;
+        levelTable.clear();     // (SLEV reads 0 until the new table is handed over: no free here)
         endSampleChange();
+        analyseSample();
         followSampleMode(suggestedBefore);
         sampleChanged();
     }
@@ -546,7 +654,7 @@ public:
     // Restarts the generator of PLAY = RAND (same seed = same order) and the order of PLAY = NEXT.
     void setSliceSeed(uint32_t seed)
     {
-        sliceRng = seed != 0 ? seed : 0x1234567u;
+        sliceGen.seed(seed, POOL_VOICES);       // (no voice's number: the order of the notes, not of a voice)
         nextSlice = 0;
     }
 
@@ -622,14 +730,14 @@ public:
 
     // --- Granular mode: test and display helpers ---
 
-    // Restarts the per-voice random generators of the granular mode (same seed = same cloud).
+    // Restarts the voices' generators (spread::Generator, one a voice, advanced once a note): the
+    // same seed, the same notes in the same order = the same grain clouds and stretch cycles
+    // (spread::Sequence over the stream Grain, begun at each note), the same RAND start offsets
+    // and the same RAND, RND2 .. RND4 of the router.
     void setGrainSeed(uint32_t seed)
     {
         for (int i = 0; i < POOL_VOICES; ++i)
-        {
-            uint32_t s = (seed ^ 0xA5A5A5A5u) + (uint32_t) (i + 1) * 0x9E3779B9u;
-            voices[i].grainRng = s != 0 ? s : 0x1234567u;
-        }
+            voices[i].gen.seed(seed, i);
     }
 
     // Grains sounding now, over all voices (plain read; for tests and meters, not for decisions).
@@ -638,9 +746,12 @@ public:
         int n = 0;
         for (int i = 0; i < POOL_VOICES; ++i)
             if (voices[i].active)
-                n += voices[i].numGrains;
+                n += voices[i].cloud.sounding();
         return n;
     }
+
+    // The grains of a voice slot as they sound now (plain read; for tests: what each grain was given).
+    const grn::Cloud<MAX_GRAINS>& getGrainCloud(int voiceIdx) const { return voices[std::clamp(voiceIdx, 0, POOL_VOICES - 1)].cloud; }
 
     // --- EngineBase overrides ---
 
@@ -648,8 +759,9 @@ public:
     {
         currentSampleRate = sr;
         currentBlockSize = blockSize;
+        router.prepare(sr);
         for (auto& v : voices)
-            v.lfos.setSampleRate(sr);
+            v.mods.prepare(sr);
     }
 
     void releaseResources() override
@@ -657,7 +769,7 @@ public:
         for (auto& v : voices)
         {
             v.active = false;
-            v.numGrains = 0;
+            v.cloud.clear();
         }
         clearPlayheads();
     }
@@ -678,64 +790,33 @@ public:
         float pitchRatio = computePitchRatio(note);
         v.playbackRate = pitchRatio * (currentSampleRate > 0 ? originalSampleRate / currentSampleRate : 1.0);
 
-        int startSamp = 0, endSamp = sampleLength;
-
-        // The LFOs are read here for everything that is fixed when the note starts (the start
-        // point, the slice, the envelope times ...), and run on from this value. P is this
-        // voice's value of a parameter: the set value unless one of its LFOs is routed to it.
-        v.lfos.noteOnAndSample();
-        v.lfos.snapSlews();     // a new note in this voice
-        v.fresh = true;         // ... which takes every glided value as it stands
+        // The note's randoms: one generator a voice, advanced once a note. The router's RAND,
+        // RND2 .. RND4, the RAND start offset and the grains' sequence are all draws of it.
+        v.pressure = 0.0f;
+        v.gen.advance();
+        v.mods.noteOn(router, note, velocity, v.gen);
+        v.grainSeq.start(v.gen, spread::Grain);
+        v.fresh = true;         // a new note in this voice takes every glided value as it stands
+        v.starting = true;      // ... and reads what is routed at its first sub-block (renderVoice)
         v.lfoRate = 1.0;
         v.lfoGain = 1.0f;
-        auto P = [this, &v](int id, float fallback) { return voiceValue(v.lfos, id, fallback); };
+        v.envScale = 1.0f;
+        v.grainPlace = 0.0f;
 
         // The SLCE stretch walks through every slice itself; otherwise the note plays one of them.
-        int sliceIdx = getStretchAlgo() == StretchSlice ? -1 : pickSlice(note, &v.lfos);
-        v.fadeFrames = 0.0;
-        if (sliceIdx >= 0 && sliceIdx < sliceCount)
-        {
-            startSamp = slices[sliceIdx].startSample;
-            endSamp = slices[sliceIdx].endSample;
-            const float keep = P(SliceLen, 1.0f);
-            if (keep < 1.0f)
-                endSamp = startSamp + std::max(1, (int) ((float) (endSamp - startSamp) * std::max(keep, 0.0f)));
-            v.fadeFrames = (double) std::clamp(P(SliceFade, 0.0f), 0.0f, 1.0f) * originalSampleRate;
-        }
-        else
-        {
-            sliceIdx = -1;
-        }
-        playingSlice.store(sliceIdx, std::memory_order_relaxed);
+        // (PLAY = ONE reads the SLIC cell, which may be moved: placeNote reads it again then.)
+        const bool walks = getStretchAlgo() == StretchSlice;
+        v.pickedSlice = walks ? -1 : pickSlice(note);
+        v.sliceByCell = ! walks && getSlicePlay() == SliceOne;
 
-        float startFrac = getParamValue(StartPoint, 0.0f);
-        if (v.lfos.routed(LfoStart))
-            startFrac = std::clamp(startFrac + v.lfos.amount(LfoStart), 0.0f, 1.0f);
-        float endFrac = P(EndPoint, 1.0f);
-        int rangeLen = endSamp - startSamp;
+        // Where the note plays, its envelope and its filter's starting point, from the cells as
+        // they are set. Whatever a slot moves of them exists at the note's first sub-block only
+        // (after mod::Voice::tick): if something does, the same is worked out again there, before
+        // the first sample.
+        placeNote(v, false);
 
-        v.regionStart = startSamp + (int)(startFrac * rangeLen);
-        v.regionEnd = startSamp + (int)(endFrac * rangeLen);
-        if (v.regionEnd <= v.regionStart) v.regionEnd = v.regionStart + 1;
-
-        float loopStartFrac = P(LoopStart, 0.0f);
-        float loopEndFrac = P(LoopEnd, 1.0f);
-        int regionLen = v.regionEnd - v.regionStart;
-        v.loopStart = v.regionStart + (int)(loopStartFrac * regionLen);
-        v.loopEnd = v.regionStart + (int)(loopEndFrac * regionLen);
-        if (v.loopEnd <= v.loopStart) v.loopEnd = v.loopStart + 1;
-
-        PlayMode mode = getPlayMode();
-        v.forward = (mode != Reverse);
-        v.position = v.forward ? (double) v.regionStart : (double)(v.regionEnd - 1);
-
-        // Granular: no grains yet, the first one starts with the note's first sample. Grains may
-        // reach anywhere in the slice (the whole sample without slices).
-        v.grainAreaStart = startSamp;
-        v.grainAreaEnd = std::max(endSamp, startSamp + 1);
-        v.numGrains = 0;
-        v.grainPhase = 1.0;
-        v.grainThreshold = 1.0f;
+        // Granular: no grains yet, the first one starts with the note's first sample.
+        v.cloud.reset();
         v.reverseGrains = false;
 
         // Time-stretch: the first cycle / slice starts with the note's first sample.
@@ -749,51 +830,6 @@ public:
 
         v.envPhase = EnvAttack;
         v.envLevel = 0.0f;
-
-        float atk = P(Attack, 0.001f);
-        v.attackRate = 1.0f / std::max(atk * (float) currentSampleRate, 1.0f);
-        float dec = P(Decay, 0.01f);
-        v.decayRate = 1.0f / std::max(dec * (float) currentSampleRate, 1.0f);
-        float rel = P(Release, 0.01f);
-        v.releaseRate = 1.0f / std::max(rel * (float) currentSampleRate, 1.0f);
-        v.sustain = std::clamp(P(Sustain, 1.0f), 0.0f, 1.0f);
-
-        // Random start offset (up to the given fraction of the region).
-        float startRand = P(StartRandom, 0.0f);
-        if (startRand > 0.0f && v.forward)
-        {
-            int span = (int) ((float) (v.regionEnd - v.regionStart) * startRand * dsp::xorshiftFloat(randomSeed));
-            v.position = (double) std::min(v.regionStart + span, v.regionEnd - 1);
-        }
-
-        // Per-voice filter. Velocity and key tracking set its starting point; the amp envelope can
-        // move it while the note sounds.
-        float velToFilter = P(VelToFilter, 0.0f);
-        float baseCutoff = getParamValue(FilterCutoff, 1.0f);
-        float keyOffset = P(FilterKey, 0.0f) * (float) (note - 60) / 120.0f;   // 1/10 of the range per octave
-        v.filterCutoff = std::clamp(baseCutoff + velToFilter * velocity + keyOffset, 0.0f, 1.0f);
-        v.filterEnvAmount = getParamValue(FilterEnv, 0.0f);
-        auto model = FilterSlot::modelFromIndex((int) getParamValue(FilterType, 0.0f));
-        v.filterOn = model != FilterModel::Bypass
-                     && (v.filterCutoff < 0.999f || v.filterEnvAmount != 0.0f
-                         || v.lfos.routed(LfoCutoff) || v.lfos.routed(LfoResonance)
-                         || v.lfos.has(FilterEnv) || v.lfos.has(FilterDrive));
-        v.filterDriveMoved = false;
-        v.filterReso = getParamValue(FilterReso, 0.0f);
-        v.filterResoMod = 0.0f;
-        if (v.filterOn)
-        {
-            for (auto* f : { &v.filterL, &v.filterR })
-            {
-                f->setSampleRate(currentSampleRate);
-                f->setModel(0, model);
-                f->setMode(0, (int) getParamValue(FilterMode, 0.0f));
-                f->setResonance(getParamValue(FilterReso, 0.0f));
-                f->setDrive(getParamValue(FilterDrive, 0.0f));
-                f->reset();
-            }
-            v.filterCountdown = 0;
-        }
     }
 
     void noteOff(int note, int /*voiceIndex*/) override
@@ -817,7 +853,7 @@ public:
         {
             v.active = false;
             v.envPhase = EnvOff;
-            v.numGrains = 0;
+            v.cloud.clear();
         }
         nextSlice = 0;      // PLAY = NEXT starts again from the first slice
         playingSlice.store(-1, std::memory_order_relaxed);
@@ -843,7 +879,7 @@ public:
             "SlcMode", "SlcSens", "SlcGap", "SlcPlay", "SlcFade", "SlcLen", "Root", "Norm",
             "StrAlgo", "StrSpd", "StrSync", "StrLen", "StrSize", "StrXfad", "StrJit", "StrSprd" };
         if (id >= SliceMode && id < NumParams) return moreNames[id - SliceMode];
-        if (EngineLfoSection::owns(id)) return EngineLfoSection::name(id);
+        if (mod::Router::owns(id)) return mod::Router::name(id);
         return {};
     }
 
@@ -860,9 +896,9 @@ public:
 
     void setParameter(ParamId id, float value) override
     {
-        if (lfoSection.owns(id))
+        if (mod::Router::owns(id))
         {
-            lfoSection.set(id, value, eachLfos());
+            router.set(id, value);
             return;
         }
         if (StageCurveParam::owns(id))
@@ -895,6 +931,7 @@ public:
         if ((id == Mode || id == StretchMode) && std::lround(params[(size_t) id]) != std::lround(value))
             soundSwapped();
         params[(size_t) id] = value;
+        router.setBase(id, value);      // (the set value of a cell that is a destination)
 
         if (id == FilterType || id == FilterMode)
         {
@@ -926,8 +963,8 @@ public:
 
     float getParameter(ParamId id) const override
     {
-        if (lfoSection.owns(id))
-            return lfoSection.get(id);
+        if (mod::Router::owns(id))
+            return router.get(id);
         if (StageCurveParam::owns(id))
             return stageCurves.get(id);
         // TRNS: the SLCS cell shows how many slices were found.
@@ -952,276 +989,98 @@ public:
         }
 
         bendRatio = std::exp2f(bend * getParamValue(BendRange, 2.0f) / 12.0f);
-        // The mod strip: the routes of the STRIP page (by default DRIV, RATE and SPRY).
+        // Once per block: the mod strip (its routes are the router's: by default DRIV, RATE and
+        // SPRY) and the track input.
         wheelNow = smoothWheel(wheelNow, wheel, numSamples, currentSampleRate);
-        lfoSection.stripBlock(wheelNow, numSamples, currentSampleRate, eachLfos());
-        const float velSens = getParamValue(VelSens, 1.0f);
+        router.beginBlock(audioInput.left, audioInput.right, audioInput.connected() ? audioInput.frames : 0,
+                          audioInput.envelope, wheelNow, currentSampleRate);
 
         float* outL = buffer.getWritePointer(0);
         float* outR = buffer.getNumChannels() > 1 ? buffer.getWritePointer(1) : nullptr;
 
-        PlayMode mode = getPlayMode();
+        // What every voice starts from in this block: the cells as they are set.
+        Block b;
+        b.mode = getPlayMode();
+        b.velSens = getParamValue(VelSens, 1.0f);
         float volume = getParamValue(Volume, 0.8f);
-        const float volumeSet = volume;
-        const float volumeScale = getParamValue(Normalize, 0.0f) > 0.5f ? normalizeGain : 1.0f;
-        if (volumeScale != 1.0f)
-            volume *= volumeScale;
-        float pan = getParamValue(Pan, 0.0f);
-        float panL = std::cos((pan + 1.0f) * 0.25f * dsp::PI_F);
-        float panR = std::sin((pan + 1.0f) * 0.25f * dsp::PI_F);
+        b.volumeScale = getParamValue(Normalize, 0.0f) > 0.5f ? normalizeGain : 1.0f;
+        if (b.volumeScale != 1.0f)
+            volume *= b.volumeScale;
+        b.volume = volume;
+        b.pan = getParamValue(Pan, 0.0f);
+        b.panL = std::cos((b.pan + 1.0f) * 0.25f * dsp::PI_F);
+        b.panR = std::sin((b.pan + 1.0f) * 0.25f * dsp::PI_F);
 
-        int bitRedBits = (int)(getParamValue(BitReduce, 0.0f) * 12.0f);
+        b.bits = (int)(getParamValue(BitReduce, 0.0f) * 12.0f);
         float rateReduce = std::min(1.0f, getParamValue(RateReduce, 0.0f));
-        int rateDiv = 1 + (int)(rateReduce * 31.0f);
+        b.rateDiv = 1 + (int)(rateReduce * 31.0f);
         const float setDrive = getParamValue(DriveAmt, 0.0f);
-        float driveAmt = std::min(1.0f, setDrive);
+        b.driveAmt = std::min(1.0f, setDrive);
         // The drive stage has gain: take most of what the strip adds to DRIV (its routes to that
-        // destination) out again, so the strip changes the tone more than the level (exactly 1
-        // with the strip at rest, or with no route to DRIV).
-        const float stripDrive = lfoSection.stripAmount(LfoDrive);
+        // destination, as the STRIP page has them) out again, so the strip changes the tone more
+        // than the level (exactly 1 with the strip at rest, or with no route to DRIV). The rule
+        // counts the strip's own routes only: a free slot from STRP to DRIV is drive as asked for.
+        float stripDrive = 0.0f;
+        if (wheelNow > 0.0f)
+            for (int r = 0; r < mod::Router::NUM_STRIP; ++r)
+                if ((int) router.get(mod::Router::stripDestId(r)) == (int) LfoDrive)
+                    stripDrive += wheelNow * router.get(mod::Router::stripAmountId(r));
         const float wheelLevel = stripDrive > 0.0f
             ? std::pow((1.0f + setDrive * 10.0f) / (1.0f + std::min(1.0f, setDrive + stripDrive) * 10.0f), 0.58f) : 1.0f;
 
-        bool hasStereoSample = !sampleR.empty();
-        const bool lfosOn = lfoSection.anyOn() || lfoSection.stripOn();    // the strip's routes are read like LFOs
-        const float glideStep = (float) (1.0 / (0.004 * std::max(currentSampleRate, 1.0)));     // a whole range in 4 ms
+        b.stereo = !sampleR.empty();
+        b.glideStep = (float) (1.0 / (0.004 * std::max(currentSampleRate, 1.0)));     // a whole range in 4 ms
 
-        const bool granular = mode == Granular;
-        const GrainSettings gs = granular ? readGrainSettings() : GrainSettings();
-        const int stretchAlgo = getStretchAlgo();       // off in GRAN mode
-        const StretchSettings stretch = stretchAlgo != StretchOff ? readStretchSettings(stretchAlgo) : StretchSettings();
+        b.granular = b.mode == Granular;
+        b.gs = b.granular ? readGrainSettings() : GrainSettings();
+        b.stretchAlgo = getStretchAlgo();       // off in GRAN mode
+        b.stretch = b.stretchAlgo != StretchOff ? readStretchSettings(b.stretchAlgo) : StretchSettings();
         // Where a note that does not loop reaches the end of its region it is faded, never cut:
         // over the slice's FADE, and at least over END_DECLICK_SECONDS (the grain and slice
         // stretches have that short fade of their own, declickEnd).
-        const bool endFades = ! granular && mode != Loop && mode != PingPong;
-        const bool sliceFades = endFades && stretchAlgo != StretchSlice;
-        const bool ownDeclick = stretchAlgo == StretchGrain || stretchAlgo == StretchSmear || stretchAlgo == StretchSlice;
-        const double declickSamples = endFades && ! ownDeclick ? END_DECLICK_SECONDS * currentSampleRate : 0.0;
-        // A voice whose LFOs move a grain or stretch cell works from its own copy of the settings.
-        GrainSettings ownGrains;
-        StretchSettings ownStretch;
+        b.endFades = ! b.granular && b.mode != Loop && b.mode != PingPong;
+        b.sliceFades = b.endFades && b.stretchAlgo != StretchSlice;
+        const bool ownDeclick = b.stretchAlgo == StretchGrain || b.stretchAlgo == StretchSmear || b.stretchAlgo == StretchSlice;
+        b.declickSamples = b.endFades && ! ownDeclick ? END_DECLICK_SECONDS * currentSampleRate : 0.0;
+        b.plain.drive = b.driveAmt;
+        b.plain.volume = b.volume;
+        b.plain.velSens = b.velSens;
+        b.plain.bits = b.bits;
+        b.plain.rateDiv = b.rateDiv;
+        b.plain.grains = &b.gs;
+        b.plain.stretch = &b.stretch;
 
-        for (int i = 0; i < numSamples; ++i)
+        // Sub-blocks: the router's control rate. Inside one the voices are rendered one after the
+        // other (they share the router's per-sample buffers), each into the mix.
+        for (int offset = 0; offset < numSamples;)
         {
-            float mixL = 0.0f, mixR = 0.0f;
-
+            const int n = router.beginChunk(offset, numSamples);
+            std::fill(mixL.begin(), mixL.begin() + n, 0.0f);
+            std::fill(mixR.begin(), mixR.begin() + n, 0.0f);
             for (int vi = 0; vi < POOL_VOICES; ++vi)
             {
                 auto& v = voices[vi];
-                if (!v.active) continue;
-
-                // LFOs, per voice and per sample. Without them every value below is as it was.
-                float voiceDrive = driveAmt;
-                float voicePanL = panL, voicePanR = panR;
-                float lfoCutOct = 0.0f;
-                bool lfoFilter = false;
-                int voiceBits = bitRedBits, voiceRateDiv = rateDiv;
-                float voiceVolume = volume, voiceVelSens = velSens;
-                const GrainSettings* voiceGrains = &gs;
-                const StretchSettings* voiceStretch = &stretch;
-                if (lfosOn)
+                if (! v.active)
                 {
-                    v.lfos.tick();
-                    if (v.lfos.keyed())
-                    {
-                        // LFOs on page cells: this voice's own value of each.
-                        voiceBits = (int) (voiceValue(v.lfos, BitReduce, 0.0f) * 12.0f);
-                        voiceRateDiv = 1 + (int) (std::min(1.0f, voiceValue(v.lfos, RateReduce, 0.0f)) * 31.0f);
-                        voiceVolume = v.lfos.value(Volume, volumeSet) * volumeScale;
-                        voiceVelSens = v.lfos.value(VelSens, velSens);
-                        if (v.filterOn && (v.lfos.has(FilterEnv) || v.lfos.has(FilterDrive)))
-                            lfoFilter = true;
-                        if (granular && keyedIn(v.lfos, GrainScan, GrainReverse))
-                        {
-                            ownGrains = readGrainSettings(&v.lfos);
-                            voiceGrains = &ownGrains;
-                        }
-                        else if (stretchAlgo != StretchOff && (keyedIn(v.lfos, StretchSize, StretchSpread)
-                                                               || keyedIn(v.lfos, SliceFade, SliceLen)))
-                        {
-                            ownStretch = readStretchSettings(stretchAlgo, &v.lfos);
-                            voiceStretch = &ownStretch;
-                        }
-                    }
-                    const float semis = v.lfos.pitchSemitones(LfoPitch);
-                    v.lfoRate = semis != 0.0f ? (double) std::exp2f(semis / 12.0f) : 1.0;
-                    v.lfoGain = v.lfos.gain(LfoAmp);
-                    if (v.lfos.routed(LfoDrive))
-                        voiceDrive = std::clamp(driveAmt + v.lfos.amount(LfoDrive), 0.0f, 1.0f);
-                    if (v.lfos.routed(LfoPan))
-                    {
-                        const float p = std::clamp(pan + v.lfos.panAmount(LfoPan), -1.0f, 1.0f);
-                        voicePanL = std::cos((p + 1.0f) * 0.25f * dsp::PI_F);
-                        voicePanR = std::sin((p + 1.0f) * 0.25f * dsp::PI_F);
-                    }
-                    if (v.filterOn && (v.lfos.routed(LfoCutoff) || v.lfos.routed(LfoResonance)))
-                    {
-                        lfoFilter = true;
-                        lfoCutOct = v.lfos.amount(LfoCutoff) * VoiceLfos::CUTOFF_OCTAVES;
-                        const float resoMod = v.lfos.amount(LfoResonance) * VoiceLfos::RESONANCE_RANGE;
-                        if (resoMod != v.filterResoMod)
-                        {
-                            v.filterResoMod = resoMod;
-                            const float r = std::clamp(v.filterReso + resoMod, 0.0f, 1.0f);
-                            v.filterL.setResonance(r);
-                            v.filterR.setResonance(r);
-                        }
-                    }
+                    // Its LFOs keep time. (Nothing is pushed into a voice here: each sub-block
+                    // reads what is moved and otherwise the set value, so nothing is to give back.)
+                    if (v.mods.idle(router, n))
+                        v.mods.restore(router, [](int, float) {});
+                    continue;
                 }
-                else if (v.lfoRate != 1.0 || v.lfoGain != 1.0f || v.filterResoMod != 0.0f)
-                {
-                    // The LFOs were switched off under a sounding note.
-                    v.lfoRate = 1.0;
-                    v.lfoGain = 1.0f;
-                    v.lfos.snapSlews();
-                    if (v.filterResoMod != 0.0f)
-                    {
-                        v.filterResoMod = 0.0f;
-                        v.filterL.setResonance(v.filterReso);
-                        v.filterR.setResonance(v.filterReso);
-                    }
-                }
-
-                // Level, velocity's share, pan, drive and the filter envelope's amount: a note takes
-                // them as they stand at its first sample; under a sounding note (a step lock, a
-                // knob, the strip) they are moved to over a few milliseconds, never jumped to.
-                if (v.fresh)
-                {
-                    v.fresh = false;
-                    v.volumeNow = voiceVolume;
-                    v.velSensNow = voiceVelSens;
-                    v.driveNow = voiceDrive;
-                    v.panLNow = voicePanL;
-                    v.panRNow = voicePanR;
-                    v.filterEnvNow = lfoFilter ? v.lfos.value(FilterEnv, v.filterEnvAmount) : v.filterEnvAmount;
-                }
-                else
-                {
-                    if (v.volumeNow != voiceVolume)   v.volumeNow = dsp::towards(v.volumeNow, voiceVolume, glideStep * std::max(1.0f, volumeScale));
-                    if (v.velSensNow != voiceVelSens) v.velSensNow = dsp::towards(v.velSensNow, voiceVelSens, glideStep);
-                    if (v.driveNow != voiceDrive)     v.driveNow = dsp::towards(v.driveNow, voiceDrive, glideStep);
-                    if (v.panLNow != voicePanL)       v.panLNow = dsp::towards(v.panLNow, voicePanL, glideStep);
-                    if (v.panRNow != voicePanR)       v.panRNow = dsp::towards(v.panRNow, voicePanR, glideStep);
-                }
-                voiceVolume = v.volumeNow;
-                voiceVelSens = v.velSensNow;
-                voiceDrive = v.driveNow;
-                voicePanL = v.panLNow;
-                voicePanR = v.panRNow;
-
-                float sampL, sampR;
-                const double positionBefore = v.position;
-                if (granular)
-                {
-                    processGrains(v, *voiceGrains, lfosOn, hasStereoSample, sampL, sampR);
-                }
-                else if (stretchAlgo != StretchOff)
-                {
-                    processStretch(v, mode, *voiceStretch, lfosOn, hasStereoSample, sampL, sampR);
-                }
-                else
-                {
-                    readVoice(v, mode, hasStereoSample, sampL, sampR);
-                    advancePosition(v, mode);
-                }
-
-                // The end of the region fades out (not while it loops): FADE for a slice, and the
-                // short declick, measured in output samples at the speed the note moves at.
-                if (endFades)
-                {
-                    double fade = declickSamples * std::abs(v.position - positionBefore);
-                    if (sliceFades)
-                        fade = std::max(fade, v.fadeFrames);
-                    const double left = v.forward ? (double) v.regionEnd - v.position : v.position - (double) v.regionStart;
-                    if (left < fade)
-                    {
-                        const float g = (float) std::max(0.0, left / fade);
-                        sampL *= g;
-                        sampR *= g;
-                    }
-                }
-                updateCurvedEnvelope(v, mode);
-
-                if (!v.active) continue;
-
-                float gain = v.envLevel * (1.0f - voiceVelSens + voiceVelSens * v.velocity) * voiceVolume * v.lfoGain;
-                sampL *= gain;
-                sampR *= gain;
-
-                // Per-voice filter; its cutoff is refreshed every 16 samples (every sample while an
-                // LFO moves it, in octaves: the 0..1 cutoff range is log2(1000) octaves wide).
-                if (v.filterOn)
-                {
-                    const float envTarget = lfoFilter ? v.lfos.value(FilterEnv, v.filterEnvAmount) : v.filterEnvAmount;
-                    const bool envGlides = v.filterEnvNow != envTarget;
-                    if (envGlides)      // 8 octaves in 4 ms at most: a filter shut in one sample is a click
-                        v.filterEnvNow = dsp::towards(v.filterEnvNow, envTarget, 0.8f * glideStep);
-                    if (--v.filterCountdown <= 0 || lfoFilter || envGlides)
-                    {
-                        v.filterCountdown = 16;
-                        const float envAmount = v.filterEnvNow;
-                        if (lfoFilter && v.lfos.has(FilterDrive))
-                        {
-                            const float d = voiceValue(v.lfos, FilterDrive, 0.0f);
-                            v.filterL.setDrive(d);
-                            v.filterR.setDrive(d);
-                            v.filterDriveMoved = true;
-                        }
-                        else if (v.filterDriveMoved)
-                        {
-                            // The LFO let go of FDRV under a sounding note.
-                            v.filterL.setDrive(getParamValue(FilterDrive, 0.0f));
-                            v.filterR.setDrive(getParamValue(FilterDrive, 0.0f));
-                            v.filterDriveMoved = false;
-                        }
-                        float norm = std::clamp(v.filterCutoff + envAmount * v.envLevel, 0.0f, 1.0f);
-                        if (lfoCutOct != 0.0f)
-                            norm = std::clamp(norm + lfoCutOct / 9.9657843f, 0.0f, 1.0f);
-                        float hz = 20.0f * std::pow(1000.0f, norm);
-                        v.filterL.setCutoff(hz);
-                        v.filterR.setCutoff(hz);
-                    }
-                    sampL = v.filterL.process(sampL);
-                    sampR = v.filterR.process(sampR);
-                }
-
-                if (voiceBits > 0)
-                {
-                    sampL = applyBitReduction(sampL, voiceBits);
-                    sampR = applyBitReduction(sampR, voiceBits);
-                }
-
-                if (voiceRateDiv > 1 && (i % voiceRateDiv) != 0)
-                {
-                    sampL = v.lastSampleL;
-                    sampR = v.lastSampleR;
-                }
-                else
-                {
-                    v.lastSampleL = sampL;
-                    v.lastSampleR = sampR;
-                }
-
-                if (voiceDrive > 0.01f)
-                {
-                    sampL = applySoftClip(sampL, voiceDrive);
-                    sampR = applySoftClip(sampR, voiceDrive);
-                }
-
-                // For stereo samples, pan each channel independently
-                // For mono samples (sampR == sampL), this still works correctly
-                mixL += sampL * voicePanL;
-                mixR += sampR * voicePanR;
+                renderVoice(v, b, offset, n);
             }
-
-            if (wheelLevelNow != wheelLevel)    // (worked out once per block: not jumped to)
-                wheelLevelNow = dsp::towards(wheelLevelNow, wheelLevel, glideStep);
-            outL[i] += mixL * wheelLevelNow;
-            if (outR) outR[i] += mixR * wheelLevelNow;
+            for (int i = 0; i < n; ++i)
+            {
+                if (wheelLevelNow != wheelLevel)    // (worked out once per block: not jumped to)
+                    wheelLevelNow = dsp::towards(wheelLevelNow, wheelLevel, b.glideStep);
+                outL[offset + i] += mixL[(size_t) i] * wheelLevelNow;
+                if (outR) outR[offset + i] += mixR[(size_t) i] * wheelLevelNow;
+            }
+            offset += n;
         }
 
-        lfoSection.endBlock(numSamples, eachLfos());
-        publishPlayheads(granular || stretchAlgo == StretchGrain || stretchAlgo == StretchSmear);
+        publishPlayheads(b.granular || b.stretchAlgo == StretchGrain || b.stretchAlgo == StretchSmear);
 
         bool anyActive = false;
         for (int vi = 0; vi < POOL_VOICES; ++vi)
@@ -1234,17 +1093,6 @@ private:
     float wheelLevelNow = 1.0f;     // the strip's level correction as it is heard (audio thread)
 
     enum EnvPhase { EnvAttack, EnvDecay, EnvSustain, EnvRelease, EnvOff };
-
-    struct Grain
-    {
-        double pos = 0.0;           // read position, sample frames
-        float ratio = 1.0f;         // speed relative to the note's (pitch jitter); negative = backwards
-        float phase = 0.0f;         // 0..1 through the window
-        float phaseInc = 0.0f;
-        float gainL = 1.0f;         // loudness normalisation x stereo placement
-        float gainR = 1.0f;
-        int window = 0;
-    };
 
     // A read position of the cyclic, slice and WSOL stretches (two per voice: the cycle that
     // sounds and the one it is fading out of).
@@ -1277,6 +1125,9 @@ private:
         // the envLevel written last, and both levels where the release began.
         float envLine = 0.0f, envWritten = 0.0f, relLine = 0.0f, relLevel = 0.0f;
         bool envReleasing = false;
+        // The envelope's times as read at the note (seconds) and ETIM's factor on them; the
+        // three rates are worked out from these (setEnvRates).
+        float attackTime = 0.001f, decayTime = 0.1f, releaseTime = 0.05f, envScale = 1.0f;
         float attackRate = 0.001f;
         float decayRate = 0.001f;
         float releaseRate = 0.001f;
@@ -1288,24 +1139,31 @@ private:
         bool filterOn = false;
         int filterCountdown = 0;
         FilterSlot filterL, filterR;
-        float filterReso = 0.0f;        // the set resonance, and what the LFOs add to it
+        float filterReso = 0.0f;        // the set resonance, and what the router adds to it
         float filterResoMod = 0.0f;
-        bool filterDriveMoved = false;  // an LFO has set the filter's drive away from FDRV
-        VoiceLfos lfos;
-        double lfoRate = 1.0;           // playback-speed ratio from the LFOs
-        float lfoGain = 1.0f;
-        // What the voice is heard with (see processBlock): moved to, never jumped to, under a note.
+        float filterDriveNow = 0.0f;    // the filter's drive as it is heard
+        bool filterDriveMoved = false;  // a slot has it, or had it, away from FDRV
+
+        // This voice's side of the modulation router, and the note's randoms
+        mod::Voice mods;
+        spread::Generator gen;          // advanced once a note (the engine seeds it: setGrainSeed)
+        spread::Sequence grainSeq;      // the note's grains and stretch cycles, in the order they start
+        bool starting = false;          // the note has not had its first sub-block yet
+        bool live = false;              // something of the router's moves this voice in this sub-block
+        int pickedSlice = -1;           // the slice chosen at the note-on (-1: none)
+        bool sliceByCell = false;       // ... by the SLIC cell (PLAY = ONE), which a slot may move
+        float pressure = 0.0f;          // this note's pad pressure, 0..1
+        double lfoRate = 1.0;           // playback-speed ratio from the router (PTCH)
+        float lfoGain = 1.0f;           // gain from the router (AMP)
+        // What the voice is heard with (see renderSamples): moved to, never jumped to, under a note.
         bool fresh = true;
         float volumeNow = 0.0f, velSensNow = 1.0f, driveNow = 0.0f, panLNow = 0.7071f, panRNow = 0.7071f, filterEnvNow = 0.0f;
 
-        // Granular mode. `position` is the scan position; grains[0 .. numGrains) are sounding.
-        Grain grains[MAX_GRAINS];
-        int numGrains = 0;
+        // Granular mode. `position` is the scan position; the cloud holds the grains that sound.
+        grn::Cloud<MAX_GRAINS> cloud;
         int grainAreaStart = 0;         // what grains may read: the slice, or the whole sample
         int grainAreaEnd = 0;
-        double grainPhase = 1.0;        // grain clock: a grain starts when it reaches grainThreshold
-        float grainThreshold = 1.0f;
-        uint32_t grainRng = 0x9E3779B9u;
+        float grainPlace = 0.0f;        // where the grain started last lies in that area, 0..1 (the source GRN)
         bool reverseGrains = false;     // stretch GRAN / SMER while the note runs backwards
 
         double fadeFrames = 0.0;        // FADE of the slice this note plays, in sample frames (0 = none)
@@ -1322,6 +1180,440 @@ private:
         double searchBestD = 0.0;       // best start for the next cycle, relative to where `cur` will be
         bool searchValid = false;
     };
+
+    struct GrainSettings;
+    struct StretchSettings;
+    struct Moved;
+    struct Block;
+
+    // One voice's value of a cell: the set value unless a slot moves it for this voice (as of the
+    // voice's last mod::Voice::tick: `live`).
+    float cellOf(const Voice& v, int id) const
+    {
+        if (v.live)
+            if (const int d = router.dests().indexOfId(id); d > 0 && v.mods.moved(d))
+                return v.mods.value(d);
+        return params[(size_t) id];
+    }
+
+    // True when a slot moves one of the destinations first..last for this voice.
+    static bool movedIn(const Voice& v, int first, int last)
+    {
+        for (int d = first; d <= last; ++d)
+            if (v.mods.moved(d))
+                return true;
+        return false;
+    }
+
+    // Everything that is fixed when a note starts: the slice, the region and the loop inside it,
+    // where the playhead begins, the envelope's times and the filter's starting point. Called at
+    // the note-on with the cells as set, and once more at the note's first sub-block when the
+    // router moves this voice (v.live): only there do a note-on's values of the sources exist.
+    void placeNote(Voice& v, bool live)
+    {
+        v.live = live;
+        const int note = v.note;
+        int startSamp = 0, endSamp = sampleLength;
+
+        int sliceIdx = v.pickedSlice;
+        if (live && v.sliceByCell && sliceCount > 0)
+            sliceIdx = std::clamp((int) (cellOf(v, SliceSelect) * sliceCount), 0, sliceCount - 1);
+        v.fadeFrames = 0.0;
+        if (sliceIdx >= 0 && sliceIdx < sliceCount)
+        {
+            startSamp = slices[sliceIdx].startSample;
+            endSamp = slices[sliceIdx].endSample;
+            const float keep = cellOf(v, SliceLen);
+            if (keep < 1.0f)
+                endSamp = startSamp + std::max(1, (int) ((float) (endSamp - startSamp) * std::max(keep, 0.0f)));
+            v.fadeFrames = (double) std::clamp(cellOf(v, SliceFade), 0.0f, 1.0f) * originalSampleRate;
+        }
+        else
+        {
+            sliceIdx = -1;
+        }
+        playingSlice.store(sliceIdx, std::memory_order_relaxed);
+
+        float startFrac = getParamValue(StartPoint, 0.0f);
+        if (live && v.mods.moved(LfoStart))
+            startFrac = std::clamp(startFrac + v.mods.value(LfoStart), 0.0f, 1.0f);
+        float endFrac = cellOf(v, EndPoint);
+        int rangeLen = endSamp - startSamp;
+
+        v.regionStart = startSamp + (int)(startFrac * rangeLen);
+        v.regionEnd = startSamp + (int)(endFrac * rangeLen);
+        if (v.regionEnd <= v.regionStart) v.regionEnd = v.regionStart + 1;
+
+        float loopStartFrac = cellOf(v, LoopStart);
+        float loopEndFrac = cellOf(v, LoopEnd);
+        int regionLen = v.regionEnd - v.regionStart;
+        v.loopStart = v.regionStart + (int)(loopStartFrac * regionLen);
+        v.loopEnd = v.regionStart + (int)(loopEndFrac * regionLen);
+        if (v.loopEnd <= v.loopStart) v.loopEnd = v.loopStart + 1;
+
+        PlayMode mode = getPlayMode();
+        v.forward = (mode != Reverse);
+        v.position = v.forward ? (double) v.regionStart : (double)(v.regionEnd - 1);
+
+        // Grains may reach anywhere in the slice (the whole sample without slices).
+        v.grainAreaStart = startSamp;
+        v.grainAreaEnd = std::max(endSamp, startSamp + 1);
+
+        v.attackTime = cellOf(v, Attack);
+        v.decayTime = cellOf(v, Decay);
+        v.releaseTime = cellOf(v, Release);
+        v.envScale = live && v.mods.moved(LfoEnvTime) ? v.mods.value(LfoEnvTime) : 1.0f;
+        setEnvRates(v);
+        v.sustain = std::clamp(cellOf(v, Sustain), 0.0f, 1.0f);
+
+        // Random start offset (up to the given fraction of the region): the note's own draw.
+        float startRand = cellOf(v, StartRandom);
+        if (startRand > 0.0f && v.forward)
+        {
+            int span = (int) ((float) (v.regionEnd - v.regionStart) * startRand * v.gen.unipolar(spread::Phase));
+            v.position = (double) std::min(v.regionStart + span, v.regionEnd - 1);
+        }
+        // GRN before the note's first grain: where the note begins in that area (not 0: a slot that
+        // reads GRN would begin every note at the area's start and move to the grains' place over 4 ms).
+        v.grainPlace = (float) std::clamp((v.position - (double) v.grainAreaStart) / (double) (v.grainAreaEnd - v.grainAreaStart), 0.0, 1.0);
+
+        // Per-voice filter. Velocity and key tracking set its starting point; the amp envelope can
+        // move it while the note sounds.
+        float velToFilter = cellOf(v, VelToFilter);
+        float baseCutoff = getParamValue(FilterCutoff, 1.0f);
+        float keyOffset = cellOf(v, FilterKey) * (float) (note - 60) / 120.0f;   // 1/10 of the range per octave
+        v.filterCutoff = std::clamp(baseCutoff + velToFilter * v.velocity + keyOffset, 0.0f, 1.0f);
+        v.filterEnvAmount = getParamValue(FilterEnv, 0.0f);
+    }
+
+    // The envelope's three rates from its times and ETIM's factor. (A time's factor of 1 leaves
+    // the rate exactly what it was without one.)
+    void setEnvRates(Voice& v) const
+    {
+        const float sr = (float) currentSampleRate;
+        v.attackRate = 1.0f / std::max(v.attackTime * v.envScale * sr, 1.0f);
+        v.decayRate = 1.0f / std::max(v.decayTime * v.envScale * sr, 1.0f);
+        v.releaseRate = 1.0f / std::max(v.releaseTime * v.envScale * sr, 1.0f);
+    }
+
+    // The note's filter, at its first sub-block (what is routed is known there).
+    void startFilter(Voice& v)
+    {
+        auto model = FilterSlot::modelFromIndex((int) getParamValue(FilterType, 0.0f));
+        v.filterOn = model != FilterModel::Bypass
+                     && (v.filterCutoff < 0.999f || v.filterEnvAmount != 0.0f
+                         || router.routed(LfoCutoff) || router.routed(LfoResonance)
+                         || router.routed(LfoFilterEnv) || router.routed(LfoFilterDrive));
+        v.filterDriveMoved = false;
+        v.filterDriveNow = getParamValue(FilterDrive, 0.0f);
+        v.filterReso = getParamValue(FilterReso, 0.0f);
+        v.filterResoMod = 0.0f;
+        if (v.filterOn)
+        {
+            for (auto* f : { &v.filterL, &v.filterR })
+            {
+                f->setSampleRate(currentSampleRate);
+                f->setModel(0, model);
+                f->setMode(0, (int) getParamValue(FilterMode, 0.0f));
+                f->setResonance(getParamValue(FilterReso, 0.0f));
+                f->setDrive(getParamValue(FilterDrive, 0.0f));
+                f->reset();
+            }
+            v.filterCountdown = 0;
+        }
+    }
+
+    // One sub-block of a voice that sounds, added to the mix. A note's first sample is a run of
+    // its own: the router's values for it are those of that very sample (an LFO that starts with
+    // the key is read where it starts), and what is read once at the note is read from them.
+    // (The rest of that sub-block is a second run of the voice, whose per-sample buffers the
+    // router fills from the sub-block's start: for those fifteen samples of a note an audio-rate
+    // source - the track input - is heard one sample late, and the sub-block's last input sample
+    // is not heard. Measured: the probe of "U4 Sampler", NEPTUNE_U4_REVIEW_PROBE.)
+    void renderVoice(Voice& v, Block& b, int offset, int n)
+    {
+        if (! v.starting)
+        {
+            renderRun(v, b, offset, 0, n);
+            return;
+        }
+        renderRun(v, b, offset, 0, 1);
+        if (n > 1 && v.active)
+            renderRun(v, b, offset + 1, 1, n - 1);
+    }
+
+    // n samples of a voice: the sample `at` of the block, the sample `into` of the sub-block's mix.
+    void renderRun(Voice& v, Block& b, int at, int into, int n)
+    {
+        // The voice's own sources, worked out only while a slot reads them.
+        if (router.wants(PubPos))
+            v.mods.publish(PubPos, (float) std::clamp((v.position - (double) v.regionStart)
+                                                      / (double) std::max(1, v.regionEnd - v.regionStart), 0.0, 1.0));
+        if (router.wants(PubGrain))
+            v.mods.publish(PubGrain, v.grainPlace);
+        if (router.wants(PubLevel))
+            v.mods.publish(PubLevel, levelAt(v.position));
+
+        // (The filter follows the one envelope: a slot's FENV is ENV here.)
+        v.live = v.mods.tick(router, n, v.envLevel, v.envLevel, v.pressure);
+        const bool first = v.starting;
+        if (v.starting)
+        {
+            // The note's first sample: what a slot moves of the things read once is read now.
+            v.starting = false;
+            if (v.live)
+                placeNote(v, true);
+            startFilter(v);
+        }
+        if (! v.live && ! v.filterDriveMoved)
+        {
+            // Nothing moves this voice: the sampler as it is without any modulation. (A filter
+            // drive that a slot has just let go of is first brought back to its cell, below.)
+            v.lfoRate = 1.0;
+            v.lfoGain = 1.0f;
+            renderSamples<false>(v, b, b.plain, at, into, n);
+            return;
+        }
+
+        const mod::Voice& mods = v.mods;
+        Moved m = b.plain;
+        m.pitch = mods.buffer(LfoPitch);
+        m.amp = mods.buffer(LfoAmp);
+        m.pan = mods.buffer(LfoPan);
+        m.gpos = mods.buffer(LfoGrainPos);
+        if (m.pitch == nullptr) v.lfoRate = 1.0;
+        if (m.amp == nullptr)   v.lfoGain = 1.0f;
+
+        // Slots on page cells: this voice's own value of each.
+        m.bits = (int) (cellOf(v, BitReduce) * 12.0f);
+        m.rateDiv = 1 + (int) (std::min(1.0f, cellOf(v, RateReduce)) * 31.0f);
+        m.volume = cellOf(v, Volume) * b.volumeScale;
+        m.velSens = cellOf(v, VelSens);
+        m.drive = std::min(1.0f, cellOf(v, DriveAmt));
+        if (mods.moved(LfoGrainSize))   { m.size = mods.value(LfoGrainSize); m.sizeMoved = true; }
+        if (mods.moved(LfoGrainDens))   { m.density = mods.value(LfoGrainDens); m.densityMoved = true; }
+        if (mods.moved(LfoSpeed))       m.speed = mods.value(LfoSpeed);
+        if (b.granular)
+        {
+            if (movedIn(v, LfoScan, LfoReverse))
+            {
+                b.ownGrains = readGrainSettings(&v);
+                m.grains = &b.ownGrains;
+            }
+        }
+        else if (b.stretchAlgo != StretchOff && (movedIn(v, LfoStretchSize, LfoStretchSpread) || movedIn(v, LfoFade, LfoSliceLen)))
+        {
+            b.ownStretch = readStretchSettings(b.stretchAlgo, &v);
+            m.stretch = &b.ownStretch;
+        }
+
+        // ETIM: the envelope's times under the sounding note; the stage goes on from where it is.
+        // (A note that is giving way keeps the fast release it was given.)
+        const float scale = mods.moved(LfoEnvTime) ? mods.value(LfoEnvTime) : 1.0f;
+        if (scale != v.envScale && ! v.dying)
+        {
+            v.envScale = scale;
+            setEnvRates(v);
+        }
+
+        if (v.filterOn)
+        {
+            m.cut = mods.buffer(LfoCutoff);
+            const float resoMod = mods.moved(LfoResonance) ? mods.value(LfoResonance) : 0.0f;
+            if (resoMod != v.filterResoMod)
+            {
+                v.filterResoMod = resoMod;
+                const float r = std::clamp(v.filterReso + resoMod, 0.0f, 1.0f);
+                v.filterL.setResonance(r);
+                v.filterR.setResonance(r);
+            }
+            // FDRV: the filter's drive is moved to sample by sample (renderSamples), never set in
+            // steps of a sub-block; a note takes it as it stands, and a slot that lets go of it
+            // under a sounding note leaves it to come back to the cell the same way.
+            if (mods.moved(LfoFilterDrive))
+            {
+                m.filterDrive = mods.value(LfoFilterDrive);
+                v.filterDriveMoved = true;
+                if (first)
+                {
+                    v.filterDriveNow = m.filterDrive;
+                    v.filterL.setDrive(m.filterDrive);
+                    v.filterR.setDrive(m.filterDrive);
+                }
+            }
+            else if (v.filterDriveMoved)
+            {
+                m.filterDrive = getParamValue(FilterDrive, 0.0f);
+                if (v.filterDriveNow == m.filterDrive)
+                    v.filterDriveMoved = false;
+            }
+            m.filterDriveMoves = v.filterDriveMoved && v.filterDriveNow != m.filterDrive;
+            m.envMoved = mods.moved(LfoFilterEnv);
+            m.envAmount = mods.value(LfoFilterEnv);
+        }
+        renderSamples<true>(v, b, m, at, into, n);
+    }
+
+    // The n samples of a voice's sub-block. Mod = false is the plain path: nothing of the router's
+    // is read (m is the block's own, its buffers empty), and the loop is what it was before the
+    // router existed.
+    template <bool Mod>
+    void renderSamples(Voice& v, const Block& b, Moved m, int at, int into, int n)
+    {
+        const PlayMode mode = b.mode;
+        const float glideStep = b.glideStep, volumeScale = b.volumeScale;
+        const bool lfoFilterEnv = Mod && m.envMoved;
+        for (int i = 0; i < n; ++i)
+        {
+            float voiceDrive = m.drive;
+            float voicePanL = b.panL, voicePanR = b.panR;
+            float lfoCutOct = 0.0f;
+            bool lfoFilter = false;
+            float voiceVolume = m.volume, voiceVelSens = m.velSens;
+            if (Mod)
+            {
+                // What the router has per sample for this voice: pitch (a ratio), level (a gain),
+                // pan (added to PAN), cutoff (octaves), the grains' place.
+                if (m.pitch != nullptr) v.lfoRate = (double) m.pitch[i];
+                if (m.amp != nullptr)   v.lfoGain = m.amp[i];
+                if (m.pan != nullptr)
+                {
+                    const float p = std::clamp(b.pan + m.pan[i], -1.0f, 1.0f);
+                    voicePanL = std::cos((p + 1.0f) * 0.25f * dsp::PI_F);
+                    voicePanR = std::sin((p + 1.0f) * 0.25f * dsp::PI_F);
+                }
+                if (m.cut != nullptr)
+                {
+                    lfoFilter = true;
+                    lfoCutOct = m.cut[i];
+                }
+                if (m.gpos != nullptr)  m.gposNow = m.gpos[i];
+            }
+
+            // Level, velocity's share, pan, drive and the filter envelope's amount: a note takes
+            // them as they stand at its first sample; under a sounding note (a step lock, a
+            // knob, the strip) they are moved to over a few milliseconds, never jumped to.
+            if (v.fresh)
+            {
+                v.fresh = false;
+                v.volumeNow = voiceVolume;
+                v.velSensNow = voiceVelSens;
+                v.driveNow = voiceDrive;
+                v.panLNow = voicePanL;
+                v.panRNow = voicePanR;
+                v.filterEnvNow = lfoFilterEnv ? m.envAmount : v.filterEnvAmount;
+            }
+            else
+            {
+                if (v.volumeNow != voiceVolume)   v.volumeNow = dsp::towards(v.volumeNow, voiceVolume, glideStep * std::max(1.0f, volumeScale));
+                if (v.velSensNow != voiceVelSens) v.velSensNow = dsp::towards(v.velSensNow, voiceVelSens, glideStep);
+                if (v.driveNow != voiceDrive)     v.driveNow = dsp::towards(v.driveNow, voiceDrive, glideStep);
+                if (v.panLNow != voicePanL)       v.panLNow = dsp::towards(v.panLNow, voicePanL, glideStep);
+                if (v.panRNow != voicePanR)       v.panRNow = dsp::towards(v.panRNow, voicePanR, glideStep);
+            }
+            voiceVolume = v.volumeNow;
+            voiceVelSens = v.velSensNow;
+            voiceDrive = v.driveNow;
+            voicePanL = v.panLNow;
+            voicePanR = v.panRNow;
+
+            float sampL, sampR;
+            const double positionBefore = v.position;
+            if (b.granular)
+            {
+                processGrains(v, *m.grains, m, b.stereo, sampL, sampR);
+            }
+            else if (b.stretchAlgo != StretchOff)
+            {
+                processStretch(v, mode, *m.stretch, m, b.stereo, sampL, sampR);
+            }
+            else
+            {
+                readVoice(v, mode, b.stereo, sampL, sampR);
+                advancePosition(v, mode);
+            }
+
+            // The end of the region fades out (not while it loops): FADE for a slice, and the
+            // short declick, measured in output samples at the speed the note moves at.
+            if (b.endFades)
+            {
+                double fade = b.declickSamples * std::abs(v.position - positionBefore);
+                if (b.sliceFades)
+                    fade = std::max(fade, v.fadeFrames);
+                const double left = v.forward ? (double) v.regionEnd - v.position : v.position - (double) v.regionStart;
+                if (left < fade)
+                {
+                    const float g = (float) std::max(0.0, left / fade);
+                    sampL *= g;
+                    sampR *= g;
+                }
+            }
+            updateCurvedEnvelope(v, mode);
+
+            if (!v.active) break;
+
+            float gain = v.envLevel * (1.0f - voiceVelSens + voiceVelSens * v.velocity) * voiceVolume * v.lfoGain;
+            sampL *= gain;
+            sampR *= gain;
+
+            // Per-voice filter; its cutoff is refreshed every 16 samples (every sample while a
+            // slot moves it, in octaves: the 0..1 cutoff range is log2(1000) octaves wide).
+            if (v.filterOn)
+            {
+                const float envTarget = lfoFilterEnv ? m.envAmount : v.filterEnvAmount;
+                const bool envGlides = v.filterEnvNow != envTarget;
+                if (envGlides)      // 8 octaves in 4 ms at most: a filter shut in one sample is a click
+                    v.filterEnvNow = dsp::towards(v.filterEnvNow, envTarget, 0.8f * glideStep);
+                if (--v.filterCountdown <= 0 || lfoFilter || envGlides)
+                {
+                    v.filterCountdown = 16;
+                    const float envAmount = v.filterEnvNow;
+                    float norm = std::clamp(v.filterCutoff + envAmount * v.envLevel, 0.0f, 1.0f);
+                    if (lfoCutOct != 0.0f)
+                        norm = std::clamp(norm + lfoCutOct / 9.9657843f, 0.0f, 1.0f);
+                    float hz = 20.0f * std::pow(1000.0f, norm);
+                    v.filterL.setCutoff(hz);
+                    v.filterR.setCutoff(hz);
+                }
+                if (Mod && m.filterDriveMoves && v.filterDriveNow != m.filterDrive)
+                {
+                    v.filterDriveNow = dsp::towards(v.filterDriveNow, m.filterDrive, glideStep);
+                    v.filterL.setDrive(v.filterDriveNow);
+                    v.filterR.setDrive(v.filterDriveNow);
+                }
+                sampL = v.filterL.process(sampL);
+                sampR = v.filterR.process(sampR);
+            }
+
+            if (m.bits > 0)
+            {
+                sampL = applyBitReduction(sampL, m.bits);
+                sampR = applyBitReduction(sampR, m.bits);
+            }
+
+            if (m.rateDiv > 1 && ((at + i) % m.rateDiv) != 0)
+            {
+                sampL = v.lastSampleL;
+                sampR = v.lastSampleR;
+            }
+            else
+            {
+                v.lastSampleL = sampL;
+                v.lastSampleR = sampR;
+            }
+
+            if (voiceDrive > 0.01f)
+            {
+                sampL = applySoftClip(sampL, voiceDrive);
+                sampR = applySoftClip(sampR, voiceDrive);
+            }
+
+            // For stereo samples, pan each channel independently
+            // For mono samples (sampR == sampL), this still works correctly
+            mixL[(size_t) (into + i)] += sampL * voicePanL;
+            mixR[(size_t) (into + i)] += sampR * voicePanR;
+        }
+    }
 
     // The slot for a new note. At most VOX notes sound; when a new one would make it more, one
     // gives way: the quietest of those whose key has been let go, else the oldest. It is not cut
@@ -1393,31 +1685,10 @@ private:
         return defaultVal;
     }
 
-    // One voice's value of a parameter: the set value unless one of the voice's LFOs is routed
-    // to it (EngineLfoSection: parameter destinations).
-    float voiceValue(const VoiceLfos& lfos, int id, float defaultVal) const
-    {
-        return lfos.value(id, getParamValue(id, defaultVal));
-    }
-
-    // True when one of the voice's LFOs is routed to a parameter in first..last.
-    static bool keyedIn(const VoiceLfos& lfos, int first, int last)
-    {
-        for (int i = 0; i < VoiceLfos::NUM_SOURCES; ++i)      // the LFOs and the strip's routes
-        {
-            const int k = lfos.keyAt(i);
-            if (k >= first && k <= last)
-                return true;
-        }
-        return false;
-    }
-
-    // lfos: for a voice (its LFOs may be moving SLIC).
-    int getActiveSlice(const VoiceLfos* lfos = nullptr) const
+    int getActiveSlice() const
     {
         if (sliceCount <= 0) return -1;
-        float sel = lfos != nullptr ? voiceValue(*lfos, SliceSelect, 0.0f) : getParamValue(SliceSelect, 0.0f);
-        return std::clamp((int)(sel * sliceCount), 0, sliceCount - 1);
+        return std::clamp((int) (getParamValue(SliceSelect, 0.0f) * sliceCount), 0, sliceCount - 1);
     }
 
     int getSliceMode() const { return std::clamp((int) std::lround(getParamValue(SliceMode, 0.0f)), 0, (int) NumSliceModes - 1); }
@@ -1432,7 +1703,7 @@ private:
     }
 
     // Which slice a new note plays (PLAY cell); -1 = the whole sample. Audio thread.
-    int pickSlice(int note, const VoiceLfos* lfos = nullptr)
+    int pickSlice(int note)
     {
         const int count = sliceCount;
         if (count <= 0) return -1;
@@ -1445,8 +1716,10 @@ private:
                 nextSlice = (s + 1) % count;
                 return s;
             }
-            case SliceRandom: return (int) (dsp::xorshift32(sliceRng) % (uint32_t) count);
-            default:          return getActiveSlice(lfos);
+            case SliceRandom:
+                sliceGen.advance();
+                return std::min((int) (sliceGen.unipolar(spread::Slice) * (float) count), count - 1);
+            default:          return getActiveSlice();
         }
     }
 
@@ -1466,15 +1739,6 @@ private:
             keyed = 0.0f;
         float totalSemi = keyed + semi + fine;
         return std::exp2f(totalSemi / 12.0f);
-    }
-
-    // Compute one-pole filter coefficient from normalized cutoff (0..1)
-    static float computeFilterCoeff(float normalizedCutoff, float sampleRate)
-    {
-        // Map 0..1 to 20Hz..20kHz exponentially, then to coefficient
-        float freq = 20.0f * std::pow(1000.0f, normalizedCutoff);
-        float w = dsp::TWO_PI_F * freq / std::max(8000.0f, sampleRate);
-        return std::clamp(w / (1.0f + w), 0.0f, 1.0f);
     }
 
     // The classic read of a voice. In LOOP (with the loop ending where the region ends, as it
@@ -1572,6 +1836,11 @@ private:
     // at the default overlap of 4, +6 dB at 16. Sparse grains (overlap < 1) play at full level.
     // Overlap above MAX_GRAINS cannot be reached: the surplus grains are skipped.
     //
+    // The clock, the pool and the grains are grn::Cloud (dsp/GrainScheduler.h: the same arithmetic,
+    // shared with the resonator's exciter); the engine gives it the position, the area and the
+    // read. A grain's five random numbers (place, pitch, pan, reverse, the next interval) are the
+    // next draws of the note's spread::Sequence (stream Grain), so a seed repeats a cloud.
+    //
     // Real time: fixed grain pool in the voice, no allocation, no locks; every length is in seconds
     // or in sample frames scaled by the two sample rates. All reads go through
     // readSampleStereoInterp, which clamps to the current sample, and the block is not rendered at
@@ -1580,89 +1849,55 @@ private:
 
     struct GrainSettings
     {
-        float size = 0.1f;          // seconds
-        float density = 40.0f;      // grains per second
+        // size (seconds), density (grains per second), SPRY as both the jitter of the intervals
+        // and the scatter of the places (scatterFrames = frames at SPRY 1), PJIT in octaves at
+        // u = 1 (already squared), SPRD, RVRS, SHAP
+        grn::Spec spec;
         double scanInc = 0.0;       // sample frames per output sample
-        float spray = 0.0f;
-        float sprayFrames = 0.0f;   // frames at SPRY = 1
-        float pitchJitter = 0.0f;   // octaves at u = 1 (already squared)
-        float spread = 0.0f;
-        float reverse = 0.0f;
-        int window = 0;
         double invSampleRate = 1.0 / 44100.0;
     };
 
-    static constexpr int WINDOW_TABLE_SIZE = 1024;
     static constexpr float MIN_GRAIN_SIZE = 0.005f, MAX_GRAIN_SIZE = 0.5f;
     static constexpr float MIN_GRAIN_DENSITY = 1.0f, MAX_GRAIN_DENSITY = 200.0f;
 
-    // Window shapes over 0..1 (one guard point so the interpolated lookup needs no wrap).
-    //   HANN  0.5 - 0.5 cos(2 pi p)
-    //   TRI   1 - |2p - 1|
-    //   PERC  "expodec": linear attack over the first 2 %, then exp(-5 q) brought to exactly 0 at the end
-    //   SWEL  "rexpodec": PERC backwards
-    static const std::array<std::array<float, WINDOW_TABLE_SIZE + 2>, NumGrainWindows>& grainWindowTables()
+    // voice: for one voice, when a slot moves SCAN, SPRY, PJIT, SPRD or RVRS of it.
+    GrainSettings readGrainSettings(const Voice* voice = nullptr) const
     {
-        static const auto tables = []
+        auto P = [this, voice](int id, float fallback)
         {
-            std::array<std::array<float, WINDOW_TABLE_SIZE + 2>, NumGrainWindows> t {};
-            const double attack = 0.02, k = 5.0, floorLevel = std::exp(-k);
-            auto perc = [&](double p)
-            {
-                if (p < attack) return p / attack;
-                const double q = (p - attack) / (1.0 - attack);
-                return (std::exp(-k * q) - floorLevel) / (1.0 - floorLevel);
-            };
-            for (int i = 0; i <= WINDOW_TABLE_SIZE + 1; ++i)
-            {
-                const double p = std::min(1.0, (double) i / (double) WINDOW_TABLE_SIZE);
-                t[WindowHann][(size_t) i] = (float) (0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * p));
-                t[WindowTriangle][(size_t) i] = (float) (1.0 - std::abs(2.0 * p - 1.0));
-                t[WindowPerc][(size_t) i] = (float) perc(p);
-                t[WindowSwell][(size_t) i] = (float) perc(1.0 - p);
-            }
-            return t;
-        }();
-        return tables;
-    }
-
-    // lfos: for one voice, whose LFOs may be moving SCAN, SPRY, PJIT, SPRD or RVRS.
-    GrainSettings readGrainSettings(const VoiceLfos* lfos = nullptr) const
-    {
-        auto P = [this, lfos](int id, float fallback)
-        {
-            return lfos != nullptr ? voiceValue(*lfos, id, fallback) : getParamValue(id, fallback);
+            return voice != nullptr ? cellOf(*voice, id) : getParamValue(id, fallback);
         };
         GrainSettings g;
+        auto& s = g.spec;
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         g.invSampleRate = 1.0 / sr;
-        g.size = std::clamp(getParamValue(GrainSize, 0.1f), MIN_GRAIN_SIZE, MAX_GRAIN_SIZE);
-        g.density = std::clamp(getParamValue(GrainDensity, 40.0f), MIN_GRAIN_DENSITY, MAX_GRAIN_DENSITY);
+        s.size = std::clamp(getParamValue(GrainSize, 0.1f), MIN_GRAIN_SIZE, MAX_GRAIN_SIZE);
+        s.density = std::clamp(getParamValue(GrainDensity, 40.0f), MIN_GRAIN_DENSITY, MAX_GRAIN_DENSITY);
         g.scanInc = (double) std::clamp(P(GrainScan, 1.0f), -2.0f, 2.0f) * originalSampleRate / sr;
         // STRCH SYNC in GRAN mode: SCAN 1.00 = STRT..END lasts LEN at the tempo.
         if (getParamValue(StretchSync, 0.0f) > 0.5f)
             g.scanInc *= syncedSpeed();
-        g.spray = std::clamp(P(GrainSpray, 0.0f), 0.0f, 1.0f);
-        g.sprayFrames = GRAIN_SPRAY_SECONDS * (float) originalSampleRate;
+        s.jitter = s.scatter = std::clamp(P(GrainSpray, 0.0f), 0.0f, 1.0f);
+        s.scatterFrames = GRAIN_SPRAY_SECONDS * (float) originalSampleRate;
         const float pj = std::clamp(P(GrainPitchJit, 0.0f), 0.0f, 1.0f);
-        g.pitchJitter = pj * pj * GRAIN_PITCH_JITTER_SEMITONES / 12.0f;
-        g.spread = std::clamp(P(GrainSpread, 0.0f), 0.0f, 1.0f);
-        g.reverse = std::clamp(P(GrainReverse, 0.0f), 0.0f, 1.0f);
-        g.window = std::clamp((int) std::lround(getParamValue(GrainShape, 0.0f)), 0, (int) NumGrainWindows - 1);
+        s.pitchJitter = pj * pj * GRAIN_PITCH_JITTER_SEMITONES / 12.0f;
+        s.spread = std::clamp(P(GrainSpread, 0.0f), 0.0f, 1.0f);
+        s.reverse = std::clamp(P(GrainReverse, 0.0f), 0.0f, 1.0f);
+        s.window = std::clamp((int) std::lround(getParamValue(GrainShape, 0.0f)), 0, (int) NumGrainWindows - 1);
         return g;
     }
 
     // One output sample of a granular voice: runs the grain clock, sums the grains, moves the scan.
-    void processGrains(Voice& v, const GrainSettings& gs, bool lfosOn, bool stereo, float& outL, float& outR)
+    void processGrains(Voice& v, const GrainSettings& gs, const Moved& m, bool stereo, float& outL, float& outR)
     {
-        processGrainCloud(v, gs, lfosOn, stereo, outL, outR);
+        processGrainCloud(v, gs, m, stereo, outL, outR);
 
         const double rStart = (double) v.regionStart, rEnd = (double) v.regionEnd, rLen = rEnd - rStart;
         if (gs.scanInc != 0.0)
         {
-            // The SPD LFO destination scales the scan speed.
-            if (lfosOn && v.lfos.routed(LfoSpeed))
-                v.position += gs.scanInc * (double) std::exp2f(SPEED_LFO_OCTAVES * v.lfos.amount(LfoSpeed));
+            // The SPD destination scales the scan speed.
+            if (m.speed != 1.0f)
+                v.position += gs.scanInc * (double) m.speed;
             else
                 v.position += gs.scanInc;
             if (v.position >= rEnd || v.position < rStart)
@@ -1676,122 +1911,47 @@ private:
 
     // The grain clock and the sum of the grains around the voice's `position` (which the caller
     // moves): GRAN mode, and the GRAN and SMER stretches of the other modes.
-    void processGrainCloud(Voice& v, const GrainSettings& gs, bool lfosOn, bool stereo, float& outL, float& outR)
+    void processGrainCloud(Voice& v, const GrainSettings& gs, const Moved& m, bool stereo, float& outL, float& outR)
     {
         const double baseInc = v.playbackRate * (double) bendRatio * v.lfoRate;
 
-        float size = gs.size, density = gs.density;
-        if (lfosOn)
-        {
-            if (v.lfos.routed(LfoGrainSize))
-                size = std::clamp(size * std::pow(MAX_GRAIN_SIZE / MIN_GRAIN_SIZE, v.lfos.amount(LfoGrainSize)),
-                                  MIN_GRAIN_SIZE, MAX_GRAIN_SIZE);
-            if (v.lfos.routed(LfoGrainDens))
-                density = std::clamp(density * std::pow(MAX_GRAIN_DENSITY / MIN_GRAIN_DENSITY, v.lfos.amount(LfoGrainDens)),
-                                     MIN_GRAIN_DENSITY, MAX_GRAIN_DENSITY);
-        }
+        // SIZE and DENS as the router has them for this voice (factors on the cells).
+        float size = gs.spec.size, density = gs.spec.density;
+        if (m.sizeMoved)
+            size = std::clamp(size * m.size, MIN_GRAIN_SIZE, MAX_GRAIN_SIZE);
+        if (m.densityMoved)
+            density = std::clamp(density * m.density, MIN_GRAIN_DENSITY, MAX_GRAIN_DENSITY);
 
-        v.grainPhase += (double) density * gs.invSampleRate;
-        if (v.grainPhase >= (double) v.grainThreshold)
-        {
-            v.grainPhase = std::max(0.0, v.grainPhase - (double) v.grainThreshold);
-            startGrain(v, gs, size, density, baseInc, lfosOn);
-            // Next interval: 1 / DENS, scattered by SPRY (mean unchanged).
-            v.grainThreshold = gs.spray > 0.0f
-                ? std::max(0.05f, 1.0f + gs.spray * dsp::xorshiftNoise(v.grainRng))
-                : 1.0f;
-        }
-
-        const double aStart = (double) v.grainAreaStart, aEnd = (double) v.grainAreaEnd, aLen = aEnd - aStart;
-        const auto& tables = grainWindowTables();
-        float l = 0.0f, r = 0.0f;
-        for (int gi = 0; gi < v.numGrains; )
-        {
-            auto& g = v.grains[gi];
-            float sl, sr;
-            readSampleStereoInterp(g.pos, stereo, sl, sr);
-
-            const float x = g.phase * (float) WINDOW_TABLE_SIZE;
-            const int xi = (int) x;
-            const float* tbl = tables[(size_t) g.window].data();
-            const float w = tbl[xi] + (x - (float) xi) * (tbl[xi + 1] - tbl[xi]);
-            l += sl * w * g.gainL;
-            r += sr * w * g.gainR;
-
-            g.pos += baseInc * (double) g.ratio;
-            if (g.pos > aEnd) g.pos -= aLen;
-            else if (g.pos < aStart) g.pos += aLen;
-            if (g.pos > aEnd || g.pos < aStart)
-            {
-                // A step longer than the area (a very high note over a short slice): one wrap is
-                // not enough, and the grain ran further out with every sample.
-                const double off = std::fmod(g.pos - aStart, aLen);
-                g.pos = aStart + (off < 0.0 ? off + aLen : off);
-            }
-
-            g.phase += g.phaseInc;
-            if (g.phase >= 1.0f)
-                g = v.grains[--v.numGrains];    // finished: the last grain takes its place
-            else
-                ++gi;
-        }
-        outL = l;
-        outR = r;
+        const grn::Area area { (double) v.grainAreaStart, (double) v.grainAreaEnd };
+        if (v.cloud.due(density, gs.invSampleRate))
+            startGrain(v, gs, m, size, density, baseInc, area);
+        v.cloud.sum([this, stereo](double pos, float& l, float& r) { readSampleStereoInterp(pos, stereo, l, r); },
+                    baseInc, area, outL, outR);
     }
 
-    void startGrain(Voice& v, const GrainSettings& gs, float size, float density, double baseInc, bool lfosOn)
+    void startGrain(Voice& v, const GrainSettings& gs, const Moved& m, float size, float density, double baseInc, const grn::Area& area)
     {
-        // The random numbers are drawn whether or not the grain is used, so a full pool does not
-        // change what the following grains get.
-        const float uPos = dsp::xorshiftNoise(v.grainRng);
-        const float uPitch = dsp::xorshiftNoise(v.grainRng);
-        const float uPan = dsp::xorshiftNoise(v.grainRng);
-        const float uReverse = dsp::xorshiftFloat(v.grainRng);
-        if (v.numGrains >= MAX_GRAINS)
-            return;
+        grn::Spec s = gs.spec;
+        s.size = size;
+        s.density = density;
+        s.backwards = v.reverseGrains;      // a note running backwards: the grain ends at the position
 
-        auto& g = v.grains[v.numGrains++];
-        const float lengthSamples = std::max(8.0f, size * (float) currentSampleRate);
-        g.phase = 0.0f;
-        g.phaseInc = 1.0f / lengthSamples;
-        g.window = gs.window;
-
-        const float ratio = gs.pitchJitter > 0.0f ? std::exp2f(gs.pitchJitter * uPitch) : 1.0f;
-
-        const double aStart = (double) v.grainAreaStart, aEnd = (double) v.grainAreaEnd, aLen = aEnd - aStart;
+        // GPOS: the place as the router has it at this very sample.
         double p = v.position;
-        if (lfosOn && v.lfos.routed(LfoGrainPos))
-            p = std::clamp(p + (double) v.lfos.amount(LfoGrainPos) * (double) (v.regionEnd - v.regionStart),
-                           aStart, aEnd - 1.0);
-        if (gs.spray > 0.0f)
-        {
-            p += (double) (gs.spray * uPos) * std::min((double) gs.sprayFrames, aLen);
-            if (p < aStart) p = aStart + (aStart - p);
-            else if (p > aEnd - 1.0) p = (aEnd - 1.0) - (p - (aEnd - 1.0));
-        }
-        const double span = (double) lengthSamples * baseInc * (double) ratio;   // frames the grain covers
-        if (v.reverseGrains)
-            p -= span;      // a note running backwards: the grain ends at the position
-        if (span < aLen)
-            p = std::min(p, aEnd - span);
-        p = std::clamp(p, aStart, aEnd - 1.0);
+        if (m.gpos != nullptr)
+            p = std::clamp(p + (double) m.gposNow * (double) (v.regionEnd - v.regionStart), area.start, area.end - 1.0);
 
-        const bool reversed = (uReverse < gs.reverse) != v.reverseGrains;
-        g.pos = reversed ? std::min(p + span, aEnd) : p;
-        g.ratio = reversed ? -ratio : ratio;
-
-        const float overlap = std::clamp(size * density, 1.0f, (float) MAX_GRAINS);
-        const float gain = 1.0f / std::sqrt(overlap);
-        if (gs.spread > 0.0f)
-        {
-            const float angle = (gs.spread * uPan + 1.0f) * 0.25f * dsp::PI_F;
-            g.gainL = gain * 1.41421356f * std::cos(angle);
-            g.gainR = gain * 1.41421356f * std::sin(angle);
-        }
-        else
-        {
-            g.gainL = g.gainR = gain;
-        }
+        // The grain's random numbers: the next draws of the note's sequence, taken whether or not
+        // the grain is used, so a full pool does not change what the following grains get.
+        grn::Cloud<MAX_GRAINS>::Draws d;
+        d.pos = v.grainSeq.bipolar();
+        d.pitch = v.grainSeq.bipolar();
+        d.pan = v.grainSeq.bipolar();
+        d.reverse = v.grainSeq.unipolar();
+        if (s.jitter > 0.0f)
+            d.interval = v.grainSeq.bipolar();
+        if (const grn::Grain* g = v.cloud.start(s, p, area, baseInc, currentSampleRate, d))
+            v.grainPlace = (float) std::clamp((g->pos - area.start) / std::max(1.0, area.end - area.start), 0.0, 1.0);
     }
 
     // -------------------------------------------------------------------------------------------
@@ -1834,15 +1994,73 @@ private:
     // Message thread, after every sample change.
     void sampleChanged()
     {
+        nextSlice = 0;
+        if (getSliceMode() == SliceTransient)
+            rebuildSlices();
+    }
+
+    // The sample's peak and its level per hop (message thread, after the sample-change handshake,
+    // as before the port: the analysis of a long sample takes tens of milliseconds and the track
+    // must not be kept silent that long). The audio thread reads only the level table and its hop
+    // (the source SLEV): they are made aside and handed over with a short handshake of their own.
+    void analyseSample()
+    {
+        std::vector<float> levelTable;      // (made here; swapped in at the end)
         float peak = 0.0f;
         for (float x : sampleL) peak = std::max(peak, std::abs(x));
         for (float x : sampleR) peak = std::max(peak, std::abs(x));
         normalizeGain = peak > 1.0e-4f ? std::min(1.0f / peak, 100.0f) : 1.0f;
-
         analyseOnsets();
-        nextSlice = 0;
-        if (getSliceMode() == SliceTransient)
-            rebuildSlices();
+
+        // SLEV's table, one value a hop: the root of the mean square over the ONSET_WINDOW_HOPS hops
+        // round it (23 ms - one hop of 2.9 ms follows the waveform of a low note, not its level:
+        // 15 .. 100 % a hundred and ten times a second on a steady 55 Hz tone), as a fraction of
+        // the loudest such stretch. A sample shorter than a hop has one value: its own level.
+        const int hops = (int) onsetEnergy.size();
+        levelTable.assign((size_t) std::max(1, hops), 0.0f);
+        if (hops == 0)
+        {
+            double e = 0.0;
+            for (int i = 0; i < sampleLength; ++i) e += (double) monoAt(i) * (double) monoAt(i);
+            levelTable[0] = e > 1.0e-12 * (double) std::max(1, sampleLength) ? 1.0f : 0.0f;
+            publishLevelTable(levelTable);
+            return;
+        }
+        const int before = (ONSET_WINDOW_HOPS - 1) / 2, after = ONSET_WINDOW_HOPS / 2;
+        double sum = 0.0, loudest = 0.0;
+        for (int h = 0; h < std::min(hops, after); ++h) sum += (double) onsetEnergy[(size_t) h];
+        for (int h = 0; h < hops; ++h)
+        {
+            if (h + after < hops)       sum += (double) onsetEnergy[(size_t) (h + after)];
+            if (h - before - 1 >= 0)    sum -= (double) onsetEnergy[(size_t) (h - before - 1)];
+            const int count = std::min(hops - 1, h + after) - std::max(0, h - before) + 1;
+            const double mean = std::max(0.0, sum) / (double) count;
+            levelTable[(size_t) h] = (float) mean;
+            loudest = std::max(loudest, mean);
+        }
+        for (float& x : levelTable)
+            x = loudest > 1.0e-12 ? (float) std::sqrt((double) x / loudest) : 0.0f;
+        publishLevelTable(levelTable);
+    }
+
+    // Hands a new level table to the audio thread; the old one is freed here, on this thread.
+    void publishLevelTable(std::vector<float>& table)
+    {
+        changingSample.store(true);
+        for (int spins = 0; inProcess.load() && spins < 2000; ++spins)
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        this->levelTable.swap(table);
+        levelHop = onsetHop;
+        changingSample.store(false);
+    }
+
+    // SLEV: the sample's level where a voice's playhead is, 0..1 of its loudest hop. Audio thread.
+    float levelAt(double position) const
+    {
+        if (levelTable.empty())
+            return 0.0f;
+        const int hop = (int) (position >= 0.0 ? std::min(position, 1.0e9) : 0.0) / std::max(1, levelHop);
+        return levelTable[(size_t) std::min(hop, (int) levelTable.size() - 1)];     // (the last, shorter hop: the one before it)
     }
 
     void analyseOnsets()
@@ -2165,6 +2383,48 @@ private:
         GrainSettings grains;
     };
 
+    // What one voice is rendered with in one sub-block: the block's own values, and over them
+    // what the router moves for this voice (renderVoice).
+    struct Moved
+    {
+        // Per sample, or null: pitch (a ratio), level (a gain), pan (added to PAN), cutoff
+        // (octaves), the grains' place (GPOS, of the region)
+        const float* pitch = nullptr;
+        const float* amp = nullptr;
+        const float* pan = nullptr;
+        const float* cut = nullptr;
+        const float* gpos = nullptr;
+        float gposNow = 0.0f;                           // GPOS at the sample being made
+        float size = 1.0f, density = 1.0f, speed = 1.0f;    // factors on SIZE, DENS and the stretch speed / SCAN
+        bool sizeMoved = false, densityMoved = false;
+        bool envMoved = false;                          // ENVF is moved: its value
+        float envAmount = 0.0f;
+        bool filterDriveMoves = false;                  // FDRV is on its way to this
+        float filterDrive = 0.0f;
+        float drive = 0.0f, volume = 0.8f, velSens = 1.0f;
+        int bits = 0, rateDiv = 1;
+        const GrainSettings* grains = nullptr;
+        const StretchSettings* stretch = nullptr;
+    };
+
+    // What processBlock works out once for all voices.
+    struct Block
+    {
+        PlayMode mode = Forward;
+        bool granular = false, stereo = false, endFades = false, sliceFades = false;
+        int stretchAlgo = StretchOff;
+        float volume = 0.8f, volumeScale = 1.0f, velSens = 1.0f, pan = 0.0f, panL = 0.7071f, panR = 0.7071f;
+        float driveAmt = 0.0f, glideStep = 0.01f;
+        int bits = 0, rateDiv = 1;
+        double declickSamples = 0.0;
+        GrainSettings gs;
+        StretchSettings stretch;
+        // A voice whose slots move a grain or stretch cell works from its own copy of the settings.
+        GrainSettings ownGrains;
+        StretchSettings ownStretch;
+        Moved plain;                // a voice nothing moves
+    };
+
     // SYNC: the loop lasts LEN bars (of four beats) at the tempo.
     double syncedSpeed() const
     {
@@ -2187,12 +2447,12 @@ private:
         return speed;
     }
 
-    // lfos: for one voice, whose LFOs may be moving SIZE, XFAD, JIT or SPRD (or FADE, SLEN).
-    StretchSettings readStretchSettings(int algo, const VoiceLfos* lfos = nullptr) const
+    // voice: for one voice, when a slot moves SIZE, XFAD, JIT or SPRD (or FADE, SLEN) of it.
+    StretchSettings readStretchSettings(int algo, const Voice* voice = nullptr) const
     {
-        auto P = [this, lfos](int id, float fallback)
+        auto P = [this, voice](int id, float fallback)
         {
-            return lfos != nullptr ? voiceValue(*lfos, id, fallback) : getParamValue(id, fallback);
+            return voice != nullptr ? cellOf(*voice, id) : getParamValue(id, fallback);
         };
         StretchSettings s;
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
@@ -2226,15 +2486,15 @@ private:
         }
         else if (algo == StretchGrain || algo == StretchSmear)
         {
-            auto& g = s.grains;
-            g.invSampleRate = 1.0 / sr;
-            float overlap;
+            s.grains.invSampleRate = 1.0 / sr;
+            auto& g = s.grains.spec;
+            float overlap, spray;
             if (algo == StretchSmear)
             {
                 g.size = std::min(size * 8.0f, 2.0f);
                 overlap = 8.0f + 24.0f * xfade;
-                g.spray = 1.0f;
-                g.sprayFrames = (0.05f + 0.45f * s.jitter) * (float) originalSampleRate;
+                spray = 1.0f;
+                g.scatterFrames = (0.05f + 0.45f * s.jitter) * (float) originalSampleRate;
             }
             else
             {
@@ -2244,11 +2504,12 @@ private:
                 // 1; JIT scatters the POSITIONS too (up to +-one grain).
                 g.size = size;
                 overlap = 2.0f + 8.0f * xfade;
-                g.spray = 0.3f + 0.7f * s.jitter;
-                g.sprayFrames = s.jitter * size * (float) originalSampleRate / g.spray;
+                spray = 0.3f + 0.7f * s.jitter;
+                g.scatterFrames = s.jitter * size * (float) originalSampleRate / spray;
             }
+            g.jitter = g.scatter = spray;
             g.density = overlap / g.size;
-            g.scanInc = 0.0;
+            s.grains.scanInc = 0.0;
             g.pitchJitter = 0.0f;
             g.spread = std::clamp(P(StretchSpread, 0.0f), 0.0f, 1.0f);
             g.reverse = 0.0f;
@@ -2311,13 +2572,12 @@ private:
     }
 
     // One output sample of a stretched voice.
-    void processStretch(Voice& v, PlayMode mode, const StretchSettings& st, bool lfosOn, bool stereo, float& outL, float& outR)
+    void processStretch(Voice& v, PlayMode mode, const StretchSettings& st, const Moved& m, bool stereo, float& outL, float& outR)
     {
         const double pitchInc = v.playbackRate * (double) bendRatio * v.lfoRate;
         double speed = st.speed;
-        if (lfosOn && v.lfos.routed(LfoSpeed))
-            speed = std::clamp(speed * (double) std::exp2f(SPEED_LFO_OCTAVES * v.lfos.amount(LfoSpeed)),
-                               MIN_STRETCH_SPEED, MAX_STRETCH_SPEED);
+        if (m.speed != 1.0f)
+            speed = std::clamp(speed * (double) m.speed, MIN_STRETCH_SPEED, MAX_STRETCH_SPEED);
         const double timeInc = speed * st.frameRatio;
 
         if (st.algo == StretchTape)
@@ -2328,7 +2588,7 @@ private:
         else if (st.algo == StretchGrain || st.algo == StretchSmear)
         {
             v.reverseGrains = ! v.forward;
-            processGrainCloud(v, st.grains, lfosOn, stereo, outL, outR);
+            processGrainCloud(v, st.grains, m, stereo, outL, outR);
             advanceScan(v, mode, timeInc);
             declickEnd(v, mode, st.declickSamples * timeInc, outL, outR);
         }
@@ -2423,7 +2683,7 @@ private:
                 if (st.algo == StretchWsol && v.searchValid)
                     startPos = v.cur.pos + v.searchBestD;
                 else if (st.algo == StretchCycle && st.jitter > 0.0f)
-                    startPos += (double) (st.jitter * dsp::xorshiftNoise(v.grainRng)) * (double) st.cycleSamples * pitchInc;
+                    startPos += (double) (st.jitter * v.grainSeq.bipolar()) * (double) st.cycleSamples * pitchInc;
             }
             v.spliceCount = st.cycleSamples;
         }
@@ -2547,7 +2807,7 @@ private:
             const bool on = v.active && ! v.dying;
             playheadVoice[i].store(on ? norm(v.position) : -1.0f, std::memory_order_relaxed);
             if (on && granular)
-                totalGrains += v.numGrains;
+                totalGrains += v.cloud.sounding();
         }
 
         int written = 0;
@@ -2560,9 +2820,9 @@ private:
                 const auto& v = voices[i];
                 if (! v.active || v.dying)
                     continue;
-                for (int gi = 0; gi < v.numGrains && written < MAX_PLAYHEAD_GRAINS; ++gi)
+                for (int gi = 0; gi < v.cloud.sounding() && written < MAX_PLAYHEAD_GRAINS; ++gi)
                     if (counter++ % step == 0)
-                        playheadGrain[written++].store(norm(v.grains[gi].pos), std::memory_order_relaxed);
+                        playheadGrain[written++].store(norm(v.cloud.grain(gi).pos), std::memory_order_relaxed);
             }
         }
         playheadGrainCount.store(written, std::memory_order_relaxed);
@@ -2749,7 +3009,7 @@ private:
         // The audio thread is out of the block (and stays out until endSampleChange): no grain of
         // the old sample survives the change.
         for (auto& v : voices)
-            v.numGrains = 0;
+            v.cloud.clear();
         clearPlayheads();
     }
     void endSampleChange() { changingSample.store(false); }
@@ -2757,7 +3017,6 @@ private:
     std::atomic<bool> inProcess { false };
     std::atomic<bool> changingSample { false };
     int bankIndex = -1;
-    uint32_t randomSeed = 0x9E3779B9u;
     float bend = 0.0f;
     float wheel = 0.0f, wheelNow = 0.0f;                // the mod strip as sent, and smoothed per block
     float bendRatio = 1.0f;
@@ -2770,7 +3029,7 @@ private:
     float tempoBpm = 120.0f;
     float normalizeGain = 1.0f;         // 1 / peak of the sample (message thread, when it changes)
     int nextSlice = 0;                  // PLAY = NEXT
-    uint32_t sliceRng = 0x2545F491u;    // PLAY = RAND
+    spread::Generator sliceGen;         // PLAY = RAND: advanced once a note that asks
     std::atomic<int> playingSlice { -1 };
 
     // Onset analysis of the sample (see the transient-slicing section): mean-square level of the
@@ -2778,10 +3037,16 @@ private:
     std::vector<float> onsetEnergy, onsetEnergyHigh, onsetScratch;
     int onsetHop = 128;
     float onsetPeak = 0.0f, onsetPeakHigh = 0.0f;
+    std::vector<float> levelTable;      // SLEV: the level per hop, 0..1 of the loudest 23 ms (made with the onset tables)
+    int levelHop = 128;                 // its hop (the audio thread's copy of onsetHop)
 
     // Published by the audio thread once per block (see getPlayheads). -1 = nothing there.
     std::atomic<float> playheadVoice[POOL_VOICES];
     std::atomic<float> playheadGrain[MAX_PLAYHEAD_GRAINS];
     std::atomic<int> playheadGrainCount { 0 };
-    EngineLfoSection lfoSection { lfoDests() };
+
+    // Everything that moves the sound: LFO1, LFO2, the STRIP and XIN pages, the free slots, the
+    // pad's pressure routes (ids 158-189 and 700-772, mod::Router's on every engine).
+    mod::Router router { lfoDests(), 2, 0, &sources() };
+    std::array<float, mod::Router::MAX_CHUNK> mixL {}, mixR {};
 };
